@@ -541,6 +541,8 @@
       kind: 'input',
       element: desc,
       value: sensitive ? null : String(value).slice(0, MAX_VALUE),
+      // Só para o gravador apagar este valor dos textos capturados; nunca é gravado.
+      secret: sensitive ? String(value).slice(0, MAX_VALUE) : null,
       typed: sensitive || !st.typedKnown ? null : st.typed.slice(0, MAX_VALUE),
       script_modified: sensitive ? false : st.scriptSet,
     });

@@ -32,6 +32,7 @@ from rapa.core.robot import (
 from rapa.fixtures.portal import DEFAULT_PASSWORD, DEFAULT_USER, current_totp
 from rapa.fixtures.server import HOST_RESOLVER_ARG, RunningPortal
 from rapa.recorder import (
+    REDACTED,
     ClickEvent,
     InputEvent,
     NavigationCause,
@@ -140,14 +141,16 @@ async def test_login_totp_and_issue_protocol(browser: Browser, portal_v1: Runnin
 
     recording = await record(browser, scenario)
     assert portal_v1.state.protocolos[0]["cpf"] == "529.982.247-25"
-    assert_no_secrets(recording.model_dump_json(), codes, username=False)
+    # Nem o nome de usuário que o portal mostra depois do login ("Olá, ...") fica na gravação.
+    assert_no_secrets(recording.model_dump_json(), codes)
+    assert any(f"Olá, {REDACTED}" in text for text in recording.observed_texts())
     sensitive = [e for e in recording.events if isinstance(e, InputEvent) and e.element.sensitive]
     assert len(sensitive) == 3 and all(e.value is None for e in sensitive)
 
     result = compile_(recording, "emitir_protocolo_gravado")
     manifest = result.manifest
     assert_no_secrets(manifest.model_dump_json(), codes)
-    assert_no_secrets(result.model_dump_json(exclude={"observed_texts"}), codes)
+    assert_no_secrets(result.model_dump_json(), codes)
     assert_login_steps(result)
 
     emitir = manifest.step_by_id("clicar_emitir")
@@ -256,7 +259,7 @@ async def test_read_notes_and_download_one_file(browser: Browser, portal_v1: Run
 
     recording = await record(browser, scenario)
     assert portal_v1.state.downloads == ["001003"]
-    assert_no_secrets(recording.model_dump_json(), codes, username=False)
+    assert_no_secrets(recording.model_dump_json(), codes)
     result = compile_(recording, "baixar_nota_gravada")
     manifest = result.manifest
     assert_no_secrets(manifest.model_dump_json(), codes)

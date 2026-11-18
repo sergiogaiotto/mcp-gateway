@@ -53,6 +53,9 @@ __all__ = ["Recorder", "RecorderError"]
 _PACKAGE = resources.files("rapa.recorder")
 _CAPTURE_JS = _PACKAGE.joinpath("capture.js").read_text(encoding="utf-8")
 _PAGE_TEXT_JS = _PACKAGE.joinpath("page_text.js").read_text(encoding="utf-8")
+#: Valores sigilosos mais curtos que isto não são procurados nos textos.
+MIN_REDACTED_CHARS = 4
+_MAX_SECRET_VALUES = 64
 _STOP_JS = "() => { const stop = window[Symbol.for('rapa.recorder.stop')]; if (stop) stop(); }"
 _FRAME_INFO_JS = """(el) => ({
   tag: el.tagName.toLowerCase(),
@@ -197,6 +200,9 @@ class Recorder:
         self._stopping = False
         self._closed = False
         self._recording: Recording | None = None
+        #: Valores de campos sigilosos (usuário, senha, código), só em memória, para
+        #: apagar dos textos capturados ao fechar a gravação. Nunca entram nela.
+        self._secret_values: set[str] = set()
 
     # -- ciclo de vida ---------------------------------------------------------
 
@@ -272,14 +278,56 @@ class Recorder:
         for disposable in reversed(self._disposables):
             with suppress(Exception):
                 await disposable.close()
+        events = [self._scrub(event) for event in self._events]
+        self._secret_values.clear()
         self._recording = Recording(
             started_at=self._started_at,
             finished_at=datetime.now(UTC),
-            events=list(self._events),
+            events=events,
             other_hosts=sorted(self._other_hosts),
             dropped_messages=self._dropped,
         )
         return self._recording
+
+    def _remember_secret(self, value: object) -> None:
+        if not isinstance(value, str):
+            return
+        value = value.strip()
+        if len(value) >= MIN_REDACTED_CHARS and len(self._secret_values) < _MAX_SECRET_VALUES:
+            self._secret_values.add(value)
+
+    def _scrub(self, event: RecordingEvent) -> RecordingEvent:
+        """Troca por ``REMOVIDO`` os valores sigilosos que aparecerem em qualquer texto do evento.
+
+        O nome de usuário costuma aparecer na página depois do login ("Olá, ana.souza")
+        e chegaria às pós-condições e ao prompt do modelo de linguagem.
+        """
+        if not self._secret_values:
+            return event
+        ordered = sorted(self._secret_values, key=len, reverse=True)
+
+        def clean(value: Any) -> Any:
+            if isinstance(value, str):
+                for secret in ordered:
+                    if secret in value:
+                        value = value.replace(secret, REDACTED)
+                return value
+            if isinstance(value, list):
+                return [clean(item) for item in value]
+            if isinstance(value, dict):
+                return {key: clean(item) for key, item in value.items()}
+            return value
+
+        data = event.model_dump(mode="json")
+        cleaned = clean(data)
+        if cleaned == data:
+            return event
+        try:
+            return type(event).model_validate(cleaned)
+        except ValidationError:
+            raise RecorderError(
+                "Não consegui apagar um valor sigiloso da gravação; grave de novo."
+            ) from None
 
     def expect_typed_navigation(self, page: Page) -> None:
         """Avisa que a próxima navegação da aba foi digitada pela pessoa (barra de endereço)."""
@@ -406,6 +454,8 @@ class Recorder:
             created = click
         elif kind == "input" and element is not None:
             sensitive = element.sensitive
+            if sensitive:
+                self._remember_secret(payload.get("secret"))
             created = self._append(
                 InputEvent,
                 element=element,

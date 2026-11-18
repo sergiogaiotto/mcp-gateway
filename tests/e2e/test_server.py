@@ -16,7 +16,6 @@ import pytest
 
 from rapa.core.ids import new_id
 from rapa.server import ServerSettings, load_dev_tokens
-from tests.control.db.conftest import app_db, pg_database  # noqa: F401
 from tests.control.db.support import PgDatabase, make_tenant
 
 DB = "postgresql://rapa_app:senha@banco:5432/rapa"
@@ -111,7 +110,7 @@ def _free_port() -> int:
 
 @pytest.fixture
 def server_process(
-    pg_database: PgDatabase,  # noqa: F811
+    pg_database: PgDatabase,
     tmp_path: Path,
     tokens: dict[str, Any],
 ) -> Iterator[str]:
@@ -164,7 +163,7 @@ def server_process(
 
 
 @pytest.fixture
-async def tokens(app_db: Any) -> dict[str, Any]:  # noqa: F811
+async def tokens(app_db: Any) -> dict[str, Any]:
     tenant = await make_tenant(app_db, "Servidor")
     return {
         "token-operadora": {
