@@ -201,10 +201,10 @@ async def test_input_validation_messages(app_db: Database) -> None:
             RunTrigger.REST,
         )
     errors = caught.value.errors
-    assert "entrada obrigatória ausente: uf" in errors
-    assert "entrada não declarada: extra" in errors
-    assert "nome: tipo inválido (esperado texto)" in errors
-    assert "cpf: formato inválido" in errors
+    assert "campo obrigatório ausente: uf" in errors
+    assert "campo não declarado: extra" in errors
+    assert "nome: tipo inválido; esperado texto" in errors
+    assert "cpf: valor fora do formato esperado" in errors
     assert all("123" not in e for e in errors)  # o valor recebido não volta na mensagem
 
 

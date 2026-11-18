@@ -82,9 +82,9 @@ MANIFEST = emitir_protocolo("http://portal-v1.rapa.test:8080", "portal-v1.rapa.t
 def test_validate_inputs_ok_and_errors() -> None:
     assert validate_inputs(MANIFEST, {"nome": "Ana", "cpf": "52998224725", "uf": "SP"}) == []
     errors = validate_inputs(MANIFEST, {"cpf": 5})
-    assert "entrada obrigatória ausente: nome" in errors
-    assert "entrada obrigatória ausente: uf" in errors
-    assert "cpf: tipo inválido (esperado texto)" in errors
+    assert "campo obrigatório ausente: nome" in errors
+    assert "campo obrigatório ausente: uf" in errors
+    assert "cpf: tipo inválido; esperado texto" in errors
 
 
 def test_validate_inputs_lists_and_dates() -> None:
@@ -115,9 +115,9 @@ def test_validate_inputs_lists_and_dates() -> None:
     )
     assert validate_inputs(manifest, {"dia": "2026-11-18", "itens": [{"numero": 1}]}) == []
     errors = validate_inputs(manifest, {"dia": "2026-13-40", "itens": [{"numero": "x", "y": 1}]})
-    assert "dia: formato inválido (date)" in errors
-    assert "itens/0: campo não declarado: y" in errors
-    assert "itens/0/numero: tipo inválido (esperado número inteiro)" in errors
+    assert "dia: formato inválido; esperado data no formato AAAA-MM-DD" in errors
+    assert "campo não declarado: itens[0].y" in errors
+    assert "itens[0].numero: tipo inválido; esperado número inteiro" in errors
 
 
 def test_psycopg_url() -> None:
