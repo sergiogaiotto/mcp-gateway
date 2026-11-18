@@ -14,17 +14,25 @@ Fase 0, que não depende do AWS Outposts:
 - [x] Templates sem lógica (`rapa.core.templates`) e portão de política determinístico (`rapa.core.policy`)
 - [x] Contratos entre os módulos (`rapa.core.contracts`, `rapa.core.events`)
 - [x] Portais de teste em pt-BR (`rapa.fixtures`) com login TOTP, tabela paginada, downloads, formulário com CPF, passo irreversível e uma variante que muda o layout
-- [ ] Executor sobre Playwright
-- [ ] Gravador e compilador
-- [ ] Cliente do hub de LLM e sonda de capacidades
-- [ ] Plano de controle: Postgres multiempresa, fila, API REST e gateway MCP
-- [ ] Interface em NiceGUI
+- [x] Executor sobre Playwright (`rapa.runner`), sem LLM, com confirmação do plano de controle antes de cada passo irreversível
+- [x] Gravador da demonstração e compilador determinístico (`rapa.recorder`, `rapa.compiler`)
+- [x] Cliente do hub de LLM, sonda de capacidades e generalização assistida (`rapa.llm`)
+- [x] Plano de controle: PostgreSQL multiempresa com isolamento por linha, fila, despachante e lançador local (`rapa.control`)
+- [x] API REST e gateway MCP com o SDK oficial (`rapa.control.api`, `rapa.control.mcp`)
+- [x] Interface em NiceGUI (`rapa.ui`)
+- [ ] Montagem num serviço só e teste ponta a ponta (publicar pelo REST, chamar pelo MCP, executar no portal de teste)
 
 ## Estrutura
 
 ```
 src/rapa/
-  core/       formato do robô, templates, política, contratos e eventos
+  core/       formato do robô, templates, política, edições, contratos e eventos
+  runner/     executor sobre Playwright (python -m rapa.runner.worker)
+  recorder/   gravador da demonstração
+  compiler/   compilação da gravação em robô
+  llm/        cliente do hub de LLM, sonda (python -m rapa.llm.probe) e generalização
+  control/    banco, fila, despachante, lançador, API REST e gateway MCP
+  ui/         interface em NiceGUI (python -m rapa.ui para o modo de desenvolvimento)
   fixtures/   portais de teste e robôs de exemplo
 tests/        testes automatizados (pytest)
 docs/         plano e documentação
@@ -46,7 +54,7 @@ uv run pytest
 uv run ruff check src tests && uv run mypy
 ```
 
-Os testes com navegador procuram o Chromium em `RAPA_CHROMIUM_PATH`, `/usr/bin/chromium` ou `/opt/pw-browsers/chromium`. Os portais de teste respondem em `*.rapa.test`, que o Chromium resolve para 127.0.0.1.
+Os testes de banco usam `RAPA_TEST_DATABASE_URL` (superusuário) ou sobem um PostgreSQL temporário com os binários locais (`initdb`, `pg_ctl`). Os testes com navegador procuram o Chromium em `RAPA_CHROMIUM_PATH`, `/usr/bin/chromium` ou `/opt/pw-browsers/chromium`. Os portais de teste respondem em `*.rapa.test`, que o Chromium resolve para 127.0.0.1.
 
 ## Licença
 

@@ -12,3 +12,5 @@ htmlcov/
 # artefatos locais de execuções (telas, vídeos, downloads)
 artefatos/
 .env
+# worktrees locais de agentes e configurações do Claude Code
+.claude/
