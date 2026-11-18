@@ -20,6 +20,7 @@ from rapa.runner.browser import run_context
 from rapa.runner.errors import ErrorCode
 from rapa.runner.interpreter import MASK, Interpreter
 from rapa.runner.ports import (
+    AckingEventSink,
     DictSecretProvider,
     DirectoryArtifactSink,
     ListEventSink,
@@ -802,3 +803,18 @@ async def test_no_secret_value_appears_in_events_results_or_artifact_names(
             if "origem" in event.data:
                 assert set(event.data) == {"duracao_ms", "origem", "tamanho"}
                 assert event.data["origem"] in ("texto", "segredo")
+
+
+async def test_irreversible_step_waits_for_ack_and_never_runs_without_it(
+    run_robot: RobotRunner, portal_v1: RunningPortal, tmp_path: Path
+) -> None:
+    sink = AckingEventSink(ListEventSink(), tmp_path / "sem-confirmacao", timeout_s=0.3)
+    outcome = await run_robot(
+        emitir_protocolo(portal_v1.base_url, portal_v1.host), PROTOCOLO_INPUTS, events=sink
+    )
+    result = outcome.result
+    # Sem confirmação, o passo irreversível não começa: falha simples, nada emitido.
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.SEM_CONFIRMACAO
+    assert not result.irreversible_started
+    assert portal_v1.state.protocolos == []

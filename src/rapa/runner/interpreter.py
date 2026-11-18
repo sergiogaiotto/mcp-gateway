@@ -774,10 +774,12 @@ class Interpreter:
                 async with asyncio.timeout_at(ctx.deadline + _TIMEOUT_GRACE_S):
                     action = await self._prepare(step, ctx)
                     if irreversible:
-                        # Daqui em diante, qualquer falha deixa a execução indeterminada.
-                        self._irreversible_step = step
+                        # O aviso vai antes: com confirmação, ele pode esperar o plano de
+                        # controle gravá-lo. Se falhar, nada foi enviado ao portal.
                         await self._emit_step_started(step, irreversible=True)
                         announced = True
+                        # Daqui em diante, qualquer falha deixa a execução indeterminada.
+                        self._irreversible_step = step
                     data = await action()
                 self._check_page_domain(step)
             except StepError:
@@ -833,9 +835,9 @@ class Interpreter:
         started = loop.time()
         # O prazo do contêiner não limita os passos de dentro: cada um tem o seu.
         irreversible = step.effect is Effect.IRREVERSIBLE
+        await self._emit_step_started(step, irreversible=irreversible)
         if irreversible:
             self._irreversible_step = step
-        await self._emit_step_started(step, irreversible=irreversible)
         try:
             if isinstance(step, ForEachStep):
                 items = self._loop_items(step)

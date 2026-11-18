@@ -41,6 +41,8 @@ class ErrorCode(StrEnum):
     #: Modo de validação: a execução parou antes do primeiro passo que grava.
     PAROU_ANTES_DE_GRAVAR = "parou_antes_de_gravar"
     NAVEGADOR_INDISPONIVEL = "navegador_indisponivel"
+    #: O plano de controle não confirmou o aviso de passo irreversível; nada foi enviado.
+    SEM_CONFIRMACAO = "sem_confirmacao"
     ERRO_INTERNO = "erro_interno"
 
 

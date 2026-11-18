@@ -18,13 +18,15 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import IO, Protocol, Self
 
-from rapa.core.events import RunEvent
+from rapa.core.events import RunEvent, RunEventKind
 from rapa.core.robot import CredentialRef
 from rapa.runner import totp
+from rapa.runner.errors import ErrorCode, StepError
 from rapa.runner.result import ArtifactRef
 
 __all__ = [
     "SECRET_FIELDS",
+    "AckingEventSink",
     "ArtifactSink",
     "DictSecretProvider",
     "DirectoryArtifactSink",
@@ -36,6 +38,8 @@ __all__ = [
     "LocalFileProvider",
     "SecretProvider",
     "SecretUnavailable",
+    "ack_path",
+    "needs_ack",
     "sanitize_filename",
 ]
 
@@ -357,3 +361,55 @@ class JsonlEventSink:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+def ack_path(ack_dir: Path, seq: int) -> Path:
+    """Arquivo que confirma o recebimento do evento ``seq`` pelo plano de controle."""
+    return ack_dir / f"{seq}.ack"
+
+
+def needs_ack(event: RunEvent) -> bool:
+    """Se o evento é o aviso de início de um passo irreversível."""
+    return event.kind is RunEventKind.STEP_STARTED and event.data.get("irreversivel") is True
+
+
+class AckingEventSink:
+    """Repassa os eventos e, antes de um passo irreversível, espera a confirmação.
+
+    O executor avisa que vai começar um passo irreversível e só segue quando o
+    plano de controle confirma que gravou o aviso (o arquivo ``<seq>.ack`` aparece
+    em ``ack_dir``). Assim, se quem acompanha a execução cair antes de gravar o
+    aviso, o passo não acontece e a execução pode voltar para a fila sem risco de
+    gravar duas vezes. Sem confirmação no prazo, o passo falha sem ter começado.
+    """
+
+    def __init__(
+        self,
+        inner: EventSink,
+        ack_dir: Path | str,
+        *,
+        timeout_s: float = 30.0,
+        poll_s: float = 0.05,
+    ) -> None:
+        if timeout_s <= 0 or poll_s <= 0:
+            raise ValueError("o prazo e o intervalo da confirmação precisam ser positivos")
+        self.inner = inner
+        self.ack_dir = Path(ack_dir)
+        self.timeout_s = timeout_s
+        self.poll_s = poll_s
+
+    async def emit(self, event: RunEvent) -> None:
+        await self.inner.emit(event)
+        if not needs_ack(event):
+            return
+        marker = ack_path(self.ack_dir, event.seq)
+        loop = asyncio.get_running_loop()
+        give_up = loop.time() + self.timeout_s
+        while not await asyncio.to_thread(marker.exists):
+            if loop.time() >= give_up:
+                raise StepError(
+                    ErrorCode.SEM_CONFIRMACAO,
+                    "O plano de controle não confirmou o aviso antes do passo irreversível; "
+                    "o passo não foi executado.",
+                )
+            await asyncio.sleep(self.poll_s)

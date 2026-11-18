@@ -4,7 +4,8 @@ Uso::
 
     python -m rapa.runner.worker --job JOB.json --result RESULT.json \\
         --events EVENTS.jsonl --artifacts DIR [--secrets SECRETS.json] \\
-        [--chromium CAMINHO] [--browser-arg=ARG ...] [--files-dir DIR]
+        [--chromium CAMINHO] [--browser-arg=ARG ...] [--files-dir DIR] \\
+        [--ack-dir DIR [--ack-timeout SEGUNDOS]]
 
 - ``JOB.json`` é um :class:`rapa.core.contracts.RunnerJob` em JSON.
 - ``SECRETS.json`` associa o nome de cada credencial a um objeto com os campos
@@ -12,6 +13,9 @@ Uso::
   ``pfx_password``. O worker apaga o arquivo logo depois de ler.
 - ``EVENTS.jsonl`` recebe um :class:`rapa.core.events.RunEvent` por linha.
 - ``RESULT.json`` recebe o :class:`rapa.runner.result.RunResult`.
+- Com ``--ack-dir``, antes de cada passo irreversível o worker espera o arquivo
+  ``<seq>.ack`` nesse diretório, criado por quem acompanha a execução depois de
+  gravar o aviso (ver :class:`rapa.runner.ports.AckingEventSink`).
 
 O código de saída é 0 sempre que o RESULT.json foi escrito, qualquer que seja o
 estado da execução; diferente de 0 só quando o próprio worker quebra. Argumentos
@@ -37,6 +41,7 @@ from rapa.runner.browser import ClientCertificate, open_browser, run_context
 from rapa.runner.errors import ErrorCode
 from rapa.runner.interpreter import Interpreter
 from rapa.runner.ports import (
+    AckingEventSink,
     DictSecretProvider,
     DirectoryArtifactSink,
     EventSink,
@@ -78,6 +83,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--files-dir", type=Path, default=None, help="diretório dos arquivos de entrada"
+    )
+    parser.add_argument(
+        "--ack-dir",
+        type=Path,
+        default=None,
+        help="diretório das confirmações antes de passos irreversíveis",
+    )
+    parser.add_argument(
+        "--ack-timeout",
+        type=float,
+        default=30.0,
+        help="segundos de espera pela confirmação (padrão: 30)",
     )
     parser.add_argument(
         "--screenshot-every-step",
@@ -201,7 +218,10 @@ async def _main_async(
     for signum in (signal.SIGTERM, signal.SIGINT):
         with contextlib.suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(signum, cancel.set)
-    with JsonlEventSink(args.events) as events:
+    with JsonlEventSink(args.events) as jsonl:
+        events: EventSink = jsonl
+        if args.ack_dir is not None:
+            events = AckingEventSink(jsonl, args.ack_dir, timeout_s=args.ack_timeout)
         return await run_job(
             job,
             secrets=secrets,
@@ -217,7 +237,10 @@ async def _main_async(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.ack_timeout > 0:
+        parser.error("--ack-timeout precisa ser maior que zero")
     # Os segredos saem do disco antes de qualquer outra coisa.
     secrets, secrets_error = _load_secrets(args.secrets)
     try:

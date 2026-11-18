@@ -246,3 +246,55 @@ def test_redactor_masks_values_but_keeps_hashes() -> None:
         "sha256": "ab" * 32,
         "outro": "abc",
     }
+
+
+# -- confirmação antes do passo irreversível -------------------------------------
+
+
+def _ack_event(seq: int, kind: RunEventKind, **data: object) -> RunEvent:
+    return RunEvent(
+        run_id=new_id(),
+        attempt=1,
+        seq=seq,
+        at=datetime.now(UTC),
+        kind=kind,
+        step_id="emitir",
+        data=dict(data),
+    )
+
+
+async def test_acking_sink_passes_ordinary_events_without_waiting(tmp_path: Path) -> None:
+    inner = ListEventSink()
+    sink = ports.AckingEventSink(inner, tmp_path, timeout_s=0.05)
+    await sink.emit(_ack_event(0, RunEventKind.STEP_STARTED, efeito="write"))
+    await sink.emit(_ack_event(1, RunEventKind.STEP_SUCCEEDED))
+    assert [e.seq for e in inner.events] == [0, 1]
+
+
+async def test_acking_sink_waits_for_the_ack_file(tmp_path: Path) -> None:
+    import asyncio
+
+    inner = ListEventSink()
+    sink = ports.AckingEventSink(inner, tmp_path, timeout_s=5, poll_s=0.01)
+    event = _ack_event(3, RunEventKind.STEP_STARTED, efeito="irreversible", irreversivel=True)
+    task = asyncio.create_task(sink.emit(event))
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    assert inner.events == [event]  # o aviso sai antes da espera
+    ports.ack_path(tmp_path, 3).write_text("ok")
+    await asyncio.wait_for(task, 2)
+
+
+async def test_acking_sink_fails_the_step_without_ack(tmp_path: Path) -> None:
+    from rapa.runner.errors import ErrorCode, StepError
+
+    sink = ports.AckingEventSink(ListEventSink(), tmp_path, timeout_s=0.05, poll_s=0.01)
+    event = _ack_event(0, RunEventKind.STEP_STARTED, efeito="irreversible", irreversivel=True)
+    with pytest.raises(StepError) as caught:
+        await sink.emit(event)
+    assert caught.value.code is ErrorCode.SEM_CONFIRMACAO
+
+
+def test_acking_sink_rejects_bad_timing(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        ports.AckingEventSink(ListEventSink(), tmp_path, timeout_s=0)
