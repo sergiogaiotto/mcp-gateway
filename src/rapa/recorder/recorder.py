@@ -8,7 +8,12 @@ principal (e dos iframes), os downloads, as requisições de documento e XHR (pa
 detectar gravações) e o texto visível de cada página depois que ela assenta.
 
 O valor de campos de senha, de código de uso único e do usuário de login nunca
-sai da página: o script manda só a marcação de campo sensível.
+entra na gravação. O script marca esses campos (inclusive senha em campo de
+texto mascarado por CSS e usuário de login sem ``<form>``) e manda o valor só
+para o gravador apagá-lo dos textos. O gravador repete as regras do lado do
+Python (``rapa.recorder.sensitivity``): marca de senha pelo rótulo e, ao fechar
+a gravação, o campo de texto preenchido logo antes da senha, que o compilador
+trata como o usuário.
 """
 
 import asyncio
@@ -21,7 +26,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib import resources
 from typing import Any, cast
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, quote_plus, urlencode, urlsplit, urlunsplit
 
 from playwright.async_api import BrowserContext, Download, Frame, Page, Request
 from playwright.async_api import Error as PlaywrightError
@@ -47,6 +52,7 @@ from rapa.recorder.models import (
     RequestEvent,
     SelectEvent,
 )
+from rapa.recorder.sensitivity import is_password_like_text, username_inputs
 
 __all__ = ["Recorder", "RecorderError"]
 
@@ -55,7 +61,8 @@ _CAPTURE_JS = _PACKAGE.joinpath("capture.js").read_text(encoding="utf-8")
 _PAGE_TEXT_JS = _PACKAGE.joinpath("page_text.js").read_text(encoding="utf-8")
 #: Valores sigilosos mais curtos que isto não são procurados nos textos.
 MIN_REDACTED_CHARS = 4
-_MAX_SECRET_VALUES = 64
+#: Cada valor sigiloso entra com as formas que ele tem num endereço (até quatro).
+_MAX_SECRET_VALUES = 256
 _STOP_JS = "() => { const stop = window[Symbol.for('rapa.recorder.stop')]; if (stop) stop(); }"
 _FRAME_INFO_JS = """(el) => ({
   tag: el.tagName.toLowerCase(),
@@ -203,6 +210,9 @@ class Recorder:
         #: Valores de campos sigilosos (usuário, senha, código), só em memória, para
         #: apagar dos textos capturados ao fechar a gravação. Nunca entram nela.
         self._secret_values: set[str] = set()
+        #: Campos sigilosos descobertos só ao fechar: os endereços já gravados são
+        #: mascarados de novo com os nomes desses campos.
+        self._redact_again = False
 
     # -- ciclo de vida ---------------------------------------------------------
 
@@ -278,6 +288,7 @@ class Recorder:
         for disposable in reversed(self._disposables):
             with suppress(Exception):
                 await disposable.close()
+        self._hide_usernames()
         events = [self._scrub(event) for event in self._events]
         self._secret_values.clear()
         self._recording = Recording(
@@ -293,18 +304,63 @@ class Recorder:
         if not isinstance(value, str):
             return
         value = value.strip()
-        if len(value) >= MIN_REDACTED_CHARS and len(self._secret_values) < _MAX_SECRET_VALUES:
-            self._secret_values.add(value)
+        if len(value) < MIN_REDACTED_CHARS:
+            return
+        # Também como o valor aparece num endereço: percent-encoding estrito, o do
+        # encodeURIComponent e o de formulário (espaço vira "+").
+        for variant in dict.fromkeys(
+            (
+                value,
+                quote(value, safe=""),
+                quote(value, safe="!~*'()"),
+                quote_plus(value, safe="*"),
+            )
+        ):
+            if len(self._secret_values) < _MAX_SECRET_VALUES:
+                self._secret_values.add(variant)
+
+    def _hide_usernames(self) -> None:
+        """Tira da gravação o usuário que o script não reconheceu (segunda camada).
+
+        O script só reconhece o usuário pelo grupo de campos da página. O
+        compilador trata como usuário o campo de texto preenchido logo antes da
+        senha, no mesmo documento; aqui a mesma regra (``username_inputs``) apaga
+        o valor desses campos, marca o campo como sensível e guarda o valor para
+        ``_scrub`` apagá-lo dos textos. Os endereços já gravados são mascarados de
+        novo com o nome do campo.
+        """
+        found = username_inputs(self._events)
+        if not found:
+            return
+        states = {state.page_id: state for state in self._pages.values()}
+        for event in found:
+            self._remember_secret(event.value)
+            self._remember_secret(event.typed)
+            event.value = None
+            event.typed = None
+            event.script_modified = False
+            event.element.is_username = True
+            event.element.sensitive = True
+            state = states.get(event.page_id)
+            if state is not None and event.element.name_attr:
+                state.sensitive_names.add(event.element.name_attr.lower())
+        self._redact_again = True
 
     def _scrub(self, event: RecordingEvent) -> RecordingEvent:
         """Troca por ``REMOVIDO`` os valores sigilosos que aparecerem em qualquer texto do evento.
 
         O nome de usuário costuma aparecer na página depois do login ("Olá, ana.souza")
-        e chegaria às pós-condições e ao prompt do modelo de linguagem.
+        e chegaria às pós-condições e ao prompt do modelo de linguagem. Quando um campo
+        sigiloso só foi descoberto ao fechar a gravação, os endereços do evento são
+        mascarados de novo com os nomes dos campos sigilosos da aba.
         """
-        if not self._secret_values:
+        if not self._secret_values and not self._redact_again:
             return event
         ordered = sorted(self._secret_values, key=len, reverse=True)
+        names: set[str] = set()
+        for state in self._pages.values():
+            if state.page_id == event.page_id:
+                names = state.sensitive_names
 
         def clean(value: Any) -> Any:
             if isinstance(value, str):
@@ -319,7 +375,13 @@ class Recorder:
             return value
 
         data = event.model_dump(mode="json")
-        cleaned = clean(data)
+        redacted = dict(data)
+        if self._redact_again:
+            for key in ("url", "frame_url"):
+                url = redacted.get(key)
+                if isinstance(url, str) and url:
+                    redacted[key] = redact_url(url, names)
+        cleaned = clean(redacted)
         if cleaned == data:
             return event
         try:
@@ -430,6 +492,10 @@ class Recorder:
         except ValidationError:
             self._dropped += 1
             return
+        if element is not None and is_password_like_text(element):
+            # Mesma regra do script (que também olha a máscara por CSS): senha em
+            # campo de texto, pelo autocomplete ou pelo rótulo.
+            element.is_password = True
         if element is not None and (
             element.is_password or element.is_one_time_code or element.is_username
         ):
@@ -455,7 +521,9 @@ class Recorder:
         elif kind == "input" and element is not None:
             sensitive = element.sensitive
             if sensitive:
-                self._remember_secret(payload.get("secret"))
+                # O valor só chega aqui se o script não marcou o campo; não é gravado.
+                for part in ("secret", "value", "typed"):
+                    self._remember_secret(payload.get(part))
             created = self._append(
                 InputEvent,
                 element=element,

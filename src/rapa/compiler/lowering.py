@@ -9,10 +9,16 @@ Regras principais:
 - a primeira navegação vira ``navigate``; as seguintes causadas por clique viram
   ``click.expect_navigation``; as digitadas viram ``navigate``; as feitas pela
   própria página (redirecionamentos) são ignoradas;
-- entradas seguidas no mesmo campo viram um ``fill`` com o valor final;
+- entradas seguidas no mesmo campo viram um ``fill`` com o valor final; as
+  requisições depois de cada edição (e do Tab que deixa o campo) contam no
+  efeito do passo, como num salvamento automático;
 - campo de senha → ``SecretValue(field="password")`` de uma credencial por
   origem; o campo preenchido logo antes, na mesma página, vira o usuário;
   código de uso único → ``SecretValue(field="totp")`` de outra credencial;
+- campo de texto com cara de senha (rótulo, nome, id ou placeholder de senha,
+  ``rapa.recorder.sensitivity``) é tratado como senha, e o valor gravado é
+  descartado; outro literal com cara de segredo (cartão, token, chave) vira
+  uma entrada obrigatória do robô, sem o valor digitado;
 - lista → ``select``; caixa de seleção e opção → ``check``; arquivo →
   ``upload`` com uma entrada do tipo arquivo; clique seguido de download →
   ``download``; Enter → ``press``; campo com máscara → ``sequential``.
@@ -65,13 +71,19 @@ from rapa.recorder.models import (
     RequestEvent,
     SelectEvent,
 )
+from rapa.recorder.sensitivity import (
+    clickable,
+    field_key,
+    focus_only,
+    is_password_like_text,
+    is_text_field,
+    looks_secret,
+)
 
 __all__ = ["CompileError", "CompileResult", "lower"]
 
-_TEXT_INPUT_TYPES = frozenset({"text", "email", "tel", "url", "search", "number", ""})
 #: Sessão de servidores Java no caminho: não vale numa nova execução.
 _JSESSIONID = re.compile(r";jsessionid=[^?#/]*", re.IGNORECASE)
-_BUTTON_INPUT_TYPES = frozenset({"submit", "button", "reset", "image"})
 
 
 class CompileError(ValueError):
@@ -106,6 +118,16 @@ class _Draft:
     document_index: int | None = None
     only_credentials: bool = False
     password_fields: int = 0
+    #: Todas as ações que o passo absorveu (a primeira é ``action_index``): edições
+    #: seguidas do mesmo campo, o Tab que deixa o campo, o segundo clique de um
+    #: clique duplo. As requisições depois de cada uma contam no efeito.
+    absorbed: list[int] = field(default_factory=list)
+    #: Entrada criada para um literal com cara de segredo (``Lowering.secret_input``).
+    secret_input: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.action_index is not None and self.action_index not in self.absorbed:
+            self.absorbed.insert(0, self.action_index)
 
 
 @dataclass
@@ -128,34 +150,7 @@ def _host(url: str) -> str | None:
 
 
 def _field_key(event: InputEvent | SelectEvent | CheckEvent | FileEvent) -> tuple[Any, ...]:
-    el = event.element
-    frames = tuple(f.css or f.id or f.name or "" for f in el.frame_path or [])
-    return (event.page_id, frames, el.css, el.id, el.name_attr)
-
-
-def _focus_only(element: ElementDescriptor) -> bool:
-    """Clique que só foca ou ativa um campo (o evento do campo basta)."""
-    if element.tag in ("textarea", "select", "option"):
-        return True
-    if element.tag == "input":
-        return element.input_type not in _BUTTON_INPUT_TYPES
-    return False
-
-
-def _clickable(element: ElementDescriptor | None) -> bool:
-    if element is None:
-        return False
-    return (
-        element.role in ("button", "link")
-        or element.tag in ("a", "button")
-        or (element.tag == "input" and element.input_type in _BUTTON_INPUT_TYPES)
-    )
-
-
-def _is_text_field(element: ElementDescriptor) -> bool:
-    return (element.tag == "input" and (element.input_type or "") in _TEXT_INPUT_TYPES) or (
-        element.tag == "textarea"
-    )
+    return field_key(event.page_id, event.element)
 
 
 class _Lowering:
@@ -172,7 +167,10 @@ class _Lowering:
         self.hosts: list[str] = []
         self.credentials: dict[tuple[str, CredentialKind], str] = {}
         self.credential_names: set[str] = set()
-        self.file_inputs: list[dict[str, Any]] = []
+        #: Entradas do robô: arquivos enviados e literais com cara de segredo.
+        self.inputs: list[dict[str, Any]] = []
+        #: Campo → entrada criada para o literal com cara de segredo digitado nele.
+        self.secret_inputs: dict[tuple[Any, ...], str] = {}
         self.outputs: list[dict[str, Any]] = []
         self.var_names: set[str] = set()
         self.postconditions: list[dict[str, Any]] = []
@@ -341,7 +339,7 @@ class _Lowering:
 
     def on_click(self, event: ClickEvent) -> None:
         element = event.element
-        if _focus_only(element):
+        if focus_only(element):
             return
         if event.index in self.popup_triggers:
             return
@@ -353,7 +351,9 @@ class _Lowering:
             and previous.step["kind"] in ("click", "download")
             and previous.element.css == element.css
         ):
-            return  # segundo clique de um clique duplo
+            # Segundo clique de um clique duplo: o que ele gravou conta no mesmo passo.
+            previous.absorbed.append(event.index)
+            return
         nxt = self.next_action.get(event.index)
         if (
             isinstance(nxt, FileEvent)
@@ -445,13 +445,74 @@ class _Lowering:
             return last
         return None
 
+    def input_name(self, label: str, fallback: str) -> str:
+        """Nome livre para uma nova entrada do robô."""
+        taken = {f["name"] for f in self.inputs}
+        base = name_from(label, fallback)
+        name = base
+        n = 2
+        while name in taken:
+            name = f"{base}_{n}"
+            n += 1
+        return name
+
+    def hide_password_like(self, event: InputEvent) -> InputEvent:
+        """Senha num campo que não é do tipo senha (mascarado por CSS, rótulo "Senha").
+
+        O gravador já marca esses campos; aqui é a segunda camada, para gravações
+        que chegaram sem a marca: o valor gravado é descartado e o campo passa a
+        ser tratado como senha (credencial do cofre e regra do usuário).
+        """
+        element = event.element
+        if element.sensitive or not is_password_like_text(element):
+            return event
+        self.warn(
+            f"O campo {quoted(element_label(element))} parece de senha, mas não é do tipo "
+            "senha; o valor gravado foi descartado e o robô digita a senha do cofre."
+        )
+        hidden = element.model_copy(update={"is_password": True, "sensitive": True})
+        return event.model_copy(
+            update={"element": hidden, "value": None, "typed": None, "script_modified": False}
+        )
+
+    def secret_input(self, key: tuple[Any, ...], label: str) -> str:
+        """Entrada obrigatória para um literal com cara de segredo (cartão, token, chave).
+
+        O valor digitado na demonstração não entra no robô: quem chama informa o
+        valor a cada execução.
+        """
+        name = self.secret_inputs.get(key)
+        if name is None:
+            name = self.input_name(label, "valor")
+            self.inputs.append(
+                {
+                    "name": name,
+                    "title": clip_label(label, 200),
+                    "description": clip_label(
+                        f"Valor digitado no campo {quoted(label)}; parece sigiloso e não foi "
+                        "guardado no robô.",
+                        1000,
+                    ),
+                    "type": "string",
+                    "required": True,
+                }
+            )
+            self.secret_inputs[key] = name
+            self.warn(
+                f"O campo {quoted(label)} parece guardar um dado sigiloso; o valor digitado "
+                f"não entrou no robô e virou a entrada {quoted(name)}."
+            )
+        return name
+
     def on_input(self, event: InputEvent) -> None:
+        event = self.hide_password_like(event)
         element = event.element
         self.document.fills.append(event)
         key = _field_key(event)
         url = event.frame_url or self.document.url
         label = element_label(element)
         title = f"Digitar {article(label)} {lower_first(clip_label(label))}"
+        secret_input: str | None = None
         if element.is_password:
             credential = self.credential(url, CredentialKind.PASSWORD)
             value: dict[str, Any] = {
@@ -475,6 +536,9 @@ class _Lowering:
         elif event.value is None:
             self.warn(f"O valor do campo {quoted(label)} não foi gravado; o passo ficou de fora.")
             return
+        elif looks_secret(element):
+            secret_input = self.secret_input(key, label)
+            value = {"source": "text", "template": f"{{{{ inputs.{secret_input} }}}}"}
         else:
             value = {"source": "text", "template": templates.escape(event.value)}
         masked = event.script_modified or (event.typed is not None and event.typed != event.value)
@@ -483,6 +547,8 @@ class _Lowering:
             existing.step["value"] = value
             existing.step["sequential"] = bool(existing.step.get("sequential")) or masked
             existing.event_index = event.index
+            existing.absorbed.append(event.index)
+            existing.secret_input = secret_input
             self.draft_by_event[event.index] = existing
             return
         step: dict[str, Any] = {
@@ -502,6 +568,7 @@ class _Lowering:
                 field_key=key,
                 action_index=event.index,
                 document_index=self.document.index,
+                secret_input=secret_input,
             )
         )
 
@@ -517,12 +584,13 @@ class _Lowering:
             or last.document_index != self.document.index
             or element.is_password
             or element.is_one_time_code
-            or not _is_text_field(element)
+            or not is_text_field(element)
             or last.field_key == _field_key(password)
         ):
             return
         last.step["value"] = {"source": "secret", "credential": credential, "field": "username"}
         last.step.pop("sequential", None)
+        last.secret_input = None
         if last.field_key is not None:
             self.username_fields.add(last.field_key)
 
@@ -543,6 +611,7 @@ class _Lowering:
         if existing is not None:
             existing.step["option"] = option
             existing.event_index = event.index
+            existing.absorbed.append(event.index)
             self.draft_by_event[event.index] = existing
             return
         label = element_label(element)
@@ -573,6 +642,7 @@ class _Lowering:
             existing.step["checked"] = event.checked
             existing.step["title"] = f"{verb} {quoted(label)}"
             existing.event_index = event.index
+            existing.absorbed.append(event.index)
             self.draft_by_event[event.index] = existing
             return
         self.emit(
@@ -596,14 +666,8 @@ class _Lowering:
         element = event.element
         self.document.fills.append(event)
         label = element.label or element.name or element.name_attr or "Arquivo"
-        taken = {f["name"] for f in self.file_inputs}
-        base = name_from(label, "arquivo")
-        name = base
-        n = 2
-        while name in taken:
-            name = f"{base}_{n}"
-            n += 1
-        self.file_inputs.append(
+        name = self.input_name(label, "arquivo")
+        self.inputs.append(
             {
                 "name": name,
                 "title": clip_label(label, 200),
@@ -634,10 +698,11 @@ class _Lowering:
 
     def on_key(self, event: KeyEvent) -> None:
         if event.key == "Tab":
+            self.absorb_tab(event)
             return
         element = event.element
         if event.key == "Enter":
-            if _clickable(element):
+            if clickable(element):
                 return  # o clique de ativação vem em seguida
             nxt = self.next_action.get(event.index)
             if isinstance(nxt, ClickEvent) and nxt.detail == 0:
@@ -648,7 +713,7 @@ class _Lowering:
             "key": key_name,
             "title": f"Pressionar {key_name}",
         }
-        if element is not None and (event.key == "Enter" or not _clickable(element)):
+        if element is not None and (event.key == "Enter" or not clickable(element)):
             label = element_label(element)
             step["title"] = f"Pressionar {key_name} em {quoted(label)}"
             step["target"] = self.target(element)
@@ -665,6 +730,26 @@ class _Lowering:
             )
         )
 
+    def absorb_tab(self, event: KeyEvent) -> None:
+        """Tab não vira passo, mas deixa o campo: o change/blur pode gravar algo.
+
+        As requisições depois do Tab passam a contar no efeito do passo do campo
+        que a pessoa deixou (o último passo, de digitar, escolher ou marcar, no
+        mesmo campo e na mesma página). Em qualquer outro caso ficam sem dono;
+        nunca vão para um clique ou tecla.
+        """
+        last = self.drafts[-1] if self.drafts else None
+        if (
+            last is None
+            or event.element is None
+            or last.step["kind"] not in ("fill", "select", "check")
+            or last.field_key is None
+            or last.field_key != field_key(event.page_id, event.element)
+            or last.document_index != self.document.index
+        ):
+            return
+        last.absorbed.append(event.index)
+
     # -- efeitos e verificações ------------------------------------------------
 
     def classify(self) -> None:
@@ -673,7 +758,9 @@ class _Lowering:
             if draft.action_index is None:
                 continue
             kind = draft.step["kind"]
-            requests = self.requests_after(draft.action_index)
+            # Requisições depois de cada ação que o passo absorveu: mais requisições
+            # só podem subir o efeito (leitura → gravação).
+            requests = [r for index in draft.absorbed for r in self.requests_after(index)]
             if kind in ("click", "download", "press"):
                 result = classify_action(
                     ActionContext(
@@ -800,11 +887,14 @@ class _Lowering:
             }
             for (origin, kind), cred_name in self.credentials.items()
         ]
+        # Entrada de literal com cara de segredo cujo campo virou usuário do login: sobra.
+        used = {draft.secret_input for draft in self.drafts}
+        unused = set(self.secret_inputs.values()) - used
         data: dict[str, Any] = {
             "name": name,
             "title": title,
             "description": description,
-            "inputs": self.file_inputs,
+            "inputs": [spec for spec in self.inputs if spec["name"] not in unused],
             "outputs": self.outputs,
             "credentials": credentials,
             "allowed_domains": self.hosts,

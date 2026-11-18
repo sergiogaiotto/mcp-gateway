@@ -2,8 +2,9 @@
 // uma binding do Playwright, um descritor de cada ação da pessoa.
 //
 // Regras: só eventos confiáveis (isTrusted); nunca envia o valor de campos de
-// senha, código de uso único ou usuário de login; o valor final de cada campo
-// sai no change/blur (ou antes da próxima ação).
+// senha (inclusive campo de texto mascarado por CSS ou com rótulo de senha),
+// código de uso único ou usuário de login (com ou sem <form>); o valor final de
+// cada campo sai no change/blur (ou antes da próxima ação).
 (() => {
   'use strict';
   const CONFIG = __RAPA_CONFIG__;
@@ -214,8 +215,6 @@
   const OTP_LABEL = /(c[oó]digo\s+de\s+(verifica[cç][aã]o|seguran[cç]a|autentica[cç][aã]o|acesso)|c[oó]digo\s+(otp|totp|sms)|token|autentica[cç][aã]o\s+em\s+duas|dois\s+fatores|\b2fa\b|one[-\s]?time|verification\s+code)/i;
   const squash = (s) => norm(s).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]/g, '');
 
-  const isPassword = (el) => el.tagName === 'INPUT' && inputType(el) === 'password';
-
   const isOneTimeCode = (el) => {
     if (el.tagName !== 'INPUT') return false;
     const type = inputType(el);
@@ -226,19 +225,69 @@
     return OTP_LABEL.test(labelText(el) || norm(el.getAttribute('placeholder')));
   };
 
+  // Senha em campo de texto (portais de banco mascaram por CSS): máscara
+  // -webkit-text-security, autocomplete de senha, ou rótulo, título, placeholder,
+  // nome ou id que falam em senha. A mesma regra (menos a máscara, que só a
+  // página conhece) está em rapa/recorder/sensitivity.py.
+  const PASSWORD_WORDS = /(?<!re)senha|password|passwd|passphrase|(?:^|[^a-z0-9])(?:pwd|pin)(?:[^a-z0-9]|$)/;
+  const PASSWORD_LABEL_TYPES = new Set(['text', '', 'tel', 'number']);
+  const plainWords = (s) => norm(s).replace(/([a-z])([A-Z])/g, '$1 $2')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  const mentionsPassword = (s) => {
+    const t = plainWords(s);
+    return !!t && PASSWORD_WORDS.test(t);
+  };
+
+  const isMaskedText = (el) => {
+    const st = styleOf(el);
+    if (!st) return false;
+    const mask = norm(st.getPropertyValue('-webkit-text-security') || st.webkitTextSecurity).toLowerCase();
+    return !!mask && mask !== 'none';
+  };
+
+  const isPasswordLikeText = (el) => {
+    if (el.tagName !== 'INPUT') return false;
+    const type = inputType(el);
+    if (!TEXT_TYPES.has(type) || isOneTimeCode(el)) return false;
+    if (isMaskedText(el)) return true;
+    const ac = norm(el.getAttribute('autocomplete')).toLowerCase().split(' ');
+    if (ac.indexOf('current-password') >= 0 || ac.indexOf('new-password') >= 0) return true;
+    if (ac.indexOf('username') >= 0 || ac.indexOf('email') >= 0 || !PASSWORD_LABEL_TYPES.has(type)) return false;
+    return [labelText(el), el.getAttribute('title'), el.getAttribute('placeholder'), el.getAttribute('name'), el.id]
+      .some(mentionsPassword);
+  };
+
+  const isPassword = (el) => el.tagName === 'INPUT' && (inputType(el) === 'password' || isPasswordLikeText(el));
+
   const isTextLike = (el) => (el.tagName === 'INPUT' && TEXT_TYPES.has(inputType(el))) || el.tagName === 'TEXTAREA';
 
   const formOf = (el) => el.form || (el.closest ? el.closest('form') : null);
+
+  // Campos de texto e de senha que vão junto com o campo, em ordem: os do
+  // formulário ou, sem <form> (login em SPA), os campos soltos e visíveis da
+  // mesma raiz (documento ou shadow root).
+  const groupFields = (el) => {
+    const form = formOf(el);
+    let all;
+    if (form) {
+      all = Array.from(form.elements);
+    } else {
+      const root = el.getRootNode ? el.getRootNode() : el.ownerDocument;
+      let found;
+      try { found = root.querySelectorAll('input, textarea'); } catch (e) { return []; }
+      if (found.length > MAX_SCAN) return [];
+      all = Array.from(found).filter((f) => !formOf(f) && !hiddenForAria(f));
+    }
+    return all.filter((f) => isTextLike(f) || isPassword(f));
+  };
 
   const isUsername = (el) => {
     if (!isTextLike(el) || el.tagName === 'TEXTAREA' || isOneTimeCode(el)) return false;
     const ac = norm(el.getAttribute('autocomplete')).toLowerCase().split(' ');
     if (ac.indexOf('username') >= 0) return true;
-    const form = formOf(el);
-    if (!form) return false;
-    const fields = Array.from(form.elements).filter((f) => isTextLike(f) || isPassword(f));
+    const fields = groupFields(el);
     const firstPassword = fields.findIndex(isPassword);
-    if (firstPassword <= 0 || fields.filter(isTextLike).length > 3) return false;
+    if (firstPassword <= 0 || fields.filter((f) => isTextLike(f) && !isPassword(f)).length > 3) return false;
     // Só o campo de texto imediatamente antes da primeira senha.
     return fields[firstPassword - 1] === el;
   };

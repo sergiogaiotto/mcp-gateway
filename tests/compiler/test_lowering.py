@@ -27,7 +27,16 @@ from rapa.core.robot import (
     TextValue,
     UploadStep,
 )
-from rapa.recorder.models import FormInfo, FrameInfo, NavigationCause, Recording, RowInfo
+from rapa.recorder.models import (
+    ElementDescriptor,
+    FormInfo,
+    FrameInfo,
+    InputEvent,
+    NavigationCause,
+    Recording,
+    RowInfo,
+)
+from rapa.recorder.sensitivity import field_key, username_inputs
 from tests.compiler.builders import (
     BASE,
     LOGIN_FORM,
@@ -650,3 +659,278 @@ def test_locators_that_do_not_fit_are_skipped() -> None:
     fill = steps(compile_(rec.build()))[1]
     assert isinstance(fill, FillStep)
     assert [loc.value for loc in fill.target.locators] == ["#campo"]
+
+
+# -- senha em campo de texto e literais com cara de segredo ---------------------
+
+
+def test_password_typed_in_a_text_field_becomes_a_secret() -> None:
+    """Senha num campo type=text (mascarado por CSS) que chegou com o valor gravado."""
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    form = FormInfo(action=f"{BASE}/login", method="post", text_fields=2)
+    rec.fill(textbox("Conta", id="conta", form=form), "12345-6")
+    rec.fill(textbox("Senha", id="senha", name_attr="senha", form=form), "S3nh@Forte!")
+    rec.click_to(button("Entrar", form=form), "/inicio", method="POST")
+    result = compile_(rec.build())
+    conta, senha = (s for s in steps(result) if isinstance(s, FillStep))
+    assert conta.value == SecretValue(credential="portal", field="username")
+    assert senha.value == SecretValue(credential="portal", field="password")
+    assert [c.kind for c in result.manifest.credentials] == [CredentialKind.PASSWORD]
+    dumped = result.model_dump_json()
+    assert "S3nh@Forte!" not in dumped and "12345-6" not in dumped
+    assert result.parameter_candidates == []
+    assert any("parece de senha" in w for w in result.warnings)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        textbox("PIN", input_type="tel", id="pin"),
+        textbox("Acesso", placeholder="Digite sua senha", id="acesso"),
+        textbox("Acesso", name_attr="novaSenha", id="acesso"),
+        textbox("Acesso", id="user_password"),
+        textbox("Chave", id="chave", autocomplete="current-password"),
+        textbox("Confirmar senha nova", id="confirmar"),
+    ],
+    ids=["pin", "placeholder", "nome", "id", "autocomplete", "confirmar"],
+)
+def test_text_fields_that_look_like_passwords(field: ElementDescriptor) -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/acesso")
+    rec.fill(field, "1234-segredo")
+    result = compile_(rec.build())
+    fill = steps(result)[1]
+    assert isinstance(fill, FillStep)
+    assert fill.value == SecretValue(credential="portal", field="password")
+    assert "1234-segredo" not in result.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("field", "literal"),
+    [
+        (textbox("Resenha", id="resenha"), False),
+        (textbox("Opinião", id="opiniao"), True),
+        (textbox("E-mail para recuperar a senha", input_type="email", id="email"), False),
+        (textbox("Usuário ou senha", id="login", autocomplete="username"), False),
+    ],
+    ids=["resenha", "opiniao", "email", "autocomplete-usuario"],
+)
+def test_text_fields_that_only_mention_passwords_are_not_passwords(
+    field: ElementDescriptor, literal: bool
+) -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/form")
+    rec.fill(field, "um texto qualquer")
+    result = compile_(rec.build())
+    fill = steps(result)[1]
+    assert isinstance(fill, FillStep) and isinstance(fill.value, TextValue)
+    assert result.manifest.credentials == []
+    # Os que ainda têm cara de segredo viram entrada, sem o valor digitado.
+    assert (fill.value.template == "um texto qualquer") is literal
+    assert ("um texto qualquer" in result.manifest.model_dump_json()) is literal
+
+
+def test_literal_that_looks_secret_becomes_an_input_without_the_value() -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/pagamento")
+    cartao = textbox("Número do cartão", id="cartao")
+    rec.fill(cartao, "4111 1111")
+    rec.fill(cartao, "4111 1111 1111 1111")
+    rec.fill(textbox("Nome impresso", id="nome"), "ANA SOUZA")
+    rec.fill(textbox("CVV", id="cvv"), "987")
+    result = compile_(rec.build())
+    cartao_step, nome, cvv = (s for s in steps(result) if isinstance(s, FillStep))
+    assert isinstance(cartao_step.value, TextValue)
+    assert cartao_step.value.template == "{{ inputs.numero_do_cartao }}"
+    assert isinstance(cvv.value, TextValue) and cvv.value.template == "{{ inputs.cvv }}"
+    assert isinstance(nome.value, TextValue) and nome.value.template == "ANA SOUZA"
+    assert [(f.name, f.type, f.required) for f in result.manifest.inputs] == [
+        ("numero_do_cartao", FieldType.STRING, True),
+        ("cvv", FieldType.STRING, True),
+    ]
+    dumped = result.model_dump_json()
+    assert "4111" not in dumped and "987" not in dumped
+    assert [c.step_id for c in result.parameter_candidates] == [nome.id]
+    assert any("Número do cartão" in w and "entrada" in w for w in result.warnings)
+
+
+def test_secret_input_of_a_field_that_became_the_username_is_dropped() -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(textbox("Token de acesso", id="token"), "abc-123")
+    rec.fill(password(), None)
+    result = compile_(rec.build())
+    token = steps(result)[1]
+    assert isinstance(token, FillStep)
+    assert token.value == SecretValue(credential="portal", field="username")
+    assert result.manifest.inputs == []
+    assert "abc-123" not in result.model_dump_json()
+
+
+# -- usuário do login: a mesma regra no gravador e no compilador ------------------
+
+
+def _username_scenarios() -> dict[str, Recording]:
+    usuario = textbox("Usuário", id="usuario", name_attr="usuario")
+    scenarios: dict[str, Recording] = {}
+
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(usuario, "ana.souza")
+    rec.fill(password(), None)
+    scenarios["direto"] = rec.build()
+
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(usuario, "ana")
+    rec.fill(usuario, "ana.souza")
+    rec.key("Tab", usuario)
+    rec.click(password())  # clique que só foca a senha
+    rec.fill(password(), None)
+    scenarios["editado_com_tab"] = rec.build()
+
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(usuario, "ana.souza")
+    rec.click(button("Continuar"))
+    rec.fill(password(), None)
+    scenarios["clique_entre"] = rec.build()
+
+    rec = RecordingBuilder()
+    rec.navigate("/busca")
+    rec.fill(textbox("Busca", id="q"), "notas fiscais")
+    rec.navigate("/login")
+    rec.fill(password(), None)
+    scenarios["outra_pagina"] = rec.build()
+
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(password(), None)
+    rec.fill(usuario, "ana.souza")
+    scenarios["senha_antes"] = rec.build()
+
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(element("textarea", role="textbox", name="Obs", label="Obs", id="obs"), "obs")
+    rec.fill(password(), None)
+    scenarios["textarea"] = rec.build()
+
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(usuario, "ana.souza")
+    rec.select(select_box("Perfil", id="perfil"), "Contador")
+    rec.fill(password(), None)
+    scenarios["lista_entre"] = rec.build()
+
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(usuario, "ana.souza")
+    rec.fill(textbox("Senha", id="senha_texto"), "S3nh@Forte!")
+    scenarios["senha_em_campo_de_texto"] = rec.build()
+
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(otp(), None)
+    rec.fill(password(), None)
+    scenarios["codigo_antes"] = rec.build()
+    return scenarios
+
+
+@pytest.mark.parametrize("name", list(_username_scenarios()))
+def test_recorder_username_rule_matches_the_compiler(name: str) -> None:
+    recording = _username_scenarios()[name]
+    result = compile_(recording)
+    by_index = {e.index: e for e in recording.events}
+    compiled: set[tuple[object, ...]] = set()
+    for fill in steps(result):
+        if isinstance(fill, FillStep) and fill.value == SecretValue(
+            credential="portal", field="username"
+        ):
+            event = by_index[result.provenance[fill.id]]
+            assert isinstance(event, InputEvent)
+            if not event.element.sensitive:
+                compiled.add(field_key(event.page_id, event.element))
+    found = username_inputs(recording.events)
+    assert {field_key(e.page_id, e.element) for e in found} == compiled
+    expected = {"direto", "editado_com_tab", "textarea", "senha_em_campo_de_texto"}
+    assert bool(compiled) is (name in expected)
+    if name == "editado_com_tab":
+        assert [e.value for e in found] == ["ana", "ana.souza"]
+
+
+# -- efeito de campos editados mais de uma vez ou deixados com Tab --------------
+
+
+def test_autosave_after_editing_a_field_twice_is_write() -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/cadastro")
+    observacao = textbox("Observação", id="obs")
+    rec.fill(observacao, "a")
+    rec.fill(observacao, "abc")
+    rec.request("POST", "/api/salvar-rascunho", "fetch")
+    rec.click(button("Voltar"))
+    result = compile_(rec.build())
+    assert step(result, "digitar_observacao").effect is Effect.WRITE
+    assert step(result, "clicar_voltar").effect is Effect.READ
+    assert result.manifest.effect() is Effect.WRITE
+
+
+def test_autosave_after_leaving_a_field_with_tab_is_write() -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/cadastro")
+    observacao = textbox("Observação", id="obs")
+    rec.fill(observacao, "abc")
+    rec.key("Tab", observacao)
+    rec.request("POST", "/api/salvar-rascunho", "fetch")
+    rec.click(button("Voltar"))
+    result = compile_(rec.build())
+    assert step(result, "digitar_observacao").effect is Effect.WRITE
+    assert result.manifest.effect() is Effect.WRITE
+    assert policy.first_write_step(result.manifest) == "digitar_observacao"
+
+
+def test_autosave_after_changing_a_list_or_box_twice_is_write() -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/cadastro")
+    uf = select_box("UF", id="uf")
+    rec.select(uf, "PR")
+    rec.select(uf, "SP")
+    rec.request("POST", "/api/uf", "xhr")
+    aviso = checkbox("Receber avisos", id="aviso")
+    rec.check(aviso, True)
+    rec.check(aviso, False)
+    rec.key("Tab", aviso)
+    rec.request("PUT", "/api/aviso", "fetch")
+    result = compile_(rec.build())
+    assert step(result, "escolher_uf").effect is Effect.WRITE
+    aviso_step = step(result, "marcar_receber_avisos")
+    assert isinstance(aviso_step, CheckStep) and not aviso_step.checked
+    assert aviso_step.effect is Effect.WRITE
+
+
+def test_tab_requests_go_only_to_the_field_being_left() -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/cadastro")
+    rec.fill(textbox("Nome", id="nome"), "Ana")
+    rec.key("Tab", textbox("Cidade", id="cidade"))  # Tab num campo que não foi editado
+    rec.request("POST", "/api/rascunho", "fetch")
+    buscar = button("Buscar")
+    rec.click(buscar)
+    rec.key("Tab", buscar)  # Tab depois de um clique: nunca vai para o clique
+    rec.request("POST", "/api/rascunho", "fetch")
+    result = compile_(rec.build())
+    assert step(result, "digitar_nome").effect is Effect.READ
+    assert step(result, "clicar_buscar").effect is Effect.READ
+
+
+def test_write_after_the_second_click_of_a_double_click_counts() -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/")
+    ok = button("Ok")
+    rec.click(ok)
+    rec.click(ok, detail=2)
+    rec.request("POST", "/api/ok", "fetch")
+    result = compile_(rec.build())
+    assert [s.kind for s in steps(result)] == ["navigate", "click"]
+    assert step(result, "clicar_ok").effect is Effect.WRITE
