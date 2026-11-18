@@ -12,17 +12,25 @@ principais:
 - antes de um passo irreversível agir, o executor avisa (evento
   ``step_started`` com ``irreversivel: true``); qualquer falha depois disso
   deixa a execução "indeterminada", nunca "falhou";
-- eventos, mensagens e saídas nunca contêm valores de credenciais.
+- valores de entradas, variáveis e itens nunca mudam o alvo de um passo: não
+  entram em seletores CSS/XPath, cada um vira um único trecho codificado do
+  endereço, e o texto que escolhe uma linha precisa ser o de uma célula inteira;
+- o que faria a execução falhar no meio por causa das entradas (campo de item
+  ausente, número que não pode ser digitado, lista maior que a repetição) falha
+  antes do primeiro passo;
+- eventos, mensagens, saídas e nomes de artefatos nunca contêm valores de
+  credenciais.
 """
 
 import asyncio
 import math
 import os
+import re
 import weakref
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Any, Literal, Self, assert_never, cast
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from uuid import UUID
 
 from playwright.async_api import (
@@ -40,7 +48,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from rapa.core import templates
 from rapa.core.contracts import RunMode, RunnerJob, RunState
 from rapa.core.events import RunEvent, RunEventKind
-from rapa.core.policy import TEST_TLD
+from rapa.core.policy import RAW_SELECTORS, TEST_TLD
 from rapa.core.robot import (
     AssertStep,
     CheckStep,
@@ -56,6 +64,7 @@ from rapa.core.robot import (
     FillStep,
     ForEachStep,
     IfStep,
+    InputField,
     Locator,
     LocatorBy,
     Manifest,
@@ -92,8 +101,14 @@ _TIMEOUT_GRACE_S = 2.0
 _SCREENSHOT_TIMEOUT_MS = 5_000
 _DETAIL_MAX = 300
 _MIN_MASKED_LENGTH = 4
+#: Campos de evento com hashes que o próprio executor calcula (nunca dados da página).
 _HASH_KEYS = frozenset({"sha256", "fingerprint"})
+_HEX_DIGEST = re.compile(r"[0-9a-f]{64}")
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+#: Problemas de entrada listados na mensagem de erro (o resto só é contado).
+_MAX_PROBLEMS = 20
+#: Maior inteiro que um float guarda sem perder precisão.
+_MAX_EXACT_FLOAT_INT = 2**53
 
 type _Root = Page | FrameLocator | PwLocator
 type _Action = Callable[[], Awaitable[dict[str, Any]]]
@@ -173,16 +188,28 @@ class _Redactor:
         return text
 
     def value(self, value: Any) -> Any:
+        """Mascara textos em qualquer profundidade, inclusive as chaves dos dicionários
+        (cabeçalhos de tabela viram chaves). Nenhuma chave fica de fora."""
         if isinstance(value, str):
             return self.text(value)
         if isinstance(value, Mapping):
-            # Hashes em hexadecimal não carregam segredos e precisam ficar intactos.
-            return {
-                key: item if key in _HASH_KEYS else self.value(item) for key, item in value.items()
-            }
+            masked: dict[Any, Any] = {}
+            for key, item in value.items():
+                name = self._free_key(self.text(key), masked) if isinstance(key, str) else key
+                masked[name] = self.value(item)
+            return masked
         if isinstance(value, (list, tuple)):
             return [self.value(item) for item in value]
         return value
+
+    @staticmethod
+    def _free_key(key: str, taken: Mapping[Any, Any]) -> str:
+        # Duas chaves que só diferem por um segredo ficariam iguais depois da máscara.
+        candidate, n = key, 1
+        while candidate in taken:
+            n += 1
+            candidate = f"{key}_{n}"
+        return candidate
 
 
 class _StepCtx:
@@ -247,6 +274,37 @@ def _coerce_output(kind: FieldType, value: Any) -> Any:
         if folded in {"não", "nao", "false", "falso", "0"}:
             return False
     return value
+
+
+def _prepare_simple(spec: InputField, value: object, where: str, problems: list[str]) -> object:
+    """Normaliza um valor simples de entrada e confere que ele pode ser digitado."""
+    if spec.type is FieldType.INTEGER and isinstance(value, float):
+        # JSON e formulários mandam 5 como 5.0; digitar "5.0" seria outro número
+        # num portal em pt-BR. Um float grande demais já perdeu dígitos.
+        if not (value.is_integer() and abs(value) <= _MAX_EXACT_FLOAT_INT):
+            problems.append(f"a entrada '{where}' precisa ser um número inteiro")
+            return value
+        value = int(value)
+    try:
+        templates.format_value(value)
+    except templates.TemplateError as exc:
+        problems.append(f"a entrada '{where}' não pode ser digitada: {exc}")
+    return value
+
+
+def _encode_url_value(text: str) -> str:
+    """Codifica um valor como um único trecho de endereço (caminho, consulta ou fragmento)."""
+    # "." e ".." são trechos especiais do caminho mesmo codificados (%2e%2e).
+    if text in (".", ".."):
+        raise templates.TemplateError(f"'{text}' não pode ser usado num endereço")
+    return quote(text, safe="")
+
+
+def _has_references(template: str) -> bool:
+    try:
+        return templates.has_references(template)
+    except templates.TemplateError:
+        return False  # o template inválido é recusado ao ser montado
 
 
 def _describe_condition(condition: Condition) -> str:
@@ -520,6 +578,13 @@ class Interpreter:
         )
 
     def _prepare_inputs(self) -> dict[str, Any]:
+        """Confere e normaliza as entradas antes do primeiro passo.
+
+        O que faria a execução falhar no meio por causa das entradas (campo de
+        item ausente, número que não pode ser digitado, lista maior que a
+        repetição aceita) falha aqui, antes de qualquer passo gravar. As entradas
+        recebidas não são alteradas.
+        """
         values = dict(self._raw_inputs)
         problems: list[str] = []
         for spec in self._manifest.inputs:
@@ -534,29 +599,105 @@ class Interpreter:
                 else:
                     values[spec.name] = ""
                 continue
-            if spec.type is FieldType.LIST and not (
-                isinstance(value, list) and all(isinstance(item, Mapping) for item in value)
-            ):
-                problems.append(f"a entrada '{spec.name}' precisa ser uma lista de objetos")
-            elif spec.type is FieldType.FILE and not isinstance(value, str):
-                problems.append(f"a entrada '{spec.name}' precisa ser o identificador do arquivo")
+            if spec.type is FieldType.LIST:
+                if isinstance(value, list) and all(isinstance(item, Mapping) for item in value):
+                    values[spec.name] = self._prepare_items(spec, value, problems)
+                else:
+                    problems.append(f"a entrada '{spec.name}' precisa ser uma lista de objetos")
+            elif spec.type is FieldType.FILE:
+                if not isinstance(value, str):
+                    problems.append(
+                        f"a entrada '{spec.name}' precisa ser o identificador do arquivo"
+                    )
+            else:
+                values[spec.name] = _prepare_simple(spec, value, spec.name, problems)
         if problems:
+            shown = problems[:_MAX_PROBLEMS]
+            if len(problems) > _MAX_PROBLEMS:
+                shown.append(f"e mais {len(problems) - _MAX_PROBLEMS} problemas")
             raise StepError(
                 ErrorCode.ENTRADA_INVALIDA,
-                "Entradas inválidas: " + "; ".join(problems) + ".",
-                details={"problemas": problems},
+                "Entradas inválidas: " + "; ".join(shown) + ".",
+                details={"problemas": shown},
             )
+        self._check_list_limits(values)
         return values
+
+    @staticmethod
+    def _prepare_items(
+        spec: InputField, items: list[Mapping[str, object]], problems: list[str]
+    ) -> list[dict[str, object]]:
+        """Itens de uma lista com os mesmos cuidados das entradas de cima."""
+        prepared: list[dict[str, object]] = []
+        for index, item in enumerate(items):
+            row = dict(item)
+            for field in spec.item_fields or ():
+                where = f"{spec.name}[{index}].{field.name}"
+                current = row.get(field.name)
+                if current is None:
+                    if field.required:
+                        problems.append(f"campo obrigatório ausente: {where}")
+                    else:
+                        # Campo opcional sem valor é digitado vazio (campos de item
+                        # nunca são listas nem arquivos).
+                        row[field.name] = ""
+                    continue
+                row[field.name] = _prepare_simple(field, current, where, problems)
+            prepared.append(row)
+        return prepared
+
+    def _check_list_limits(self, values: Mapping[str, Any]) -> None:
+        """Recusa, antes do primeiro passo, uma lista maior que a repetição que a percorre."""
+        for step, _ in self._manifest.iter_steps():
+            if not isinstance(step, ForEachStep):
+                continue
+            scope, name = step.items.split(".", 1)
+            items = values.get(name) if scope == "inputs" else None
+            if isinstance(items, list) and len(items) > step.max_items:
+                err = self._too_many_items(step, len(items))
+                err.step_id = step.id
+                err.reported = True  # o passo nem começou: não há evento nem tela
+                raise err
+
+    @staticmethod
+    def _too_many_items(step: ForEachStep, count: int) -> StepError:
+        return StepError(
+            ErrorCode.LIMITE_DE_ITENS_EXCEDIDO,
+            f"'{step.items}' tem {count} itens, mais que o limite de "
+            f"{step.max_items} do passo '{step.title}'.",
+            details={"itens": count, "limite": step.max_items},
+        )
 
     def _collect_outputs(self) -> dict[str, Any]:
         outputs: dict[str, Any] = {}
         for spec in self._manifest.outputs:
             name = spec.source.split(".", 1)[1]
             outputs[spec.name] = (
-                _coerce_output(spec.type, self._vars[name]) if name in self._vars else None
+                self._output_value(spec.type, self._vars[name]) if name in self._vars else None
             )
-        redacted: dict[str, Any] = self._redactor.value(outputs)
-        return redacted
+        return outputs
+
+    def _output_value(self, kind: FieldType, raw: Any) -> Any:
+        """Valor de uma saída, já mascarado.
+
+        A máscara vem antes da conversão de tipo: um segredo só de dígitos viraria
+        número e escaparia dela. Se a máscara mudou algo, fica o texto mascarado.
+        """
+        if isinstance(raw, ArtifactRef):
+            # Só o hash, calculado pelo próprio executor, fica fora da máscara.
+            data = raw.model_dump(mode="json")
+            return {
+                key: item if key == "sha256" else self._redactor.value(item)
+                for key, item in data.items()
+            }
+        masked = self._redactor.value(raw)
+        if masked != raw:
+            return masked
+        converted = _coerce_output(kind, raw)
+        if converted is not raw and self._redactor.text(str(converted)) != str(converted):
+            # A conversão juntou um segredo (por exemplo, tirando os pontos de um número).
+            return MASK
+        return converted
 
     async def _check_postconditions(self) -> None:
         conditions = self._manifest.postconditions
@@ -597,10 +738,28 @@ class Interpreter:
             at=datetime.now(UTC),
             kind=kind,
             step_id=step_id,
-            data=self._redactor.value(dict(data or {})),
+            data=self._mask_event_data(data or {}),
         )
         self._seq += 1
         await self._events.emit(event)
+
+    def _mask_event_data(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        """Mascara os dados de um evento.
+
+        As chaves de primeiro nível são sempre do executor; só os hashes que ele
+        mesmo calcula (``sha256`` e ``fingerprint``, em hexadecimal) ficam
+        intactos, porque um segredo curto poderia aparecer neles por acaso.
+        """
+        hashes = {
+            key: item
+            for key, item in data.items()
+            if key in _HASH_KEYS and isinstance(item, str) and _HEX_DIGEST.fullmatch(item)
+        }
+        masked: dict[str, Any] = self._redactor.value(
+            {key: item for key, item in data.items() if key not in hashes}
+        )
+        masked.update(hashes)
+        return masked
 
     async def _emit_step_started(self, step: Step, *, irreversible: bool = False) -> None:
         data: dict[str, Any] = {
@@ -877,12 +1036,9 @@ class Interpreter:
                 f"'{step.items}' não é uma lista de itens no passo '{step.title}'.",
             )
         if len(value) > step.max_items:
-            raise StepError(
-                ErrorCode.LIMITE_DE_ITENS_EXCEDIDO,
-                f"'{step.items}' tem {len(value)} itens, mais que o limite de "
-                f"{step.max_items} do passo '{step.title}'.",
-                details={"itens": len(value), "limite": step.max_items},
-            )
+            # Listas de entradas já foram conferidas antes do primeiro passo; aqui
+            # sobram as tabelas extraídas da página.
+            raise self._too_many_items(step, len(value))
         return list(value)
 
     async def _prepare(self, step: Step, ctx: _StepCtx) -> _Action:
@@ -924,7 +1080,7 @@ class Interpreter:
         return self._page
 
     def _prepare_navigate(self, step: NavigateStep, ctx: _StepCtx) -> _Action:
-        url = self._render(step.url)
+        url = self._render_url(step)
         try:
             parts = urlsplit(url)
             host = (parts.hostname or "").lower()
@@ -966,6 +1122,28 @@ class Interpreter:
             return {"dominio": host, "status": response.status if response is not None else None}
 
         return act
+
+    def _render_url(self, step: NavigateStep) -> str:
+        """Monta o endereço codificando cada valor como um único trecho.
+
+        Barras, ``?``, ``#`` ou ``..`` num valor nunca mudam o caminho nem a
+        consulta, e domínio, porta e usuário vêm só do trecho literal do começo.
+        """
+        url = self._render(step.url, encode=_encode_url_value)
+        parts = templates.parse(step.url)  # já conferido por _render
+        prefix = parts[0] if parts and isinstance(parts[0], str) else ""
+        try:
+            fixed = urlsplit(prefix).netloc.lower() == urlsplit(url).netloc.lower()
+        except ValueError:
+            fixed = False
+        if not fixed:
+            raise StepError(
+                ErrorCode.DOMINIO_NAO_PERMITIDO,
+                f"O domínio do endereço do passo '{step.title}' precisa ser fixo; só o "
+                "caminho e a consulta podem usar valores.",
+                details={"dominio": _host(url)},
+            )
+        return url
 
     async def _prepare_click(self, step: ClickStep, ctx: _StepCtx) -> _Action:
         locator = await self._resolve(step.target, step, ctx)
@@ -1119,7 +1297,8 @@ class Interpreter:
 
         async def act() -> dict[str, Any]:
             raw = await locator.evaluate(_READ_TABLE_JS, step.max_rows, timeout=ctx.remaining_ms())
-            headers = [str(h) for h in raw.get("headers", [])]
+            # Cabeçalhos viram chaves: mascarados antes, os repetidos viram coluna_N.
+            headers = [self._redactor.text(str(h)) for h in raw.get("headers", [])]
             rows = [[str(cell) for cell in row] for row in raw.get("rows", [])]
             keys = self._table_keys(step.columns, headers, rows)
             table = [
@@ -1161,7 +1340,7 @@ class Interpreter:
         return act
 
     async def _prepare_download(self, step: DownloadStep, ctx: _StepCtx) -> _Action:
-        name = sanitize_filename(self._render(step.save_as), default=f"{step.id}.bin")
+        name = self._artifact_name(self._render(step.save_as), default=f"{step.id}.bin")
         locator = await self._resolve(step.target, step, ctx)
 
         async def act() -> dict[str, Any]:
@@ -1191,10 +1370,17 @@ class Interpreter:
                 except PlaywrightError:
                     pass
             await self._register_artifact(step.id, ref)
-            self._vars[step.into] = ref.model_dump(mode="json")
+            # A própria referência: na saída, só o hash dela fica fora da máscara.
+            self._vars[step.into] = ref
             return {"arquivo": ref.name, "tamanho": ref.size, "sha256": ref.sha256}
 
         return act
+
+    def _artifact_name(self, rendered: str, *, default: str) -> str:
+        """Nome saneado e sem segredos: vira o nome e o caminho do artefato."""
+        name = sanitize_filename(self._redactor.text(rendered), default=default)
+        # O saneamento tira acentos e separadores e poderia remontar um segredo.
+        return name if self._redactor.text(name) == name else default
 
     async def _prepare_upload(self, step: UploadStep, ctx: _StepCtx) -> _Action:
         file_id = self._inputs.get(step.file_input)
@@ -1223,7 +1409,7 @@ class Interpreter:
     # Templates, localizadores e condições
     # ------------------------------------------------------------------
 
-    def _render(self, template: str) -> str:
+    def _render(self, template: str, *, encode: Callable[[str], str] | None = None) -> str:
         scopes: dict[templates.Scope, Mapping[str, object]] = {
             templates.Scope.INPUTS: self._inputs,
             templates.Scope.VARS: self._vars,
@@ -1231,7 +1417,7 @@ class Interpreter:
         if self._items:
             scopes[templates.Scope.ITEM] = self._items[-1][0]
         try:
-            return templates.render(template, scopes)
+            return templates.render(template, scopes, encode=encode)
         except templates.TemplateError as exc:
             raise StepError(
                 ErrorCode.TEMPLATE_INVALIDO, f"Não consegui montar um valor do passo: {exc}."
@@ -1261,6 +1447,7 @@ class Interpreter:
                 assert_never(locator.by)
 
     def _candidates(self, target: Target) -> list[PwLocator]:
+        self._refuse_dynamic_selectors(target)
         root: Page | FrameLocator = self.page
         for selector in target.frames:
             root = root.frame_locator(selector)
@@ -1268,9 +1455,36 @@ class Interpreter:
         if target.within is not None:
             within = self._build(root, target.within)
             if target.within_has_text is not None:
-                within = within.filter(has_text=self._render(target.within_has_text))
+                key = self._render(target.within_has_text)
+                if not key.strip():
+                    # Sem texto, o filtro sumiria e qualquer contêiner serviria.
+                    raise StepError(
+                        ErrorCode.TEMPLATE_INVALIDO,
+                        f"O texto que escolhe o contêiner de '{target.intent}' ficou vazio; "
+                        "sem ele não há como saber qual usar.",
+                    )
+                # O texto precisa ser o de um elemento inteiro do contêiner (uma
+                # célula, por exemplo), com as mesmas maiúsculas: "12" não escolhe a
+                # linha da nota "120" nem a do valor "12,00".
+                within = within.filter(has=self.page.get_by_text(key, exact=True))
             container = within
         return [self._build(container, locator) for locator in target.locators]
+
+    @staticmethod
+    def _refuse_dynamic_selectors(target: Target) -> None:
+        """Seletores CSS/XPath não escapam valores: um valor com aspas ou colchetes
+        escolheria outro elemento. Vale também para robôs publicados antes de o
+        portão de política recusar isso."""
+        locators = [*target.locators, *([target.within] if target.within is not None else [])]
+        for locator in locators:
+            if locator.by in RAW_SELECTORS and _has_references(locator.value):
+                raise StepError(
+                    ErrorCode.TEMPLATE_INVALIDO,
+                    f"O alvo '{target.intent}' usa uma entrada, variável ou item num "
+                    f"localizador {locator.by.value}, onde o valor entraria cru no seletor. "
+                    "O robô precisa de conserto.",
+                    details={"estrategia": locator.by.value},
+                )
 
     @staticmethod
     async def _count(locator: PwLocator) -> int:

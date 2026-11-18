@@ -1,5 +1,7 @@
 from typing import Any
 
+import pytest
+
 from rapa.core import policy
 from rapa.core.robot import Manifest
 from rapa.fixtures.robots import baixar_notas, emitir_protocolo
@@ -91,3 +93,41 @@ def test_duplicate_step_ids() -> None:
     data = protocolo()
     data["steps"][1]["id"] = "abrir_login"
     assert "passo_repetido" in codes(data)
+
+
+# -- valores dinâmicos em seletores e endereços ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("by", "value"),
+    [
+        ("css", 'button[data-nota="{{ inputs.nome }}"]'),
+        ("xpath", "//button[@data-nota='{{ inputs.nome }}']"),
+    ],
+)
+def test_dynamic_css_or_xpath_locator_is_rejected(by: str, value: str) -> None:
+    data = protocolo()
+    data["steps"][8]["target"]["locators"].append({"by": by, "value": value})
+    assert "seletor_dinamico" in codes(data)
+
+
+def test_dynamic_css_container_is_rejected() -> None:
+    data = baixar_notas(BASE, HOST).model_dump(mode="json")
+    target = data["steps"][9]["steps"][0]["target"]
+    target["within"] = {"by": "css", "value": "tr[data-numero='{{ item.numero }}']"}
+    target["within_has_text"] = None
+    assert "seletor_dinamico" in codes(data)
+
+
+def test_literal_css_and_dynamic_role_name_are_accepted() -> None:
+    data = protocolo()
+    target = data["steps"][8]["target"]
+    target["locators"].append({"by": "css", "value": "input[data-x='{{{{']"})
+    target["locators"].append({"by": "role", "value": "textbox", "name": "{{ inputs.nome }}"})
+    assert codes(data) == []
+
+
+def test_dynamic_port_is_rejected() -> None:
+    data = protocolo()
+    data["steps"][0]["url"] = "http://portal-v1.rapa.test:{{ inputs.nome }}/login"
+    assert "dominio_dinamico" in codes(data)
