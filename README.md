@@ -20,7 +20,7 @@ Fase 0, que não depende do AWS Outposts:
 - [x] Plano de controle: PostgreSQL multiempresa com isolamento por linha, fila, despachante e lançador local (`rapa.control`)
 - [x] API REST e gateway MCP com o SDK oficial (`rapa.control.api`, `rapa.control.mcp`)
 - [x] Interface em NiceGUI (`rapa.ui`)
-- [ ] Montagem num serviço só e teste ponta a ponta (publicar pelo REST, chamar pelo MCP, executar no portal de teste)
+- [x] Montagem num serviço só (`python -m rapa.server`), cadastro pela linha de comando (`python -m rapa.control.admin`) e teste ponta a ponta: publicar pelo REST, chamar pelo MCP e pelo REST, executar no portal de teste
 
 ## Estrutura
 
@@ -33,6 +33,7 @@ src/rapa/
   llm/        cliente do hub de LLM, sonda (python -m rapa.llm.probe) e generalização
   control/    banco, fila, despachante, lançador, API REST e gateway MCP
   ui/         interface em NiceGUI (python -m rapa.ui para o modo de desenvolvimento)
+  server.py   o serviço num processo só: REST, MCP, interface e despachante
   fixtures/   portais de teste e robôs de exemplo
 tests/        testes automatizados (pytest)
 docs/         plano e documentação
@@ -55,6 +56,57 @@ uv run ruff check src tests && uv run mypy
 ```
 
 Os testes de banco usam `RAPA_TEST_DATABASE_URL` (superusuário) ou sobem um PostgreSQL temporário com os binários locais (`initdb`, `pg_ctl`). Os testes com navegador procuram o Chromium em `RAPA_CHROMIUM_PATH`, `/usr/bin/chromium` ou `/opt/pw-browsers/chromium`. Os portais de teste respondem em `*.rapa.test`, que o Chromium resolve para 127.0.0.1.
+
+## Rodando o RaPA localmente
+
+O exemplo usa um PostgreSQL local e o modo de desenvolvimento (tokens fixos e login sem senha). Em produção, os tokens vêm do Keycloak e os segredos do OpenBao.
+
+1. Crie os três papéis e o banco, como superusuário do PostgreSQL: `rapa_owner` é o dono das tabelas, `rapa_app` serve a aplicação (sujeito ao isolamento por empresa) e `rapa_dispatcher` serve o despachante.
+
+```sql
+CREATE ROLE rapa_owner LOGIN PASSWORD 'SENHA';
+CREATE ROLE rapa_app LOGIN PASSWORD 'SENHA' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
+CREATE ROLE rapa_dispatcher LOGIN PASSWORD 'SENHA' NOSUPERUSER BYPASSRLS NOCREATEDB NOCREATEROLE;
+CREATE DATABASE rapa OWNER rapa_owner;
+```
+
+2. Crie as tabelas como dono:
+
+```bash
+uv run python -m rapa.control.db.migrate --url postgresql://rapa_owner:SENHA@localhost/rapa
+```
+
+3. Cadastre uma empresa, uma área e as pessoas. Cada comando imprime o identificador criado.
+
+```bash
+export RAPA_DATABASE_URL=postgresql://rapa_app:SENHA@localhost/rapa
+```
+
+```bash
+uv run python -m rapa.control.admin empresa "Minha empresa" --vagas 2
+```
+
+```bash
+uv run python -m rapa.control.admin area EMPRESA "Fiscal"
+```
+
+```bash
+uv run python -m rapa.control.admin usuario EMPRESA ana@empresa --papel creator:AREA --papel operator
+```
+
+```bash
+uv run python -m rapa.control.admin usuario EMPRESA bruno@empresa --papel approver:AREA
+```
+
+4. Escreva `tokens.json` com um token de desenvolvimento por pessoa, no formato `{"token-ana": {"sujeito": "ana@empresa", "empresa": "EMPRESA"}}`. Os segredos dos portais vão em `segredos.json`, no formato `{"EMPRESA": {"portal": {"username": "...", "password": "..."}}}`.
+
+5. Suba o serviço:
+
+```bash
+RAPA_DEV=1 RAPA_COOKIE_SEGURO=0 RAPA_TOKENS_DEV=tokens.json RAPA_SEGREDOS_DEV=segredos.json RAPA_DISPATCHER_DATABASE_URL=postgresql://rapa_dispatcher:SENHA@localhost/rapa uv run python -m rapa.server --port 8000
+```
+
+A interface fica em http://127.0.0.1:8000, a API REST em `/v1` e o gateway MCP em `/mcp`, com `Authorization: Bearer token-ana`. Um robô criado por uma pessoa precisa ser publicado por outra, com o papel de aprovador.
 
 ## Licença
 
