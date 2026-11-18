@@ -1,0 +1,104 @@
+[project]
+name = "rapa"
+version = "0.1.0"
+description = "RaPA: gerador de robôs RPA sob demanda, publicados como tools MCP e endpoints REST"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.14"
+dependencies = [
+    "pydantic>=2.14,<3",
+]
+
+[project.optional-dependencies]
+# Executor: interpreta a lista de passos sobre Playwright, sem LLM.
+runner = [
+    "playwright==1.65.2",
+]
+# Cliente do hub de LLM (API compatível com OpenAI).
+llm = [
+    "httpx2>=2.16,<3",
+]
+# Plano de controle: API REST, gateway MCP, banco, fila e despachante.
+control = [
+    "fastapi>=0.164",
+    "uvicorn>=0.54",
+    "sqlalchemy[asyncio]>=2.1.9,<2.2",
+    "psycopg[binary,pool]>=3.3.9,<3.4",
+    "alembic>=1.20",
+    "pyjwt[crypto]>=2.15.1",
+    "mcp==2.3.0",
+    "jsonschema-rs>=0.61",
+    "httpx2>=2.16,<3",
+]
+# Interface web em Python.
+ui = [
+    "nicegui==4.0.0",
+    "authlib>=1.9",
+    "httpx2>=2.16,<3",
+]
+# Portais de teste usados nos testes automatizados.
+fixtures = [
+    "fastapi>=0.164",
+    "uvicorn>=0.54",
+    "pyotp>=2.12",
+    "python-multipart>=0.0.34",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2",
+    "pytest-asyncio>=1.5",
+    "ruff>=0.17",
+    "mypy>=2.4",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rapa"]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "ASYNC", "RUF"]
+ignore = [
+    "E501",   # o formatador cuida do comprimento; mensagens longas em pt-BR ficam inteiras
+    "RUF001", # textos em pt-BR usam acentos e aspas tipográficas
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S108", "S311"]
+"src/rapa/fixtures/**" = ["S105", "S106", "S311"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+plugins = ["pydantic.mypy"]
+mypy_path = "src"
+packages = ["rapa"]
+
+[[tool.mypy.overrides]]
+module = ["pyotp.*", "playwright.*", "nicegui.*", "authlib.*", "jsonschema_rs.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "browser: testes que abrem o Chromium",
+    "database: testes que precisam de PostgreSQL",
+    "slow: testes longos (por exemplo, 100 reexecuções)",
+]
+addopts = "-ra"

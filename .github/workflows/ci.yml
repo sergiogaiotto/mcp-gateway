@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  testes:
+    name: Lint, tipos e testes
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Debian 13 (trixie): o mesmo Chromium de código aberto usado na imagem do executor.
+    container:
+      image: python:3.14-slim-trixie
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      RAPA_CHROMIUM_PATH: /usr/bin/chromium
+      RAPA_TEST_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+    steps:
+      - name: Instalar o Chromium do Debian e utilitários
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends chromium git ca-certificates fonts-liberation
+      - uses: actions/checkout@v4
+      - name: Instalar o uv
+        run: pip install --no-cache-dir "uv>=0.11"
+      - name: Instalar dependências
+        run: uv sync --all-extras --frozen
+      - name: Lint
+        run: |
+          uv run ruff check src tests
+          uv run ruff format --check src tests
+      - name: Tipos
+        run: uv run mypy
+      - name: Testes
+        run: uv run pytest -q
