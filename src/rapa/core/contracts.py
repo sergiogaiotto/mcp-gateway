@@ -10,11 +10,12 @@ from enum import StrEnum
 from typing import Any, Protocol
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from rapa.core.robot import Effect, Manifest
 
 __all__ = [
+    "MAX_RUNS_LISTED",
     "Conflict",
     "ContractError",
     "Forbidden",
@@ -195,7 +196,8 @@ class RunnerJob(_Model):
     manifest: Manifest
     inputs: dict[str, Any]
     mode: RunMode = RunMode.FULL
-    deadline: datetime
+    #: Prazo da execução, sempre com fuso horário.
+    deadline: AwareDatetime
 
 
 class ContractError(Exception):
@@ -262,6 +264,14 @@ class RunService(Protocol):
 
     async def get(self, principal: Principal, run_id: UUID) -> RunStatus | None: ...
 
+    async def list_recent(self, principal: Principal, limit: int = 50) -> list[RunStatus]:
+        """Execuções mais recentes que o principal pode ver (das áreas em que tem papel)."""
+        ...
+
+
+#: Quantas execuções, no máximo, uma listagem devolve.
+MAX_RUNS_LISTED = 200
+
 
 class RobotAdmin(Protocol):
     """Ciclo de vida rascunho → validado → publicado."""
@@ -275,6 +285,10 @@ class RobotAdmin(Protocol):
     async def get_version(
         self, principal: Principal, robot_id: UUID, version_no: int
     ) -> RobotVersionInfo | None: ...
+
+    async def list_versions(self, principal: Principal, robot_id: UUID) -> list[RobotVersionInfo]:
+        """Versões do robô, da primeira à mais nova; ``NotFound`` se o robô não é visível."""
+        ...
 
     async def mark_validated(
         self, principal: Principal, robot_id: UUID, version_no: int

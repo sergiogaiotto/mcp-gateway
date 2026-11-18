@@ -11,7 +11,6 @@ from fastapi.responses import RedirectResponse
 from rapa.core.contracts import Principal
 from rapa.ui.auth import LOGIN_PATH, UiAuth, UiSession, safe_return_path
 from rapa.ui.backend import Backend, NotAuthenticated
-from rapa.ui.history import RunHistory
 
 __all__ = ["BackendFactory", "UiContext", "UiSettings", "Viewer"]
 
@@ -63,12 +62,10 @@ class UiContext:
         self,
         backend_factory: BackendFactory,
         auth: UiAuth,
-        history: RunHistory,
         settings: UiSettings,
     ) -> None:
         self.backend_factory = backend_factory
         self.auth = auth
-        self.history = history
         self.settings = settings
 
     async def viewer(self, request: Request) -> Viewer | None:

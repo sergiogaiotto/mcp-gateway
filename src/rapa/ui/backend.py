@@ -50,7 +50,6 @@ if TYPE_CHECKING:
     from rapa.ui.auth import UiSession
 
 __all__ = [
-    "MAX_VERSIONS",
     "Backend",
     "BackendError",
     "BackendUnavailable",
@@ -65,9 +64,6 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
-
-#: Quantas versões de um robô a interface lista no máximo.
-MAX_VERSIONS = 100
 
 type ManifestLike = Manifest | Mapping[str, Any] | str
 
@@ -116,6 +112,8 @@ class Backend(Protocol):
     ) -> RunStatus: ...
 
     async def get_run(self, run_id: UUID) -> RunStatus | None: ...
+
+    async def list_runs(self, limit: int = 50) -> list[RunStatus]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -232,13 +230,10 @@ class ContractsBackend:
         return await self._admin.list_robots(self._principal)
 
     async def list_versions(self, robot_id: UUID) -> list[RobotVersionInfo]:
-        versions: list[RobotVersionInfo] = []
-        for number in range(1, MAX_VERSIONS + 1):
-            info = await self._admin.get_version(self._principal, robot_id, number)
-            if info is None:
-                break
-            versions.append(info)
-        return versions
+        try:
+            return await self._admin.list_versions(self._principal, robot_id)
+        except NotFound:
+            return []
 
     async def get_version(self, robot_id: UUID, version_no: int) -> RobotVersionInfo | None:
         if version_no < 1:
@@ -265,6 +260,9 @@ class ContractsBackend:
 
     async def get_run(self, run_id: UUID) -> RunStatus | None:
         return await self._runs.get(self._principal, run_id)
+
+    async def list_runs(self, limit: int = 50) -> list[RunStatus]:
+        return await self._runs.list_recent(self._principal, limit)
 
 
 class _Platform(RobotCatalog, RunService, RobotAdmin, Protocol):
@@ -295,7 +293,9 @@ _SUMMARIES: TypeAdapter[list[RobotSummary]] = TypeAdapter(list[RobotSummary])
 _SUMMARY: TypeAdapter[RobotSummary] = TypeAdapter(RobotSummary)
 _ROBOTS: TypeAdapter[list[RobotInfo]] = TypeAdapter(list[RobotInfo])
 _VERSION: TypeAdapter[RobotVersionInfo] = TypeAdapter(RobotVersionInfo)
+_VERSIONS: TypeAdapter[list[RobotVersionInfo]] = TypeAdapter(list[RobotVersionInfo])
 _RUN: TypeAdapter[RunStatus] = TypeAdapter(RunStatus)
+_RUNS: TypeAdapter[list[RunStatus]] = TypeAdapter(list[RunStatus])
 
 _MAX_MESSAGE = 500
 _MAX_DETAILS = 50
@@ -434,13 +434,8 @@ class RestBackend:
         return self._parse(_ROBOTS, await self._send("GET", "/v1/robos"))
 
     async def list_versions(self, robot_id: UUID) -> list[RobotVersionInfo]:
-        versions: list[RobotVersionInfo] = []
-        for number in range(1, MAX_VERSIONS + 1):
-            info = await self.get_version(robot_id, number)
-            if info is None:
-                break
-            versions.append(info)
-        return versions
+        data = await self._send("GET", f"/v1/robos/{robot_id}/versoes", not_found_is_none=True)
+        return [] if data is None else self._parse(_VERSIONS, data)
 
     async def get_version(self, robot_id: UUID, version_no: int) -> RobotVersionInfo | None:
         if version_no < 1:
@@ -482,6 +477,10 @@ class RestBackend:
     async def get_run(self, run_id: UUID) -> RunStatus | None:
         data = await self._send("GET", f"/v1/execucoes/{run_id}", not_found_is_none=True)
         return None if data is None else self._parse(_RUN, data)
+
+    async def list_runs(self, limit: int = 50) -> list[RunStatus]:
+        data = await self._send("GET", "/v1/execucoes", params={"limite": str(limit)})
+        return self._parse(_RUNS, data)
 
 
 class RestBackendFactory:

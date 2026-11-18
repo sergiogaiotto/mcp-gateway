@@ -5,6 +5,7 @@ from collections.abc import Callable
 from fastapi import FastAPI
 
 from rapa.core.contracts import RobotSummary
+from rapa.core.ids import new_id
 from rapa.ui.app import create_ui
 from rapa.ui.auth import UiSession
 from rapa.ui.backend import Backend, BackendUnavailable, ContractsBackend
@@ -35,7 +36,8 @@ def _build(world: World, backend_cls: type[ContractsBackend]) -> Callable[[FastA
 
 async def test_unexpected_error_page_hides_details(world: World) -> None:
     async with simulate(_build(world, Exploding)) as user:
-        await login(user, "operador", "/execucoes")
+        # Entra por uma página que não usa o catálogo (detalhe de execução inexistente).
+        await login(user, "operador", f"/execucoes/{new_id()}")
         response = await user.http_client.get("/catalogo")
         assert response.status_code == 500
         assert "Algo deu errado ao montar esta página" in response.text

@@ -243,6 +243,22 @@ class PgRobotAdmin(PgService):
                 return None
         return version_info(robot_id, row)
 
+    async def list_versions(self, principal: Principal, robot_id: UUID) -> list[RobotVersionInfo]:
+        async with self.db.tenant_session(principal.company_id) as session:
+            await self._robot(session, principal, robot_id)
+            rows = (
+                (
+                    await session.execute(
+                        select(*_VERSION_COLUMNS)
+                        .where(robot_versions.c.robot_id == robot_id)
+                        .order_by(robot_versions.c.version_no)
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        return [version_info(robot_id, row) for row in rows]
+
     async def mark_validated(
         self, principal: Principal, robot_id: UUID, version_no: int
     ) -> RobotVersionInfo:

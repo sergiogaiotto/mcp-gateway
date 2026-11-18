@@ -110,6 +110,10 @@ class FakeApi:
             if summary is None:
                 raise NotFound(f"robô '{m.group(1)}' não encontrado")
             return ok(summary)
+        if path == "/v1/execucoes":
+            return ok(await p.list_recent(principal, int(request.url.params["limite"])))
+        if m := re.fullmatch(r"/v1/robos/([0-9a-f-]+)/versoes", path):
+            return ok(await p.list_versions(principal, UUID(m.group(1))))
         if m := re.fullmatch(r"/v1/execucoes/([0-9a-f-]+)", path):
             run = await p.get(principal, UUID(m.group(1)))
             if run is None:

@@ -544,7 +544,14 @@ class CredentialRef(_Model):
             raise ValueError("a origem da credencial deve ser https://host")
         if parts.path not in ("", "/") or parts.query or parts.fragment or parts.username:
             raise ValueError("a origem da credencial não pode ter caminho, consulta ou usuário")
-        return f"{parts.scheme}://{parts.netloc.lower()}"
+        try:
+            port = parts.port
+        except ValueError:
+            raise ValueError("a porta da origem da credencial é inválida") from None
+        # Mesma forma que o navegador usa para a origem: sem a porta padrão do esquema.
+        if port is None or port == {"https": 443, "http": 80}[parts.scheme]:
+            return f"{parts.scheme}://{host}"
+        return f"{parts.scheme}://{host}:{port}"
 
 
 def _check_hostname(host: str) -> str:

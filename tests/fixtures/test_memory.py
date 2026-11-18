@@ -1,6 +1,14 @@
 import pytest
 
-from rapa.core.contracts import Conflict, Forbidden, Role, RunState, RunTrigger, VersionStatus
+from rapa.core.contracts import (
+    Conflict,
+    Forbidden,
+    NotFound,
+    Role,
+    RunState,
+    RunTrigger,
+    VersionStatus,
+)
 from rapa.core.ids import new_id
 from rapa.fixtures.memory import MemoryPlatform, make_principal
 from rapa.fixtures.robots import emitir_protocolo
@@ -62,3 +70,30 @@ async def test_idempotency() -> None:
         )  # type: ignore[arg-type]
     done = platform.set_run_state(a.run_id, RunState.SUCCEEDED, outputs={"protocolo": "PRT-1"})
     assert done.finished_at is not None
+
+
+async def test_versions_and_recent_runs_follow_area_roles() -> None:
+    platform, ctx = await published_platform()
+    approver, creator = ctx["approver"], ctx["creator"]
+    robot_id = next(iter(platform.robots))
+    await platform.create_version(creator, ctx["area"], emitir_protocolo(BASE, HOST))  # type: ignore[arg-type]
+    versions = await platform.list_versions(approver, robot_id)  # type: ignore[arg-type]
+    assert [(v.version_no, v.status) for v in versions] == [
+        (1, VersionStatus.PUBLISHED),
+        (2, VersionStatus.DRAFT),
+    ]
+    first = await platform.start(approver, "emitir_protocolo", INPUTS, RunTrigger.MCP)  # type: ignore[arg-type]
+    second = await platform.start(approver, "emitir_protocolo", INPUTS, RunTrigger.REST)  # type: ignore[arg-type]
+    recent = await platform.list_recent(approver)  # type: ignore[arg-type]
+    assert [r.run_id for r in recent] == [second.run_id, first.run_id]
+    assert [r.run_id for r in await platform.list_recent(approver, 1)] == [second.run_id]  # type: ignore[arg-type]
+    # Papel só noutra área da mesma empresa: não vê nada desta área.
+    neighbour = make_principal(
+        ctx["company"],  # type: ignore[arg-type]
+        subject="vizinha",
+        area_roles={new_id(): frozenset({Role.OPERATOR})},
+    )
+    assert await platform.list_recent(neighbour) == []
+    assert await platform.get(neighbour, first.run_id) is None
+    with pytest.raises(NotFound):
+        await platform.list_versions(neighbour, robot_id)  # type: ignore[arg-type]

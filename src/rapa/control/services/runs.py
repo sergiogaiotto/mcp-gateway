@@ -23,10 +23,16 @@ from rapa.control.db.schema import (
     runs,
 )
 from rapa.control.services import audit
-from rapa.control.services._common import PRIORITY_BY_TRIGGER, PgService, run_status
+from rapa.control.services._common import (
+    PRIORITY_BY_TRIGGER,
+    PgService,
+    run_status,
+    visible_areas,
+)
 from rapa.control.services.inputs import validate_inputs
 from rapa.control.services.robots import published_query
 from rapa.core.contracts import (
+    MAX_RUNS_LISTED,
     Conflict,
     Forbidden,
     InvalidInput,
@@ -351,4 +357,28 @@ class PgRunService(PgService):
 
     async def get(self, principal: Principal, run_id: UUID) -> RunStatus | None:
         async with self.db.tenant_session(principal.company_id) as session:
+            allowed = visible_areas(principal)
+            if allowed is not None:
+                area = await session.scalar(
+                    select(runs.c.area_id).where(
+                        runs.c.id == run_id, runs.c.company_id == principal.company_id
+                    )
+                )
+                if area is None or area not in allowed:
+                    return None
             return await self._status(session, principal.company_id, run_id)
+
+    async def list_recent(self, principal: Principal, limit: int = 50) -> list[RunStatus]:
+        limit = max(1, min(limit, MAX_RUNS_LISTED))
+        query = (
+            _status_query()
+            .where(runs.c.company_id == principal.company_id)
+            .order_by(runs.c.created_at.desc(), runs.c.id.desc())
+            .limit(limit)
+        )
+        allowed = visible_areas(principal)
+        if allowed is not None:
+            query = query.where(runs.c.area_id.in_(allowed))
+        async with self.db.tenant_session(principal.company_id) as session:
+            rows = (await session.execute(query)).mappings().all()
+        return [run_status(row) for row in rows]

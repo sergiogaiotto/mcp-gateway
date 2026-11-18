@@ -7,7 +7,6 @@ requisição. As ações dos botões conferem a sessão de novo a cada clique.
 
 import json
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote
 from uuid import UUID
@@ -33,7 +32,6 @@ from rapa.ui.auth import BINDING_COOKIE, HOME_PATH, LOGIN_ERRORS, LoginError, sa
 from rapa.ui.backend import BackendError, BackendUnavailable, NotAuthenticated
 from rapa.ui.context import UiContext, Viewer
 from rapa.ui.forms import SchemaForm
-from rapa.ui.history import RecentRun
 from rapa.ui.labels import (
     ROBOT_STATUS_LABELS,
     TRIGGER_LABELS,
@@ -56,6 +54,9 @@ from rapa.ui.permissions import (
     publish_block_reason,
     validate_block_reason,
 )
+
+#: Quantas execuções a tela Execuções mostra.
+RECENT_RUNS = 50
 
 __all__ = ["RunPanel", "register_pages"]
 
@@ -630,10 +631,6 @@ async def _execute(viewer: Viewer, slug: str) -> None:
         finally:
             button.enable()
         attempt["key"] = new_id().hex
-        await viewer.ctx.history.record(
-            viewer.principal,
-            RecentRun(status.run_id, summary.slug, summary.title, datetime.now(UTC)),
-        )
         ui.notify("Execução iniciada.", type="positive")
         status_area.clear()
         with status_area:
@@ -761,7 +758,8 @@ class RunPanel:
 async def _runs(viewer: Viewer) -> None:
     ui.label("Execuções").classes("text-h5")
     ui.label(
-        "As execuções que você iniciou por esta interface, das mais novas às mais antigas."
+        "As execuções mais recentes dos robôs das suas áreas, iniciadas por aqui, pelo MCP "
+        "ou pela API, das mais novas às mais antigas."
     ).classes("text-caption")
     with ui.row().classes("items-center gap-2"):
         number = ui.input("Abrir execução pelo número").classes("w-96").mark("numero-busca")
@@ -774,26 +772,28 @@ async def _runs(viewer: Viewer) -> None:
             ui.navigate.to(f"/execucoes/{run_id}")
 
         ui.button("Abrir", on_click=open_run).mark("abrir-execucao")
-    recent = await viewer.ctx.history.recent(viewer.principal)
     backend = await viewer.backend()
+    recent = await backend.list_runs(RECENT_RUNS)
+    titles = {summary.slug: summary.title for summary in await backend.list_catalog()}
     with ui.card().classes("w-full").mark("lista-execucoes"):
         if not recent:
             ui.label("Nenhuma execução recente.")
-        for item in recent:
-            status = await backend.get_run(item.run_id)
-            if status is None:
-                continue
+        for status in recent:
             with (
-                ui.row().classes("w-full items-center justify-between").mark(f"linha-{item.run_id}")
+                ui.row()
+                .classes("w-full items-center justify-between")
+                .mark(f"linha-{status.run_id}")
             ):
                 with ui.row().classes("items-center gap-2"):
-                    ui.label(item.robot_title).classes("text-weight-medium")
+                    ui.label(titles.get(status.robot_slug, status.robot_slug)).classes(
+                        "text-weight-medium"
+                    )
                     state_badge(status.state)
                     ui.label(format_datetime(status.created_at)).classes("text-caption")
                 ui.button(
                     "Detalhes",
-                    on_click=lambda r=item.run_id: ui.navigate.to(f"/execucoes/{r}"),
-                ).props("flat").mark(f"detalhes-{item.run_id}")
+                    on_click=lambda r=status.run_id: ui.navigate.to(f"/execucoes/{r}"),
+                ).props("flat").mark(f"detalhes-{status.run_id}")
 
 
 async def _run_detail(viewer: Viewer, run_id: str) -> None:

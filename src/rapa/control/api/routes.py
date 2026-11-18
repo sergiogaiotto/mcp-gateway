@@ -21,6 +21,7 @@ from rapa.control.api.ratelimit import RateLimiter
 from rapa.control.auth import Authenticator
 from rapa.control.validation import InputValidator, InvalidSchemaError
 from rapa.core.contracts import (
+    MAX_RUNS_LISTED,
     InvalidInput,
     NotFound,
     Principal,
@@ -179,7 +180,21 @@ def create_api_router(services: ApiServices) -> APIRouter:
         response.headers["Location"] = f"/v1/execucoes/{status.run_id}"
         return status
 
+    # -- quem está chamando ----------------------------------------------------
+
+    @router.get("/eu", response_model=Principal)
+    async def whoami(principal: Annotated[Principal, caller_dep]) -> Principal:
+        """O principal autenticado, com os papéis na empresa e em cada área."""
+        return principal
+
     # -- execuções ----------------------------------------------------------
+
+    @router.get("/execucoes", response_model=list[RunStatus])
+    async def list_runs(
+        principal: Annotated[Principal, caller_dep],
+        limite: Annotated[int, Query(ge=1, le=MAX_RUNS_LISTED)] = 50,
+    ) -> list[RunStatus]:
+        return await services.runs.list_recent(principal, limite)
 
     @router.get("/execucoes/{run_id}", response_model=RunStatus)
     async def get_run(run_id: UUID, principal: Annotated[Principal, caller_dep]) -> RunStatus:
@@ -203,6 +218,12 @@ def create_api_router(services: ApiServices) -> APIRouter:
         info = await services.admin.create_version(principal, body.area_id, body.manifesto)
         response.headers["Location"] = f"/v1/robos/{info.robot_id}/versoes/{info.version_no}"
         return info
+
+    @router.get("/robos/{robot_id}/versoes", response_model=list[RobotVersionInfo])
+    async def list_robot_versions(
+        robot_id: UUID, principal: Annotated[Principal, caller_dep]
+    ) -> list[RobotVersionInfo]:
+        return await services.admin.list_versions(principal, robot_id)
 
     @router.get("/robos/{robot_id}/versoes/{n}", response_model=RobotVersionInfo)
     async def get_robot_version(

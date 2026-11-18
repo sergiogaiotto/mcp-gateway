@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from rapa.core.robot import Effect, FieldType, Locator, Manifest
+from rapa.core.robot import CredentialRef, Effect, FieldType, Locator, Manifest
 from rapa.fixtures.robots import baixar_notas, emitir_protocolo
 
 BASE = "http://portal-v1.rapa.test:8080"
@@ -67,3 +67,41 @@ def test_credential_origin_requires_tls_outside_test_domain() -> None:
     data["credentials"][0]["origin"] = "http://portal.exemplo.com.br"
     with pytest.raises(ValidationError, match="https"):
         Manifest.model_validate(data)
+
+
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [
+        ("https://Portal.Exemplo.com.br", "https://portal.exemplo.com.br"),
+        ("https://portal.exemplo.com.br:443/", "https://portal.exemplo.com.br"),
+        ("https://portal.exemplo.com.br:8443", "https://portal.exemplo.com.br:8443"),
+        ("http://portal-v1.rapa.test:80", "http://portal-v1.rapa.test"),
+        ("http://portal-v1.rapa.test:8080", "http://portal-v1.rapa.test:8080"),
+    ],
+)
+def test_credential_origin_is_normalized_like_the_browser(given: str, expected: str) -> None:
+    ref = CredentialRef(name="portal", kind="password", origin=given)
+    assert ref.origin == expected
+
+
+def test_credential_origin_with_bad_port_is_refused() -> None:
+    with pytest.raises(ValidationError, match="porta"):
+        CredentialRef(name="portal", kind="password", origin="https://portal.exemplo.com.br:99999")
+
+
+def test_runner_job_deadline_needs_a_timezone() -> None:
+    from datetime import UTC, datetime
+
+    from rapa.core.contracts import RunnerJob
+    from rapa.core.ids import new_id
+
+    base = {
+        "run_id": new_id(),
+        "company_id": new_id(),
+        "attempt": 1,
+        "manifest": emitir_protocolo(BASE, HOST),
+        "inputs": {},
+    }
+    RunnerJob.model_validate({**base, "deadline": datetime.now(UTC)})
+    with pytest.raises(ValidationError, match="timezone"):
+        RunnerJob.model_validate({**base, "deadline": datetime(2026, 11, 18, 12, 0)})

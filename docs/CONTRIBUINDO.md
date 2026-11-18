@@ -20,6 +20,8 @@ src/rapa/
   control/    plano de controle: banco, fila, API REST e gateway MCP
   ui/         interface em NiceGUI
   fixtures/   portais de teste e robôs de exemplo
+  server.py   montagem do serviço num processo só
+tests/e2e/    o serviço inteiro sobre PostgreSQL, Chromium e o portal de teste
 ```
 
 Os módulos conversam pelos contratos de `rapa.core.contracts` e `rapa.core.events`. Mudanças no formato do robô (`rapa.core.robot`) exigem subir `schema_version` e escrever a migração.

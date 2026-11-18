@@ -34,6 +34,7 @@ __all__ = [
     "AuthUnavailable",
     "Authenticator",
     "BearerVerifier",
+    "DevTokenVerifier",
     "JwksClient",
     "JwtSettings",
     "PrincipalResolver",
@@ -190,6 +191,31 @@ class StaticTokenVerifier:
             client_id=principal.client_id,
             principal=principal,
         )
+
+
+class DevTokenVerifier(StaticTokenVerifier):
+    """Tokens fixos que só dizem quem é a pessoa; os papéis vêm do banco.
+
+    Para desenvolvimento e demonstração sobre o PostgreSQL: cada token aponta
+    para (sujeito, empresa), e o :class:`PrincipalResolver` busca os papéis,
+    como faria com um token do Keycloak. Também exige ``allow_static_tokens``.
+    """
+
+    def __init__(self, tokens: Mapping[str, tuple[str, UUID]]) -> None:
+        if not tokens:
+            raise ValueError("informe pelo menos um token")
+        self._identities: dict[bytes, tuple[str, UUID]] = {}
+        for token, identity in tokens.items():
+            if not token or _BEARER.fullmatch(f"Bearer {token}") is None:
+                raise ValueError("token fixo com caracteres inválidos")
+            self._identities[_digest(token)] = identity
+
+    async def verify(self, token: str) -> VerifiedToken:
+        identity = self._identities.get(_digest(token))
+        if identity is None:
+            raise Unauthenticated("token inválido", bearer_error="invalid_token")
+        subject, company_id = identity
+        return VerifiedToken(subject=subject, company_id=company_id)
 
 
 # ---------------------------------------------------------------------------
