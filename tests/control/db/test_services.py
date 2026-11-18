@@ -323,3 +323,37 @@ async def test_validation_run_is_interactive_and_stops_before_writing(app_db: Da
             )
         ).one()
     assert tuple(row) == ("until_first_write", 0)
+
+
+async def test_list_versions_and_recent_runs_respect_areas(app_db: Database) -> None:
+    platform = PgPlatform(app_db)
+    tenant = await make_tenant(app_db, "Listas")
+    other = await make_tenant(app_db, "Listas B")
+    first = await publish(platform, tenant, protocolo())
+    await platform.create_version(tenant.creator, tenant.area_id, protocolo())
+
+    versions = await platform.list_versions(tenant.approver, first.robot_id)
+    assert [(v.version_no, v.status) for v in versions] == [
+        (1, VersionStatus.PUBLISHED),
+        (2, VersionStatus.DRAFT),
+    ]
+    for stranger in (tenant.outsider, other.admin):
+        with pytest.raises(NotFound):
+            await platform.list_versions(stranger, first.robot_id)
+
+    runs = [
+        await platform.start(tenant.operator, "emitir_protocolo", PROTOCOLO_INPUTS, trigger)
+        for trigger in (RunTrigger.MCP, RunTrigger.REST, RunTrigger.MANUAL)
+    ]
+    recent = await platform.list_recent(tenant.operator, 2)
+    assert [r.run_id for r in recent] == [runs[2].run_id, runs[1].run_id]
+    assert [r.trigger for r in await platform.list_recent(tenant.admin)] == [
+        RunTrigger.MANUAL,
+        RunTrigger.REST,
+        RunTrigger.MCP,
+    ]
+    # Papel só noutra área (ou noutra empresa): não vê as execuções nem pelo número.
+    assert await platform.list_recent(tenant.outsider) == []
+    assert await platform.list_recent(other.admin) == []
+    assert await platform.get(tenant.outsider, runs[0].run_id) is None
+    assert await platform.get(other.admin, runs[0].run_id) is None

@@ -17,6 +17,7 @@ from uuid import UUID
 
 from rapa.core import policy
 from rapa.core.contracts import (
+    MAX_RUNS_LISTED,
     Conflict,
     Forbidden,
     InvalidInput,
@@ -96,6 +97,7 @@ class _Robot:
 @dataclass
 class _Run:
     company_id: UUID
+    area_id: UUID
     status: RunStatus
     inputs: dict[str, Any]
     manifest: Manifest
@@ -227,6 +229,10 @@ class MemoryPlatform:
         except NotFound:
             return None
 
+    async def list_versions(self, principal: Principal, robot_id: UUID) -> list[RobotVersionInfo]:
+        robot = self._robot(principal, robot_id)
+        return [self._version_info(robot, version) for version in robot.versions]
+
     async def mark_validated(
         self, principal: Principal, robot_id: UUID, version_no: int
     ) -> RobotVersionInfo:
@@ -335,7 +341,9 @@ class MemoryPlatform:
             trigger=trigger,
             created_at=_now(),
         )
-        self.runs[status.run_id] = _Run(principal.company_id, status, dict(inputs), manifest)
+        self.runs[status.run_id] = _Run(
+            principal.company_id, robot.area_id, status, dict(inputs), manifest
+        )
         if idempotency_key is not None:
             self._idempotency[(principal.company_id, idempotency_key)] = (
                 request_hash,
@@ -343,11 +351,20 @@ class MemoryPlatform:
             )
         return status
 
+    def _run_visible(self, principal: Principal, run: _Run) -> bool:
+        return run.company_id == principal.company_id and bool(principal.roles_in(run.area_id))
+
     async def get(self, principal: Principal, run_id: UUID) -> RunStatus | None:
         run = self.runs.get(run_id)
-        if run is None or run.company_id != principal.company_id:
+        if run is None or not self._run_visible(principal, run):
             return None
         return run.status
+
+    async def list_recent(self, principal: Principal, limit: int = 50) -> list[RunStatus]:
+        limit = max(1, min(limit, MAX_RUNS_LISTED))
+        visible = [r.status for r in self.runs.values() if self._run_visible(principal, r)]
+        visible.sort(key=lambda s: (s.created_at, s.run_id), reverse=True)
+        return visible[:limit]
 
     @staticmethod
     def _check_inputs(manifest: Manifest, inputs: dict[str, Any]) -> list[str]:

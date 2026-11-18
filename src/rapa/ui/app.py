@@ -23,7 +23,6 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from rapa.ui.auth import HOME_PATH, UiAuth
 from rapa.ui.context import BackendFactory, UiContext, UiSettings
-from rapa.ui.history import MemoryRunHistory, RunHistory
 from rapa.ui.pages import register_pages
 
 __all__ = ["SecurityHeadersMiddleware", "create_ui"]
@@ -73,12 +72,11 @@ def create_ui(
     *,
     backend_factory: BackendFactory,
     auth: UiAuth,
-    history: RunHistory | None = None,
     settings: UiSettings | None = None,
 ) -> None:
     """Registra as rotas de login e as páginas, e monta o NiceGUI em ``app``."""
     settings = settings or UiSettings()
-    ctx = UiContext(backend_factory, auth, history or MemoryRunHistory(), settings)
+    ctx = UiContext(backend_factory, auth, settings)
     app.include_router(auth.router())
     register_pages(ctx)
     nicegui_app.on_page_exception(_page_error)

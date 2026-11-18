@@ -142,6 +142,33 @@ def test_start_run_and_follow_location(client: TestClient, world: World) -> None
     _error(client.get("/v1/execucoes/nao-e-uuid", headers=auth(TOKEN_A)), 422, "entrada_invalida")
 
 
+def test_whoami_and_recent_runs(client: TestClient, world: World) -> None:
+    me = client.get("/v1/eu", headers=auth(TOKEN_A))
+    assert me.status_code == 200, me.text
+    assert me.json()["subject"] == world.operator_a.subject
+    assert me.json()["company_id"] == str(world.company_a)
+    assert sorted(me.json()["company_roles"]) == ["approver", "operator"]
+
+    started = [
+        client.post(
+            "/v1/catalogo/emitir_protocolo/execucoes",
+            json={"entradas": INPUTS},
+            headers=auth(TOKEN_A),
+        ).json()["run_id"]
+        for _ in range(3)
+    ]
+    listed = client.get("/v1/execucoes", params={"limite": 2}, headers=auth(TOKEN_A))
+    assert listed.status_code == 200, listed.text
+    assert [r["run_id"] for r in listed.json()] == started[::-1][:2]
+    assert client.get("/v1/execucoes", headers=auth(TOKEN_B)).json() == []
+    _error(
+        client.get("/v1/execucoes", params={"limite": 0}, headers=auth(TOKEN_A)),
+        422,
+        "entrada_invalida",
+    )
+    _error(client.get("/v1/execucoes"), 401, "nao_autenticado")
+
+
 def test_company_comes_from_token_not_from_body(client: TestClient, world: World) -> None:
     response = client.post(
         "/v1/catalogo/emitir_protocolo/execucoes",
@@ -264,6 +291,13 @@ def test_robot_lifecycle_over_rest(client: TestClient, world: World) -> None:
     assert created.headers["location"] == base
 
     assert client.get(base, headers=auth(TOKEN_A)).json()["status"] == "draft"
+    listed = client.get(f"/v1/robos/{info['robot_id']}/versoes", headers=auth(TOKEN_A))
+    assert [v["version_no"] for v in listed.json()] == [1]
+    _error(
+        client.get(f"/v1/robos/{info['robot_id']}/versoes", headers=auth(TOKEN_B)),
+        404,
+        "nao_encontrado",
+    )
     _error(client.get(base, headers=auth(TOKEN_B)), 404, "nao_encontrado")
     _error(
         client.get(f"/v1/robos/{info['robot_id']}/versoes/9", headers=auth(TOKEN_A)),

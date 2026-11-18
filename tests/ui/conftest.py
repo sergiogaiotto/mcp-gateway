@@ -38,7 +38,6 @@ from rapa.ui.app import create_ui
 from rapa.ui.auth import DevLogin, DevProfile, MemorySessionStore, UiAuth
 from rapa.ui.backend import ContractsBackendFactory
 from rapa.ui.context import UiSettings
-from rapa.ui.history import MemoryRunHistory
 
 # Mesmo isolamento do plugin oficial: o armazenamento do NiceGUI vai para uma pasta temporária.
 Storage.path = Path(tempfile.mkdtemp(prefix="rapa-nicegui-test-")).resolve()
@@ -85,7 +84,6 @@ class World:
     area_b: UUID
     principals: dict[str, Principal]
     store: MemorySessionStore = field(default_factory=MemorySessionStore)
-    history: MemoryRunHistory = field(default_factory=MemoryRunHistory)
     robot_ids: dict[str, UUID] = field(default_factory=dict)
 
     def auth(self) -> UiAuth:
@@ -107,7 +105,6 @@ class World:
             app,
             backend_factory=ContractsBackendFactory.from_platform(self.platform),
             auth=self.auth(),
-            history=self.history,
             settings=self.settings(),
         )
 
