@@ -284,6 +284,7 @@ class Interpreter:
         events: EventSink,
         run_id: UUID,
         attempt: int,
+        first_seq: int = 0,
         mode: RunMode = RunMode.FULL,
         deadline: datetime | None = None,
         cancel: asyncio.Event | None = None,
@@ -296,6 +297,8 @@ class Interpreter:
     ) -> None:
         if attempt < 1:
             raise ValueError("attempt começa em 1")
+        if first_seq < 0:
+            raise ValueError("first_seq não pode ser negativo")
         self._manifest = manifest
         self._raw_inputs = dict(inputs)
         self._secrets = secrets
@@ -318,7 +321,8 @@ class Interpreter:
 
         self._credentials: dict[str, CredentialRef] = {c.name: c for c in manifest.credentials}
         self._allowed_hosts = frozenset(manifest.allowed_domains)
-        self._seq = 0
+        # A numeração dos eventos é da execução: cada tentativa continua a anterior.
+        self._seq = first_seq
         self._used = False
         self._page: Page | None = None
         self._deadline = math.inf
@@ -354,6 +358,7 @@ class Interpreter:
             events=events,
             run_id=job.run_id,
             attempt=job.attempt,
+            first_seq=job.first_seq,
             mode=job.mode,
             deadline=job.deadline,
             **options,

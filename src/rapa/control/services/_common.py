@@ -28,11 +28,14 @@ __all__ = [
     "visible_areas",
 ]
 
-#: Menor número = maior prioridade: interativo, depois MCP e API, depois
-#: agenda e webhook, depois lote.
+#: Menor número = maior prioridade: interativo, depois MCP, API e interface,
+#: depois agenda e webhook, depois lote. Só o interativo (a validação e, no
+#: futuro, gravação e controle ao vivo) usa a reserva e fica fora da cota da
+#: empresa; o botão "Executar" da interface roda em produção e conta na cota,
+#: senão uma empresa poderia tomar todas as vagas das outras.
 PRIORITY_BY_TRIGGER: dict[RunTrigger, int] = {
-    RunTrigger.MANUAL: 0,
     RunTrigger.VALIDATION: 0,
+    RunTrigger.MANUAL: 1,
     RunTrigger.MCP: 1,
     RunTrigger.REST: 1,
     RunTrigger.SCHEDULE: 2,

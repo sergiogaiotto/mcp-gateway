@@ -2,6 +2,7 @@
 
 from collections import Counter
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -10,9 +11,25 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from rapa.control.db import Database
-from rapa.control.services import PgPlatform, PgRunQueue, StaleAttempt, verify_chain
+from rapa.control.launcher import LocalLauncherSettings, LocalProcessLauncher, _EventTail
+from rapa.control.services import (
+    EventConflict,
+    PgPlatform,
+    PgRunQueue,
+    StaleAttempt,
+    verify_chain,
+)
 from rapa.core.contracts import InvalidInput, RunMode, RunnerJob, RunState, RunTrigger
-from rapa.core.events import RunEventKind
+from rapa.core.events import RunEvent, RunEventKind
+from rapa.core.robot import Effect
+from rapa.runner.errors import ErrorCode
+from rapa.runner.interpreter import Interpreter
+from rapa.runner.ports import (
+    DictSecretProvider,
+    DirectoryArtifactSink,
+    ListEventSink,
+    LocalFileProvider,
+)
 
 from .support import (
     PROTOCOLO_INPUTS,
@@ -48,6 +65,14 @@ async def _enqueue(
     return out
 
 
+async def _validate(platform: PgPlatform, tenant: Tenant, slug: str = "baixar_notas") -> UUID:
+    """Enfileira a validação da versão publicada: uma execução interativa."""
+    robot = await platform.get_published(tenant.creator, slug)
+    assert robot is not None
+    status = await platform.start_validation(tenant.creator, robot.robot_id, robot.version_no, {})
+    return status.run_id
+
+
 async def _claim_all(queue: PgRunQueue) -> list[RunnerJob]:
     jobs = []
     while (job := await queue.claim_next()) is not None:
@@ -76,10 +101,13 @@ async def test_fair_admission_between_two_companies(
     assert all(job.mode is RunMode.FULL for job in jobs)
     assert [job.company_id for job in jobs][:4] == [a.company_id] * 4
 
-    # A vaga reservada continua livre para uma execução interativa.
-    manual = await platform.start(a.operator, "baixar_notas", {}, RunTrigger.MANUAL)
+    # A execução pela interface conta na cota da empresa: não há vaga para ela.
+    await platform.start(a.operator, "baixar_notas", {}, RunTrigger.MANUAL)
+    assert await queue.claim_next() is None
+    # A vaga reservada continua livre para uma execução interativa (validação).
+    validation = await _validate(platform, a)
     job = await queue.claim_next()
-    assert job is not None and job.run_id == manual.run_id
+    assert job is not None and job.run_id == validation
     assert await queue.claim_next() is None
 
     # A vaga liberada pela A volta para ela, que chegou primeiro (as duas pedem emprestado).
@@ -123,9 +151,12 @@ async def test_company_without_guarantee_only_runs_interactive(
     tenant = await _tenant_with_robots(platform, app_db, "Sem cota", guaranteed_slots=0)
     await _enqueue(platform, tenant, 2)
     assert await queue.claim_next() is None
-    manual = await platform.start(tenant.operator, "baixar_notas", {}, RunTrigger.MANUAL)
+    # O botão "Executar" da interface roda em produção: conta na cota como a API.
+    await platform.start(tenant.operator, "baixar_notas", {}, RunTrigger.MANUAL)
+    assert await queue.claim_next() is None
+    validation = await _validate(platform, tenant)
     job = await queue.claim_next()
-    assert job is not None and job.run_id == manual.run_id
+    assert job is not None and job.run_id == validation
 
 
 async def test_interactive_reserve(
@@ -141,21 +172,66 @@ async def test_interactive_reserve(
     batch = await _claim_all(queue)
     assert len(batch) == 9  # 10 vagas menos a reserva
 
-    manual = await platform.start(tenant.operator, "baixar_notas", {}, RunTrigger.MANUAL)
+    first = await _validate(platform, tenant)
     job = await queue.claim_next()
-    assert job is not None and job.run_id == manual.run_id
-    second_manual = await platform.start(tenant.operator, "baixar_notas", {}, RunTrigger.MANUAL)
+    assert job is not None and job.run_id == first
+    second = await _validate(platform, tenant)
     assert await queue.claim_next() is None  # as 10 vagas estão ocupadas
 
-    # Uma vaga liberada vai primeiro para o interativo que espera.
+    # Uma vaga liberada vai primeiro para o interativo que espera (a garantia que
+    # ele ocupa é da própria empresa).
     await queue.finish(batch[0].run_id, 1, result(batch[0].run_id, 1))
     job = await queue.claim_next()
-    assert job is not None and job.run_id == second_manual.run_id
+    assert job is not None and job.run_id == second
     # Com 2 interativos rodando (1 além da reserva), o lote fica com 8 vagas: hoje usa 7.
     await queue.finish(batch[1].run_id, 1, result(batch[1].run_id, 1))
     job = await queue.claim_next()
-    assert job is not None and job.run_id not in {manual.run_id, second_manual.run_id}
+    assert job is not None and job.run_id not in {first, second}
     assert await queue.claim_next() is None
+
+
+async def test_ui_runs_cannot_starve_another_company(
+    app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine
+) -> None:
+    # 4 vagas, 1 reservada para interativo: 3 para as empresas.
+    await reset_queue(superuser_engine, total_slots=4, reserve_ratio=0.25)
+    platform = PgPlatform(app_db)
+    queue = PgRunQueue(dispatcher_db)
+    a = await _tenant_with_robots(platform, app_db, "Fome A", guaranteed_slots=1)
+    b = await _tenant_with_robots(platform, app_db, "Fome B", guaranteed_slots=2)
+    # B pede 2 pela API (a garantia dela); A clica em "Executar" 10 vezes na interface.
+    b_runs = await _enqueue(platform, b, 2)
+    await _enqueue(platform, a, 10, RunTrigger.MANUAL)
+
+    jobs = await _claim_all(queue)
+    per_company = Counter(job.company_id for job in jobs)
+    assert per_company == {a.company_id: 1, b.company_id: 2}
+    assert {j.run_id for j in jobs if j.company_id == b.company_id} == set(b_runs)
+    # A reserva segue livre para gravação, controle ao vivo e testes.
+    validation = await _validate(platform, a)
+    job = await queue.claim_next()
+    assert job is not None and job.run_id == validation
+
+
+async def test_interactive_overflow_never_takes_another_company_guarantee(
+    app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine
+) -> None:
+    await reset_queue(superuser_engine, total_slots=4, reserve_ratio=0.25)
+    platform = PgPlatform(app_db)
+    queue = PgRunQueue(dispatcher_db)
+    a = await _tenant_with_robots(platform, app_db, "Valida A", guaranteed_slots=1)
+    b = await _tenant_with_robots(platform, app_db, "Valida B", guaranteed_slots=2)
+    # Sem ninguém na fila, as validações da A usam a reserva e depois vagas ociosas.
+    validations = [await _validate(platform, a), await _validate(platform, a)]
+    assert [j.run_id for j in await _claim_all(queue)] == validations
+
+    # Com a B esperando a garantia, a validação seguinte da A não toma a vaga dela.
+    b_runs = await _enqueue(platform, b, 2)
+    waiting = await _validate(platform, a)
+    jobs = await _claim_all(queue)
+    assert [j.run_id for j in jobs] == b_runs
+    status = await platform.get(a.creator, waiting)
+    assert status is not None and status.state is RunState.QUEUED
 
 
 async def test_priority_order(
@@ -174,12 +250,15 @@ async def test_priority_order(
         RunTrigger.MANUAL,
     ]
     ids = {trigger: (await _enqueue(platform, tenant, 1, trigger))[0] for trigger in order}
+    ids[RunTrigger.VALIDATION] = await _validate(platform, tenant)
     jobs = await _claim_all(queue)
     by_id = {v: k for k, v in ids.items()}
+    # Interativo (validação) primeiro; a interface vem junto com MCP e API, por ordem de chegada.
     assert [by_id[j.run_id] for j in jobs] == [
-        RunTrigger.MANUAL,
+        RunTrigger.VALIDATION,
         RunTrigger.MCP,
         RunTrigger.REST,
+        RunTrigger.MANUAL,
         RunTrigger.SCHEDULE,
         RunTrigger.WEBHOOK,
         RunTrigger.BATCH,
@@ -291,9 +370,17 @@ async def test_event_ingestion_is_idempotent(
     ]
     assert await queue.ingest_events(rid, 1, batch) == 3
     assert await queue.ingest_events(rid, 1, batch) == 0
-    # Reenvio parcial com um evento novo; o mesmo seq com conteúdo diferente é ignorado.
+    # O mesmo seq com conteúdo diferente é recusado, e nada do lote é gravado: um
+    # reenvio só é ignorado quando é o mesmo evento (o lançador confirma o aviso
+    # irreversível só depois de a gravação dar certo).
     changed = event(rid, 1, 2, RunEventKind.STEP_FAILED, "abrir_login")
-    more = [changed, event(rid, 1, 3, RunEventKind.STEP_STARTED, "digitar_usuario")]
+    novel = event(rid, 1, 3, RunEventKind.STEP_STARTED, "digitar_usuario")
+    with pytest.raises(EventConflict):
+        await queue.ingest_events(rid, 1, [e.model_dump(mode="json") for e in (changed, novel)])
+    with pytest.raises(EventConflict):
+        await queue.ingest_events(rid, 1, [novel, novel.model_copy(update={"step_id": "outro"})])
+    # Reenvio parcial com um evento novo.
+    more = [batch[2], novel]
     assert await queue.ingest_events(rid, 1, [e.model_dump(mode="json") for e in more]) == 1
     assert await queue.ingest_events(rid, 1, []) == 0
     async with app_db.tenant_session(tenant.company_id) as session:
@@ -379,12 +466,22 @@ async def test_reaper_before_and_after_irreversible_step(
     later = now + timedelta(seconds=20)
     job = await queue.claim_next(now=later)
     assert job is not None and job.attempt == 2
+    # A tentativa 2 numera os eventos depois dos da tentativa 1.
+    assert job.first_seq == 3
     await queue.ingest_events(
         rid,
         2,
         [
             event(rid, 2, 3, RunEventKind.RUN_STARTED),
-            event(rid, 2, 4, RunEventKind.STEP_STARTED, "emitir", efeito="irreversible"),
+            event(
+                rid,
+                2,
+                4,
+                RunEventKind.STEP_STARTED,
+                "emitir",
+                efeito="irreversible",
+                irreversivel=True,
+            ),
         ],
     )
     report = await queue.reap_expired(now=later + timedelta(seconds=11))
@@ -411,7 +508,7 @@ async def test_reaper_before_and_after_irreversible_step(
     assert chain.ok, chain.problems
 
 
-async def test_irreversible_detected_from_manifest_and_attempts_limit(
+async def test_irreversible_marked_by_the_warning_and_attempts_limit(
     app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine
 ) -> None:
     await reset_queue(superuser_engine, total_slots=5)
@@ -420,13 +517,34 @@ async def test_irreversible_detected_from_manifest_and_attempts_limit(
     tenant = await _tenant_with_robots(platform, app_db, "Manifesto")
     now = datetime.now(UTC)
 
-    # Sem "efeito" nos dados: o passo é reconhecido como irreversível pelo manifesto.
+    # Só o aviso ("irreversivel": true) marca o início do passo irreversível. O
+    # passo do manifesto anunciado sem o aviso falhou antes de agir (por exemplo,
+    # botão não encontrado) e não impede a volta para a fila.
     run = await platform.start(
         tenant.operator, "emitir_protocolo", PROTOCOLO_INPUTS, RunTrigger.REST
     )
     assert await queue.claim_next(now=now) is not None
     await queue.ingest_events(
-        run.run_id, 1, [event(run.run_id, 1, 0, RunEventKind.STEP_STARTED, "emitir")]
+        run.run_id,
+        1,
+        [event(run.run_id, 1, 0, RunEventKind.STEP_STARTED, "emitir", efeito="irreversible")],
+    )
+    assert (await queue.reap_expired(now=now + timedelta(seconds=2))).requeued == [run.run_id]
+    job = await queue.claim_next(now=now)
+    assert job is not None and job.run_id == run.run_id and job.attempt == 2
+    await queue.ingest_events(
+        run.run_id,
+        2,
+        [
+            event(
+                run.run_id,
+                2,
+                job.first_seq,
+                RunEventKind.STEP_STARTED,
+                "emitir",
+                irreversivel=True,
+            )
+        ],
     )
     assert (await queue.reap_expired(now=now + timedelta(seconds=2))).indeterminate == [run.run_id]
 
@@ -526,3 +644,319 @@ async def test_finish_rejects_malformed_results(
         await queue.finish(run.run_id, 1, result(run.run_id, 2))
     status = await platform.get(tenant.operator, run.run_id)
     assert status is not None and status.state is RunState.RUNNING
+
+
+# ---------------------------------------------------------------------------
+# Numeração dos eventos entre tentativas e confirmação do aviso irreversível
+# ---------------------------------------------------------------------------
+
+
+def _launcher(queue: PgRunQueue, tmp_path: Path) -> LocalProcessLauncher:
+    return LocalProcessLauncher(
+        queue,
+        LocalLauncherSettings(work_dir=tmp_path / "trabalho", artifacts_dir=tmp_path / "artefatos"),
+    )
+
+
+async def _deliver(
+    queue: PgRunQueue, job: RunnerJob, tmp_path: Path, events: list[RunEvent]
+) -> Path:
+    """Entrega os eventos como o lançador local faz com o EVENTS.jsonl do worker.
+
+    Devolve a pasta das confirmações (``<seq>.ack``) que o worker espera.
+    """
+    work = tmp_path / f"{job.run_id}-{job.attempt}"
+    (work / "ack").mkdir(parents=True)
+    (work / "events.jsonl").write_text(
+        "".join(e.model_dump_json() + "\n" for e in events), encoding="utf-8"
+    )
+    await _launcher(queue, tmp_path)._forward(job, _EventTail(work / "events.jsonl"), work, [])
+    return work / "ack"
+
+
+def _warning(run_id: UUID, attempt: int, seq: int) -> RunEvent:
+    """Aviso de início do passo irreversível, como o interpretador o emite."""
+    return event(
+        run_id,
+        attempt,
+        seq,
+        RunEventKind.STEP_STARTED,
+        "emitir",
+        tipo="click",
+        titulo="Emitir protocolo",
+        efeito="irreversible",
+        irreversivel=True,
+    )
+
+
+async def _run_row(db: Database, run_id: UUID) -> tuple[str, datetime | None, int]:
+    async with db.dispatcher_session() as session:
+        row = (
+            await session.execute(
+                text("SELECT state, irreversible_started_at, attempt FROM runs WHERE id = :id"),
+                {"id": run_id},
+            )
+        ).one()
+    return row[0], row[1], row[2]
+
+
+async def _stored(db: Database, run_id: UUID) -> list[tuple[int, int, str]]:
+    async with db.dispatcher_session() as session:
+        rows = (
+            await session.execute(
+                text("SELECT attempt, seq, kind FROM run_events WHERE run_id = :id ORDER BY seq"),
+                {"id": run_id},
+            )
+        ).all()
+    return [(r[0], r[1], r[2]) for r in rows]
+
+
+async def _first_attempt_lost_before_emitting(
+    queue: PgRunQueue, platform: PgPlatform, tenant: Tenant, now: datetime
+) -> UUID:
+    """Tentativa 1 grava 7 eventos (com um "step_healed" a mais) e perde a concessão."""
+    run = await platform.start(
+        tenant.operator, "emitir_protocolo", PROTOCOLO_INPUTS, RunTrigger.REST
+    )
+    rid = run.run_id
+    job = await queue.claim_next(now=now)
+    assert job is not None and job.attempt == 1 and job.first_seq == 0
+    await queue.ingest_events(
+        rid,
+        1,
+        [
+            event(rid, 1, 0, RunEventKind.RUN_STARTED),
+            event(rid, 1, 1, RunEventKind.STEP_STARTED, "abrir_protocolo", efeito="read"),
+            event(rid, 1, 2, RunEventKind.STEP_SUCCEEDED, "abrir_protocolo"),
+            event(rid, 1, 3, RunEventKind.STEP_STARTED, "digitar_cpf", efeito="write"),
+            event(rid, 1, 4, RunEventKind.STEP_HEALED, "digitar_cpf"),
+            event(rid, 1, 5, RunEventKind.STEP_SUCCEEDED, "digitar_cpf"),
+            event(rid, 1, 6, RunEventKind.ARTIFACT, "digitar_cpf"),
+        ],
+    )
+    report = await queue.reap_expired(now=now + timedelta(seconds=11))
+    assert report.requeued == [rid]
+    return rid
+
+
+async def test_new_attempt_continues_event_numbering(
+    app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    await reset_queue(superuser_engine, total_slots=5)
+    platform = PgPlatform(app_db)
+    queue = PgRunQueue(dispatcher_db, lease=timedelta(seconds=10))
+    tenant = await _tenant_with_robots(platform, app_db, "Numeração")
+    now = datetime.now(UTC)
+    rid = await _first_attempt_lost_before_emitting(queue, platform, tenant, now)
+
+    later = now + timedelta(seconds=12)
+    job = await queue.claim_next(now=later)
+    assert job is not None and job.attempt == 2
+    # A tentativa 2 continua a numeração da execução, depois do último evento gravado.
+    assert job.first_seq == 7
+
+    # O interpretador da tentativa 2 numera a partir dali.
+    sink = ListEventSink()
+    interpreter = Interpreter.from_job(
+        job,
+        secrets=DictSecretProvider({}),
+        files=LocalFileProvider(None),
+        artifacts=DirectoryArtifactSink(tmp_path / "telas"),
+        events=sink,
+    )
+    await interpreter.fail_without_browser(ErrorCode.NAVEGADOR_INDISPONIVEL, "sem navegador")
+    assert [e.seq for e in sink.events] == [7, 8]
+    assert all(e.attempt == 2 for e in sink.events)
+
+    # O aviso do passo irreversível da tentativa 2 é gravado antes de ser confirmado.
+    acks = await _deliver(
+        queue,
+        job,
+        tmp_path,
+        [
+            event(rid, 2, 7, RunEventKind.RUN_STARTED),
+            event(rid, 2, 8, RunEventKind.STEP_STARTED, "abrir_protocolo", efeito="read"),
+            event(rid, 2, 9, RunEventKind.STEP_SUCCEEDED, "abrir_protocolo"),
+            _warning(rid, 2, 10),
+        ],
+    )
+    assert (acks / "10.ack").exists()
+    state, irreversible_at, _ = await _run_row(dispatcher_db, rid)
+    assert state == "running" and irreversible_at is not None
+    stored = await _stored(dispatcher_db, rid)
+    assert [s[1] for s in stored] == list(range(11))
+    assert [s[0] for s in stored] == [1] * 7 + [2] * 4
+
+    # O executor some depois do aviso: indeterminado, nunca de volta à fila.
+    report = await queue.reap_expired(now=later + timedelta(seconds=11))
+    assert report.indeterminate == [rid] and report.requeued == []
+
+
+async def test_reused_event_numbers_are_refused_and_never_acknowledged(
+    app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    await reset_queue(superuser_engine, total_slots=5)
+    platform = PgPlatform(app_db)
+    queue = PgRunQueue(dispatcher_db, lease=timedelta(seconds=10))
+    tenant = await _tenant_with_robots(platform, app_db, "Numeração repetida")
+    now = datetime.now(UTC)
+    rid = await _first_attempt_lost_before_emitting(queue, platform, tenant, now)
+    job = await queue.claim_next(now=now + timedelta(seconds=12))
+    assert job is not None and job.attempt == 2
+
+    # Um executor que recomeça do zero repete números da tentativa 1: o lote é
+    # recusado, o aviso não é confirmado e o executor é parado.
+    with pytest.raises(StaleAttempt):
+        await _deliver(
+            queue,
+            job,
+            tmp_path,
+            [
+                event(rid, 2, 0, RunEventKind.RUN_STARTED),
+                event(rid, 2, 1, RunEventKind.STEP_STARTED, "abrir_protocolo", efeito="read"),
+                event(rid, 2, 2, RunEventKind.STEP_SUCCEEDED, "abrir_protocolo"),
+                _warning(rid, 2, 3),
+            ],
+        )
+    assert not (tmp_path / f"{rid}-2" / "ack" / "3.ack").exists()
+    state, irreversible_at, _ = await _run_row(dispatcher_db, rid)
+    assert state == "running" and irreversible_at is None
+    assert all(attempt == 1 for attempt, _, _ in await _stored(dispatcher_db, rid))
+
+    # Mesmo número de uma tentativa anterior, ainda que com o mesmo conteúdo, também.
+    with pytest.raises(EventConflict):
+        await queue.ingest_events(rid, 2, [event(rid, 2, 6, RunEventKind.ARTIFACT, "digitar_cpf")])
+    assert await queue.ingest_events(rid, 2, [event(rid, 2, 7, RunEventKind.RUN_STARTED)]) == 1
+
+    # Número abaixo do início da tentativa, mesmo sem colidir (eventos da tentativa
+    # anterior que não chegaram ao banco), também é recusado.
+    gap = await platform.start(
+        tenant.operator, "emitir_protocolo", PROTOCOLO_INPUTS, RunTrigger.REST
+    )
+    gid = gap.run_id
+    assert await queue.claim_next(now=now) is not None
+    await queue.ingest_events(
+        gid,
+        1,
+        [event(gid, 1, 0, RunEventKind.RUN_STARTED), event(gid, 1, 5, RunEventKind.ARTIFACT)],
+    )
+    assert (await queue.reap_expired(now=now + timedelta(seconds=11))).requeued == [gid]
+    job = await queue.claim_next(now=now + timedelta(seconds=12))
+    assert job is not None and job.run_id == gid and job.first_seq == 6
+    with pytest.raises(EventConflict):
+        await queue.ingest_events(gid, 2, [_warning(gid, 2, 3)])
+    state, irreversible_at, _ = await _run_row(dispatcher_db, gid)
+    assert state == "running" and irreversible_at is None
+    assert await queue.ingest_events(gid, 2, [_warning(gid, 2, 6)]) == 1
+
+
+async def test_events_after_the_run_finished_are_refused_and_never_acknowledged(
+    app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    await reset_queue(superuser_engine, total_slots=5)
+    platform = PgPlatform(app_db)
+    queue = PgRunQueue(dispatcher_db, lease=timedelta(seconds=10))  # 3 tentativas
+    tenant = await _tenant_with_robots(platform, app_db, "Depois do fim")
+    now = datetime.now(UTC)
+
+    # A concessão vence nas 3 tentativas (banco fora do ar): a execução falha de vez.
+    run = await platform.start(
+        tenant.operator, "emitir_protocolo", PROTOCOLO_INPUTS, RunTrigger.REST
+    )
+    rid = run.run_id
+    job: RunnerJob | None = None
+    for attempt in (1, 2, 3):
+        job = await queue.claim_next(now=now)
+        assert job is not None and job.attempt == attempt
+        report = await queue.reap_expired(now=now + timedelta(seconds=11))
+    assert job is not None and report.failed == [rid]
+
+    # O worker da tentativa 3 seguia vivo e chega ao passo irreversível: nada é
+    # gravado nem confirmado, e o lançador para o worker.
+    with pytest.raises(StaleAttempt):
+        await _deliver(queue, job, tmp_path, [_warning(rid, 3, job.first_seq)])
+    assert not (tmp_path / f"{rid}-3" / "ack" / f"{job.first_seq}.ack").exists()
+    state, irreversible_at, _ = await _run_row(dispatcher_db, rid)
+    assert state == "failed" and irreversible_at is None
+    assert not await queue.finish(rid, 3, result(rid, 3, "failed"))
+
+    # Indeterminada pelo recolhedor: os passos seguintes do worker também são recusados.
+    other = await platform.start(
+        tenant.operator, "emitir_protocolo", PROTOCOLO_INPUTS, RunTrigger.REST
+    )
+    oid = other.run_id
+    job = await queue.claim_next(now=now)
+    assert job is not None and job.run_id == oid
+    await queue.ingest_events(oid, 1, [_warning(oid, 1, 0)])
+    report = await queue.reap_expired(now=now + timedelta(seconds=11))
+    assert report.indeterminate == [oid]
+    with pytest.raises(StaleAttempt):
+        await queue.ingest_events(oid, 1, [event(oid, 1, 1, RunEventKind.STEP_SUCCEEDED, "emitir")])
+    assert [seq for _, seq, _ in await _stored(dispatcher_db, oid)] == [0]
+
+
+async def test_irreversible_step_that_failed_before_its_warning_is_a_plain_failure(
+    app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    await reset_queue(superuser_engine, total_slots=5)
+    platform = PgPlatform(app_db)
+    queue = PgRunQueue(dispatcher_db, lease=timedelta(seconds=10))
+    tenant = await _tenant_with_robots(platform, app_db, "Botão sumiu")
+    now = datetime.now(UTC)
+    run = await platform.start(
+        tenant.operator, "emitir_protocolo", PROTOCOLO_INPUTS, RunTrigger.REST
+    )
+    rid = run.run_id
+    job = await queue.claim_next(now=now)
+    assert job is not None
+
+    # O botão "Emitir" não foi encontrado: o interpretador anuncia o passo sem o
+    # aviso (nada foi enviado ao portal) e informa a falha.
+    sink = ListEventSink()
+    interpreter = Interpreter.from_job(
+        job,
+        secrets=DictSecretProvider({}),
+        files=LocalFileProvider(None),
+        artifacts=DirectoryArtifactSink(tmp_path / "telas"),
+        events=sink,
+    )
+    emitir = next(s for s, _ in job.manifest.iter_steps() if s.effect is Effect.IRREVERSIBLE)
+    await interpreter._emit_step_started(emitir)
+    late = sink.events[0]
+    assert late.data.get("efeito") == "irreversible" and "irreversivel" not in late.data
+    failed = event(rid, 1, 1, RunEventKind.STEP_FAILED, "emitir", codigo="elemento_nao_encontrado")
+    await queue.ingest_events(rid, 1, [late, failed])
+    state, irreversible_at, _ = await _run_row(dispatcher_db, rid)
+    assert state == "running" and irreversible_at is None
+
+    # Sem resultado (executor sumiu), a execução pode voltar para a fila.
+    report = await queue.reap_expired(now=now + timedelta(seconds=11))
+    assert report.requeued == [rid] and report.indeterminate == []
+
+    # Com resultado, é uma falha comum, não um indeterminado.
+    job = await queue.claim_next(now=now + timedelta(seconds=12))
+    assert job is not None and job.attempt == 2
+    first = job.first_seq
+    await queue.ingest_events(
+        rid,
+        2,
+        [
+            event(rid, 2, first, RunEventKind.STEP_STARTED, "emitir", efeito="irreversible"),
+            event(rid, 2, first + 1, RunEventKind.STEP_FAILED, "emitir"),
+        ],
+    )
+    assert await queue.finish(
+        rid,
+        2,
+        result(
+            rid,
+            2,
+            "failed",
+            error_code="elemento_nao_encontrado",
+            error_message="O botão não foi encontrado.",
+            failed_step_id="emitir",
+        ),
+    )
+    status = await platform.get(tenant.operator, rid)
+    assert status is not None and status.state is RunState.FAILED
+    assert status.error_code == "elemento_nao_encontrado"

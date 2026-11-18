@@ -34,7 +34,7 @@ from uuid import UUID
 
 from pydantic import ValidationError
 
-from rapa.control.services.dispatcher import failure_result
+from rapa.control.services.dispatcher import WorkerNotStarted, failure_result
 from rapa.control.services.queue import StaleAttempt
 from rapa.core.contracts import RunnerJob
 from rapa.core.events import RunEvent
@@ -258,22 +258,30 @@ class LocalProcessLauncher:
         return command
 
     async def launch(self, job: RunnerJob) -> dict[str, Any]:
+        """Roda a tentativa num worker e devolve o RESULT.json.
+
+        Falhas antes de o processo do worker existir (pasta, segredos, programa)
+        levantam :class:`WorkerNotStarted`: nada pode ter rodado.
+        """
         work, artifacts = self._paths(job)
-        await asyncio.to_thread(self._prepare, job, work, artifacts)
         try:
-            secrets = await self.secrets.secrets_for(job)
-            if secrets:
-                payload = json.dumps({name: dict(fields) for name, fields in secrets.items()})
-                await asyncio.to_thread(_write_private, work / "secrets.json", payload)
-            process = await asyncio.create_subprocess_exec(
-                *self._command(work, artifacts, with_secrets=bool(secrets)),
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-                env=_worker_env(),
-                cwd=work,
-                start_new_session=True,
-            )
+            try:
+                await asyncio.to_thread(self._prepare, job, work, artifacts)
+                secrets = await self.secrets.secrets_for(job)
+                if secrets:
+                    payload = json.dumps({name: dict(fields) for name, fields in secrets.items()})
+                    await asyncio.to_thread(_write_private, work / "secrets.json", payload)
+                process = await asyncio.create_subprocess_exec(
+                    *self._command(work, artifacts, with_secrets=bool(secrets)),
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=_worker_env(),
+                    cwd=work,
+                    start_new_session=True,
+                )
+            except Exception as exc:
+                raise WorkerNotStarted("o executor não pôde ser iniciado") from exc
             try:
                 await self._follow(job, process, work)
             except BaseException:
@@ -412,7 +420,7 @@ class LocalProcessLauncher:
 
     def _cleanup(self, work: Path) -> None:
         secrets = work / "secrets.json"
-        with contextlib.suppress(FileNotFoundError):
+        with contextlib.suppress(FileNotFoundError, NotADirectoryError):
             secrets.unlink()
         if not self.settings.keep_work_dir:
             shutil.rmtree(work, ignore_errors=True)
