@@ -18,29 +18,46 @@ principais:
   vazio), e o texto que escolhe uma linha precisa ser o texto inteiro de um
   elemento dela (uma célula, por exemplo), com as mesmas maiúsculas e sem
   nenhum valor vazio;
-- esse texto é comparado com o texto do HTML (``textContent``), e não com o
-  que a página mostra: ``extract_table`` e ``extract_text`` leem o texto
-  mostrado (``innerText``), já com o ``text-transform`` do CSS. Numa página que
-  muda as maiúsculas pelo CSS, uma chave lida dela falha fechado: não escolhe
-  nenhuma linha (``elemento_nao_encontrado``, nada é feito) ou, se outra linha
-  tem no HTML o texto mostrado, escolhe essa outra. A comparação nunca ignora
+- a linha é escolhida pelo texto do HTML (``textContent``, como o Playwright
+  compara), mas ``extract_table`` e ``extract_text`` leem o texto mostrado
+  (``innerText``), que pode ser outro: o ``text-transform`` do CSS muda as
+  maiúsculas, e um texto escondido na célula (a chave de ordenação do
+  DataTables, ``<span hidden>0007</span>7``) só existe no HTML. Por isso a
+  linha escolhida precisa ser a **única** com a chave nas duas bases: nenhuma
+  outra linha pode ter, no HTML, um elemento com esse texto inteiro, e nenhuma
+  outra pode mostrar um elemento com esse texto (o ``innerText`` normalizado
+  como acima). Se o HTML e o texto mostrado apontam para linhas diferentes, ou
+  para mais de uma, o passo falha fechado com ``elemento_ambiguo`` antes de
+  agir, e nada é feito; vale também para passos de leitura, cujo valor pode ir
+  para um passo que grava, e numa condição (``visible``, ``text_contains``) a
+  linha que não é única conta como elemento não encontrado, como dois elementos
+  já contavam. Se nenhuma linha tem a chave no HTML, o passo falha
+  com ``elemento_nao_encontrado`` (uma chave lida em ``NF 7`` de uma célula
+  ``nf 7`` mostrada em maiúsculas não escolhe nada). A comparação nunca ignora
   maiúsculas, para uma chave nunca escolher a linha de outro código;
-- numa execução, o mesmo passo que grava (``write`` ou ``irreversible``) nunca
-  age duas vezes na linha escolhida pelo mesmo texto: na segunda vez, ele falha
-  com ``elemento_ambiguo`` antes de agir (e antes do aviso de passo
-  irreversível). Passos diferentes podem agir na mesma linha, e passos de
-  leitura podem voltar a ela. É a rede de segurança para itens repetidos e para
-  duas linhas lidas com o mesmo texto (``ab3x`` mostrado como ``AB3X`` ao lado
-  de ``AB3X``): a ação pode ter caído na outra linha, mas nunca se repete;
+- numa execução, a mesma ação que grava (``write`` ou ``irreversible``) nunca
+  se repete na mesma linha: a ação é o tipo do passo e o alvo (localizador
+  principal, contêiner e quadros, com os valores já montados), e a linha é a
+  página (esquema, domínio e caminho do endereço) e o texto que a escolhe. Na
+  segunda vez, o passo falha com ``elemento_ambiguo`` antes de agir (e antes do
+  aviso de passo irreversível). Dois passos com o mesmo alvo, nos dois ramos de
+  um ``if``, fazem a mesma ação; alvos diferentes na mesma linha (digitar a
+  quantidade e clicar em Salvar) não, e passos de leitura podem voltar a ela. A
+  mesma chave em outra página (a nota 1 de cada filial) é outra linha. É a rede
+  de segurança para itens repetidos de uma tabela lida da página;
 - o que faria a execução falhar no meio por causa das entradas (campo de item
   ausente, número que não pode ser digitado, lista maior que a repetição, valor
   que não pode ir no caminho ou na rota do endereço, valor vazio no texto que
-  escolhe a linha) falha antes do primeiro passo. Valores usados só em passos
-  que não rodam não contam: um ramo de ``if`` cuja condição é um ``equals`` só
-  de entradas e itens de listas de entrada é decidido antes, como seria na
-  execução, e uma repetição sobre uma lista de entrada vazia não roda. Quando a
-  condição depende da página ou de variáveis, na dúvida o valor é recusado
-  antes, e a mensagem diz o passo e o ramo;
+  escolhe a linha, itens de uma lista de entrada que repetiriam a mesma ação na
+  mesma linha) falha antes do primeiro passo. Itens repetidos são os que
+  escolhem a mesma linha, pelo mesmo texto normalizado, para a mesma ação que
+  grava, e fazem no resto da repetição os mesmos passos com os mesmos valores
+  onde isso pode mudar a página (endereços, alvos, opções). Valores usados só em
+  passos que não rodam não contam: um ramo de ``if`` cuja condição é um
+  ``equals`` só de entradas e itens de listas de entrada é decidido antes, como
+  seria na execução, e uma repetição sobre uma lista de entrada vazia não roda.
+  Quando a condição depende da página ou de variáveis, na dúvida o valor é
+  recusado antes, e a mensagem diz o passo e o ramo;
 - eventos, mensagens, saídas e nomes de artefatos nunca contêm valores de
   credenciais; as chaves dos eventos e os valores que são constantes do
   executor (efeito, estado, código de erro, id de passo) nunca são mascarados.
@@ -55,7 +72,7 @@ import weakref
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Literal, Self, assert_never, cast
+from typing import Any, Literal, NamedTuple, Self, assert_never, cast
 from urllib.parse import quote, urlsplit
 from uuid import UUID
 
@@ -176,6 +193,11 @@ _PATH_SLOTS: dict[_UrlSlot, str] = {
 type _Rows = tuple[str, list[tuple[int, Mapping[str, object]]]]
 #: Ramos de ``if`` em volta de um bloco que só durante a execução se sabe se rodam.
 type _Undecided = tuple[str, ...]
+#: Uma ação que grava numa linha: o tipo do passo e o alvo (:func:`_target_signature`)
+#: e o texto normalizado que escolhe a linha. Na execução, a página vem antes.
+type _RowAction = tuple[object, ...]
+#: Passos que só leem a página: não mudam a página nem a linha onde os seguintes agem.
+_PAGE_READS = (ExtractTextStep, ExtractTableStep, AssertStep, WaitForStep)
 
 #: Contextos já usados por alguma execução: nunca se reaproveita um contexto.
 _claimed_contexts: weakref.WeakSet[BrowserContext] = weakref.WeakSet()
@@ -216,6 +238,39 @@ _READ_TABLE_JS = """
     rows: rows.slice(0, maxRows).map((row) => cells(row).map(text)),
     total: rows.length,
   };
+}
+"""
+
+# Quantos contêineres, fora o escolhido pelo texto do HTML, mostram a chave: têm um
+# elemento (ou são um) cujo texto mostrado (innerText), normalizado como o Playwright
+# normaliza, é a chave inteira. -1 se o escolhido não está entre os contêineres. Cada
+# elemento é visto uma vez, e quem mostra a chave marca os elementos que o contêm.
+_OTHER_ROWS_SHOWING_KEY_JS = r"""
+(rows, [key, chosen]) => {
+  if (!rows.includes(chosen)) return -1;
+  const normalize = (text) => text.replace(/[\u200b\u00ad]/g, '').replace(/\s+/g, ' ').trim();
+  const skipped = new Set(['SCRIPT', 'NOSCRIPT', 'STYLE']);
+  const seen = new Set();
+  const marked = new Set();
+  const mark = (node) => {
+    for (let at = node; at && !marked.has(at); at = at.parentNode ?? at.host) marked.add(at);
+  };
+  for (const row of rows) {
+    const pending = [row];
+    while (pending.length) {
+      const node = pending.pop();
+      if (seen.has(node)) continue;
+      seen.add(node);
+      if (node.nodeType === 1) {
+        if (skipped.has(node.nodeName)) continue;
+        const text = typeof node.innerText === 'string' ? node.innerText : node.textContent;
+        if (normalize(text ?? '') === key) mark(node);
+        if (node.shadowRoot) pending.push(node.shadowRoot);
+      }
+      for (const child of node.children) pending.push(child);
+    }
+  }
+  return rows.filter((row) => row !== chosen && marked.has(row)).length;
 }
 """
 
@@ -276,6 +331,44 @@ class _Redactor:
         return candidate
 
 
+class _RowChoice(NamedTuple):
+    """Os contêineres de um alvo e os que têm, no HTML, o texto que escolhe a linha."""
+
+    rows: PwLocator
+    chosen: PwLocator
+    key: str
+
+
+class _RowIssue(NamedTuple):
+    """Por que a linha escolhida pelo texto não é a única com ele (``None``: não conferido)."""
+
+    by_html: int | None
+    shown_elsewhere: int | None
+
+
+class _ListLoop:
+    """O que cada item de uma repetição sobre uma entrada de lista faz no corpo dela.
+
+    ``traces`` guarda, para cada item, os valores já montados dos passos que podem
+    mudar a página ou a linha onde os seguintes agem (endereços, alvos, opções), ou
+    ``None`` quando algum deles depende da página (variáveis, itens de uma tabela
+    lida). ``actions`` guarda, para cada ação que grava numa linha escolhida pelo
+    texto, os itens que chegam a ela, com o passo e os ramos que só a execução decide.
+    """
+
+    __slots__ = ("actions", "name", "traces")
+
+    def __init__(self, name: str, indexes: Iterable[int]) -> None:
+        self.name = name
+        self.traces: dict[int, list[object] | None] = {index: [] for index in indexes}
+        self.actions: dict[_RowAction, list[tuple[int, Step, _Undecided]]] = {}
+
+    def forget(self, indexes: Iterable[int]) -> None:
+        """Esses itens fazem algo que só a página decide: nunca contam como repetidos."""
+        for index in indexes:
+            self.traces[index] = None
+
+
 class _StepCtx:
     __slots__ = ("deadline", "step")
 
@@ -309,6 +402,20 @@ def _host(url: str) -> str:
         return (urlsplit(url).hostname or "").lower()
     except ValueError:
         return ""
+
+
+def _page_key(url: str) -> str:
+    """A página de um endereço: esquema, domínio (e porta, se não for a padrão) e caminho.
+
+    A consulta e o fragmento não contam: ``/notas?pagina=2`` é a mesma página de
+    ``/notas`` para a rede contra ações repetidas (na dúvida, a mesma linha).
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    origin = _normalize_origin(url) or f"{parts.scheme}:"
+    return f"{origin}{parts.path or '/'}"
 
 
 def _number_source(kind: FieldType, text: str) -> str:
@@ -485,7 +592,9 @@ def _whole_text(key: str) -> re.Pattern[str]:
     textos: brancos nas pontas e repetidos, U+200B e U+00AD. Os caracteres
     precisam ser os mesmos, com as mesmas maiúsculas e minúsculas: ``ab3x`` nunca
     escolhe a linha de ``AB3X``. O ``text-transform`` do CSS não conta, porque o
-    texto é o do HTML (o gravador também grava a chave a partir dele).
+    texto é o do HTML (o gravador também grava a chave a partir dele); o texto
+    mostrado é conferido à parte, para nenhuma outra linha mostrar a mesma chave
+    (:meth:`Interpreter._row_issue`).
     """
     words = (_INSIDE_WORD.join(_js_escape(char) for char in word) for word in key.split(" "))
     body = _BETWEEN_WORDS.join(words)
@@ -500,6 +609,138 @@ def _step_targets(step: Step) -> list[Target]:
         if isinstance(target, Target):
             targets.append(target)
     return targets
+
+
+def _target_signature(kind: str, target: Target, render: Callable[[str], str]) -> _RowAction:
+    """A ação de um passo num alvo: o tipo do passo e onde ele age.
+
+    Onde ele age é o localizador principal (o único que passos que gravam usam), o
+    contêiner e os quadros, com os valores já montados. O id do passo e a descrição
+    do alvo não entram: dois passos que agem no mesmo elemento, nos dois ramos de um
+    ``if``, fazem a mesma ação.
+    """
+
+    def locator(spec: Locator) -> tuple[object, ...]:
+        name = render(spec.name) if spec.name is not None else None
+        return (spec.by.value, render(spec.value), name, spec.exact)
+
+    within = locator(target.within) if target.within is not None else None
+    return (kind, tuple(target.frames), within, locator(target.locators[0]))
+
+
+def _trace_templates(step: Step) -> list[str]:
+    """Os templates que decidem onde um passo age ou para onde ele leva a página.
+
+    Inclui os localizadores alternativos: um passo de leitura pode usá-los.
+    """
+    found: list[str] = []
+    if isinstance(step, NavigateStep):
+        found.append(step.url)
+    target = getattr(step, "target", None)
+    if isinstance(target, Target):
+        for spec in (*target.locators, target.within):
+            if spec is not None:
+                found.extend(t for t in (spec.value, spec.name) if t is not None)
+        if target.within_has_text is not None:
+            found.append(target.within_has_text)
+    if isinstance(step, SelectStep):
+        found.append(step.option)
+    return found
+
+
+def _page_trace(
+    step: Step, scopes: Mapping[templates.Scope, Mapping[str, object]]
+) -> tuple[object, ...]:
+    """O que um passo faz com a página, com os valores já montados (ver :class:`_ListLoop`).
+
+    Num ``navigate``, a página do endereço, com cada valor codificado como na
+    execução (como a rede contra ações repetidas a compara); nos outros, a ação no
+    alvo, a linha e o que pode mudar a página (a opção escolhida, a tecla). O valor
+    digitado não entra: digitar outro texto no mesmo campo não leva a outra página.
+    Levanta :class:`~rapa.core.templates.TemplateError` se um valor faltar.
+    """
+
+    def render(template: str) -> str:
+        return templates.render(template, scopes)
+
+    if isinstance(step, NavigateStep):
+        url = templates.render(step.url, scopes, encode=lambda _index, text: quote(text, safe=""))
+        return ("navigate", _page_key(url))
+    target = getattr(step, "target", None)
+    if not isinstance(target, Target):
+        return (step.kind, getattr(step, "key", None))
+    row = None
+    if target.within_has_text is not None:
+        row = _normalize_text(
+            templates.render(target.within_has_text, scopes, encode=_row_key_value)
+        )
+    extra: object = None
+    if isinstance(step, SelectStep):
+        extra = render(step.option)
+    elif isinstance(step, PressStep):
+        extra = step.key
+    elif isinstance(step, CheckStep):
+        extra = step.checked
+    elif isinstance(step, UploadStep):
+        extra = step.file_input
+    return (_target_signature(step.kind, target, render), row, extra)
+
+
+def _changes_page(steps: Iterable[Step]) -> bool:
+    """Se algum dos passos, inclusive os de dentro de contêineres, pode mudar a página."""
+    for step in steps:
+        if isinstance(step, ForEachStep):
+            if _changes_page(step.steps):
+                return True
+        elif isinstance(step, IfStep):
+            if _changes_page(step.then) or _changes_page(step.otherwise):
+                return True
+        elif not isinstance(step, _PAGE_READS):
+            return True
+    return False
+
+
+def _join_names(names: list[str]) -> str:
+    """``'a'``, ``'a' e 'b'``, ``'a', 'b' e 'c'``."""
+    if len(names) < 2:
+        return "".join(names)
+    return f"{', '.join(names[:-1])} e {names[-1]}"
+
+
+def _repeated_rows(loop: _ListLoop) -> list[str]:
+    """Itens de uma lista de entrada que repetiriam uma ação na mesma linha.
+
+    São os que chegam à mesma ação que grava, com o mesmo texto normalizado para
+    escolher a linha, e que fazem no resto da repetição os mesmos passos com os
+    mesmos valores onde isso pode mudar a página: na execução, a segunda vez
+    pararia no meio, depois de outros itens já terem gravado.
+    """
+    found: list[str] = []
+    for uses in loop.actions.values():
+        groups: dict[tuple[object, ...], list[tuple[int, Step, _Undecided]]] = {}
+        for use in uses:
+            trace = loop.traces.get(use[0])
+            if trace is not None:
+                groups.setdefault(tuple(trace), []).append(use)
+        for group in groups.values():
+            indexes = sorted({index for index, _, _ in group})
+            if len(indexes) < 2:
+                continue
+            items = _join_names([f"'{loop.name}[{index}]'" for index in indexes])
+            step_ids = [f"'{step_id}'" for step_id in dict.fromkeys(s.id for _, s, _ in group)]
+            if len(step_ids) == 1:
+                steps = f"o passo {step_ids[0]} agir"
+            else:
+                steps = f"os passos {_join_names(step_ids)} (com o mesmo alvo) agirem"
+            target = getattr(group[0][1], "target", None)
+            intent = target.intent if isinstance(target, Target) else group[0][1].title
+            undecided = next((u for _, _, u in group if u), ())
+            found.append(
+                f"os itens {items} escolheriam, pelo mesmo texto, a mesma linha para {steps} "
+                f"em '{intent}', e a mesma ação se repetiria nela (a lista tem itens "
+                f"repetidos?){_undecided_reason(undecided, 'a lista é recusada')}"
+            )
+    return found
 
 
 def _static_holds(
@@ -524,14 +765,14 @@ def _static_holds(
     return (left == right) != condition.negate
 
 
-def _undecided_reason(undecided: _Undecided) -> str:
+def _undecided_reason(undecided: _Undecided, refused: str = "o valor é recusado") -> str:
     """Por que o valor de um passo que talvez nem rode é conferido antes do primeiro passo."""
     if not undecided:
         return ""
     branches = "esse ramo roda" if len(undecided) == 1 else "esses ramos rodam"
     return (
         f" (o passo fica {' e '.join(undecided)}, e só durante a execução se sabe se "
-        f"{branches}; na dúvida, o valor é recusado antes do primeiro passo)"
+        f"{branches}; na dúvida, {refused} antes do primeiro passo)"
     )
 
 
@@ -632,9 +873,9 @@ class Interpreter:
         self._items: list[tuple[Mapping[str, object], int]] = []
         self._steps_done = 0
         self._irreversible_step: Step | None = None
-        #: Linhas onde cada passo que grava já agiu: id do passo -> texto da linha ->
-        #: repetição em que agiu (``None`` fora de repetições).
-        self._acted_rows: dict[str, dict[str, int | None]] = {}
+        #: Ações que gravam já feitas numa linha: (página, ação, texto da linha) -> id
+        #: do passo que agiu e repetição em que agiu (``None`` fora de repetições).
+        self._acted_rows: dict[_RowAction, tuple[str, int | None]] = {}
         self._artifacts: list[ArtifactRef] = []
         self._secret_locators: list[PwLocator] = []
         self._blocked_navigation: str | None = None
@@ -908,26 +1149,53 @@ class Interpreter:
         repetição sobre uma lista de entrada vazia não roda. Quando a condição só
         se conhece durante a execução, os dois ramos são conferidos, e a mensagem
         diz em que ramo está o passo.
+
+        Também recusa os itens repetidos de uma lista de entrada
+        (:func:`_repeated_rows`): na execução, a rede contra ações repetidas pararia
+        no segundo deles, talvez depois de outros itens já terem gravado. Listas
+        lidas da página (variáveis) ficam com a rede, durante a execução.
         """
         found: list[str] = []
 
-        def walk(steps: Iterable[Step], rows: _Rows | None, undecided: _Undecided) -> None:
+        def walk(
+            steps: Iterable[Step],
+            rows: _Rows | None,
+            undecided: _Undecided,
+            loops: tuple[tuple[_ListLoop, tuple[int, ...]], ...],
+        ) -> None:
             for step in steps:
                 if isinstance(step, NavigateStep):
                     found.extend(self._url_value_problems(step, values, rows, undecided))
                 for target in _step_targets(step):
                     found.extend(self._row_key_problems(step, target, values, rows, undecided))
+                if loops and rows is not None:
+                    self._trace_step(step, values, rows, undecided, loops)
                 if isinstance(step, ForEachStep):
                     inner = self._loop_rows(step, values)
-                    if inner is None or inner[1]:  # sobre uma lista de entrada vazia, nada roda
-                        walk(step.steps, inner, undecided)
+                    if inner is None:
+                        # Sobre uma tabela lida: quantas vezes e onde ela age, só a página
+                        # sabe. Se ela pode mudar a página, nenhum item de fora conta.
+                        if _changes_page(step.steps):
+                            for each_loop, each_reach in loops:
+                                each_loop.forget(each_reach)
+                        walk(step.steps, None, undecided, ())
+                    elif inner[1]:  # sobre uma lista de entrada vazia, nada roda
+                        indexes = tuple(index for index, _ in inner[1])
+                        loop = _ListLoop(inner[0], indexes)
+                        walk(step.steps, inner, undecided, (*loops, (loop, indexes)))
+                        found.extend(_repeated_rows(loop))
                 elif isinstance(step, IfStep):
                     for block, block_rows, block_undecided in self._branches(
                         step, values, rows, undecided
                     ):
-                        walk(block, block_rows, block_undecided)
+                        block_loops = loops
+                        if rows is not None and block_rows is not None:
+                            # Só os itens que chegam ao ramo (a repetição de dentro é a deles).
+                            reach = tuple(index for index, _ in block_rows[1])
+                            block_loops = (*loops[:-1], (loops[-1][0], reach))
+                        walk(block, block_rows, block_undecided, block_loops)
 
-        walk(self._manifest.steps, None, ())
+        walk(self._manifest.steps, None, (), ())
         for condition in self._manifest.postconditions:
             target = getattr(condition, "target", None)
             if isinstance(target, Target):
@@ -946,6 +1214,63 @@ class Interpreter:
         if isinstance(rows, list) and all(isinstance(row, Mapping) for row in rows):
             return name, list(enumerate(rows))
         return None
+
+    @staticmethod
+    def _trace_step(
+        step: Step,
+        values: Mapping[str, Any],
+        rows: _Rows,
+        undecided: _Undecided,
+        loops: tuple[tuple[_ListLoop, tuple[int, ...]], ...],
+    ) -> None:
+        """Anota o que ``step`` faz para cada item das repetições sobre listas de entrada.
+
+        ``loops`` são essas repetições em volta do passo, da mais externa à mais
+        interna, cada uma com os itens que chegam ao passo; ``rows`` são os itens da
+        mais interna, de onde vem ``item``. Ver :class:`_ListLoop`.
+        """
+        if isinstance(step, (ForEachStep, IfStep)):
+            return  # nos contêineres, contam os passos de dentro
+        reads_page = isinstance(step, _PAGE_READS)
+        target = getattr(step, "target", None)
+        acts_on_row = (
+            step.effect is not Effect.READ
+            and isinstance(target, Target)
+            and target.within is not None
+            and target.within_has_text is not None
+        )
+        if reads_page and not acts_on_row:
+            return  # só lê: não muda a página nem a linha dos passos seguintes
+        refs: list[templates.Ref] = []
+        for template in _trace_templates(step):
+            try:
+                refs.extend(templates.references(template))
+            except templates.TemplateError:
+                pass  # recusado ao montar o passo
+        if any(ref.scope is templates.Scope.VARS for ref in refs):
+            # Onde o passo age depende da página: nenhum item que chega a ele conta.
+            if not reads_page:
+                for each, each_reach in loops:
+                    each.forget(each_reach)
+            return
+        *outer, (loop, _) = loops
+        if not reads_page:
+            for each, each_reach in outer:
+                # Para as repetições de fora, o passo é o mesmo em todos os itens delas.
+                for index in each_reach:
+                    if (trace := each.traces[index]) is not None:
+                        trace.append(("passo", step.id))
+        for index, item in rows[1]:
+            scopes = {templates.Scope.INPUTS: values, templates.Scope.ITEM: item}
+            try:
+                entry = _page_trace(step, scopes)
+            except templates.TemplateError:
+                loop.forget([index])  # o valor que falta já foi recusado em outro lugar
+                continue
+            if not reads_page and (trace := loop.traces[index]) is not None:
+                trace.append(entry)
+            if acts_on_row and entry[1]:  # (ação, texto da linha, ...); vazio já é recusado
+                loop.actions.setdefault(entry[:2], []).append((index, step, undecided))
 
     @staticmethod
     def _branches(
@@ -1381,8 +1706,10 @@ class Interpreter:
         try:
             try:
                 async with asyncio.timeout_at(ctx.deadline + _TIMEOUT_GRACE_S):
-                    row = self._row_not_acted_on(step)
                     action = await self._prepare(step, ctx)
+                    # Com o alvo já encontrado, a página é a dele; e ainda antes do aviso
+                    # de passo irreversível.
+                    row = self._row_not_acted_on(step)
                     if irreversible:
                         # O aviso vai antes: com confirmação, ele pode esperar o plano de
                         # controle gravá-lo. Se falhar, nada foi enviado ao portal.
@@ -1393,7 +1720,7 @@ class Interpreter:
                     if row is not None:
                         # Registrada antes de agir: uma ação que falhou no meio também conta.
                         iteration = self._items[-1][1] if self._items else None
-                        self._acted_rows.setdefault(step.id, {})[row] = iteration
+                        self._acted_rows[row] = (step.id, iteration)
                     data = await action()
                 self._check_page_domain(step)
             except StepError:
@@ -1907,24 +2234,93 @@ class Interpreter:
             case _:  # pragma: no cover - conjunto fechado
                 assert_never(locator.by)
 
-    def _candidates(self, target: Target) -> list[PwLocator]:
-        self._refuse_dynamic_selectors(target)
+    def _root(self, target: Target) -> Page | FrameLocator:
         root: Page | FrameLocator = self.page
         for selector in target.frames:
             root = root.frame_locator(selector)
+        return root
+
+    def _row_choice(self, target: Target) -> _RowChoice | None:
+        """Os contêineres do alvo e os escolhidos pelo texto (``None`` sem esse texto)."""
+        self._refuse_dynamic_selectors(target)
+        key = self._row_key(target)
+        if key is None or target.within is None:
+            return None
+        rows = self._build(self._root(target), target.within)
+        # O texto precisa ser o texto inteiro de um elemento do contêiner (uma célula,
+        # por exemplo), com os mesmos caracteres e as mesmas maiúsculas: "12" não
+        # escolhe a linha da nota "120" nem a do valor "12,00", e "ab3x" não escolhe a
+        # de "AB3X". Mais de um contêiner com o texto continua ambíguo, e o texto
+        # mostrado também é conferido (:meth:`_row_issue`).
+        return _RowChoice(rows, rows.filter(has=self.page.get_by_text(_whole_text(key))), key)
+
+    def _candidates(self, target: Target, choice: _RowChoice | None) -> list[PwLocator]:
+        self._refuse_dynamic_selectors(target)
+        root = self._root(target)
         container: _Root = root
-        if target.within is not None:
-            within = self._build(root, target.within)
-            key = self._row_key(target)
-            if key is not None:
-                # O texto precisa ser o texto inteiro de um elemento do contêiner (uma
-                # célula, por exemplo), com os mesmos caracteres e as mesmas
-                # maiúsculas: "12" não escolhe a linha da nota "120" nem a do valor
-                # "12,00", e "ab3x" não escolhe a de "AB3X". Mais de um contêiner com
-                # o texto continua ambíguo.
-                within = within.filter(has=self.page.get_by_text(_whole_text(key)))
-            container = within
+        if choice is not None:
+            container = choice.chosen
+        elif target.within is not None:
+            container = self._build(root, target.within)
         return [self._build(container, locator) for locator in target.locators]
+
+    async def _row_issue(self, choice: _RowChoice | None) -> _RowIssue | None:
+        """Confere que a linha escolhida pelo texto é a única com ele, nas duas bases.
+
+        Pelo texto do HTML (como o Playwright compara), só um contêiner pode ter um
+        elemento com o texto inteiro; pelo texto mostrado (``innerText``,
+        normalizado igual), nenhum outro contêiner pode ter. Uma célula com
+        ``text-transform`` ou com uma chave de ordenação escondida mostra um texto
+        que não está no HTML, e a linha certa pode ser outra. ``None`` quando a
+        linha é única (ou o alvo não escolhe linha pelo texto); se a página mudar
+        no meio da conferência, a linha não conta como única.
+        """
+        if choice is None:
+            return None
+        unchecked = _RowIssue(None, None)
+        try:
+            handles = await choice.chosen.element_handles()
+        except PlaywrightError:
+            return unchecked
+        try:
+            if len(handles) != 1:
+                return _RowIssue(len(handles), None) if handles else unchecked
+            others = await choice.rows.evaluate_all(
+                _OTHER_ROWS_SHOWING_KEY_JS, [choice.key, handles[0]]
+            )
+        except PlaywrightError:
+            return unchecked
+        finally:
+            for handle in handles:
+                await self._dispose(handle)
+        if not isinstance(others, int) or others < 0:
+            return unchecked
+        return _RowIssue(1, others) if others else None
+
+    @staticmethod
+    def _row_issue_error(target: Target, issue: _RowIssue, details: dict[str, object]) -> StepError:
+        if issue.by_html is None:
+            reason = "a página mudou enquanto eu conferia se só uma linha tem esse texto"
+        elif issue.by_html > 1:
+            reason = f"mais de uma linha ({issue.by_html}) tem um elemento com esse texto no HTML"
+            details = {**details, "linhas_pelo_html": issue.by_html}
+        else:
+            reason = (
+                "outra linha mostra esse mesmo texto na página (por exemplo, pelo "
+                "text-transform do CSS ou por um texto escondido na célula), e não dá para "
+                "saber qual delas o texto quer dizer"
+            )
+            details = {
+                **details,
+                "linhas_pelo_html": issue.by_html,
+                "outras_linhas_pelo_texto_mostrado": issue.shown_elsewhere,
+            }
+        return StepError(
+            ErrorCode.ELEMENTO_AMBIGUO,
+            f"O texto que escolhe o contêiner de '{target.intent}' não aponta para uma linha "
+            f"só: {reason}. Nada foi feito.",
+            details=details,
+        )
 
     def _row_key(self, target: Target) -> str | None:
         """O texto que escolhe o contêiner do alvo, normalizado (``None`` se não houver)."""
@@ -1946,16 +2342,17 @@ class Interpreter:
             )
         return key
 
-    def _row_not_acted_on(self, step: Step) -> str | None:
-        """O texto da linha onde um passo que grava vai agir, se ele ainda não agiu nela.
+    def _row_not_acted_on(self, step: Step) -> _RowAction | None:
+        """A ação que um passo que grava vai fazer numa linha, se ela ainda não foi feita.
 
-        Rede de segurança contra ações repetidas: numa execução, o mesmo passo que
-        grava nunca age duas vezes na linha escolhida pelo mesmo texto. Isso acontece
-        com itens repetidos numa lista e com duas linhas que a página mostra iguais
-        (``ab3x`` em maiúsculas pelo CSS ao lado de ``AB3X``), lidas com o mesmo texto
-        e que escolheriam a mesma linha. A segunda vez falha antes de agir, e antes do
-        aviso de passo irreversível. Passos de leitura e passos diferentes na mesma
-        linha não contam.
+        Rede de segurança contra ações repetidas: numa execução, a mesma ação que
+        grava (o tipo do passo e o alvo, :func:`_target_signature`) nunca é feita
+        duas vezes na mesma linha, que é a página (:func:`_page_key`) e o texto
+        normalizado que a escolhe. Isso acontece com itens repetidos numa tabela lida
+        da página, inclusive quando cada um vai para um ramo de um ``if`` com o mesmo
+        alvo. A segunda vez falha antes de agir, e antes do aviso de passo
+        irreversível. Passos de leitura, alvos diferentes na mesma linha e a mesma
+        chave em outra página (a nota 1 de cada filial) não contam.
         """
         if step.effect is Effect.READ:
             return None
@@ -1965,21 +2362,27 @@ class Interpreter:
         key = self._row_key(target)
         if key is None:
             return None
-        acted = self._acted_rows.get(step.id, {})
-        if key in acted:
-            details: dict[str, object] = {"alvo": target.intent}
-            if (previous := acted[key]) is not None:
-                details["iteracao_anterior"] = previous
+        action = (
+            _page_key(self.page.url),
+            _target_signature(step.kind, target, self._render),
+            key,
+        )
+        previous = self._acted_rows.get(action)
+        if previous is not None:
+            step_id, iteration = previous
+            details: dict[str, object] = {"alvo": target.intent, "passo_anterior": step_id}
+            if iteration is not None:
+                details["iteracao_anterior"] = iteration
+            who = "ele" if step_id == step.id else f"o passo '{step_id}', com o mesmo alvo,"
             raise StepError(
                 ErrorCode.ELEMENTO_AMBIGUO,
-                f"O passo '{step.title}' já agiu, nesta execução, em '{target.intent}' na "
-                "linha escolhida por este mesmo texto; agir de novo repetiria a ação na "
-                "mesma linha, então nada foi feito agora. Confira se a lista tem itens "
-                "repetidos ou se a página mostra o texto da linha diferente do HTML (por "
-                "exemplo, em maiúsculas pelo text-transform do CSS).",
+                f"O passo '{step.title}' agiria em '{target.intent}' na linha escolhida por "
+                f"este mesmo texto, nesta mesma página, onde {who} já agiu nesta execução; "
+                "agir de novo repetiria a ação na mesma linha, então nada foi feito agora. "
+                "Confira se a lista tem itens repetidos.",
                 details=details,
             )
-        return key
+        return action
 
     @staticmethod
     def _refuse_dynamic_selectors(target: Target) -> None:
@@ -2011,8 +2414,11 @@ class Interpreter:
         O localizador principal tem preferência. Em passos de leitura, os
         alternativos entram depois de ``heal_after_ms`` (ou no fim do prazo) e
         geram o evento ``step_healed``; em passos que gravam, só o principal vale.
+        Num contêiner escolhido pelo texto, a linha também precisa ser a única com
+        ele, no HTML e no texto mostrado (:meth:`_row_issue`).
         """
-        candidates = self._candidates(target)
+        choice = self._row_choice(target)
+        candidates = self._candidates(target, choice)
         allow_fallback = step.effect is Effect.READ
         loop = asyncio.get_running_loop()
         start = loop.time()
@@ -2020,23 +2426,32 @@ class Interpreter:
         counts: list[int | None] = [None] * len(candidates)
         while True:
             last_round = loop.time() + self._poll_s >= ctx.deadline
+            issue: _RowIssue | None = None
+            found: int | None = None
             counts[0] = await self._count(candidates[0])
             if counts[0] == 1:
-                return candidates[0]
-            if allow_fallback and (last_round or loop.time() >= heal_at):
+                found = 0
+            elif allow_fallback and (last_round or loop.time() >= heal_at):
                 for index in range(1, len(candidates)):
                     counts[index] = await self._count(candidates[index])
                     if counts[index] == 1:
+                        found = index
+                        break
+            if found is not None:
+                # O contêiner é o mesmo para todos os localizadores.
+                issue = await self._row_issue(choice)
+                if issue is None:
+                    if found:
                         await self._emit(
                             RunEventKind.STEP_HEALED,
                             step.id,
                             {
-                                "localizador": index,
-                                "estrategia": target.locators[index].by.value,
+                                "localizador": found,
+                                "estrategia": target.locators[found].by.value,
                                 "contagens": list(counts),
                             },
                         )
-                        return candidates[index]
+                    return candidates[found]
             if last_round:
                 break
             await asyncio.sleep(self._poll_s)
@@ -2050,6 +2465,8 @@ class Interpreter:
             "estrategias": [locator.by.value for locator in target.locators],
             "contagens": list(counts),
         }
+        if issue is not None:
+            raise self._row_issue_error(target, issue, details)
         if not allow_fallback:
             fallback = next((i for i in range(1, len(counts)) if counts[i] == 1), None)
             if fallback is not None:
@@ -2093,7 +2510,7 @@ class Interpreter:
             pass
 
     async def _wait_hidden(self, target: Target, ctx: _StepCtx) -> None:
-        candidates = self._candidates(target)
+        candidates = self._candidates(target, self._row_choice(target))
         loop = asyncio.get_running_loop()
         while True:
             visible = 0
@@ -2110,9 +2527,12 @@ class Interpreter:
             await asyncio.sleep(self._poll_s)
 
     async def _first_unique(self, target: Target) -> PwLocator | None:
-        for candidate in self._candidates(target):
+        """O primeiro localizador com um elemento só, numa linha que é a única com o
+        texto que a escolhe (como em :meth:`_resolve`); senão, ``None``."""
+        choice = self._row_choice(target)
+        for candidate in self._candidates(target, choice):
             if await self._count(candidate) == 1:
-                return candidate
+                return candidate if await self._row_issue(choice) is None else None
         return None
 
     async def _holds(self, condition: Condition) -> bool:
