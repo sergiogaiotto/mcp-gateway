@@ -18,10 +18,29 @@ principais:
   vazio), e o texto que escolhe uma linha precisa ser o texto inteiro de um
   elemento dela (uma célula, por exemplo), com as mesmas maiúsculas e sem
   nenhum valor vazio;
+- esse texto é comparado com o texto do HTML (``textContent``), e não com o
+  que a página mostra: ``extract_table`` e ``extract_text`` leem o texto
+  mostrado (``innerText``), já com o ``text-transform`` do CSS. Numa página que
+  muda as maiúsculas pelo CSS, uma chave lida dela falha fechado: não escolhe
+  nenhuma linha (``elemento_nao_encontrado``, nada é feito) ou, se outra linha
+  tem no HTML o texto mostrado, escolhe essa outra. A comparação nunca ignora
+  maiúsculas, para uma chave nunca escolher a linha de outro código;
+- numa execução, o mesmo passo que grava (``write`` ou ``irreversible``) nunca
+  age duas vezes na linha escolhida pelo mesmo texto: na segunda vez, ele falha
+  com ``elemento_ambiguo`` antes de agir (e antes do aviso de passo
+  irreversível). Passos diferentes podem agir na mesma linha, e passos de
+  leitura podem voltar a ela. É a rede de segurança para itens repetidos e para
+  duas linhas lidas com o mesmo texto (``ab3x`` mostrado como ``AB3X`` ao lado
+  de ``AB3X``): a ação pode ter caído na outra linha, mas nunca se repete;
 - o que faria a execução falhar no meio por causa das entradas (campo de item
   ausente, número que não pode ser digitado, lista maior que a repetição, valor
   que não pode ir no caminho ou na rota do endereço, valor vazio no texto que
-  escolhe a linha) falha antes do primeiro passo;
+  escolhe a linha) falha antes do primeiro passo. Valores usados só em passos
+  que não rodam não contam: um ramo de ``if`` cuja condição é um ``equals`` só
+  de entradas e itens de listas de entrada é decidido antes, como seria na
+  execução, e uma repetição sobre uma lista de entrada vazia não roda. Quando a
+  condição depende da página ou de variáveis, na dúvida o valor é recusado
+  antes, e a mensagem diz o passo e o ramo;
 - eventos, mensagens, saídas e nomes de artefatos nunca contêm valores de
   credenciais; as chaves dos eventos e os valores que são constantes do
   executor (efeito, estado, código de erro, id de passo) nunca são mascarados.
@@ -86,7 +105,6 @@ from rapa.core.robot import (
     UrlContainsCondition,
     VisibleCondition,
     WaitForStep,
-    child_blocks,
 )
 from rapa.runner.errors import ErrorCode, StepError
 from rapa.runner.ports import (
@@ -153,8 +171,11 @@ _PATH_SLOTS: dict[_UrlSlot, str] = {
     "caminho": "no caminho do endereço",
     "rota": "na rota do endereço (depois do '#')",
 }
-#: Itens de uma repetição sobre uma entrada de lista: o nome da lista e as linhas.
-type _Rows = tuple[str, list[Mapping[str, object]]]
+#: Itens de uma repetição sobre uma entrada de lista: o nome da lista e as linhas que
+#: chegam a um bloco de passos, cada uma com a sua posição na lista.
+type _Rows = tuple[str, list[tuple[int, Mapping[str, object]]]]
+#: Ramos de ``if`` em volta de um bloco que só durante a execução se sabe se rodam.
+type _Undecided = tuple[str, ...]
 
 #: Contextos já usados por alguma execução: nunca se reaproveita um contexto.
 _claimed_contexts: weakref.WeakSet[BrowserContext] = weakref.WeakSet()
@@ -481,6 +502,39 @@ def _step_targets(step: Step) -> list[Target]:
     return targets
 
 
+def _static_holds(
+    condition: Condition, values: Mapping[str, Any], item: Mapping[str, object] | None
+) -> bool | None:
+    """O resultado de uma condição que dá para saber antes do primeiro passo.
+
+    Só um ``equals`` cujos dois lados usam apenas entradas e, numa repetição sobre
+    uma entrada de lista, o item: ele é avaliado como seria durante a execução.
+    ``None`` quando só a execução sabe (a página, variáveis, um template que falha).
+    """
+    if not isinstance(condition, EqualsCondition):
+        return None
+    scopes: dict[templates.Scope, Mapping[str, object]] = {templates.Scope.INPUTS: values}
+    if item is not None:
+        scopes[templates.Scope.ITEM] = item
+    try:
+        left = templates.render(condition.left, scopes)
+        right = templates.render(condition.right, scopes)
+    except templates.TemplateError:
+        return None  # variáveis só existem durante a execução; o resto falha lá
+    return (left == right) != condition.negate
+
+
+def _undecided_reason(undecided: _Undecided) -> str:
+    """Por que o valor de um passo que talvez nem rode é conferido antes do primeiro passo."""
+    if not undecided:
+        return ""
+    branches = "esse ramo roda" if len(undecided) == 1 else "esses ramos rodam"
+    return (
+        f" (o passo fica {' e '.join(undecided)}, e só durante a execução se sabe se "
+        f"{branches}; na dúvida, o valor é recusado antes do primeiro passo)"
+    )
+
+
 def _has_references(template: str) -> bool:
     try:
         return templates.has_references(template)
@@ -578,6 +632,9 @@ class Interpreter:
         self._items: list[tuple[Mapping[str, object], int]] = []
         self._steps_done = 0
         self._irreversible_step: Step | None = None
+        #: Linhas onde cada passo que grava já agiu: id do passo -> texto da linha ->
+        #: repetição em que agiu (``None`` fora de repetições).
+        self._acted_rows: dict[str, dict[str, int | None]] = {}
         self._artifacts: list[ArtifactRef] = []
         self._secret_locators: list[PwLocator] = []
         self._blocked_navigation: str | None = None
@@ -843,28 +900,38 @@ class Interpreter:
         endereço e os que vão no texto que escolhe um contêiner. Se um deles não
         serve, a execução pararia nesse passo, talvez depois de outros já terem
         gravado. Variáveis só existem durante a execução: essas são conferidas
-        quando o passo roda. Vale para todos os passos, inclusive os de ramos de
-        ``if`` que podem nem rodar.
+        quando o passo roda.
+
+        Só contam os passos que podem rodar. Um ``if`` cuja condição dá para
+        avaliar antes (:func:`_static_holds`) só tem conferido o ramo que vai
+        rodar (numa repetição sobre uma entrada de lista, item a item), e uma
+        repetição sobre uma lista de entrada vazia não roda. Quando a condição só
+        se conhece durante a execução, os dois ramos são conferidos, e a mensagem
+        diz em que ramo está o passo.
         """
         found: list[str] = []
 
-        def walk(steps: Iterable[Step], rows: _Rows | None) -> None:
+        def walk(steps: Iterable[Step], rows: _Rows | None, undecided: _Undecided) -> None:
             for step in steps:
                 if isinstance(step, NavigateStep):
-                    found.extend(self._url_value_problems(step, values, rows))
+                    found.extend(self._url_value_problems(step, values, rows, undecided))
                 for target in _step_targets(step):
-                    found.extend(self._row_key_problems(step, target, values, rows))
+                    found.extend(self._row_key_problems(step, target, values, rows, undecided))
                 if isinstance(step, ForEachStep):
-                    walk(step.steps, self._loop_rows(step, values))
-                else:
-                    for block in child_blocks(step):
-                        walk(block, rows)
+                    inner = self._loop_rows(step, values)
+                    if inner is None or inner[1]:  # sobre uma lista de entrada vazia, nada roda
+                        walk(step.steps, inner, undecided)
+                elif isinstance(step, IfStep):
+                    for block, block_rows, block_undecided in self._branches(
+                        step, values, rows, undecided
+                    ):
+                        walk(block, block_rows, block_undecided)
 
-        walk(self._manifest.steps, None)
+        walk(self._manifest.steps, None, ())
         for condition in self._manifest.postconditions:
             target = getattr(condition, "target", None)
             if isinstance(target, Target):
-                found.extend(self._row_key_problems(None, target, values, None))
+                found.extend(self._row_key_problems(None, target, values, None, ()))
         seen = set(problems)
         for problem in found:
             if problem not in seen:  # a mesma entrada pode aparecer em vários passos
@@ -877,8 +944,41 @@ class Interpreter:
         scope, name = step.items.split(".", 1)
         rows = values.get(name) if scope == "inputs" else None
         if isinstance(rows, list) and all(isinstance(row, Mapping) for row in rows):
-            return name, rows
+            return name, list(enumerate(rows))
         return None
+
+    @staticmethod
+    def _branches(
+        step: IfStep, values: Mapping[str, Any], rows: _Rows | None, undecided: _Undecided
+    ) -> list[tuple[list[Step], _Rows | None, _Undecided]]:
+        """Os ramos de um ``if`` que podem rodar, cada um com os itens que chegam a ele.
+
+        Se a condição dá para avaliar antes (para todos os itens, numa repetição
+        sobre uma entrada de lista), só entram os ramos que vão rodar, cada um com
+        os seus itens. Senão, entram os dois, marcados como ramos que só a
+        execução decide.
+        """
+        if rows is None:
+            holds = _static_holds(step.condition, values, None)
+            if holds is not None:
+                return [(step.then if holds else step.otherwise, None, undecided)]
+        else:
+            name, items = rows
+            decided = [
+                (index, row, _static_holds(step.condition, values, row)) for index, row in items
+            ]
+            if all(holds is not None for _, _, holds in decided):
+                then = [(index, row) for index, row, holds in decided if holds]
+                otherwise = [(index, row) for index, row, holds in decided if not holds]
+                return [
+                    (block, (name, part), undecided)
+                    for block, part in ((step.then, then), (step.otherwise, otherwise))
+                    if part
+                ]
+        return [
+            (step.then, rows, (*undecided, f"no ramo 'então' do passo '{step.id}'")),
+            (step.otherwise, rows, (*undecided, f"no ramo 'senão' do passo '{step.id}'")),
+        ]
 
     @staticmethod
     def _ref_values(
@@ -891,13 +991,17 @@ class Interpreter:
             name, items = rows
             return [
                 (f"o campo '{name}[{index}].{ref.name}'", row[ref.name])
-                for index, row in enumerate(items)
+                for index, row in items
                 if ref.name in row
             ]
         return []  # variáveis (e referências sem valor, recusadas ao montar o passo)
 
     def _url_value_problems(
-        self, step: NavigateStep, values: Mapping[str, Any], rows: _Rows | None
+        self,
+        step: NavigateStep,
+        values: Mapping[str, Any],
+        rows: _Rows | None,
+        undecided: _Undecided,
     ) -> list[str]:
         try:
             parts = templates.parse(step.url)
@@ -916,12 +1020,19 @@ class Interpreter:
                     continue  # já recusado como valor que não pode ser digitado
                 problem = _path_value_problem(text)
                 if problem is not None:
-                    found.append(f"{where} não pode ir {place} do passo '{step.id}': {problem}")
+                    found.append(
+                        f"{where} não pode ir {place} do passo '{step.id}': {problem}"
+                        f"{_undecided_reason(undecided)}"
+                    )
         return found
 
     @staticmethod
     def _row_key_problems(
-        step: Step | None, target: Target, values: Mapping[str, Any], rows: _Rows | None
+        step: Step | None,
+        target: Target,
+        values: Mapping[str, Any],
+        rows: _Rows | None,
+        undecided: _Undecided,
     ) -> list[str]:
         """Valores de entradas e de itens que ficariam vazios no texto que escolhe o contêiner.
 
@@ -945,7 +1056,7 @@ class Interpreter:
                 checks = [("", values)]
             elif ref.scope is templates.Scope.ITEM and rows is not None:
                 name, items = rows
-                checks = [(f" para '{name}[{index}]'", row) for index, row in enumerate(items)]
+                checks = [(f" para '{name}[{index}]'", row) for index, row in items]
             else:
                 continue  # variáveis e itens de uma tabela lida da página
             for suffix, scope_values in checks:
@@ -958,7 +1069,7 @@ class Interpreter:
                 if not _normalize_text(text):
                     found.append(
                         f"{ref} ficaria vazio no texto que escolhe o contêiner de "
-                        f"'{target.intent}' {where}{suffix}"
+                        f"'{target.intent}' {where}{suffix}{_undecided_reason(undecided)}"
                     )
         return found
 
@@ -1270,6 +1381,7 @@ class Interpreter:
         try:
             try:
                 async with asyncio.timeout_at(ctx.deadline + _TIMEOUT_GRACE_S):
+                    row = self._row_not_acted_on(step)
                     action = await self._prepare(step, ctx)
                     if irreversible:
                         # O aviso vai antes: com confirmação, ele pode esperar o plano de
@@ -1278,6 +1390,10 @@ class Interpreter:
                         announced = True
                         # Daqui em diante, qualquer falha deixa a execução indeterminada.
                         self._irreversible_step = step
+                    if row is not None:
+                        # Registrada antes de agir: uma ação que falhou no meio também conta.
+                        iteration = self._items[-1][1] if self._items else None
+                        self._acted_rows.setdefault(step.id, {})[row] = iteration
                     data = await action()
                 self._check_page_domain(step)
             except StepError:
@@ -1799,21 +1915,8 @@ class Interpreter:
         container: _Root = root
         if target.within is not None:
             within = self._build(root, target.within)
-            if target.within_has_text is not None:
-                # Normalizada como o Playwright normaliza: um texto só de U+200B,
-                # U+00AD ou U+FEFF (a célula vazia de um CSV do Excel) fica vazio.
-                # Cada valor é conferido sozinho (entradas e itens já foram antes do
-                # primeiro passo; aqui entram as variáveis): um valor vazio numa
-                # chave com trecho fixo deixaria só o trecho fixo.
-                key = _normalize_text(self._render(target.within_has_text, encode=_row_key_value))
-                if not key:
-                    # Sem texto, qualquer elemento vazio (uma célula, um botão só com
-                    # ícone) serviria, e qualquer contêiner seria escolhido.
-                    raise StepError(
-                        ErrorCode.TEMPLATE_INVALIDO,
-                        f"O texto que escolhe o contêiner de '{target.intent}' ficou vazio; "
-                        "sem ele não há como saber qual usar.",
-                    )
+            key = self._row_key(target)
+            if key is not None:
                 # O texto precisa ser o texto inteiro de um elemento do contêiner (uma
                 # célula, por exemplo), com os mesmos caracteres e as mesmas
                 # maiúsculas: "12" não escolhe a linha da nota "120" nem a do valor
@@ -1822,6 +1925,61 @@ class Interpreter:
                 within = within.filter(has=self.page.get_by_text(_whole_text(key)))
             container = within
         return [self._build(container, locator) for locator in target.locators]
+
+    def _row_key(self, target: Target) -> str | None:
+        """O texto que escolhe o contêiner do alvo, normalizado (``None`` se não houver)."""
+        if target.within is None or target.within_has_text is None:
+            return None
+        # Normalizada como o Playwright normaliza: um texto só de U+200B, U+00AD ou
+        # U+FEFF (a célula vazia de um CSV do Excel) fica vazio. Cada valor é
+        # conferido sozinho (entradas e itens já foram antes do primeiro passo; aqui
+        # entram as variáveis): um valor vazio numa chave com trecho fixo deixaria só
+        # o trecho fixo.
+        key = _normalize_text(self._render(target.within_has_text, encode=_row_key_value))
+        if not key:
+            # Sem texto, qualquer elemento vazio (uma célula, um botão só com ícone)
+            # serviria, e qualquer contêiner seria escolhido.
+            raise StepError(
+                ErrorCode.TEMPLATE_INVALIDO,
+                f"O texto que escolhe o contêiner de '{target.intent}' ficou vazio; "
+                "sem ele não há como saber qual usar.",
+            )
+        return key
+
+    def _row_not_acted_on(self, step: Step) -> str | None:
+        """O texto da linha onde um passo que grava vai agir, se ele ainda não agiu nela.
+
+        Rede de segurança contra ações repetidas: numa execução, o mesmo passo que
+        grava nunca age duas vezes na linha escolhida pelo mesmo texto. Isso acontece
+        com itens repetidos numa lista e com duas linhas que a página mostra iguais
+        (``ab3x`` em maiúsculas pelo CSS ao lado de ``AB3X``), lidas com o mesmo texto
+        e que escolheriam a mesma linha. A segunda vez falha antes de agir, e antes do
+        aviso de passo irreversível. Passos de leitura e passos diferentes na mesma
+        linha não contam.
+        """
+        if step.effect is Effect.READ:
+            return None
+        target = getattr(step, "target", None)
+        if not isinstance(target, Target):
+            return None
+        key = self._row_key(target)
+        if key is None:
+            return None
+        acted = self._acted_rows.get(step.id, {})
+        if key in acted:
+            details: dict[str, object] = {"alvo": target.intent}
+            if (previous := acted[key]) is not None:
+                details["iteracao_anterior"] = previous
+            raise StepError(
+                ErrorCode.ELEMENTO_AMBIGUO,
+                f"O passo '{step.title}' já agiu, nesta execução, em '{target.intent}' na "
+                "linha escolhida por este mesmo texto; agir de novo repetiria a ação na "
+                "mesma linha, então nada foi feito agora. Confira se a lista tem itens "
+                "repetidos ou se a página mostra o texto da linha diferente do HTML (por "
+                "exemplo, em maiúsculas pelo text-transform do CSS).",
+                details=details,
+            )
+        return key
 
     @staticmethod
     def _refuse_dynamic_selectors(target: Target) -> None:
