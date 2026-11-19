@@ -145,14 +145,19 @@ class RecordingBuilder:
         self.base = base
         self.events: list[RecordingEvent] = []
         self.frame_url = base
+        #: Tempo a mais entre eventos (``wait``), além dos 50 ms de cada um.
+        self.waited_ms = 0.0
 
     def _add[E: BaseModel](self, cls: type[E], **data: Any) -> E:
         data.setdefault("page_id", 0)
-        event = cls.model_validate(
-            {"index": len(self.events), "t_ms": len(self.events) * 50.0, **data}
-        )
+        t_ms = len(self.events) * 50.0 + self.waited_ms
+        event = cls.model_validate({"index": len(self.events), "t_ms": t_ms, **data})
         self.events.append(cast(RecordingEvent, event))
         return event
+
+    def wait(self, ms: float) -> None:
+        """A pessoa demora ``ms`` milissegundos antes do próximo evento."""
+        self.waited_ms += ms
 
     def url(self, path: str) -> str:
         return path if path.startswith("http") else f"{self.base}{path}"
@@ -197,7 +202,12 @@ class RecordingBuilder:
         *,
         typed: str | None = None,
         script_modified: bool = False,
+        editing_since: RecordingEvent | None = None,
     ) -> InputEvent:
+        """Valor final do campo; ``editing_since``: a edição começou logo antes desse evento."""
+        extra: dict[str, Any] = {}
+        if editing_since is not None:
+            extra["editing_since_ms"] = max(0.0, editing_since.t_ms - 1)
         return self._add(
             InputEvent,
             element=el,
@@ -205,6 +215,7 @@ class RecordingBuilder:
             typed=None if el.sensitive else (typed if typed is not None else value),
             script_modified=script_modified,
             frame_url=self.frame_url,
+            **extra,
         )
 
     def select(self, el: ElementDescriptor, label: str) -> SelectEvent:

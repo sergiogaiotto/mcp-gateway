@@ -4,13 +4,21 @@ O script da página (``capture.js``) aplica a regra de campo de senha antes de
 mandar o valor; o gravador a repete do lado do Python (segunda camada) e o
 compilador também, para gravações que chegaram sem ela. As regras:
 
-- campo de texto que é de senha: ``autocomplete`` de senha, ou rótulo, nome,
-  id, título ou placeholder que falam em senha, PIN ou password (o script
-  também olha a máscara por CSS, ``-webkit-text-security``, que só a página
-  conhece);
+- campo de texto que é de senha: ``autocomplete`` de senha, ou rótulo
+  (``<label>``, ``aria-labelledby`` ou ``aria-label``, nessa ordem, como no
+  script), título, placeholder, atributo ``name`` ou id que falam em senha, PIN
+  ou password (o script também olha a máscara por CSS,
+  ``-webkit-text-security``, que só a página conhece); um campo que o script já
+  marcou como usuário nunca vira senha;
 - usuário do login: o campo de texto preenchido logo antes de uma senha, no
-  mesmo documento (a regra de ``mark_username`` do compilador, repetida aqui
-  para o gravador tirar o valor da gravação);
+  mesmo documento, ou, no login em duas etapas de uma SPA, o primeiro campo da
+  página, preenchido antes de um "Continuar" ou de um Enter que mostrou a senha
+  (a regra de ``mark_username`` do compilador, repetida aqui para o gravador
+  tirar o valor da gravação);
+- senha de transação (PIN, assinatura eletrônica, senha de pagamento) ou senha
+  enviada por um botão com verbo irreversível ("Confirmar pagamento",
+  "Transferir"): não é login. O campo antes dela some da gravação do mesmo jeito,
+  mas não vira o usuário do cofre (o robô pede o valor numa entrada);
 - literal com cara de segredo (cartão, token, chave): o mesmo padrão que a
   generalização usa para ocultar valores do modelo de linguagem.
 """
@@ -18,6 +26,7 @@ compilador também, para gravações que chegaram sem ela. As regras:
 import re
 import unicodedata
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 from rapa.recorder.models import (
@@ -36,14 +45,22 @@ __all__ = [
     "BUTTON_INPUT_TYPES",
     "SENSITIVE_TEXT",
     "TEXT_INPUT_TYPES",
+    "LoginInputs",
+    "action_label",
     "clickable",
+    "declared_username",
     "field_key",
     "focus_only",
+    "irreversible_click",
+    "irreversible_verb",
     "is_password_field",
     "is_password_like_text",
     "is_text_field",
+    "is_transaction_secret",
+    "login_inputs",
     "looks_secret",
     "mentions_password",
+    "submit_after",
     "username_inputs",
 ]
 
@@ -57,6 +74,23 @@ _PASSWORD_WORDS = re.compile(
     r"(?<!re)senha|password|passwd|passphrase|(?:^|[^a-z0-9])(?:pwd|pin)(?:[^a-z0-9]|$)"
 )
 _CAMEL = re.compile(r"([a-z])([A-Z])")
+#: Segredo de uma operação, não de login: senha de transação, de pagamento ou do
+#: cartão, assinatura eletrônica, PIN. Igual a ``TRANSACTION_WORDS`` em ``capture.js``.
+_TRANSACTION_WORDS = re.compile(
+    r"transac|transfer|assinatura|assinar|autoriza|pagamento|operac|cartao"
+    r"|(?:^|[^a-z0-9])pin(?:[^a-z0-9]|$)"
+)
+#: Verbos de ação irreversível em pt-BR, sem acentos (emitir, enviar, pagar,
+#: transferir, excluir...). Igual a ``IRREVERSIBLE`` em ``capture.js``.
+_IRREVERSIBLE = re.compile(
+    r"\b("
+    r"emitir|emita|enviar|envie|transmitir|transmita|pagar|pague|confirmar pagamento"
+    r"|confirmar transferencia|transferir|transfira"
+    r"|excluir|exclua|apagar|apague|assinar|assine|finalizar|finalize|concluir|conclua"
+    r"|protocolar|protocole|autorizar|autorize|aprovar|aprove|solicitar|solicite"
+    r"|cancelar|cancele"
+    r")\b"
+)
 #: Texto com cara de segredo (o mesmo padrão que ``rapa.llm.generalize`` usa para
 #: ocultar literais do modelo de linguagem).
 SENSITIVE_TEXT = re.compile(
@@ -87,7 +121,11 @@ def is_password_like_text(element: ElementDescriptor) -> bool:
     """Campo de texto (não do tipo senha) que é de senha pelo autocomplete ou pelo rótulo.
 
     Campos de e-mail, endereço e busca, e os marcados como usuário ou e-mail no
-    ``autocomplete``, só contam pelo ``autocomplete`` de senha.
+    ``autocomplete``, só contam pelo ``autocomplete`` de senha. Os textos são os
+    mesmos que o script olha: o rótulo (``<label>`` antes de ``aria-labelledby``),
+    o título, o placeholder, o nome e o id; o nome acessível, em que
+    ``aria-labelledby`` vem antes do ``<label>``, não entra, para que as duas
+    camadas nunca discordem.
     """
     if element.tag != "input" or element.is_password or element.is_one_time_code:
         return False
@@ -105,13 +143,50 @@ def is_password_like_text(element: ElementDescriptor) -> bool:
         mentions_password(text)
         for text in (
             element.label,
-            element.name,
-            element.placeholder,
             element.title,
+            element.placeholder,
             element.name_attr,
             element.id,
         )
     )
+
+
+def is_transaction_secret(element: ElementDescriptor) -> bool:
+    """Senha ou código de uma operação (transação, pagamento, assinatura, PIN), não de login."""
+    texts = (
+        element.label,
+        element.name,
+        element.placeholder,
+        element.title,
+        element.name_attr,
+        element.id,
+    )
+    return any(_TRANSACTION_WORDS.search(_plain(text)) for text in texts if text)
+
+
+def _strip_accents(text: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in decomposed if not unicodedata.combining(c))
+
+
+def irreversible_verb(text: str | None) -> str | None:
+    """O verbo irreversível que aparece no texto, se houver."""
+    if not text:
+        return None
+    match = _IRREVERSIBLE.search(" ".join(_strip_accents(text).lower().split()))
+    return match.group(1) if match else None
+
+
+def action_label(element: ElementDescriptor | None) -> str | None:
+    """O texto de um botão ou link que a regra do verbo irreversível olha."""
+    if element is None:
+        return None
+    return element.name or element.text or element.title
+
+
+def declared_username(element: ElementDescriptor) -> bool:
+    """A página declara o campo como usuário (``autocomplete="username"``)."""
+    return "username" in _autocomplete(element)
 
 
 def is_password_field(element: ElementDescriptor) -> bool:
@@ -164,65 +239,180 @@ def clickable(element: ElementDescriptor | None) -> bool:
     )
 
 
-def username_inputs(events: Sequence[RecordingEvent]) -> list[InputEvent]:
-    """Entradas que o compilador vai tratar como o usuário do login, ainda com valor.
+def irreversible_click(element: ElementDescriptor | None) -> bool:
+    """Botão, link ou item de menu cujo texto tem um verbo irreversível."""
+    if element is None:
+        return False
+    is_control = element.role == "menuitem" or clickable(element)
+    return is_control and irreversible_verb(action_label(element)) is not None
 
-    É a regra de ``mark_username``: o último passo antes de digitar uma senha é
-    digitar um campo de texto (não senha nem código) da mesma página. Edições
-    seguidas do mesmo campo são um passo só; Tab, cliques que só focam um
-    campo e outras ações que não viram passo não separam o usuário da senha.
+
+def submit_after(events: Sequence[RecordingEvent], position: int) -> ClickEvent | None:
+    """O clique que envia o campo do evento em ``position`` (a senha, por exemplo).
+
+    É a primeira ação seguinte que não é editar o mesmo campo de novo, Tab ou um
+    clique que só foca um campo, no mesmo documento. Um Enter só leva ao botão
+    quando o formulário o aciona em seguida (o clique de envio implícito); sem
+    clique assim (o próprio Enter enviou, outra ação, outra página, fim da
+    gravação), não há botão.
+    """
+    current = events[position]
+    if not isinstance(current, InputEvent):
+        return None
+    key = field_key(current.page_id, current.element)
+    entered = False
+    for event in events[position + 1 :]:
+        if isinstance(event, NavigationEvent) and event.main_frame:
+            return None
+        if event.type not in USER_ACTION_TYPES:
+            continue
+        if entered and not (isinstance(event, ClickEvent) and event.detail == 0):
+            return None
+        if isinstance(event, InputEvent) and field_key(event.page_id, event.element) == key:
+            continue
+        if isinstance(event, KeyEvent) and event.key == "Tab":
+            continue
+        if isinstance(event, KeyEvent) and event.key == "Enter":
+            entered = True
+            continue
+        if isinstance(event, ClickEvent):
+            if focus_only(event.element):
+                continue
+            return event
+        return None
+    return None
+
+
+@dataclass(frozen=True)
+class LoginInputs:
+    """Campos de texto que ficam antes de uma senha na gravação."""
+
+    #: Os que o compilador trata como o usuário do login e que ainda têm valor.
+    usernames: list[InputEvent]
+    #: Os que ficam antes de uma senha de transação (ou de uma senha enviada por um
+    #: botão irreversível): saem da gravação, mas não viram o usuário do cofre.
+    hidden: list[InputEvent]
+
+
+@dataclass
+class _Step:
+    """Um passo que o compilador vai fazer, na simulação de ``login_inputs``."""
+
+    #: "fill" (digitar), "bridge" (clique ou Enter que não separa usuário e senha
+    #: numa SPA) ou "other" (qualquer outro passo).
+    kind: str
+    key: tuple[Any, ...] | None = None
+    inputs: list[InputEvent] = field(default_factory=list)
+
+
+def _username_chain(steps: Sequence[_Step], password_key: tuple[Any, ...]) -> list[InputEvent]:
+    """Entradas do campo que é o usuário da senha que vem depois de ``steps``.
+
+    O último passo antes da senha digita um campo de texto (não senha nem código)
+    diferente da senha. Se entre os dois houve só cliques sem verbo irreversível
+    ou Enter (login em duas etapas de uma SPA: "Continuar" mostra a senha), o
+    campo também precisa ser o primeiro preenchido no documento.
+    """
+    position = len(steps) - 1
+    bridged = False
+    while position >= 0 and steps[position].kind == "bridge":
+        bridged = True
+        position -= 1
+    if position < 0 or steps[position].kind != "fill":
+        return []
+    candidate = steps[position]
+    first = candidate.inputs[0].element
+    if (
+        candidate.key == password_key
+        or is_password_field(first)
+        or first.is_one_time_code
+        or not is_text_field(first)
+    ):
+        return []
+    if not bridged:
+        return list(candidate.inputs)
+    chain = list(candidate.inputs)
+    for step in reversed(steps[:position]):
+        if step.kind == "bridge":
+            continue
+        if step.kind == "fill" and step.key == candidate.key:
+            chain = step.inputs + chain
+            continue
+        return []
+    return chain
+
+
+def login_inputs(events: Sequence[RecordingEvent]) -> LoginInputs:
+    """Usuários de login (ainda com valor) e campos antes de senhas de transação.
+
+    É a regra de ``mark_username`` do compilador, repetida sobre os eventos:
+    edições seguidas do mesmo campo são um passo só; Tab, cliques que só focam um
+    campo e outras ações que não viram passo não separam o usuário da senha; um
+    clique sem verbo irreversível ou um Enter separam, mas ainda valem quando o
+    campo foi o primeiro preenchido na página (login em duas etapas). Quando a
+    senha é de transação ou vai num botão irreversível, o campo vai para
+    ``hidden`` (a não ser que a página o declare como usuário no ``autocomplete``).
     """
     popup_triggers = {
         e.trigger_index
         for e in events
         if isinstance(e, NavigationEvent) and e.main_frame and e.cause is NavigationCause.POPUP
     }
-    found: list[InputEvent] = []
+    usernames: list[InputEvent] = []
+    hidden: list[InputEvent] = []
     navigated = False
-    document: int | None = None
-    #: Entradas do último passo, quando ele é de digitar (edições seguidas de um campo).
-    run: list[InputEvent] = []
-    run_document: int | None = None
-    for event in events:
+    #: Passos do documento atual (desde a última navegação do quadro principal).
+    steps: list[_Step] = []
+    for position, event in enumerate(events):
         if isinstance(event, NavigationEvent):
             if event.main_frame:
                 navigated = True
-                document = event.index
+                steps = []
             continue
         if event.type not in USER_ACTION_TYPES or not navigated:
             continue
         if isinstance(event, KeyEvent):
-            if event.key != "Tab" and not (event.key == "Enter" and clickable(event.element)):
-                run = []
+            if event.key == "Tab":
+                continue
+            steps.append(_Step("bridge" if event.key == "Enter" else "other"))
             continue
         if isinstance(event, ClickEvent):
-            if not focus_only(event.element) and event.index not in popup_triggers:
-                run = []
+            if focus_only(event.element) or event.index in popup_triggers:
+                continue
+            steps.append(_Step("other" if irreversible_click(event.element) else "bridge"))
             continue
         if isinstance(event, SelectEvent) and not event.label:
             continue  # sem rótulo da opção o compilador não faz passo
         if not isinstance(event, InputEvent):
-            run = []
+            steps.append(_Step("other"))
             continue
         element = event.element
         key = field_key(event.page_id, element)
         if is_password_field(element):
-            first = run[0].element if run else None
-            if (
-                first is not None
-                and run_document == document
-                and not first.sensitive
-                and not is_password_field(first)
-                and not first.is_one_time_code
-                and is_text_field(first)
-                and field_key(run[0].page_id, first) != key
-            ):
-                found.extend(e for e in run if not e.element.sensitive)
+            chain = _username_chain(steps, key)
+            transaction = bool(chain) and (
+                is_transaction_secret(element)
+                or irreversible_click(_element(submit_after(events, position)))
+            )
+            for entry in chain:
+                if transaction and not declared_username(entry.element):
+                    hidden.append(entry)
+                elif not entry.element.sensitive:
+                    usernames.append(entry)
         elif not element.sensitive and event.value is None:
             continue  # o compilador não faz passo sem o valor
-        if run and field_key(run[0].page_id, run[0].element) == key:
-            run.append(event)
+        last = steps[-1] if steps else None
+        if last is not None and last.kind == "fill" and last.key == key:
+            last.inputs.append(event)
         else:
-            run = [event]
-            run_document = document
-    return found
+            steps.append(_Step("fill", key, [event]))
+    return LoginInputs(usernames=usernames, hidden=hidden)
+
+
+def _element(event: ClickEvent | None) -> ElementDescriptor | None:
+    return event.element if event is not None else None
+
+
+def username_inputs(events: Sequence[RecordingEvent]) -> list[InputEvent]:
+    """Entradas que o compilador vai tratar como o usuário do login, ainda com valor."""
+    return login_inputs(events).usernames

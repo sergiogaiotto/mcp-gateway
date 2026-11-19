@@ -36,7 +36,7 @@ from rapa.recorder.models import (
     Recording,
     RowInfo,
 )
-from rapa.recorder.sensitivity import field_key, username_inputs
+from rapa.recorder.sensitivity import field_key, login_inputs, username_inputs
 from tests.compiler.builders import (
     BASE,
     LOGIN_FORM,
@@ -790,12 +790,54 @@ def _username_scenarios() -> dict[str, Recording]:
     rec.fill(password(), None)
     scenarios["editado_com_tab"] = rec.build()
 
+    # Login em duas etapas na mesma página (SPA): a senha só aparece depois do
+    # "Continuar" ou do Enter no campo do usuário.
     rec = RecordingBuilder()
     rec.navigate("/login")
     rec.fill(usuario, "ana.souza")
     rec.click(button("Continuar"))
     rec.fill(password(), None)
     scenarios["clique_entre"] = rec.build()
+
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(usuario, "ana")
+    rec.key("Enter", usuario)
+    rec.fill(usuario, "ana.souza")
+    rec.key("Enter", usuario)
+    rec.fill(password(), None)
+    scenarios["enter_entre"] = rec.build()
+
+    # Na segunda etapa, só vale o primeiro campo preenchido na página.
+    rec = RecordingBuilder()
+    rec.navigate("/transferencia")
+    rec.fill(textbox("Chave Pix", id="chave"), "ana@exemplo.com.br")
+    rec.fill(textbox("Descrição", id="descricao"), "aluguel")
+    rec.click(button("Continuar"))
+    rec.fill(password(), None)
+    scenarios["clique_depois_de_outro_campo"] = rec.build()
+
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(usuario, "ana.souza")
+    rec.click(button("Enviar código"))
+    rec.fill(password(), None)
+    scenarios["verbo_entre"] = rec.build()
+
+    rec = RecordingBuilder()
+    rec.navigate("/pix")
+    rec.fill(textbox("Valor", id="valor"), "1250,00")
+    rec.fill(textbox("Senha de transação", id="senha_tx"), "4829")
+    scenarios["senha_de_transacao"] = rec.build()
+
+    # O Enter enviou o login; o "Excluir" bem depois, na mesma página, não é o envio.
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(usuario, "ana.souza")
+    rec.fill(password(), None)
+    rec.key("Enter", password())
+    rec.click(button("Excluir rascunho"))
+    scenarios["enter_envia_o_login"] = rec.build()
 
     rec = RecordingBuilder()
     rec.navigate("/busca")
@@ -853,10 +895,21 @@ def test_recorder_username_rule_matches_the_compiler(name: str) -> None:
                 compiled.add(field_key(event.page_id, event.element))
     found = username_inputs(recording.events)
     assert {field_key(e.page_id, e.element) for e in found} == compiled
-    expected = {"direto", "editado_com_tab", "textarea", "senha_em_campo_de_texto"}
+    expected = {
+        "direto",
+        "editado_com_tab",
+        "textarea",
+        "senha_em_campo_de_texto",
+        "clique_entre",
+        "enter_entre",
+        "enter_envia_o_login",
+    }
     assert bool(compiled) is (name in expected)
-    if name == "editado_com_tab":
+    if name in ("editado_com_tab", "enter_entre"):
         assert [e.value for e in found] == ["ana", "ana.souza"]
+    # O que fica antes de uma senha de transação some da gravação sem virar usuário.
+    hidden = login_inputs(recording.events).hidden
+    assert [e.element.id for e in hidden] == (["valor"] if name == "senha_de_transacao" else [])
 
 
 # -- efeito de campos editados mais de uma vez ou deixados com Tab --------------
@@ -934,3 +987,277 @@ def test_write_after_the_second_click_of_a_double_click_counts() -> None:
     result = compile_(rec.build())
     assert [s.kind for s in steps(result)] == ["navigate", "click"]
     assert step(result, "clicar_ok").effect is Effect.WRITE
+
+
+# -- confirmação de transação nunca é login ---------------------------------------
+
+PAY_FORM = FormInfo(action=f"{BASE}/pagar", method="post", has_password=True, text_fields=1)
+
+
+def _confirmation(secret: ElementDescriptor, button_label: str) -> CompileResult:
+    rec = RecordingBuilder()
+    rec.navigate("/boletos")
+    rec.page_text("Pagamento de boleto")
+    rec.fill(secret, "482913")
+    click = rec.click(button(button_label, id="ok", form=PAY_FORM))
+    rec.request("POST", "/pagar")
+    rec.navigate("/comprovante", cause=NavigationCause.CLICK, trigger=click)
+    rec.page_text("Comprovante")
+    return compile_(rec.build())
+
+
+@pytest.mark.parametrize(
+    "button_label", ["Confirmar pagamento", "Autorizar", "Assinar", "Emitir", "Transferir"]
+)
+@pytest.mark.parametrize(
+    "secret",
+    [
+        textbox("Senha de transação", id="segredo", form=PAY_FORM),
+        textbox("PIN", input_type="tel", id="segredo", form=PAY_FORM),
+        # Como o script marca um campo de texto mascarado por CSS.
+        textbox(
+            "Assinatura eletrônica", id="segredo", form=PAY_FORM, is_password=True, sensitive=True
+        ),
+        password("Senha", id="segredo", form=PAY_FORM),
+    ],
+    ids=["senha-de-transacao", "pin", "assinatura-mascarada", "senha"],
+)
+def test_irreversible_confirmation_is_never_authentication(
+    secret: ElementDescriptor, button_label: str
+) -> None:
+    result = _confirmation(secret, button_label)
+    click = next(s for s in steps(result) if isinstance(s, ClickStep))
+    assert click.effect is Effect.IRREVERSIBLE
+    assert result.manifest.effect() is Effect.IRREVERSIBLE
+    assert "482913" not in result.model_dump_json()
+
+
+def test_username_and_password_before_an_irreversible_button_is_not_login() -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/assinar")
+    rec.fill(textbox("Usuário", id="usuario", form=LOGIN_FORM), "ana.souza")
+    rec.fill(password(), None)
+    rec.click(button("Assinar contrato", form=LOGIN_FORM))
+    rec.request("POST", "/assinar")
+    result = compile_(rec.build())
+    assert step(result, "clicar_assinar_contrato").effect is Effect.IRREVERSIBLE
+    assert "ana.souza" not in result.model_dump_json()
+
+
+def test_field_before_a_transaction_pin_is_not_the_username() -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/pix")
+    rec.fill(textbox("Valor", id="valor", form=PAY_FORM), "1250,00")
+    rec.fill(textbox("PIN", input_type="tel", id="pin", form=PAY_FORM), "4829")
+    rec.click(button("OK", id="ok", form=PAY_FORM))
+    rec.request("POST", "/pix")
+    recording = rec.build()
+    result = compile_(recording)
+    valor = step(result, "digitar_valor")
+    assert isinstance(valor, FillStep)
+    # Nem o usuário do cofre (que seria digitado no valor) nem o valor gravado: uma entrada.
+    assert valor.value == TextValue(template="{{ inputs.valor }}")
+    assert [(f.name, f.required) for f in result.manifest.inputs] == [("valor", True)]
+    pin = step(result, "digitar_pin")
+    assert isinstance(pin, FillStep) and isinstance(pin.value, SecretValue)
+    # Senha de transação não é login: o clique que grava continua gravando.
+    assert step(result, "clicar_ok").effect is Effect.WRITE
+    dumped = result.model_dump_json()
+    assert "4829" not in dumped and "1250,00" not in dumped
+    # O gravador esconde o mesmo campo, sem chamá-lo de usuário.
+    found = login_inputs(recording.events)
+    assert found.usernames == []
+    assert [e.element.id for e in found.hidden] == ["valor"]
+
+
+def test_field_before_a_password_and_an_irreversible_button_is_not_the_username() -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/transferencia")
+    rec.fill(textbox("Valor", id="valor", form=PAY_FORM), "1250,00")
+    senha = password("Senha", id="senha", form=PAY_FORM)
+    rec.fill(senha, None)
+    rec.key("Tab", senha)
+    rec.click(button("Transferir", id="ok", form=PAY_FORM))
+    rec.request("POST", "/transferencia")
+    recording = rec.build()
+    result = compile_(recording)
+    valor = step(result, "digitar_valor")
+    assert isinstance(valor, FillStep)
+    assert valor.value == TextValue(template="{{ inputs.valor }}")
+    assert step(result, "clicar_transferir").effect is Effect.IRREVERSIBLE
+    found = login_inputs(recording.events)
+    assert found.usernames == []
+    assert [e.element.id for e in found.hidden] == ["valor"]
+
+
+def _login(
+    button_label: str = "Entrar", *, username: bool = True, wrote_before: bool = False
+) -> CompileResult:
+    rec = RecordingBuilder()
+    if wrote_before:
+        rec.navigate("/cadastro")
+        rec.click(button("Gravar"))
+        rec.request("POST", "/cadastro")
+    rec.navigate("/login")
+    if username:
+        rec.fill(textbox("Usuário", id="usuario", form=LOGIN_FORM), "ana.souza")
+    rec.fill(password(), None)
+    click = rec.click(button(button_label, id="entrar", form=LOGIN_FORM))
+    rec.request("POST", "/login")
+    rec.navigate("/inicio", cause=NavigationCause.CLICK, trigger=click)
+    return compile_(rec.build())
+
+
+@pytest.mark.parametrize("label", ["Entrar", "Acessar", "Login", "Continuar", "OK"])
+def test_login_with_username_password_and_a_login_button_is_read(label: str) -> None:
+    result = _login(label)
+    click = steps(result)[-1]
+    assert isinstance(click, ClickStep) and click.effect is Effect.READ
+
+
+def test_login_needs_username_password_and_a_login_button() -> None:
+    # Sem usuário, com um botão que não é de login ou depois de gravar: não é login.
+    assert step(_login(username=False), "clicar_entrar").effect is Effect.WRITE
+    assert step(_login("Salvar"), "clicar_salvar").effect is Effect.WRITE
+    assert step(_login(wrote_before=True), "clicar_entrar").effect is Effect.WRITE
+
+
+def test_enter_in_the_password_field_of_a_login_is_read() -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(textbox("Usuário", id="usuario", form=LOGIN_FORM), "ana.souza")
+    senha = password(id="senha")
+    rec.fill(senha, None)
+    enter = rec.key("Enter", senha)
+    rec.request("POST", "/login")
+    rec.navigate("/inicio", cause=NavigationCause.KEY, trigger=enter)
+    result = compile_(rec.build())
+    assert step(result, "pressionar_enter").effect is Effect.READ
+
+
+# -- requisição feita enquanto a pessoa edita o campo (salvamento com atraso) -----
+
+
+def test_write_while_the_field_is_being_edited_counts_for_the_field() -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(textbox("Usuário", id="usuario", form=LOGIN_FORM), "ana.souza")
+    rec.fill(password(), None)
+    click = rec.click(button("Entrar", form=LOGIN_FORM))
+    rec.request("POST", "/login")
+    rec.navigate("/cadastro", cause=NavigationCause.CLICK, trigger=click)
+    started = rec.page_text("Cadastro")  # a pessoa começa a digitar depois disto
+    rec.request("POST", "/api/rascunho", "fetch")  # salvamento com atraso, antes do valor
+    observacao = textbox("Observação", id="obs")
+    rec.fill(observacao, "abc", editing_since=started)
+    rec.key("Tab", observacao)
+    rec.click(button("Voltar"))
+    result = compile_(rec.build())
+    assert step(result, "clicar_entrar").effect is Effect.READ
+    assert step(result, "digitar_observacao").effect is Effect.WRITE
+    assert result.manifest.effect() is Effect.WRITE
+
+
+def test_write_on_the_first_page_while_editing_counts_for_the_field() -> None:
+    rec = RecordingBuilder()
+    started = rec.navigate("/cadastro")
+    rec.request("POST", "/api/rascunho", "fetch")
+    rec.fill(textbox("Observação", id="obs"), "abc", editing_since=started)
+    result = compile_(rec.build())
+    assert step(result, "digitar_observacao").effect is Effect.WRITE
+
+
+def test_requests_before_the_edit_or_the_page_do_not_count_for_the_field() -> None:
+    rec = RecordingBuilder()
+    first = rec.navigate("/inicio")
+    click = rec.click(button("Novo cadastro"))
+    rec.request("POST", "/api/cadastro")  # do clique, antes da página nova
+    rec.navigate("/cadastro", cause=NavigationCause.CLICK, trigger=click)
+    rec.request("POST", "/api/visita", "fetch")  # bem antes de a pessoa começar a digitar
+    rec.wait(1000)
+    started = rec.page_text("Cadastro")
+    rec.fill(textbox("Nome", id="nome"), "Ana", editing_since=started)
+    # Começo informado antes da ação anterior: só vale o que veio depois dela.
+    rec.fill(textbox("Cidade", id="cidade"), "Recife", editing_since=first)
+    result = compile_(rec.build())
+    assert step(result, "clicar_novo_cadastro").effect is Effect.WRITE
+    assert step(result, "digitar_nome").effect is Effect.READ
+    assert step(result, "digitar_cidade").effect is Effect.READ
+
+
+def test_requests_of_the_navigation_to_the_page_do_not_count_for_the_field() -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(textbox("Usuário", id="usuario", form=LOGIN_FORM), "ana.souza")
+    rec.fill(password(), None)
+    click = rec.click(button("Entrar", form=LOGIN_FORM))
+    started = rec.request("POST", "/login")
+    rec.navigate("/codigo", cause=NavigationCause.CLICK, trigger=click)
+    # O começo da edição chegou antes da navegação: o POST do login não é do código.
+    rec.fill(otp(), None, editing_since=started)
+    rec.click(button("Confirmar", form=otp().form))
+    result = compile_(rec.build())
+    assert step(result, "digitar_codigo_de_verificacao").effect is Effect.READ
+    assert step(result, "clicar_confirmar").effect is Effect.READ
+    assert result.manifest.effect() is Effect.READ
+
+
+# -- verificação só com o que a própria ação mostrou -------------------------------
+
+
+@pytest.mark.parametrize("variant", ["single", "double", "tab"])
+def test_assert_after_a_field_ignores_headings_of_the_next_action(variant: str) -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/cadastro")
+    rec.page_text("Cadastro")
+    observacao = textbox("Observação", id="obs")
+    if variant == "double":
+        rec.fill(observacao, "a")
+    rec.fill(observacao, "abc")
+    if variant == "tab":
+        rec.key("Tab", observacao)
+    rec.request("POST", "/api/rascunho", "fetch")
+    click = rec.click(button("Salvar", id="salvar"))
+    rec.request("POST", "/api/salvar", "fetch")
+    rec.page_text("Cadastro", "Registro salvo", after=click)
+    result = compile_(rec.build())
+    assert [(s.id, s.kind) for s in steps(result)] == [
+        ("abrir_cadastro", "navigate"),
+        ("digitar_observacao", "fill"),
+        ("clicar_salvar", "click"),
+        ("conferir_registro_salvo", "assert"),
+    ]
+    assert step(result, "digitar_observacao").effect is Effect.WRITE
+
+
+def test_assert_after_a_login_field_does_not_jump_over_the_password() -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.page_text("Portal")
+    cpf = textbox("CPF", id="cpf", form=LOGIN_FORM)
+    rec.fill(cpf, "12345678900")
+    rec.key("Tab", cpf)
+    rec.request("POST", "/api/cpf/verificar", "xhr")
+    rec.fill(password(id="senha"), None)
+    click = rec.click(button("Entrar", id="entrar", form=LOGIN_FORM))
+    rec.request("POST", "/api/login", "xhr")
+    rec.page_text("Portal", "Início", after=click)
+    result = compile_(rec.build())
+    assert [s.kind for s in steps(result)] == ["navigate", "fill", "fill", "click", "assert"]
+    assert "12345678900" not in result.model_dump_json()
+
+
+def test_assert_after_a_navigation_ignores_headings_of_the_next_action() -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/protocolo")
+    rec.page_text("Emitir protocolo")
+    click = rec.click(button("Emitir"))
+    rec.request("POST", "/protocolo")
+    result_nav = rec.navigate("/resultado", cause=NavigationCause.CLICK, trigger=click)
+    rec.page_text("Emitir protocolo", navigation=result_nav)
+    detalhar = rec.click(button("Detalhar"))
+    rec.page_text(
+        "Emitir protocolo", "Detalhes do protocolo", navigation=result_nav, after=detalhar
+    )
+    result = compile_(rec.build())
+    assert not any(isinstance(s, AssertStep) for s in steps(result))

@@ -179,6 +179,10 @@ class InputEvent(_EventBase):
     typed: str | None = Field(default=None, max_length=4000)
     #: A página alterou o valor por script durante a digitação (máscara).
     script_modified: bool = False
+    #: Quando a pessoa começou a editar o campo, no mesmo relógio de ``t_ms`` (None se
+    #: o script não soube). O valor só sai quando ela deixa o campo; as requisições
+    #: feitas enquanto ela digitava (salvamento automático) contam no efeito do passo.
+    editing_since_ms: float | None = Field(default=None, ge=0)
 
 
 class SelectEvent(_EventBase):

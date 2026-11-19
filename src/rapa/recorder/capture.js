@@ -3,8 +3,9 @@
 //
 // Regras: só eventos confiáveis (isTrusted); nunca envia o valor de campos de
 // senha (inclusive campo de texto mascarado por CSS ou com rótulo de senha),
-// código de uso único ou usuário de login (com ou sem <form>); o valor final de
-// cada campo sai no change/blur (ou antes da próxima ação).
+// código de uso único, usuário de login (com ou sem <form>) ou do campo logo
+// antes de uma senha de transação; o valor final de cada campo sai no
+// change/blur (ou antes da próxima ação), com há quanto tempo a edição começou.
 (() => {
   'use strict';
   const CONFIG = __RAPA_CONFIG__;
@@ -17,6 +18,10 @@
   const MAX_TEXT = 300;
   const MAX_NAME = 300;
   const MAX_SCAN = 6000;
+  // Relógio guardado antes dos scripts da página (que podem trocar o performance.now).
+  const clock = (() => {
+    try { const p = W.performance; const now = p.now.bind(p); now(); return now; } catch (e) { return Date.now; }
+  })();
 
   // -- canal com o Python -----------------------------------------------------
 
@@ -259,6 +264,30 @@
 
   const isPassword = (el) => el.tagName === 'INPUT' && (inputType(el) === 'password' || isPasswordLikeText(el));
 
+  // Senha de transação (PIN, assinatura eletrônica, senha de pagamento) e verbos
+  // irreversíveis: as mesmas regras de rapa/recorder/sensitivity.py.
+  const TRANSACTION_WORDS = /transac|transfer|assinatura|assinar|autoriza|pagamento|operac|cartao|(?:^|[^a-z0-9])pin(?:[^a-z0-9]|$)/;
+  const IRREVERSIBLE = /\b(emitir|emita|enviar|envie|transmitir|transmita|pagar|pague|confirmar pagamento|confirmar transferencia|transferir|transfira|excluir|exclua|apagar|apague|assinar|assine|finalizar|finalize|concluir|conclua|protocolar|protocole|autorizar|autorize|aprovar|aprove|solicitar|solicite|cancelar|cancele)\b/;
+  const verbText = (s) => norm(s).normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+
+  const isTransactionSecret = (el) => [
+    labelText(el), accessibleName(el, roleOf(el)), el.getAttribute('placeholder'),
+    el.getAttribute('title'), el.getAttribute('name'), el.id,
+  ].some((s) => { const t = plainWords(s); return !!t && TRANSACTION_WORDS.test(t); });
+
+  // O botão padrão do formulário (o que o Enter aciona) tem verbo irreversível.
+  const irreversibleSubmit = (el) => {
+    const form = formOf(el);
+    if (!form) return false;
+    for (const f of Array.from(form.elements)) {
+      const type = f.tagName === 'BUTTON' ? String(f.type || 'submit').toLowerCase() : inputType(f);
+      if (type !== 'submit' && !(f.tagName === 'INPUT' && type === 'image')) continue;
+      const text = accessibleName(f, roleOf(f)) || norm(f.textContent);
+      return IRREVERSIBLE.test(verbText(text));
+    }
+    return false;
+  };
+
   const isTextLike = (el) => (el.tagName === 'INPUT' && TEXT_TYPES.has(inputType(el))) || el.tagName === 'TEXTAREA';
 
   const formOf = (el) => el.form || (el.closest ? el.closest('form') : null);
@@ -281,15 +310,20 @@
     return all.filter((f) => isTextLike(f) || isPassword(f));
   };
 
-  const isUsername = (el) => {
-    if (!isTextLike(el) || el.tagName === 'TEXTAREA' || isOneTimeCode(el)) return false;
+  // 'username': o usuário do login; 'hidden': o campo antes de uma senha de
+  // transação (ou de uma senha num formulário com botão irreversível), que não
+  // vai na gravação mas também não é o usuário; null: campo comum.
+  const loginRole = (el) => {
+    if (!isTextLike(el) || el.tagName === 'TEXTAREA' || isOneTimeCode(el)) return null;
     const ac = norm(el.getAttribute('autocomplete')).toLowerCase().split(' ');
-    if (ac.indexOf('username') >= 0) return true;
+    if (ac.indexOf('username') >= 0) return 'username';
     const fields = groupFields(el);
     const firstPassword = fields.findIndex(isPassword);
-    if (firstPassword <= 0 || fields.filter((f) => isTextLike(f) && !isPassword(f)).length > 3) return false;
+    if (firstPassword <= 0 || fields.filter((f) => isTextLike(f) && !isPassword(f)).length > 3) return null;
     // Só o campo de texto imediatamente antes da primeira senha.
-    return fields[firstPassword - 1] === el;
+    if (fields[firstPassword - 1] !== el) return null;
+    const password = fields[firstPassword];
+    return isTransactionSecret(password) || irreversibleSubmit(password) ? 'hidden' : 'username';
   };
 
   // -- seletores ---------------------------------------------------------------
@@ -414,22 +448,81 @@
 
   // -- linha de tabela ----------------------------------------------------------
 
+  // Texto de um elemento como o Playwright o compara em getByText: o texto do DOM
+  // (textContent, sem script e estilo, com o valor de botões <input> e o shadow
+  // root), sem U+200B e U+00AD e com os brancos juntados. Não é o innerText, que
+  // passa pelo CSS (text-transform, elementos escondidos, <br>).
+  const SKIP_TEXT = new Set(['SCRIPT', 'NOSCRIPT', 'STYLE']);
+  const pwNormalize = (s) => String(s).replace(/[\u200b\u00ad]/g, '').trim().replace(/\s+/g, ' ');
+  const domText = (node, cache, depth) => {
+    let out = cache.get(node);
+    if (out !== undefined) return out;
+    out = '';
+    if (node.nodeType === 1 && SKIP_TEXT.has(node.nodeName)) {
+      out = '';
+    } else if (node.nodeType === 1 && node.tagName === 'INPUT' && ['submit', 'button', 'reset'].indexOf(node.type) >= 0) {
+      out = String(node.value);
+    } else if (depth < 60) {
+      for (let child = node.firstChild; child; child = child.nextSibling) {
+        if (child.nodeType === 3) out += child.nodeValue || '';
+        else if (child.nodeType === 1) out += domText(child, cache, depth + 1);
+      }
+      if (node.shadowRoot) out += domText(node.shadowRoot, cache, depth + 1);
+    }
+    cache.set(node, out);
+    return out;
+  };
+
+  // Chave da linha: o texto de uma célula que, comparado inteiro e com maiúsculas
+  // (como o executor compara), só aparece numa linha visível do documento.
+  const rowKey = (row, cells) => {
+    const root = row.getRootNode ? row.getRootNode() : row.ownerDocument;
+    const rows = scan(root, 'tr, [role=row]');
+    if (!rows) return null;
+    const visible = rows.filter((r) => roleOf(r) === 'row' && !hiddenForAria(r));
+    if (visible.indexOf(row) < 0) return null;
+    let budget = MAX_SCAN;
+    const inside = new Map();
+    for (const r of visible) {
+      const all = r.querySelectorAll('*');
+      budget -= all.length;
+      if (budget < 0) return null;
+      inside.set(r, all);
+    }
+    const cache = new Map();
+    const normalized = new Map();
+    const textOf = (node) => {
+      let t = normalized.get(node);
+      if (t === undefined) { t = pwNormalize(domText(node, cache, 0)); normalized.set(node, t); }
+      return t;
+    };
+    for (const cell of cells) {
+      const key = textOf(cell);
+      if (key.length < 2 || key.length >= 200) continue;
+      let hits = 0;
+      let mine = false;
+      for (const r of visible) {
+        let found = false;
+        for (const child of inside.get(r)) {
+          if (textOf(child) === key) { found = true; break; }
+        }
+        if (!found) continue;
+        hits += 1;
+        if (r === row) mine = true;
+        if (hits > 1) break;
+      }
+      if (hits === 1 && mine) return key;
+    }
+    return null;
+  };
+
   const rowInfo = (el, role, name, text) => {
     const row = el.closest('tr, [role=row]');
     if (!row) return null;
-    const table = row.closest('table, [role=table], [role=grid], [role=treegrid]');
-    const cells = Array.from(row.querySelectorAll('td, th, [role=cell], [role=gridcell], [role=rowheader], [role=columnheader]'))
-      .slice(0, 20).map((c) => clip(c.innerText || c.textContent, 200));
-    let key = null;
-    if (table) {
-      const rows = Array.from(table.querySelectorAll('tr, [role=row]'));
-      for (const cell of cells) {
-        if (cell.length < 2) continue;
-        const needle = cell.toLowerCase();
-        const hits = rows.filter((r) => norm(r.textContent).toLowerCase().indexOf(needle) >= 0).length;
-        if (hits === 1) { key = cell; break; }
-      }
-    }
+    const cellElements = Array.from(row.querySelectorAll('td, th, [role=cell], [role=gridcell], [role=rowheader], [role=columnheader]'))
+      .slice(0, 20);
+    const cells = cellElements.map((c) => clip(c.innerText || c.textContent, 200));
+    const key = rowKey(row, cellElements);
     return {
       text: clip(row.innerText || row.textContent, 500),
       cells,
@@ -483,7 +576,7 @@
     const type = inputType(el);
     const password = isPassword(el);
     const otp = isOneTimeCode(el);
-    const username = !password && !otp && isUsername(el);
+    const login = !password && !otp ? loginRole(el) : null;
     const isControl = tag === 'input' || tag === 'select' || tag === 'textarea';
     let text = '';
     if (!isControl) text = clip(el.innerText || el.textContent, MAX_TEXT);
@@ -508,8 +601,8 @@
       frame_path: framePath(),
       is_password: password,
       is_one_time_code: otp,
-      is_username: username,
-      sensitive: password || otp || username,
+      is_username: login === 'username',
+      sensitive: password || otp || login !== null,
       row: rowInfo(el, role, name, textForCount),
       form: formInfo(el),
       counts: {
@@ -526,7 +619,7 @@
 
   // -- máscaras e valores pendentes ---------------------------------------------
 
-  // elemento -> {session, typed, typedKnown, scriptSet, lastSent}. Uma "sessão" vai da
+  // elemento -> {session, typed, typedKnown, scriptSet, lastSent, since}. Uma "sessão" vai da
   // primeira tecla até o envio do valor; `typed` só vale se ela começou com o campo
   // vazio ou com todo o texto selecionado (substituição).
   const fields = new Map();
@@ -535,7 +628,7 @@
   const fieldState = (el) => {
     let st = fields.get(el);
     if (!st) {
-      st = { session: false, typed: '', typedKnown: true, scriptSet: false, lastSent: undefined };
+      st = { session: false, typed: '', typedKnown: true, scriptSet: false, lastSent: undefined, since: null };
       fields.set(el, st);
     }
     return st;
@@ -554,6 +647,9 @@
     st.session = true;
     st.typed = '';
     st.typedKnown = known;
+    // Começo da edição: o que a página gravar daqui até o valor sair (salvamento
+    // automático com atraso) conta no efeito do passo.
+    st.since = clock();
   };
 
   const hookValueSetter = (proto) => {
@@ -594,9 +690,13 @@
       secret: sensitive ? String(value).slice(0, MAX_VALUE) : null,
       typed: sensitive || !st.typedKnown ? null : st.typed.slice(0, MAX_VALUE),
       script_modified: sensitive ? false : st.scriptSet,
+      // Há quanto tempo a pessoa começou a editar (o gravador converte no relógio dele).
+      editing_ms: st.session && typeof st.since === 'number'
+        ? Math.max(0, Math.round(clock() - st.since)) : null,
     });
     st.lastSent = value;
     st.session = false;
+    st.since = null;
     st.typed = '';
     st.typedKnown = true;
     st.scriptSet = false;

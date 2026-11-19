@@ -7,6 +7,7 @@ import pytest
 
 from rapa.recorder import (
     REDACTED,
+    ElementDescriptor,
     Heading,
     InputEvent,
     NavigationCause,
@@ -17,6 +18,7 @@ from rapa.recorder import (
     Recording,
 )
 from rapa.recorder.recorder import redact_url
+from rapa.recorder.sensitivity import is_password_like_text
 
 
 def test_redact_url_masks_sensitive_params_and_drops_fragment() -> None:
@@ -158,3 +160,52 @@ def test_observed_texts_split_lines_and_headings() -> None:
         "Notas fiscais",
         "Consulta confirmada",
     }
+
+
+def test_secret_values_are_removed_in_any_letter_case() -> None:
+    recorder = Recorder(probe_locators=False, capture_text=False)
+    recorder._register_page(_FakePage())
+    recorder._remember_secret("ana.souza")
+    recorder._remember_secret("joão.weiß")
+    url = "https://portal.exemplo.com.br/inicio"
+    # O cabeçalho com text-transform: uppercase chega pelo innerText em maiúsculas.
+    text = "ANA.SOUZA\nOlá, Ana.Souza\nJOÃO.WEISS e joão.weiss\nana.souzas"
+    recorder._append(PageTextEvent, page_id=0, url=url, text=text, title="Ana.SOUZA")
+    event = recorder._scrub(recorder._events[0])
+    assert isinstance(event, PageTextEvent)
+    assert event.title == REDACTED
+    assert event.text == f"{REDACTED}\nOlá, {REDACTED}\n{REDACTED} e {REDACTED}\n{REDACTED}s"
+
+
+def test_recorder_never_turns_a_username_of_the_script_into_a_password() -> None:
+    recorder = Recorder(probe_locators=False, capture_text=False)
+    frame = _FakeFrame(_FakePage(), "https://portal.exemplo.com.br/login")
+    # O nome do campo fala em senha, mas o script já o marcou como usuário.
+    _send_input(
+        recorder,
+        frame,
+        "12345678900",
+        label="CPF",
+        name="Entre com seu CPF e senha",
+        name_attr="cpf_senha",
+        css="#cpf",
+        is_username=True,
+        sensitive=True,
+    )
+    (event,) = recorder._events
+    assert isinstance(event, InputEvent)
+    assert event.element.is_username and not event.element.is_password
+    assert event.value is None and "12345678900" in recorder._secret_values
+
+
+def test_password_rule_ignores_the_accessible_name_like_the_page_script() -> None:
+    def field(**kw: object) -> ElementDescriptor:
+        return ElementDescriptor.model_validate(
+            {"tag": "input", "input_type": "text", "css": "#c", **kw}
+        )
+
+    # aria-labelledby (nome acessível) fala em senha e o <label> é "CPF": o script
+    # olha o rótulo, e o gravador e o compilador também.
+    assert not is_password_like_text(field(label="CPF", name="Entre com seu CPF e senha"))
+    assert is_password_like_text(field(label="Senha", name="CPF"))
+    assert is_password_like_text(field(placeholder="Sua senha", name="Acesso"))
