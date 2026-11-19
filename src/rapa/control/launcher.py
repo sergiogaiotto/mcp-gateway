@@ -8,8 +8,10 @@ uso único com gVisor. Para cada tentativa, o lançador:
 2. inicia o worker num grupo de processos próprio e com um ambiente mínimo, sem
    as variáveis do plano de controle (URL do banco, chaves etc.);
 3. lê EVENTS.jsonl enquanto o worker roda e entrega os eventos ao banco; quando o
-   aviso de passo irreversível foi gravado, cria ``<seq>.ack`` para o worker
-   seguir (ver :class:`rapa.runner.ports.AckingEventSink`);
+   início de um passo que grava (ou o aviso de passo irreversível) foi gravado,
+   cria ``<seq>.ack`` para o worker seguir (ver
+   :class:`rapa.runner.ports.AckingEventSink`). Gravado esse início, a execução
+   nunca mais volta para a fila (ver :mod:`rapa.control.services.queue`);
 4. no fim (ou no prazo, com SIGTERM e depois SIGKILL), lê RESULT.json e o
    devolve ao despachante.
 
@@ -44,7 +46,7 @@ from rapa.control.services.dispatcher import WorkerNotStarted, failure_result
 from rapa.control.services.queue import StaleAttempt
 from rapa.core.contracts import RunnerJob
 from rapa.core.events import RunEvent
-from rapa.runner.ports import SECRET_FIELDS, ack_path, needs_ack
+from rapa.runner.ports import SECRET_FIELDS, ack_path, waits_for_ack
 from rapa.runner.result import RunResult
 
 __all__ = [
@@ -190,7 +192,7 @@ class LocalLauncherSettings:
     python: str = field(default_factory=lambda: sys.executable)
     #: Intervalo de leitura dos eventos do worker.
     poll_s: float = 0.1
-    #: Espera do worker pela confirmação do aviso de passo irreversível.
+    #: Espera do worker pela confirmação antes de cada passo que grava.
     ack_timeout_s: float = 30.0
     #: Tempo entre o SIGTERM e o SIGKILL quando o prazo acaba ou a tentativa é cancelada.
     kill_grace_s: float = 10.0
@@ -403,11 +405,13 @@ class LocalProcessLauncher:
         *,
         final: bool = False,
     ) -> None:
-        """Grava os eventos novos e confirma os avisos de passo irreversível.
+        """Grava os eventos novos e confirma o início dos passos que gravam.
 
         Gravar é idempotente (``seq``), então uma falha passageira do banco só
         adia a entrega para a próxima leitura; no fim, tenta mais algumas vezes.
-        Uma tentativa antiga (:class:`StaleAttempt`) interrompe o lançamento.
+        Só o que foi gravado é confirmado: o worker não começa um passo que grava
+        antes de o banco saber dele. Uma tentativa antiga (:class:`StaleAttempt`)
+        interrompe o lançamento.
         """
         pending.extend(await asyncio.to_thread(tail.read_new))
         if not pending:
@@ -435,7 +439,7 @@ class LocalProcessLauncher:
                 event = RunEvent.model_validate(raw)
             except ValidationError:
                 continue
-            if needs_ack(event):
+            if waits_for_ack(event):
                 await asyncio.to_thread(_write_ack, work / "ack", event.seq)
 
     @staticmethod

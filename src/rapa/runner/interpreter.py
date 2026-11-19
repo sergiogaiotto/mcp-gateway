@@ -1681,6 +1681,8 @@ class Interpreter:
         }
         if self._items:
             data["iteracao"] = self._items[-1][1]
+        if step.effect is Effect.WRITE:  # o executor espera a confirmação (ports.waits_for_ack)
+            data["grava"] = True
         if irreversible:
             data["irreversivel"] = True
         await self._emit(RunEventKind.STEP_STARTED, step.id, data)

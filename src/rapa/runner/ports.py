@@ -41,6 +41,7 @@ __all__ = [
     "ack_path",
     "needs_ack",
     "sanitize_filename",
+    "waits_for_ack",
 ]
 
 #: Campos aceitos para cada credencial no SECRETS.json.
@@ -369,18 +370,41 @@ def ack_path(ack_dir: Path, seq: int) -> Path:
 
 
 def needs_ack(event: RunEvent) -> bool:
-    """Se o evento é o aviso de início de um passo irreversível."""
+    """Se o evento é o aviso de início de um passo irreversível (``"irreversivel": true``).
+
+    O executor também espera a confirmação antes de um passo que grava; para saber
+    se um evento qualquer espera a confirmação, use :func:`waits_for_ack`.
+    """
     return event.kind is RunEventKind.STEP_STARTED and event.data.get("irreversivel") is True
 
 
-class AckingEventSink:
-    """Repassa os eventos e, antes de um passo irreversível, espera a confirmação.
+def waits_for_ack(event: RunEvent) -> bool:
+    """Se o executor espera a confirmação do plano de controle depois deste evento.
 
-    O executor avisa que vai começar um passo irreversível e só segue quando o
-    plano de controle confirma que gravou o aviso (o arquivo ``<seq>.ack`` aparece
-    em ``ack_dir``). Assim, se quem acompanha a execução cair antes de gravar o
-    aviso, o passo não acontece e a execução pode voltar para a fila sem risco de
-    gravar duas vezes. Sem confirmação no prazo, o passo falha sem ter começado.
+    Vale para o início de todo passo que grava no sistema de destino: o passo de
+    efeito ``write`` (``"grava": true``) e o aviso de passo irreversível
+    (``"irreversivel": true``). Só o valor booleano conta, e as chaves de primeiro
+    nível dos eventos nunca são mascaradas: um segredo não apaga o anúncio. A regra
+    é a mesma dos dois lados: o executor espera por estes eventos, e o lançador só
+    os confirma depois de gravá-los no banco.
+    """
+    if event.kind is not RunEventKind.STEP_STARTED:
+        return False
+    return event.data.get("grava") is True or event.data.get("irreversivel") is True
+
+
+class AckingEventSink:
+    """Repassa os eventos e, antes de cada passo que grava, espera a confirmação.
+
+    O executor anuncia que vai começar um passo que grava (``"grava": true``) ou
+    um passo irreversível (o aviso, ``"irreversivel": true``) e só segue quando o
+    plano de controle confirma que gravou o anúncio (o arquivo ``<seq>.ack``
+    aparece em ``ack_dir``). Assim, se quem acompanha a execução cair antes de
+    gravá-lo, o passo não acontece e a execução pode voltar para a fila sem risco
+    de gravar duas vezes; e, se cair depois, o banco já sabe que algo pode ter sido
+    gravado, e a execução nunca volta para a fila (ver
+    :mod:`rapa.control.services.queue`). Sem confirmação no prazo, o passo falha
+    sem ter começado.
     """
 
     def __init__(
@@ -400,16 +424,25 @@ class AckingEventSink:
 
     async def emit(self, event: RunEvent) -> None:
         await self.inner.emit(event)
-        if not needs_ack(event):
+        if not waits_for_ack(event):
             return
         marker = ack_path(self.ack_dir, event.seq)
         loop = asyncio.get_running_loop()
         give_up = loop.time() + self.timeout_s
         while not await asyncio.to_thread(marker.exists):
             if loop.time() >= give_up:
-                raise StepError(
-                    ErrorCode.SEM_CONFIRMACAO,
-                    "O plano de controle não confirmou o aviso antes do passo irreversível; "
-                    "o passo não foi executado.",
-                )
+                if needs_ack(event):
+                    message = (
+                        "O plano de controle não confirmou o aviso antes do passo irreversível; "
+                        "o passo não foi executado."
+                    )
+                else:
+                    message = (
+                        "O plano de controle não confirmou o início do passo que grava; "
+                        "o passo não foi executado."
+                    )
+                error = StepError(ErrorCode.SEM_CONFIRMACAO, message)
+                # O passo que não começou (o executor o troca pelo contêiner, se houver).
+                error.step_id = event.step_id
+                raise error
             await asyncio.sleep(self.poll_s)

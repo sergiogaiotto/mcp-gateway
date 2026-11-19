@@ -14,10 +14,10 @@ Fase 0, que não depende do AWS Outposts:
 - [x] Templates sem lógica (`rapa.core.templates`) e portão de política determinístico (`rapa.core.policy`)
 - [x] Contratos entre os módulos (`rapa.core.contracts`, `rapa.core.events`)
 - [x] Portais de teste em pt-BR (`rapa.fixtures`) com login TOTP, tabela paginada, downloads, formulário com CPF, passo irreversível e uma variante que muda o layout
-- [x] Executor sobre Playwright (`rapa.runner`), sem LLM, com confirmação do plano de controle antes de cada passo irreversível
+- [x] Executor sobre Playwright (`rapa.runner`), sem LLM, com confirmação do plano de controle antes de cada passo que grava (e do aviso de cada passo irreversível)
 - [x] Gravador da demonstração e compilador determinístico (`rapa.recorder`, `rapa.compiler`)
 - [x] Cliente do hub de LLM, sonda de capacidades e generalização assistida (`rapa.llm`)
-- [x] Plano de controle: PostgreSQL multiempresa com isolamento por linha, fila, despachante e lançador local (`rapa.control`)
+- [x] Plano de controle: PostgreSQL multiempresa com isolamento por linha, fila, despachante e lançador local (`rapa.control`); uma execução que perde o executor só volta para a fila se nenhum passo que grava tinha começado (depois de um passo que grava, falha; depois de um irreversível, fica indeterminada)
 - [x] API REST e gateway MCP com o SDK oficial (`rapa.control.api`, `rapa.control.mcp`)
 - [x] Interface em NiceGUI (`rapa.ui`)
 - [x] Montagem num serviço só (`python -m rapa.server`), cadastro pela linha de comando (`python -m rapa.control.admin`) e teste ponta a ponta: publicar pelo REST, chamar pelo MCP e pelo REST, executar no portal de teste
