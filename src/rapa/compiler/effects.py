@@ -4,11 +4,12 @@
   transferir, assinar, autorizar, excluir...) é ``irreversible``, venha antes
   dele uma senha ou não. A exceção é um link que só abriu outra página por GET
   onde a pessoa passou a preencher um formulário: isso é navegação.
-- Login é leitura, mas só pela regra conservadora de
+- Login é leitura, mas só pela regra de
   ``rapa.recorder.sensitivity.analyze_logins``: o texto inteiro do botão é de
-  login (ou é o Enter num campo de credencial), na página a pessoa só preencheu
-  credenciais e nada gravou antes no robô. Quem decide é o compilador
-  (``ActionContext.authentication``); na dúvida, o envio grava.
+  login (o Enter só conta quando aciona esse botão no mesmo ``<form>``), na
+  página a pessoa só preencheu credenciais de uma credencial e nada gravou antes
+  no robô. Quem decide é o compilador (``ActionContext.authentication``); na
+  dúvida, o envio grava.
 - Um clique (ou Enter) cujas requisições seguintes incluem um documento, XHR ou
   fetch que não é GET grava algo: efeito ``write``.
 """

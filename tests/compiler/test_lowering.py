@@ -36,7 +36,7 @@ from rapa.recorder.models import (
     Recording,
     RowInfo,
 )
-from rapa.recorder.sensitivity import field_key, login_inputs, username_inputs
+from rapa.recorder.sensitivity import field_key, secret_page_inputs
 from tests.compiler.builders import (
     BASE,
     LOGIN_FORM,
@@ -674,8 +674,11 @@ def test_password_typed_in_a_text_field_becomes_a_secret() -> None:
     rec.click_to(button("Entrar", form=form), "/inicio", method="POST")
     result = compile_(rec.build())
     conta, senha = (s for s in steps(result) if isinstance(s, FillStep))
-    assert conta.value == SecretValue(credential="portal", field="username")
+    # "Conta" não é usuário pelo próprio campo e a senha não é type=password: não é
+    # login; a conta, numa página com senha, vira uma entrada.
+    assert conta.value == TextValue(template="{{ inputs.conta }}")
     assert senha.value == SecretValue(credential="portal", field="password")
+    assert step(result, "clicar_entrar").effect is Effect.WRITE
     assert [c.kind for c in result.manifest.credentials] == [CredentialKind.PASSWORD]
     dumped = result.model_dump_json()
     assert "S3nh@Forte!" not in dumped and "12345-6" not in dumped
@@ -755,18 +758,18 @@ def test_literal_that_looks_secret_becomes_an_input_without_the_value() -> None:
     assert any("Número do cartão" in w and "entrada" in w for w in result.warnings)
 
 
-def test_secret_input_of_a_field_that_became_the_username_is_dropped() -> None:
+def test_a_field_that_looks_secret_beside_a_password_is_an_input() -> None:
     rec = RecordingBuilder()
     rec.navigate("/login")
     rec.fill(textbox("Token de acesso", id="token"), "abc-123")
     rec.fill(password(), None)
-    # O campo só vira o usuário do cofre quando o envio é de login.
+    # O campo não é usuário pelo próprio campo: nunca vira o usuário do cofre.
     rec.click(button("Entrar", id="entrar"))
     result = compile_(rec.build())
     token = steps(result)[1]
     assert isinstance(token, FillStep)
-    assert token.value == SecretValue(credential="portal", field="username")
-    assert result.manifest.inputs == []
+    assert token.value == TextValue(template="{{ inputs.token_de_acesso }}")
+    assert [(f.name, f.required) for f in result.manifest.inputs] == [("token_de_acesso", True)]
     assert "abc-123" not in result.model_dump_json()
 
 
@@ -887,36 +890,52 @@ def _username_scenarios() -> dict[str, Recording]:
 
 
 @pytest.mark.parametrize("name", list(_username_scenarios()))
-def test_recorder_username_rule_matches_the_compiler(name: str) -> None:
+def test_recorder_hides_every_value_the_compiler_does_not_keep_literal(name: str) -> None:
     recording = _username_scenarios()[name]
     result = compile_(recording)
     by_index = {e.index: e for e in recording.events}
+    found = secret_page_inputs(recording.events)
+    hidden_users = {e.index for e in found.usernames}
+    hidden = hidden_users | {e.index for e in found.others}
     compiled: set[tuple[object, ...]] = set()
     for fill in steps(result):
-        if isinstance(fill, FillStep) and fill.value == SecretValue(
-            credential="portal", field="username"
-        ):
-            event = by_index[result.provenance[fill.id]]
-            assert isinstance(event, InputEvent)
-            if not event.element.sensitive:
-                compiled.add(field_key(event.page_id, event.element))
-    found = username_inputs(recording.events)
-    assert {field_key(e.page_id, e.element) for e in found} == compiled
-    # Área de texto nunca é o usuário (o script também não a trata como usuário).
-    expected = {
-        "direto",
-        "editado_com_tab",
-        "senha_em_campo_de_texto",
-        "clique_entre",
-        "enter_entre",
-        "enter_envia_o_login",
-    }
+        if not isinstance(fill, FillStep):
+            continue
+        event = by_index[result.provenance[fill.id]]
+        assert isinstance(event, InputEvent)
+        if event.element.sensitive:
+            continue
+        if fill.value == SecretValue(credential="portal", field="username"):
+            # Só vira o usuário do cofre o que o gravador tira da gravação como usuário.
+            assert event.index in hidden_users
+            compiled.add(field_key(event.page_id, event.element))
+        elif isinstance(fill.value, TextValue) and not fill.value.template.startswith("{{"):
+            # O que fica literal no robô o gravador deixa na gravação.
+            assert event.index not in hidden
+        else:
+            # Uma entrada, ou a senha do cofre (senha em campo de texto, com o valor).
+            assert isinstance(fill.value, TextValue) or fill.value.field == "password"
+    # Usuário do cofre só num login que passa na regra: o campo de usuário, a senha
+    # de verdade e o botão de login, nessa forma (ou em duas etapas, pelo clique).
+    expected = {"direto", "editado_com_tab", "clique_entre", "senha_antes"}
     assert bool(compiled) is (name in expected)
-    if name in ("editado_com_tab", "enter_entre"):
-        assert [e.value for e in found] == ["ana", "ana.souza"]
-    # O que fica antes de uma senha de transação some da gravação sem virar usuário.
-    hidden = login_inputs(recording.events).hidden
-    assert [e.element.id for e in hidden] == (["valor"] if name == "senha_de_transacao" else [])
+    if name == "editado_com_tab":
+        assert [e.value for e in found.usernames] == ["ana", "ana.souza"]
+    # Numa página com senha, os outros campos saem da gravação sem a marca de usuário.
+    others = {
+        "clique_depois_de_outro_campo": ["chave", "descricao"],
+        "senha_de_transacao": ["valor"],
+        "textarea": ["obs"],
+    }
+    assert [e.element.id for e in found.others] == others.get(name, [])
+    users = {
+        "outra_pagina": [],
+        "senha_de_transacao": [],
+        "textarea": [],
+        "clique_depois_de_outro_campo": [],
+        "codigo_antes": [],
+    }
+    assert bool(found.usernames) is bool(users.get(name, True))
 
 
 # -- efeito de campos editados mais de uma vez ou deixados com Tab --------------
@@ -1072,9 +1091,9 @@ def test_field_before_a_transaction_pin_is_not_the_username() -> None:
     dumped = result.model_dump_json()
     assert "4829" not in dumped and "1250,00" not in dumped
     # O gravador esconde o mesmo campo, sem chamá-lo de usuário.
-    found = login_inputs(recording.events)
+    found = secret_page_inputs(recording.events)
     assert found.usernames == []
-    assert [e.element.id for e in found.hidden] == ["valor"]
+    assert [e.element.id for e in found.others] == ["valor"]
 
 
 def test_field_before_a_password_and_an_irreversible_button_is_not_the_username() -> None:
@@ -1092,9 +1111,9 @@ def test_field_before_a_password_and_an_irreversible_button_is_not_the_username(
     assert isinstance(valor, FillStep)
     assert valor.value == TextValue(template="{{ inputs.valor }}")
     assert step(result, "clicar_transferir").effect is Effect.IRREVERSIBLE
-    found = login_inputs(recording.events)
+    found = secret_page_inputs(recording.events)
     assert found.usernames == []
-    assert [e.element.id for e in found.hidden] == ["valor"]
+    assert [e.element.id for e in found.others] == ["valor"]
 
 
 def _login(
@@ -1131,17 +1150,28 @@ def test_login_needs_username_password_and_a_login_button() -> None:
     assert step(_login(wrote_before=True), "clicar_entrar").effect is Effect.WRITE
 
 
-def test_enter_in_the_password_field_of_a_login_is_read() -> None:
+@pytest.mark.parametrize("implicit_click", [True, False], ids=["clique_implicito", "so_o_enter"])
+def test_enter_in_the_password_field_is_a_login_only_through_the_button(
+    implicit_click: bool,
+) -> None:
     rec = RecordingBuilder()
     rec.navigate("/login")
     rec.fill(textbox("Usuário", id="usuario", form=LOGIN_FORM), "ana.souza")
     senha = password(id="senha")
     rec.fill(senha, None)
     enter = rec.key("Enter", senha)
+    trigger = enter
+    if implicit_click:
+        # O navegador clica no botão de envio do mesmo formulário.
+        trigger = rec.click(button("Entrar", id="entrar", form=LOGIN_FORM), detail=0)
     rec.request("POST", "/login")
-    rec.navigate("/inicio", cause=NavigationCause.KEY, trigger=enter)
+    rec.navigate("/inicio", cause=NavigationCause.KEY, trigger=trigger)
     result = compile_(rec.build())
-    assert step(result, "pressionar_enter").effect is Effect.READ
+    if implicit_click:
+        assert step(result, "clicar_entrar").effect is Effect.READ
+    else:
+        # Sem o clique do formulário, o Enter nunca é login: o POST grava.
+        assert step(result, "pressionar_enter").effect is Effect.WRITE
 
 
 # -- requisição feita enquanto a pessoa edita o campo (salvamento com atraso) -----

@@ -1,8 +1,10 @@
-"""Regra conservadora do login gravada num Chromium de verdade, e compilada.
+"""Regra do login gravada num Chromium de verdade, e compilada.
 
 As páginas são servidas pela rota do contexto: transações com senha que não são
-login, logins em duas etapas de SPA, o botão de mostrar a senha, a limpeza dos
-valores sigilosos e o campo que só o nome acessível diz ser senha.
+login (inclusive com o Enter, um "Continuar" de SPA, um código de transação ou o
+"Confirmar" do formulário do código), logins em duas etapas de SPA, o botão de
+mostrar a senha, a limpeza dos valores sigilosos (também no texto dos elementos)
+e o campo que só o ``aria-label`` ou o ``aria-labelledby`` diz ser senha.
 """
 
 import html
@@ -14,11 +16,18 @@ from playwright.async_api import Browser, Page, Route, async_playwright
 
 from rapa.compiler import CompileResult, lower
 from rapa.core import policy
-from rapa.core.robot import ClickStep, Effect, FillStep, Manifest, SecretValue, TextValue
+from rapa.core.robot import (
+    ClickStep,
+    Effect,
+    FillStep,
+    Manifest,
+    PressStep,
+    SecretValue,
+    TextValue,
+)
 from rapa.fixtures.server import HOST_RESOLVER_ARG
 from rapa.llm.generalize import build_user_prompt
 from rapa.recorder import InputEvent, Recorder, Recording
-from rapa.recorder.sensitivity import username_inputs
 
 pytestmark = pytest.mark.browser
 
@@ -112,6 +121,18 @@ def click_effect(result: CompileResult, step_id: str) -> Effect:
     found = result.manifest.step_by_id(step_id)
     assert isinstance(found, ClickStep), [s.id for s in result.manifest.steps]
     return found.effect
+
+
+def an_input(name: str) -> TextValue:
+    return TextValue(template=f"{{{{ inputs.{name} }}}}")
+
+
+def input_of(recording: Recording, name_attr: str) -> InputEvent:
+    return next(
+        e
+        for e in recording.events
+        if isinstance(e, InputEvent) and e.element.name_attr == name_attr
+    )
 
 
 def page(title: str, body: str) -> str:
@@ -301,17 +322,16 @@ async def test_a_payment_wizard_is_not_a_two_step_login(browser: Browser, with_f
         await p.get_by_role("heading", name=done).wait_for()
 
     recording = await record_site(browser, {"/pix": pix}, "/pix", scenario)
-    assert username_inputs(recording.events) == []
+    valor_event = input_of(recording, "valor")
+    assert valor_event.element.sensitive and not valor_event.element.is_username
+    assert "1250,00" not in recording.model_dump_json()
     result = compile_(recording)
     assert usernames_in(result) == []
     assert click_effect(result, "clicar_confirmar") is Effect.WRITE
     assert result.manifest.effect() is Effect.WRITE
-    valor = fill_value(result, "digitar_valor")
-    if with_form:
-        # O script tirou o valor (campo antes da senha no formulário): vira entrada.
-        assert valor == TextValue(template="{{ inputs.valor }}")
-    else:
-        assert valor == TextValue(template="1250,00")
+    # O valor estava numa página com senha (o script tira no formulário; o gravador,
+    # ao fechar, quando a senha só aparece depois): vira uma entrada.
+    assert fill_value(result, "digitar_valor") == an_input("valor")
 
 
 async def test_a_search_before_a_password_modal_is_not_the_username(browser: Browser) -> None:
@@ -344,9 +364,12 @@ async def test_a_search_before_a_password_modal_is_not_the_username(browser: Bro
         await p.get_by_role("heading", name="Nota liberada").wait_for()
 
     recording = await record_site(browser, {"/notas": notas}, "/notas", scenario)
-    assert username_inputs(recording.events) == []
+    busca = input_of(recording, "q")
+    assert busca.element.sensitive and not busca.element.is_username and busca.value is None
     result = compile_(recording)
-    assert fill_value(result, "digitar_buscar_nota") == TextValue(template="Nota 123")
+    # Na mesma página da senha: a busca vira uma entrada, nunca o usuário do cofre.
+    assert fill_value(result, "digitar_buscar_nota") == an_input("buscar_nota")
+    assert usernames_in(result) == []
     assert click_effect(result, "clicar_confirmar") is Effect.WRITE
     assert result.manifest.effect() is Effect.WRITE
 
@@ -435,8 +458,284 @@ async def test_a_field_named_like_a_password_never_reaches_the_recording(
     assert "918273" not in dumped and "12345678909" not in dumped
     inputs = {e.element.name_attr: e for e in recording.events if isinstance(e, InputEvent)}
     assert inputs["cod"].element.sensitive and not inputs["cod"].element.is_password
+    assert inputs["cpf"].element.is_username
     result = compile_(recording)
+    # Não é uma senha type=password: não é login; os dois valores viram entradas.
     cpf, cod = (s for s in result.manifest.steps if isinstance(s, FillStep))
-    assert cpf.value == SecretValue(credential="banco", field="username")
-    assert cod.value == SecretValue(credential="banco", field="password")
+    assert cpf.value == an_input("cpf")
+    assert isinstance(cod.value, TextValue) and cod.value.template.startswith("{{ inputs.")
+    assert click_effect(result, "clicar_entrar") is Effect.WRITE
+    assert result.manifest.credentials == []
+    assert "918273" not in result.model_dump_json()
+
+
+async def test_an_aria_label_of_a_password_hides_the_field_beside_aria_labelledby(
+    browser: Browser,
+) -> None:
+    entrar = page(
+        "Entrar",
+        """<h1>Portal</h1><form action="/entrar" method="post">
+<label for="cpf">CPF</label><input id="cpf" name="cpf">
+<span id="t">Código pessoal</span>
+<input id="k" name="cod" aria-labelledby="t" aria-label="Senha de 6 dígitos">
+<button>Entrar</button></form>""",
+    )
+
+    async def scenario(p: Page) -> None:
+        await p.locator("#cpf").fill("12345678909")
+        await p.locator("#k").fill("918273")
+        await p.get_by_role("button", name="Entrar").click()
+        await p.get_by_role("heading", name="Comprovante").wait_for()
+
+    recording = await record_site(browser, {"/entrar": entrar}, "/entrar", scenario)
+    dumped = recording.model_dump_json()
+    assert "918273" not in dumped and "12345678909" not in dumped
+    cod = input_of(recording, "cod")
+    assert cod.element.aria_mentions_password and cod.element.name == "Código pessoal"
+    assert cod.element.sensitive and not cod.element.is_password
+    result = compile_(recording)
+    assert fill_value(result, "digitar_cpf") == an_input("cpf")
+    assert click_effect(result, "clicar_entrar") is Effect.WRITE
+    prompt = build_user_prompt(result.manifest, result.observed_texts)
+    assert "918273" not in result.model_dump_json() and "918273" not in prompt
+    assert "12345678909" not in prompt
+
+
+# -- o Enter, um "Continuar" de SPA e códigos de transação não são login -----------
+
+#: A página paga (fetch POST) e mostra "Pix enviado".
+_PAY = (
+    "fetch('/api/pix', {method: 'POST', body: 'x'}).then(() => {"
+    "document.getElementById('ok').textContent = 'Pix enviado'; })"
+)
+
+
+@pytest.mark.parametrize("with_form", [False, True], ids=["sem_formulario", "formulario"])
+async def test_an_enter_in_the_password_of_a_transaction_is_write(
+    browser: Browser, with_form: bool
+) -> None:
+    fields = f"""<label for="v">Valor</label><input id="v" name="valor">
+<label for="s">Senha</label><input id="s" name="senha" type="password"
+  onkeydown="if (event.key === 'Enter') {{ event.preventDefault(); {_PAY} }}">
+<button type="button" onclick="{_PAY}">Pagar</button><p id="ok"></p>"""
+    body = f'<form onsubmit="return false">{fields}</form>' if with_form else f"<div>{fields}</div>"
+    pix = page("Pix", f"<h1>Pix</h1>{body}")
+
+    async def scenario(p: Page) -> None:
+        await p.get_by_label("Valor").fill("1250,00")
+        await p.get_by_label("Senha").fill(PASSWORD)
+        await p.get_by_label("Senha").press("Enter")
+        await p.get_by_text("Pix enviado").wait_for()
+
+    recording = await record_site(browser, {"/pix": pix}, "/pix", scenario)
+    assert "1250,00" not in recording.model_dump_json()
+    result = compile_(recording)
+    press = next(s for s in result.manifest.steps if isinstance(s, PressStep))
+    assert press.effect is Effect.WRITE
+    assert result.manifest.effect() is Effect.WRITE
+    assert usernames_in(result) == []
+    assert fill_value(result, "digitar_valor") == an_input("valor")
+
+
+async def test_a_continue_button_of_a_spa_after_a_value_and_a_password_is_write(
+    browser: Browser,
+) -> None:
+    pix = page(
+        "Pix",
+        f"""<h1>Pix</h1><div>
+<label for="v">Valor</label><input id="v" name="valor">
+<label for="s">Senha</label><input id="s" name="senha" type="password">
+<button type="button" onclick="{_PAY}">Continuar</button><p id="ok"></p></div>""",
+    )
+
+    async def scenario(p: Page) -> None:
+        await p.get_by_label("Valor").fill("1250,00")
+        await p.get_by_label("Senha").fill(PASSWORD)
+        await p.get_by_role("button", name="Continuar").click()
+        await p.get_by_text("Pix enviado").wait_for()
+
+    recording = await record_site(browser, {"/pix": pix}, "/pix", scenario)
+    result = compile_(recording)
+    assert click_effect(result, "clicar_continuar") is Effect.WRITE
+    assert usernames_in(result) == []
+    assert fill_value(result, "digitar_valor") == an_input("valor")
+    assert any("página que pede senha ou código" in w for w in result.warnings)
+
+
+@pytest.mark.parametrize("button", ["Continuar", "Entrar"])
+async def test_a_transaction_token_never_makes_a_login(browser: Browser, button: str) -> None:
+    pix = page(
+        "Pix",
+        f"""<h1>Pix</h1><form action="/pix" method="post">
+<label for="v">Valor</label><input id="v" name="valor">
+<label for="s">Senha</label><input id="s" name="senha" type="password">
+<label for="t">Token da transação</label><input id="t" name="token" autocomplete="one-time-code">
+<button>{button}</button></form>""",
+    )
+
+    async def scenario(p: Page) -> None:
+        await p.get_by_label("Valor").fill("1250,00")
+        await p.get_by_label("Senha").fill(PASSWORD)
+        await p.get_by_label("Token da transação").fill("123456")
+        await p.get_by_role("button", name=button).click()
+        await p.get_by_role("heading", name="Comprovante").wait_for()
+
+    recording = await record_site(browser, {"/pix": pix}, "/pix", scenario)
+    result = compile_(recording)
+    assert click_effect(result, f"clicar_{button.lower()}") is Effect.WRITE
+    assert usernames_in(result) == []
+    assert fill_value(result, "digitar_valor") == an_input("valor")
+
+
+async def test_confirm_in_the_form_of_the_code_after_a_value_and_a_password_is_write(
+    browser: Browser,
+) -> None:
+    pix = page(
+        "Pix",
+        f"""<h1>Pix</h1>
+<form id="a" onsubmit="return false"><label for="v">Valor</label><input id="v" name="valor">
+<label for="s">Senha</label><input id="s" name="senha" type="password"></form>
+<form id="b" onsubmit="{_PAY}; return false"><label for="c">Código de verificação</label>
+<input id="c" name="codigo" autocomplete="one-time-code"><button>Confirmar</button></form>
+<p id="ok"></p>""",
+    )
+
+    async def scenario(p: Page) -> None:
+        await p.get_by_label("Valor").fill("1250,00")
+        await p.get_by_label("Senha").fill(PASSWORD)
+        await p.get_by_label("Código de verificação").fill("123456")
+        await p.get_by_role("button", name="Confirmar").click()
+        await p.get_by_text("Pix enviado").wait_for()
+
+    recording = await record_site(browser, {"/pix": pix}, "/pix", scenario)
+    result = compile_(recording)
+    assert click_effect(result, "clicar_confirmar") is Effect.WRITE
+    assert usernames_in(result) == []
+    assert fill_value(result, "digitar_valor") == an_input("valor")
+
+
+async def test_a_security_code_and_confirm_is_write(browser: Browser) -> None:
+    pagar = page(
+        "Pagamento",
+        f"""<h1>Pagar com o cartão final 4242</h1><p>Total: R$ 1.250,00</p>
+<form onsubmit="{_PAY}; return false"><label for="cvv">Código de segurança</label>
+<input id="cvv" name="cvv" inputmode="numeric"><button>Confirmar</button></form>
+<p id="ok"></p>""",
+    )
+
+    async def scenario(p: Page) -> None:
+        await p.get_by_label("Código de segurança").fill("737")
+        await p.get_by_role("button", name="Confirmar").click()
+        await p.get_by_text("Pix enviado").wait_for()
+
+    recording = await record_site(browser, {"/pagar": pagar}, "/pagar", scenario)
+    result = compile_(recording)
+    assert click_effect(result, "clicar_confirmar") is Effect.WRITE
+    assert result.manifest.effect() is Effect.WRITE
+
+
+async def test_an_enter_never_bridges_a_two_step_login(browser: Browser) -> None:
+    show = "document.getElementById('s2').style.display = 'block'"
+    pix = page(
+        "Pix",
+        f"""<h1>Pix</h1><div>
+<label for="c">Chave Pix</label><input id="c" name="chave"
+  onkeydown="if (event.key === 'Enter') {{ {show} }}"></div>
+<div id="s2" style="display: none"><label for="s">Senha</label>
+<input id="s" name="senha" type="password">
+<button type="button" onclick="{_PAY}">Entrar</button><p id="ok"></p></div>""",
+    )
+
+    async def scenario(p: Page) -> None:
+        await p.get_by_label("Chave Pix").fill("ana@exemplo.com.br")
+        await p.get_by_label("Chave Pix").press("Enter")
+        await p.get_by_label("Senha").fill(PASSWORD)
+        await p.get_by_role("button", name="Entrar").click()
+        await p.get_by_text("Pix enviado").wait_for()
+
+    recording = await record_site(browser, {"/pix": pix}, "/pix", scenario)
+    chave = input_of(recording, "chave")
+    assert chave.element.sensitive and not chave.element.is_username and chave.value is None
+    result = compile_(recording)
+    assert click_effect(result, "clicar_entrar") is Effect.WRITE
+    assert result.manifest.effect() is Effect.WRITE
+    assert usernames_in(result) == []
+    assert fill_value(result, "digitar_chave_pix") == an_input("chave_pix")
+    assert "ana@exemplo.com.br" not in result.model_dump_json()
+
+
+async def test_an_enter_in_the_password_of_a_login_form_clicks_the_login_button(
+    browser: Browser,
+) -> None:
+    login = page(
+        "Entrar",
+        """<h1>Portal</h1><form action="/login" method="post">
+<label for="u">Usuário</label><input id="u" name="usuario">
+<label for="p">Senha</label><input id="p" name="senha" type="password">
+<button>Entrar</button></form>""",
+    )
+
+    async def scenario(p: Page) -> None:
+        await p.get_by_label("Usuário").fill(USER)
+        await p.get_by_label("Senha").fill(PASSWORD)
+        await p.get_by_label("Senha").press("Enter")
+        await p.get_by_role("heading", name="Comprovante").wait_for()
+
+    recording = await record_site(
+        browser, {"/login": login}, "/login", scenario, redirects={"/login": "/inicio"}
+    )
+    assert USER not in recording.model_dump_json()
+    result = compile_(recording)
+    assert not any(isinstance(s, PressStep) for s in result.manifest.steps)
     assert click_effect(result, "clicar_entrar") is Effect.READ
+    assert usernames_in(result) == ["digitar_usuario"]
+
+
+async def test_scrub_ignores_letter_case_in_the_text_of_elements_and_rows(
+    browser: Browser,
+) -> None:
+    login = page(
+        "Entrar",
+        """<h1>Portal</h1><form action="/login" method="post">
+<label for="u">Usuário</label><input id="u" name="usuario">
+<label for="p">Senha</label><input id="p" name="senha" type="password">
+<button>Entrar</button></form>""",
+    )
+    inicio = page(
+        "Início",
+        """<header><a href="/perfil" style="text-transform: uppercase">ana.souza</a></header>
+<h1>Início</h1>
+<table><tr><th>Responsável</th><th>Documento</th><th></th></tr>
+<tr><td style="text-transform: uppercase">ana.souza</td><td>NF 10</td>
+<td><button type="button" onclick="this.textContent = 'Aberto'">Abrir</button></td></tr>
+<tr><td style="text-transform: uppercase">bruno.lima</td><td>NF 11</td>
+<td><button type="button">Abrir</button></td></tr></table>""",
+    )
+
+    async def scenario(p: Page) -> None:
+        await p.get_by_label("Usuário").fill(USER)
+        await p.get_by_label("Senha").fill(PASSWORD)
+        await p.get_by_role("button", name="Entrar").click()
+        await p.get_by_role("heading", name="Início").wait_for()
+        await p.get_by_role("row").nth(1).get_by_role("button", name="Abrir").click()
+        await p.get_by_role("button", name="Aberto").wait_for()
+        await p.get_by_role("link").first.click()
+        await p.get_by_role("heading", name="Perfil").wait_for()
+
+    recording = await record_site(
+        browser,
+        {"/login": login, "/inicio": inicio, "/perfil": page("Perfil", "<h1>Perfil</h1>")},
+        "/login",
+        scenario,
+        redirects={"/login": "/inicio"},
+    )
+    dumped = recording.model_dump_json()
+    assert USER not in dumped and USER.upper() not in dumped
+    result = compile_(recording)
+    manifest = result.manifest.model_dump_json()
+    assert USER not in manifest and USER.upper() not in manifest
+    abrir = result.manifest.step_by_id("clicar_abrir")
+    assert isinstance(abrir, ClickStep) and abrir.target.snapshot is not None
+    assert "NF 10" in abrir.target.snapshot and USER.upper() not in abrir.target.snapshot
+    prompt = build_user_prompt(result.manifest, result.observed_texts)
+    assert USER not in prompt and USER.upper() not in prompt

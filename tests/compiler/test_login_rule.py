@@ -1,8 +1,9 @@
-"""Regra conservadora do login, sobre gravações montadas à mão (sem navegador).
+"""Regra do login, sobre gravações montadas à mão (sem navegador).
 
 Na dúvida o passo grava: um login tratado como gravação é aceitável, uma
 transação tratada como login (leitura, com o usuário do cofre digitado num campo
-de dado) é um defeito.
+de dado) é um defeito. O usuário só é reconhecido pelo próprio campo, e qualquer
+outro campo de uma página com senha ou código vira uma entrada obrigatória.
 """
 
 import pytest
@@ -18,7 +19,7 @@ from rapa.recorder.models import (
     NavigationCause,
     Recording,
 )
-from rapa.recorder.sensitivity import login_inputs, username_inputs
+from rapa.recorder.sensitivity import secret_page_inputs, username_by_signal
 from tests.compiler.builders import (
     BASE,
     LOGIN_FORM,
@@ -67,6 +68,10 @@ def usernames_in(result: CompileResult) -> list[str]:
     ]
 
 
+def an_input(name: str) -> TextValue:
+    return TextValue(template=f"{{{{ inputs.{name} }}}}")
+
+
 def script_username(label: str, **kw: object) -> ElementDescriptor:
     """Campo que o script da página marcou como usuário (valor fora da gravação)."""
     return textbox(label, is_username=True, sensitive=True, **kw)  # type: ignore[arg-type]
@@ -94,6 +99,9 @@ TRANSACTIONS = [
     ("Conta destino", "Confirmar compra"),
     ("Valor", "OK"),
     ("Valor", "Continuar para o pagamento"),
+    # Botões do vocabulário de login: o campo de dado não é credencial.
+    ("Valor", "Continuar"),
+    ("Chave Pix", "Entrar"),
 ]
 
 
@@ -108,18 +116,17 @@ def test_a_transaction_with_a_password_is_never_a_login(
     click = next(s for s in result.manifest.steps if isinstance(s, ClickStep))
     assert click.effect is Effect.WRITE
     assert result.manifest.effect() is Effect.WRITE
-    # O usuário do cofre nunca é digitado no campo de dado da operação.
+    # O usuário do cofre nunca é digitado no campo de dado da operação, e o valor
+    # (que o gravador tira da gravação) vira uma entrada obrigatória, com aviso.
     assert usernames_in(result) == []
     value = next(s.value for s in result.manifest.steps if isinstance(s, FillStep))
-    if marked_by_script:
-        # O valor já saiu da gravação: vira uma entrada obrigatória, com aviso.
-        assert isinstance(value, TextValue) and value.template.startswith("{{ inputs.")
-        assert [(f.required) for f in result.manifest.inputs] == [True]
-        assert any(field_label in w and "entrada" in w for w in result.warnings)
-    else:
-        assert value == TextValue(template="12345678909")
-    recording_rule = login_inputs(_rebuilt(field, button_label).events)
-    assert recording_rule.usernames == [] and recording_rule.hidden == []
+    assert isinstance(value, TextValue) and value.template.startswith("{{ inputs.")
+    assert [f.required for f in result.manifest.inputs] == [True]
+    assert any(field_label in w and "entrada" in w for w in result.warnings)
+    assert "12345678909" not in result.manifest.model_dump_json()
+    found = secret_page_inputs(_rebuilt(field, button_label).events)
+    assert found.usernames == []
+    assert [e.element.id for e in found.others] == ([] if marked_by_script else ["campo"])
 
 
 def _rebuilt(field: ElementDescriptor, button_label: str) -> Recording:
@@ -186,11 +193,12 @@ def test_any_other_button_that_sends_a_post_is_write(label: str) -> None:
     result = _login(label)
     click = next(s for s in result.manifest.steps if isinstance(s, ClickStep))
     assert click.effect is Effect.WRITE
-    # Sem login confirmado, o campo antes da senha não vira o usuário do cofre.
+    # Sem login confirmado, o campo do usuário não vira o usuário do cofre.
     assert usernames_in(result) == []
+    assert fill_value(result, "digitar_usuario") == an_input("usuario")
 
 
-def test_confirm_only_counts_for_a_one_time_code_form() -> None:
+def test_confirm_only_counts_when_only_codes_were_filled() -> None:
     rec = RecordingBuilder()
     rec.navigate("/codigo")
     rec.fill(otp(id="codigo"), None)
@@ -198,8 +206,70 @@ def test_confirm_only_counts_for_a_one_time_code_form() -> None:
     rec.request("POST", "/codigo")
     result = compile_(rec.build())
     assert step(result, "clicar_confirmar").effect is Effect.READ
-    # O mesmo botão num formulário com usuário e senha não é login.
+    # O mesmo botão depois de usuário e senha não é login.
     assert step(_login("Confirmar"), "clicar_confirmar").effect is Effect.WRITE
+
+
+@pytest.mark.parametrize("label", ["Confirmar", "Continuar", "Próximo", "Avançar", "Entrar"])
+@pytest.mark.parametrize("form", [None, OTP_FORM, LOGIN_FORM], ids=["sem_form", "codigo", "login"])
+def test_a_code_alone_is_a_login_judged_by_what_was_filled(
+    label: str, form: FormInfo | None
+) -> None:
+    # Só o código foi preenchido: vale o que a pessoa preencheu, não o formulário do botão.
+    rec = RecordingBuilder()
+    rec.navigate("/codigo")
+    rec.fill(otp(id="codigo", form=form), None)
+    rec.click(button(label, id="ok", form=form))
+    rec.request("POST", "/api/codigo", "fetch")
+    result = compile_(rec.build())
+    click = next(s for s in result.manifest.steps if isinstance(s, ClickStep))
+    assert click.effect is Effect.READ
+
+
+def test_confirm_in_the_form_of_the_code_after_a_value_and_a_password_is_write() -> None:
+    # O "Confirmar" fica no formulário que só tem o código, mas a pessoa preencheu
+    # o valor e a senha no outro formulário: vale o que foi preenchido na página.
+    rec = RecordingBuilder()
+    rec.navigate("/pix")
+    rec.fill(textbox("Valor", id="valor", form=PIX_FORM), "1250,00")
+    rec.fill(password(id="senha", form=PIX_FORM), None)
+    rec.fill(otp(id="cod", form=OTP_FORM), None)
+    rec.click(button("Confirmar", id="ok", form=OTP_FORM))
+    rec.request("POST", "/api/pix", "fetch")
+    result = compile_(rec.build())
+    assert step(result, "clicar_confirmar").effect is Effect.WRITE
+    assert usernames_in(result) == []
+    assert fill_value(result, "digitar_valor") == an_input("valor")
+    assert "1250,00" not in result.manifest.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        otp("Token da transação", id="tok", form=PIX_FORM),
+        otp("Código de segurança", id="cvv", form=PIX_FORM),
+        otp("CVV", id="cvv", form=PIX_FORM),
+        otp("Assinatura eletrônica", id="ass", form=PIX_FORM),
+    ],
+    ids=["token-da-transacao", "codigo-de-seguranca", "cvv", "assinatura"],
+)
+@pytest.mark.parametrize("button_label", ["Continuar", "Entrar", "Confirmar"])
+@pytest.mark.parametrize("with_username", [False, True], ids=["valor", "usuario"])
+def test_a_transaction_code_never_makes_a_login(
+    code: ElementDescriptor, button_label: str, with_username: bool
+) -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/pix")
+    if with_username:
+        rec.fill(textbox("Usuário", id="usuario", form=PIX_FORM), "ana.souza")
+        rec.fill(password(id="senha", form=PIX_FORM), None)
+    rec.fill(code, None)
+    rec.click(button(button_label, id="ok", form=PIX_FORM))
+    rec.request("POST", "/pix")
+    result = compile_(rec.build())
+    click = next(s for s in result.manifest.steps if isinstance(s, ClickStep))
+    assert click.effect is Effect.WRITE
+    assert usernames_in(result) == []
 
 
 def test_a_login_after_a_write_keeps_the_username_out_of_the_robot() -> None:
@@ -214,8 +284,8 @@ def test_a_login_after_a_write_keeps_the_username_out_of_the_robot() -> None:
     rec.request("POST", "/login")
     result = compile_(rec.build())
     assert step(result, "clicar_entrar").effect is Effect.WRITE
-    # O gravador já teria tirado o valor (cara de login); o robô pede o usuário.
-    assert fill_value(result, "digitar_usuario") == TextValue(template="{{ inputs.usuario }}")
+    # O gravador tira o valor (página com senha); o robô pede o usuário.
+    assert fill_value(result, "digitar_usuario") == an_input("usuario")
     assert "ana.souza" not in result.manifest.model_dump_json()
 
 
@@ -227,7 +297,7 @@ def test_a_username_marked_by_the_script_without_a_login_becomes_an_input() -> N
     rec.click(button("Pagar agora", id="ok"))
     rec.request("POST", "/api/pix", "fetch")
     result = compile_(rec.build())
-    assert fill_value(result, "digitar_valor") == TextValue(template="{{ inputs.valor }}")
+    assert fill_value(result, "digitar_valor") == an_input("valor")
     assert step(result, "clicar_pagar_agora").effect is Effect.IRREVERSIBLE
 
 
@@ -244,19 +314,66 @@ def test_a_page_declared_username_stays_the_username() -> None:
     assert fill_value(result, "digitar_usuario") == USERNAME
 
 
-def test_an_enter_in_the_password_without_a_button_is_a_login() -> None:
+# -- o Enter só é login pelo clique implícito no botão do mesmo formulário ---------
+
+
+@pytest.mark.parametrize("form", [None, LOGIN_FORM], ids=["sem_formulario", "formulario"])
+def test_an_enter_without_the_click_of_the_form_is_never_a_login(form: FormInfo | None) -> None:
     rec = RecordingBuilder()
     rec.navigate("/login")
-    rec.fill(textbox("Usuário", id="usuario"), "ana.souza")
-    senha = password(id="senha", form=None)
+    rec.fill(textbox("Usuário", id="usuario", form=form), "ana.souza")
+    senha = password(id="senha", form=form)
     rec.fill(senha, None)
     enter = rec.key("Enter", senha)
     rec.request("POST", "/api/login", "fetch")
     rec.navigate("/inicio", cause=NavigationCause.KEY, trigger=enter)
     result = compile_(rec.build())
     press = next(s for s in result.manifest.steps if isinstance(s, PressStep))
-    assert press.effect is Effect.READ
-    assert fill_value(result, "digitar_usuario") == USERNAME
+    assert press.effect is Effect.WRITE
+    assert usernames_in(result) == []
+    assert fill_value(result, "digitar_usuario") == an_input("usuario")
+
+
+@pytest.mark.parametrize("form", [None, PIX_FORM], ids=["sem_formulario", "formulario"])
+def test_an_enter_in_the_password_of_a_transaction_is_write(form: FormInfo | None) -> None:
+    # A página trata o Enter na senha e paga (fetch POST); o botão "Pagar" fica lá.
+    rec = RecordingBuilder()
+    rec.navigate("/pix")
+    rec.fill(textbox("Valor", id="valor", form=form), "1250,00")
+    senha = password(id="senha", form=form)
+    rec.fill(senha, None)
+    rec.key("Enter", senha)
+    rec.request("POST", "/api/pix", "fetch")
+    result = compile_(rec.build())
+    assert step(result, "pressionar_enter").effect is Effect.WRITE
+    assert result.manifest.effect() is Effect.WRITE
+    assert fill_value(result, "digitar_valor") == an_input("valor")
+    assert "1250,00" not in result.manifest.model_dump_json()
+
+
+@pytest.mark.parametrize("same_form", [True, False], ids=["mesmo_formulario", "outro_formulario"])
+def test_an_enter_is_a_login_through_the_implicit_click_of_the_same_form(same_form: bool) -> None:
+    other = FormInfo(action=f"{BASE}/busca", method="get", text_fields=1)
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(textbox("Usuário", id="usuario", form=LOGIN_FORM), "ana.souza")
+    senha = password(id="senha", form=LOGIN_FORM)
+    rec.fill(senha, None)
+    rec.key("Enter", senha)
+    click = rec.click(
+        button("Entrar", id="entrar", form=LOGIN_FORM if same_form else other), detail=0
+    )
+    rec.request("POST", "/login")
+    rec.navigate("/inicio", cause=NavigationCause.CLICK, trigger=click)
+    result = compile_(rec.build())
+    entrar = step(result, "clicar_entrar")
+    assert not any(isinstance(s, PressStep) for s in result.manifest.steps)
+    if same_form:
+        assert entrar.effect is Effect.READ
+        assert fill_value(result, "digitar_usuario") == USERNAME
+    else:
+        assert entrar.effect is Effect.WRITE
+        assert fill_value(result, "digitar_usuario") == an_input("usuario")
 
 
 def test_one_time_code_on_the_login_page_after_the_login() -> None:
@@ -273,6 +390,146 @@ def test_one_time_code_on_the_login_page_after_the_login() -> None:
     assert step(result, "clicar_entrar").effect is Effect.READ
     assert step(result, "clicar_confirmar").effect is Effect.READ
     assert result.manifest.effect() is Effect.READ
+
+
+def test_after_a_login_only_codes_may_follow_on_the_same_page() -> None:
+    # Depois do login (SPA), um "Confirme sua senha" com "Continuar" que libera uma
+    # operação: a senha de novo, na mesma página, não é login.
+    rec = RecordingBuilder()
+    rec.navigate("/app")
+    rec.fill(textbox("Usuário", id="usuario"), "ana.souza")
+    rec.fill(password(id="senha", form=None), None)
+    rec.click(button("Entrar", id="entrar"))
+    rec.request("POST", "/api/login", "fetch")
+    rec.fill(password(id="confirma", form=None), None)
+    rec.click(button("Continuar", id="continuar"))
+    rec.request("POST", "/api/notas/123/liberar", "fetch")
+    result = compile_(rec.build())
+    assert step(result, "clicar_entrar").effect is Effect.READ
+    assert step(result, "clicar_continuar").effect is Effect.WRITE
+    assert fill_value(result, "digitar_usuario") == USERNAME
+
+
+def test_a_field_filled_after_the_login_on_the_same_page_stays_literal() -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/app")
+    rec.fill(textbox("Usuário", id="usuario"), "ana.souza")
+    rec.fill(password(id="senha", form=None), None)
+    rec.click(button("Entrar", id="entrar"))
+    rec.request("POST", "/api/login", "fetch")
+    rec.fill(textbox("Nome completo", id="nome"), "Maria da Silva")
+    rec.click(button("Salvar", id="salvar"))
+    rec.request("POST", "/api/cadastro", "fetch")
+    result = compile_(rec.build())
+    assert fill_value(result, "digitar_usuario") == USERNAME
+    assert fill_value(result, "digitar_nome_completo") == TextValue(template="Maria da Silva")
+    assert step(result, "clicar_salvar").effect is Effect.WRITE
+
+
+def test_a_password_without_a_username_is_not_a_login() -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/pagar")
+    rec.fill(password(id="senha", form=None), None)
+    rec.click(button("Continuar", id="continuar"))
+    rec.request("POST", "/api/pagar", "fetch")
+    result = compile_(rec.build())
+    assert step(result, "clicar_continuar").effect is Effect.WRITE
+
+
+def test_two_passwords_are_not_one_credential() -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(textbox("Usuário", id="usuario"), "ana.souza")
+    rec.fill(password("Senha atual", id="atual", form=None), None)
+    rec.fill(password("Nova senha", id="nova", form=None), None)
+    rec.click(button("Continuar", id="continuar"))
+    rec.request("POST", "/api/senha", "fetch")
+    result = compile_(rec.build())
+    assert step(result, "clicar_continuar").effect is Effect.WRITE
+    assert usernames_in(result) == []
+
+
+# -- usuário só pelo próprio campo ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        textbox("Usuário", id="campo"),
+        textbox("USER", id="campo"),
+        textbox("Login", id="campo"),
+        textbox("E-mail", id="campo"),
+        textbox("Endereço", input_type="email", id="campo"),
+        textbox("Acesso", id="campo", autocomplete="username"),
+        textbox("Acesso", id="campo", autocomplete="email"),
+        textbox("Acesso", id="campo", name_attr="j_username"),
+        textbox("Acesso", id="txtCPF"),
+        textbox("Acesso", id="campo", placeholder="Seu CNPJ"),
+        textbox("Matrícula", id="campo"),
+        textbox("Código do usuário", id="campo"),
+    ],
+    ids=[
+        "usuario",
+        "user",
+        "login",
+        "e-mail",
+        "type-email",
+        "autocomplete-username",
+        "autocomplete-email",
+        "name",
+        "id",
+        "placeholder",
+        "matricula",
+        "codigo-do-usuario",
+    ],
+)
+def test_only_the_field_itself_makes_a_username(field: ElementDescriptor) -> None:
+    assert username_by_signal(field)
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(field, "ana.souza")
+    rec.fill(password(id="senha", form=None), None)
+    rec.click(button("Entrar", id="entrar"))
+    rec.request("POST", "/api/login", "fetch")
+    recording = rec.build()
+    assert [e.value for e in secret_page_inputs(recording.events).usernames] == ["ana.souza"]
+    result = compile_(recording)
+    assert step(result, "clicar_entrar").effect is Effect.READ
+    assert len(usernames_in(result)) == 1
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        textbox("Conta", id="campo"),
+        textbox("Agência", id="campo"),
+        textbox("Chave Pix", id="campo"),
+        textbox("Valor", id="campo"),
+        textbox("Usuários", id="campo"),
+        # O nome acessível (aria-labelledby num título, por exemplo) não conta.
+        textbox("Identificação", id="campo").model_copy(update={"name": "Usuário"}),
+        textbox("Busca", input_type="search", id="campo", name_attr="usuario"),
+    ],
+    ids=["conta", "agencia", "chave-pix", "valor", "usuarios", "nome-acessivel", "busca"],
+)
+def test_any_other_field_beside_a_password_is_an_input(field: ElementDescriptor) -> None:
+    assert not username_by_signal(field)
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(field, "12345-6")
+    rec.fill(password(id="senha", form=None), None)
+    rec.click(button("Entrar", id="entrar"))
+    rec.request("POST", "/api/login", "fetch")
+    recording = rec.build()
+    found = secret_page_inputs(recording.events)
+    assert found.usernames == [] and [e.value for e in found.others] == ["12345-6"]
+    result = compile_(recording)
+    assert step(result, "clicar_entrar").effect is Effect.WRITE
+    assert usernames_in(result) == []
+    value = next(s.value for s in result.manifest.steps if isinstance(s, FillStep))
+    assert isinstance(value, TextValue) and value.template.startswith("{{ inputs.")
+    assert any("página que pede senha ou código" in w for w in result.warnings)
+    assert "12345-6" not in result.manifest.model_dump_json()
 
 
 # -- o botão de mostrar a senha não é o envio ---------------------------------------
@@ -292,13 +549,13 @@ def test_the_show_password_button_is_not_the_submit(marked_by_script: bool) -> N
     rec.navigate("/pagar", cause=NavigationCause.CLICK, trigger=click)
     recording = rec.build()
     result = compile_(recording)
-    assert fill_value(result, "digitar_valor") == TextValue(template="{{ inputs.valor }}")
+    assert fill_value(result, "digitar_valor") == an_input("valor")
     assert [f.name for f in result.manifest.inputs] == ["valor"]
     assert usernames_in(result) == []
     assert step(result, "clicar_confirmar_pagamento").effect is Effect.IRREVERSIBLE
     assert result.manifest.effect() is Effect.IRREVERSIBLE
     assert "1250,00" not in result.manifest.model_dump_json()
-    assert login_inputs(recording.events).usernames == []
+    assert secret_page_inputs(recording.events).usernames == []
 
 
 def test_the_show_password_button_does_not_break_a_login() -> None:
@@ -349,8 +606,8 @@ def element_radio(label: str) -> ElementDescriptor:
 @pytest.mark.parametrize("variant", ["simples", "pushstate", "hash", "radio", "lembrar"])
 def test_two_step_login_variants_hide_the_username(variant: str) -> None:
     recording = _two_step(variant)
-    found = username_inputs(recording.events)
-    assert [e.value for e in found] == ["ana.souza"]
+    found = secret_page_inputs(recording.events)
+    assert [e.value for e in found.usernames] == ["ana.souza"] and found.others == []
     result = compile_(recording)
     assert fill_value(result, "digitar_usuario") == USERNAME
     assert step(result, "clicar_entrar").effect is Effect.READ
@@ -372,9 +629,34 @@ def test_the_bridge_of_a_two_step_login_may_check_the_username() -> None:
     assert fill_value(result, "digitar_e_mail") == USERNAME
 
 
+def test_a_write_between_the_steps_of_a_two_step_login_drops_it() -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(textbox("Usuário", id="usuario"), "ana.souza")
+    rec.click(button("Continuar", id="continuar"))
+    senha = password(id="senha", form=None)
+    started = rec.page_text("Senha")
+    rec.request("POST", "/api/rascunho", "fetch")  # a página grava enquanto a pessoa digita
+    rec.fill(senha, None, editing_since=started)
+    rec.click(button("Entrar", id="entrar"))
+    rec.request("POST", "/api/login", "fetch")
+    result = compile_(rec.build())
+    assert step(result, "digitar_senha").effect is Effect.WRITE
+    assert step(result, "clicar_entrar").effect is Effect.WRITE
+    assert usernames_in(result) == []
+    assert fill_value(result, "digitar_usuario") == an_input("usuario")
+
+
 @pytest.mark.parametrize(
     "variant",
-    ["ponte_com_texto_a_mais", "lista_antes", "outro_campo_antes", "senha_em_campo_de_texto"],
+    [
+        "ponte_com_texto_a_mais",
+        "lista_antes",
+        "outro_campo_antes",
+        "senha_em_campo_de_texto",
+        "enter_como_ponte",
+        "outro_clique_antes",
+    ],
 )
 def test_two_step_login_needs_the_exact_shape(variant: str) -> None:
     rec = RecordingBuilder()
@@ -383,9 +665,15 @@ def test_two_step_login_needs_the_exact_shape(variant: str) -> None:
         rec.select(select_box("Perfil", id="perfil"), "Contador")
     if variant == "outro_campo_antes":
         rec.fill(textbox("Empresa", id="empresa"), "ACME")
-    rec.fill(textbox("Usuário", id="usuario"), "ana.souza")
-    bridge = "Continuar para a senha" if variant == "ponte_com_texto_a_mais" else "Continuar"
-    rec.click(button(bridge, id="continuar"))
+    if variant == "outro_clique_antes":
+        rec.click(button("Aceitar cookies", id="cookies"))
+    usuario = textbox("Usuário", id="usuario")
+    rec.fill(usuario, "ana.souza")
+    if variant == "enter_como_ponte":
+        rec.key("Enter", usuario)
+    else:
+        bridge = "Continuar para a senha" if variant == "ponte_com_texto_a_mais" else "Continuar"
+        rec.click(button(bridge, id="continuar"))
     if variant == "senha_em_campo_de_texto":
         rec.fill(textbox("Senha", id="senha_texto"), "S3nh@Forte!")
     else:
@@ -393,14 +681,16 @@ def test_two_step_login_needs_the_exact_shape(variant: str) -> None:
     rec.click(button("Entrar", id="entrar"))
     rec.request("POST", "/api/login", "fetch")
     recording = rec.build()
-    assert username_inputs(recording.events) == []
     result = compile_(recording)
-    # Sem a forma exata o campo fica literal e o envio grava.
-    assert fill_value(result, "digitar_usuario") == TextValue(template="ana.souza")
+    # Sem a forma exata o envio grava; o usuário (que o gravador tira da gravação,
+    # por estar numa página com senha) vira uma entrada obrigatória.
     assert step(result, "clicar_entrar").effect is Effect.WRITE
+    assert usernames_in(result) == []
+    assert fill_value(result, "digitar_usuario") == an_input("usuario")
+    assert "ana.souza" not in result.manifest.model_dump_json()
 
 
-@pytest.mark.parametrize("final", ["Confirmar", "Confirmar transação", "Concluir", "OK"])
+@pytest.mark.parametrize("final", ["Confirmar", "Confirmar transação", "Concluir", "OK", "Entrar"])
 @pytest.mark.parametrize("with_form", [True, False], ids=["formulario", "sem_formulario"])
 def test_a_payment_wizard_is_not_a_two_step_login(final: str, with_form: bool) -> None:
     form = PIX_FORM if with_form else None
@@ -413,16 +703,30 @@ def test_a_payment_wizard_is_not_a_two_step_login(final: str, with_form: bool) -
     rec.click(button(final, id="ok", form=form or MODAL_FORM))
     rec.request("POST", "/api/pix", "fetch")
     recording = rec.build()
-    assert username_inputs(recording.events) == []
+    assert secret_page_inputs(recording.events).usernames == []
     result = compile_(recording)
     assert usernames_in(result) == []
     assert result.manifest.effect() in (Effect.WRITE, Effect.IRREVERSIBLE)
-    valor = fill_value(result, "digitar_valor")
-    if final == "Concluir":
-        # Verbo irreversível: o campo antes da senha sai do robô, como antes.
-        assert valor == TextValue(template="{{ inputs.valor }}")
-    else:
-        assert valor == TextValue(template="1250,00")
+    # O valor (numa página com senha) vira uma entrada, sem o valor digitado.
+    assert fill_value(result, "digitar_valor") == an_input("valor")
+    assert "1250,00" not in result.manifest.model_dump_json()
+
+
+@pytest.mark.parametrize("form", [None, PIX_FORM], ids=["sem_formulario", "formulario"])
+def test_an_enter_never_bridges_a_two_step_login(form: FormInfo | None) -> None:
+    # "Chave Pix" + Enter (a página mostra a senha) + Senha + "Entrar" (paga).
+    rec = RecordingBuilder()
+    rec.navigate("/pix")
+    chave = textbox("Chave Pix", id="chave", form=form)
+    rec.fill(chave, "ana@exemplo.com.br")
+    rec.key("Enter", chave)
+    rec.fill(password(id="senha", form=form), None)
+    rec.click(button("Entrar", id="entrar", form=form))
+    rec.request("POST", "/api/pix", "fetch")
+    result = compile_(rec.build())
+    assert step(result, "clicar_entrar").effect is Effect.WRITE
+    assert usernames_in(result) == []
+    assert fill_value(result, "digitar_chave_pix") == an_input("chave_pix")
 
 
 def test_a_search_before_a_password_modal_is_not_the_username() -> None:
@@ -437,16 +741,18 @@ def test_a_search_before_a_password_modal_is_not_the_username() -> None:
     rec.click(button("Confirmar", id="confirmar", form=MODAL_FORM))
     rec.request("POST", "/api/notas/123/liberar", "fetch")
     recording = rec.build()
-    assert username_inputs(recording.events) == []
+    assert secret_page_inputs(recording.events).usernames == []
     result = compile_(recording)
-    assert fill_value(result, "digitar_buscar_nota") == TextValue(template="Nota 123")
+    # Na mesma página da senha: o valor da busca vira uma entrada, nunca o usuário.
+    assert fill_value(result, "digitar_buscar_nota") == an_input("buscar_nota")
+    assert usernames_in(result) == []
     assert step(result, "clicar_confirmar").effect is Effect.WRITE
     assert result.manifest.effect() is Effect.WRITE
 
 
 def test_the_compiler_never_turns_a_hidden_field_into_the_username() -> None:
-    # O script marcou o campo como "escondido" (antes de uma senha de transação);
-    # mesmo com um botão de login depois, ele não vira o usuário do cofre.
+    # O script escondeu o campo (grupo com senha) sem chamá-lo de usuário; mesmo com
+    # um botão de login depois, ele não vira o usuário do cofre.
     rec = RecordingBuilder()
     rec.navigate("/pix")
     rec.fill(textbox("Valor", id="valor", sensitive=True), None)
@@ -454,7 +760,7 @@ def test_the_compiler_never_turns_a_hidden_field_into_the_username() -> None:
     rec.click(button("Entrar", id="entrar"))
     rec.request("POST", "/api/pix", "fetch")
     result = compile_(rec.build())
-    assert fill_value(result, "digitar_valor") == TextValue(template="{{ inputs.valor }}")
+    assert fill_value(result, "digitar_valor") == an_input("valor")
     assert step(result, "clicar_entrar").effect is Effect.WRITE
 
 
@@ -468,16 +774,14 @@ def test_a_fill_with_a_removed_value_becomes_an_input() -> None:
     rec.click(button("Salvar", id="salvar"))
     rec.request("POST", "/salvar")
     result = compile_(rec.build())
-    assert fill_value(result, "digitar_departamento") == TextValue(
-        template="{{ inputs.departamento }}"
-    )
+    assert fill_value(result, "digitar_departamento") == an_input("departamento")
     assert REDACTED not in result.manifest.model_dump_json()
     assert any("Departamento" in w and "sensível" in w for w in result.warnings)
 
 
-def _named_password(button_label: str, *, sensitive: bool) -> CompileResult:
+def _named_password(button_label: str, *, sensitive: bool, aria: bool = False) -> CompileResult:
     form = FormInfo(action=f"{BASE}/entrar", method="post", text_fields=2)
-    cod = element_named_password(sensitive=sensitive, form=form)
+    cod = element_named_password(sensitive=sensitive, form=form, aria=aria)
     rec = RecordingBuilder()
     rec.navigate("/entrar")
     rec.fill(textbox("CPF", id="cpf", form=form), "12345678909")
@@ -492,30 +796,38 @@ def _named_password(button_label: str, *, sensitive: bool) -> CompileResult:
 NAMED = "digitar_digite_a_senha_de_6"
 
 
-def element_named_password(*, sensitive: bool, form: FormInfo) -> ElementDescriptor:
+def element_named_password(
+    *, sensitive: bool, form: FormInfo, aria: bool = False
+) -> ElementDescriptor:
     field = textbox("Código pessoal", id="cod", form=form, sensitive=sensitive)
+    if aria:
+        # aria-labelledby ("Código pessoal") e aria-label de senha: o script manda o sinal.
+        return field.model_copy(update={"aria_mentions_password": True})
     return field.model_copy(update={"name": "Digite a senha de 6 dígitos"})
 
 
-@pytest.mark.parametrize("sensitive", [True, False], ids=["marcado", "sem_marca"])
-def test_a_field_named_like_a_password_is_the_password_of_a_login(sensitive: bool) -> None:
-    result = _named_password("Entrar", sensitive=sensitive)
-    assert fill_value(result, NAMED) == PASSWORD
-    assert fill_value(result, "digitar_cpf") == USERNAME
-    assert step(result, "clicar_entrar").effect is Effect.READ
+@pytest.mark.parametrize("button_label", ["Entrar", "Gravar"])
+@pytest.mark.parametrize(
+    ("sensitive", "aria"),
+    [(True, False), (False, False), (False, True)],
+    ids=["marcado", "sem_marca", "aria_label"],
+)
+def test_a_field_named_like_a_password_is_always_an_input(
+    button_label: str, sensitive: bool, aria: bool
+) -> None:
+    result = _named_password(button_label, sensitive=sensitive, aria=aria)
+    named = next(
+        s for s in result.manifest.steps if isinstance(s, FillStep) and s.id not in ("digitar_cpf",)
+    )
+    assert isinstance(named.value, TextValue) and named.value.template.startswith("{{ inputs.")
+    # Não é uma senha de verdade: o envio grava, e o CPF (página com senha) vira entrada.
+    assert fill_value(result, "digitar_cpf") == an_input("cpf")
+    assert [f.required for f in result.manifest.inputs] == [True, True]
+    assert any("fala em senha" in w for w in result.warnings)
+    click = next(s for s in result.manifest.steps if isinstance(s, ClickStep))
+    assert click.effect is Effect.WRITE
     dumped = result.model_dump_json()
     assert "918273" not in dumped and "12345678909" not in dumped
-
-
-@pytest.mark.parametrize("sensitive", [True, False], ids=["marcado", "sem_marca"])
-def test_a_field_named_like_a_password_outside_a_login_becomes_an_input(sensitive: bool) -> None:
-    result = _named_password("Gravar", sensitive=sensitive)
-    value = fill_value(result, NAMED)
-    assert isinstance(value, TextValue) and value.template.startswith("{{ inputs.digite_a_senha")
-    assert [f.required for f in result.manifest.inputs] == [True]
-    assert any("fala em senha" in w for w in result.warnings)
-    assert step(result, "clicar_gravar").effect is Effect.WRITE
-    assert "918273" not in result.model_dump_json()
     assert result.manifest.credentials == []
 
 
@@ -547,7 +859,7 @@ def test_a_field_in_another_tab_is_never_the_username() -> None:
     rec.click(button("Entrar", id="entrar"))
     rec.request("POST", "/api/login", "fetch")
     recording = rec.build()
-    assert username_inputs(recording.events) == []
+    assert secret_page_inputs(recording.events).usernames == []
     result = compile_(recording)
     assert usernames_in(result) == []
     assert step(result, "clicar_entrar").effect is Effect.WRITE

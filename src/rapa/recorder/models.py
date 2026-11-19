@@ -5,8 +5,9 @@ elemento), navegações, downloads, requisições e o texto visível das página
 É só dado: o compilador (``rapa.compiler``) a transforma num robô sem usar
 modelo de linguagem.
 
-Nenhum evento guarda o valor de campos de senha, de código de uso único ou do
-usuário de login: esses campos chegam marcados como sensíveis e sem valor.
+Nenhum evento guarda o valor de campos de senha, de código de uso único, do
+usuário de login nem dos outros campos de texto de uma página que pede senha ou
+código: esses campos chegam marcados como sensíveis e sem valor.
 """
 
 from datetime import datetime
@@ -134,6 +135,9 @@ class ElementDescriptor(_Model):
     is_one_time_code: bool = False
     is_username: bool = False
     sensitive: bool = False
+    #: O ``aria-label`` ou o texto do ``aria-labelledby`` do campo fala em senha (o
+    #: script olha os dois, mesmo quando o nome acessível vem só de um deles).
+    aria_mentions_password: bool = False
     row: RowInfo | None = None
     form: FormInfo | None = None
     counts: LocatorCounts = Field(default_factory=LocatorCounts)

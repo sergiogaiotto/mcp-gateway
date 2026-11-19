@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 from rapa.core import templates
 from rapa.core.robot import ARIA_ROLES, Locator, LocatorBy, Target
-from rapa.recorder.models import ElementDescriptor, FrameInfo
+from rapa.recorder.models import REDACTED, ElementDescriptor, FrameInfo
 
 __all__ = [
     "BuiltTarget",
@@ -152,8 +152,15 @@ def _verdict(js: int | None, pw: int | None) -> tuple[bool, bool]:
 
 
 def _loc(by: LocatorBy, value: str | None, name: str | None = None) -> Locator | None:
-    """Localizador com os textos já escapados, ou None se não couber no formato."""
+    """Localizador com os textos já escapados, ou None se não couber no formato.
+
+    Um texto (nome, rótulo, placeholder, texto visível) com um valor sigiloso
+    apagado pela limpeza da gravação (``REMOVIDO``) nunca aparece assim na página:
+    não vira localizador.
+    """
     if not value:
+        return None
+    if by is not LocatorBy.CSS and (REDACTED in value or (name is not None and REDACTED in name)):
         return None
     value = templates.escape(value)
     escaped_name = templates.escape(name) if name else None

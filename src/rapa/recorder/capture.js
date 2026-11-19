@@ -3,10 +3,11 @@
 //
 // Regras: só eventos confiáveis (isTrusted); nunca envia o valor de campos de
 // senha (inclusive campo de texto mascarado por CSS, com rótulo de senha ou cujo
-// nome acessível fala em senha), código de uso único, usuário de login (com ou
-// sem <form>) ou do campo logo antes de uma senha de transação; o valor final de
-// cada campo sai no change/blur (ou antes da próxima ação), com há quanto tempo a
-// edição começou.
+// aria-label ou aria-labelledby fala em senha), de código de uso único, nem de
+// nenhum outro campo de texto do grupo (o <form> ou, sem <form>, os campos soltos
+// visíveis) que tem senha ou código: o usuário (pelo próprio campo) e os outros;
+// o valor final de cada campo sai no change/blur (ou antes da próxima ação), com
+// há quanto tempo a edição começou.
 (() => {
   'use strict';
   const CONFIG = __RAPA_CONFIG__;
@@ -265,40 +266,36 @@
 
   const isPassword = (el) => el.tagName === 'INPUT' && (inputType(el) === 'password' || isPasswordLikeText(el));
 
-  // Campo que só o nome acessível (aria-labelledby, aria-label) diz ser senha: o
-  // valor não sai, mas o campo não vira senha (rapa/recorder/sensitivity.py,
-  // password_by_name) e o usuário marcado pelo grupo continua usuário.
+  // Usuário só pelo próprio campo (rapa/recorder/sensitivity.py,
+  // username_by_signal): autocomplete de usuário ou e-mail, type=email, ou rótulo,
+  // atributo name, id ou placeholder com uma palavra inteira de usuário. O texto
+  // da página (títulos, parágrafos) não conta.
+  const USERNAME_WORDS = /(?:^|[^a-z0-9])(?:usuario|user|username|login|e-mail|email|cpf|cnpj|matricula|codigo do usuario)(?:[^a-z0-9]|$)/;
+  const USERNAME_TYPES = new Set(['text', 'email', 'tel', 'number', '']);
+  const isUsernameField = (el) => {
+    if (el.tagName !== 'INPUT' || !USERNAME_TYPES.has(inputType(el))) return false;
+    if (isPassword(el) || isOneTimeCode(el)) return false;
+    const ac = norm(el.getAttribute('autocomplete')).toLowerCase().split(' ');
+    if (ac.indexOf('username') >= 0 || ac.indexOf('email') >= 0 || inputType(el) === 'email') return true;
+    return [labelText(el), el.getAttribute('name'), el.id, el.getAttribute('placeholder')]
+      .some((s) => { const t = plainWords(s); return !!t && USERNAME_WORDS.test(t); });
+  };
+
+  // O aria-label ou o texto do aria-labelledby fala em senha: os dois, porque o
+  // nome acessível guarda só um deles (o aria-labelledby, quando há).
+  const ariaMentionsPassword = (el) =>
+    mentionsPassword(el.getAttribute('aria-label')) || mentionsPassword(labelledByText(el));
+
+  // Campo que só o aria-label ou o aria-labelledby diz ser senha: o valor não sai,
+  // mas o campo não vira senha (rapa/recorder/sensitivity.py, password_by_name), e
+  // o usuário pelo próprio campo continua usuário.
   const isPasswordByName = (el) => {
     if (el.tagName !== 'INPUT' || isPassword(el) || isOneTimeCode(el)) return false;
-    if (!PASSWORD_LABEL_TYPES.has(inputType(el))) return false;
-    const ac = norm(el.getAttribute('autocomplete')).toLowerCase().split(' ');
-    if (ac.indexOf('username') >= 0 || ac.indexOf('email') >= 0) return false;
-    return mentionsPassword(accessibleName(el, roleOf(el)));
+    if (!PASSWORD_LABEL_TYPES.has(inputType(el)) || isUsernameField(el)) return false;
+    return ariaMentionsPassword(el);
   };
 
-  // Senha de transação (PIN, assinatura eletrônica, senha de pagamento) e verbos
-  // irreversíveis: as mesmas regras de rapa/recorder/sensitivity.py.
-  const TRANSACTION_WORDS = /transac|transfer|assinatura|assinar|autoriza|pagamento|operac|cartao|(?:^|[^a-z0-9])pin(?:[^a-z0-9]|$)/;
-  const IRREVERSIBLE = /\b(emitir|emita|enviar|envie|transmitir|transmita|pagar|pague|confirmar pagamento|confirmar transferencia|transferir|transfira|excluir|exclua|apagar|apague|assinar|assine|finalizar|finalize|concluir|conclua|protocolar|protocole|autorizar|autorize|aprovar|aprove|solicitar|solicite|cancelar|cancele)\b/;
-  const verbText = (s) => norm(s).normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
-
-  const isTransactionSecret = (el) => [
-    labelText(el), accessibleName(el, roleOf(el)), el.getAttribute('placeholder'),
-    el.getAttribute('title'), el.getAttribute('name'), el.id,
-  ].some((s) => { const t = plainWords(s); return !!t && TRANSACTION_WORDS.test(t); });
-
-  // O botão padrão do formulário (o que o Enter aciona) tem verbo irreversível.
-  const irreversibleSubmit = (el) => {
-    const form = formOf(el);
-    if (!form) return false;
-    for (const f of Array.from(form.elements)) {
-      const type = f.tagName === 'BUTTON' ? String(f.type || 'submit').toLowerCase() : inputType(f);
-      if (type !== 'submit' && !(f.tagName === 'INPUT' && type === 'image')) continue;
-      const text = accessibleName(f, roleOf(f)) || norm(f.textContent);
-      return IRREVERSIBLE.test(verbText(text));
-    }
-    return false;
-  };
+  const isSecretField = (el) => isPassword(el) || isOneTimeCode(el) || isPasswordByName(el);
 
   const isTextLike = (el) => (el.tagName === 'INPUT' && TEXT_TYPES.has(inputType(el))) || el.tagName === 'TEXTAREA';
 
@@ -322,20 +319,16 @@
     return all.filter((f) => isTextLike(f) || isPassword(f));
   };
 
-  // 'username': o usuário do login; 'hidden': o campo antes de uma senha de
-  // transação (ou de uma senha num formulário com botão irreversível), que não
-  // vai na gravação mas também não é o usuário; null: campo comum.
+  // 'username': o usuário pelo próprio campo; 'hidden': outro campo de texto do
+  // grupo, que não vai na gravação mas também não é o usuário; null: campo comum
+  // (o grupo não tem senha nem código). O campo que a página declara como usuário
+  // (autocomplete=username) é sempre o usuário.
   const loginRole = (el) => {
-    if (!isTextLike(el) || el.tagName === 'TEXTAREA' || isOneTimeCode(el)) return null;
+    if (!isTextLike(el) || isSecretField(el)) return null;
     const ac = norm(el.getAttribute('autocomplete')).toLowerCase().split(' ');
     if (ac.indexOf('username') >= 0) return 'username';
-    const fields = groupFields(el);
-    const firstPassword = fields.findIndex(isPassword);
-    if (firstPassword <= 0 || fields.filter((f) => isTextLike(f) && !isPassword(f)).length > 3) return null;
-    // Só o campo de texto imediatamente antes da primeira senha.
-    if (fields[firstPassword - 1] !== el) return null;
-    const password = fields[firstPassword];
-    return isTransactionSecret(password) || irreversibleSubmit(password) ? 'hidden' : 'username';
+    if (!groupFields(el).some((f) => f !== el && isSecretField(f))) return null;
+    return isUsernameField(el) ? 'username' : 'hidden';
   };
 
   // -- seletores ---------------------------------------------------------------
@@ -588,8 +581,8 @@
     const type = inputType(el);
     const password = isPassword(el);
     const otp = isOneTimeCode(el);
-    const login = !password && !otp ? loginRole(el) : null;
-    const byName = !password && !otp && login === null && isPasswordByName(el);
+    const byName = isPasswordByName(el);
+    const login = loginRole(el);
     const isControl = tag === 'input' || tag === 'select' || tag === 'textarea';
     let text = '';
     if (!isControl) text = clip(el.innerText || el.textContent, MAX_TEXT);
@@ -616,6 +609,7 @@
       is_one_time_code: otp,
       is_username: login === 'username',
       sensitive: password || otp || login !== null || byName,
+      aria_mentions_password: tag === 'input' && ariaMentionsPassword(el),
       row: rowInfo(el, role, name, textForCount),
       form: formInfo(el),
       counts: {

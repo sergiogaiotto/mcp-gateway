@@ -16,20 +16,20 @@ Regras principais:
 - campo de senha → ``SecretValue(field="password")`` de uma credencial por
   origem; código de uso único → ``SecretValue(field="totp")`` de outra
   credencial;
-- usuário e envio do login pela regra conservadora de
-  ``rapa.recorder.sensitivity.analyze_logins``: o campo só vira o usuário do
-  cofre, e o envio só é leitura, quando o botão é de login, a página só tem
-  credenciais e nada gravou antes no robô (o envio é confirmado na
-  classificação). Sem a confirmação, um campo cujo valor já saiu da gravação
-  (antes de uma senha de transação, ou que tinha a forma de usuário) vira uma
-  entrada obrigatória com aviso; os outros ficam literais;
+- usuário e envio do login pela regra de
+  ``rapa.recorder.sensitivity.analyze_logins``: o envio só é leitura quando só
+  credenciais de uma credencial foram preenchidas, o botão é de login e nada
+  gravou antes no robô (confirmado na classificação); o campo que é o usuário
+  pelo próprio campo vira o usuário do cofre só num login confirmado (ou quando a
+  página o declara no ``autocomplete``). Qualquer outro campo de texto de uma
+  página com senha ou código, e o usuário de um login não confirmado, vira uma
+  entrada obrigatória com aviso, nunca um literal nem um segredo do cofre;
 - campo de texto com cara de senha (rótulo, nome, id ou placeholder de senha,
   ``rapa.recorder.sensitivity``) é tratado como senha, e o valor gravado é
-  descartado; o que só o nome acessível diz ser senha perde o valor e vira a
-  senha do cofre num login confirmado, ou uma entrada; outro literal com cara de
-  segredo (cartão, token, chave), ou com um valor sensível apagado pela limpeza
-  da gravação (``REMOVIDO``), vira uma entrada obrigatória do robô, sem o valor
-  digitado;
+  descartado; o que só o ``aria-label`` ou o ``aria-labelledby`` diz ser senha
+  perde o valor e vira uma entrada; outro literal com cara de segredo (cartão,
+  token, chave), ou com um valor sensível apagado pela limpeza da gravação
+  (``REMOVIDO``), vira uma entrada obrigatória do robô, sem o valor digitado;
 - lista → ``select``; caixa de seleção e opção → ``check``; arquivo →
   ``upload`` com uma entrada do tipo arquivo; clique seguido de download →
   ``download``; Enter → ``press``; campo com máscara → ``sequential``.
@@ -85,8 +85,6 @@ from rapa.recorder.models import (
     SelectEvent,
 )
 from rapa.recorder.sensitivity import (
-    LOGIN_WORDS,
-    action_label,
     analyze_logins,
     clickable,
     declared_username,
@@ -95,7 +93,6 @@ from rapa.recorder.sensitivity import (
     is_password_like_text,
     looks_secret,
     password_by_name,
-    plain_label,
 )
 
 __all__ = ["CompileError", "CompileResult", "lower"]
@@ -141,11 +138,10 @@ class _Draft:
     #: seguidas do mesmo campo, o Tab que deixa o campo, o segundo clique de um
     #: clique duplo. As requisições depois de cada uma contam no efeito.
     absorbed: list[int] = field(default_factory=list)
-    #: Entrada criada para um literal com cara de segredo (``Lowering.secret_input``).
+    #: Entrada criada para um valor que não fica no robô (``Lowering.secret_input``).
     secret_input: str | None = None
-    #: Campo do login que espera a confirmação do envio: "username" (o usuário) ou
-    #: "password" (senha só pelo nome acessível). ``Lowering.finish_logins`` decide.
-    pending: str | None = None
+    #: Usuário de login que espera a confirmação do envio (``Lowering.finish_logins``).
+    pending: bool = False
     #: Última entrada do campo (já sem o valor, se ele era sigiloso) e o endereço dela.
     source: InputEvent | None = None
     url: str = ""
@@ -177,17 +173,17 @@ def _field_key(event: InputEvent | SelectEvent | CheckEvent | FileEvent) -> tupl
     return field_key(event.page_id, event.element)
 
 
-def _hidden_warning(label: str, name: str) -> str:
-    """Aviso do campo antes de uma senha de transação, que virou a entrada ``name``."""
+def _secret_page_warning(label: str, name: str) -> str:
+    """Aviso do campo preenchido numa página com senha ou código, que virou a entrada ``name``."""
     return (
-        f"O campo {quoted(label)} vem antes de uma senha de transação ou de um botão "
-        "irreversível; não foi tratado como usuário do login, o valor digitado não "
-        f"entrou no robô e virou a entrada {name}."
+        f"O campo {quoted(label)} foi preenchido numa página que pede senha ou código; para "
+        "não confundir o dado com uma credencial, não foi tratado como usuário do login, o "
+        f"valor digitado não entrou no robô e virou a entrada {name}."
     )
 
 
 def _login_warning(label: str, name: str) -> str:
-    """Aviso do campo com cara de usuário de um login que não foi confirmado."""
+    """Aviso do campo de usuário de um login que não foi confirmado."""
     return (
         f"O campo {quoted(label)} parecia o usuário de um login, mas o envio não passou na "
         "regra do login (botão de login, só credenciais na página e nada gravado antes); "
@@ -197,7 +193,7 @@ def _login_warning(label: str, name: str) -> str:
 
 
 def _named_password_warning(label: str, name: str) -> str:
-    """Aviso do campo que só o nome acessível diz ser senha, fora de um login."""
+    """Aviso do campo que só o ``aria-label`` ou o ``aria-labelledby`` diz ser senha."""
     return (
         f"O nome do campo {quoted(label)} fala em senha; o valor digitado não entrou no "
         f"robô e virou a entrada {name}."
@@ -236,22 +232,19 @@ class _Lowering:
         self.postconditions: list[dict[str, Any]] = []
         self.document = _Document(index=None, url="")
         self.navigated = False
-        #: Logins da gravação (regra conservadora) e os que o envio confirmou.
+        #: Logins da gravação (pela regra), os campos das páginas com senha e os
+        #: logins que a classificação confirmou (pelo índice do envio).
         self.logins = analyze_logins(self.events)
         self.confirmed: set[int] = set()
-        self.username_groups: dict[int, list[int]] = {}
-        self.password_groups: dict[int, list[int]] = {}
-        self.submit_groups: dict[int, list[int]] = {}
-        self.bridge_groups: dict[int, list[int]] = {}
-        for number, group in enumerate(self.logins.groups):
-            for entry in group.username:
-                self.username_groups.setdefault(entry.index, []).append(number)
-            for entry in group.password:
-                self.password_groups.setdefault(entry.index, []).append(number)
-            if group.submit is not None:
-                self.submit_groups.setdefault(group.submit.index, []).append(number)
-            for bridge in group.bridges:
-                self.bridge_groups.setdefault(bridge.index, []).append(number)
+        self.login_by_submit = {login.submit.index: login for login in self.logins.logins}
+        self.login_by_bridge = {
+            login.bridge.index: login for login in self.logins.logins if login.bridge is not None
+        }
+        #: Entrada do usuário → envios dos logins de que ela faz parte.
+        self.username_submits: dict[int, set[int]] = {}
+        for login in self.logins.logins:
+            for entry in login.username:
+                self.username_submits.setdefault(entry.index, set()).add(login.submit.index)
         user_actions = [e for e in self.events if e.type in USER_ACTION_TYPES]
         self.action_indices = [e.index for e in user_actions]
         self.next_action: dict[int, RecordingEvent | None] = {}
@@ -566,7 +559,7 @@ class _Lowering:
     def secret_input(
         self, key: tuple[Any, ...], label: str, warning: Callable[[str], str] | None = None
     ) -> str:
-        """Entrada obrigatória para um literal com cara de segredo (cartão, token, chave).
+        """Entrada obrigatória para um valor que não fica no robô (segredo, campo de login).
 
         O valor digitado na demonstração não entra no robô: quem chama informa o
         valor a cada execução.
@@ -597,10 +590,10 @@ class _Lowering:
         return name
 
     def hide_password_by_name(self, event: InputEvent) -> InputEvent:
-        """Campo que só o nome acessível diz ser senha (segunda camada do gravador).
+        """Campo que só o ``aria-label`` ou o ``aria-labelledby`` diz ser senha (segunda camada).
 
-        O valor gravado é descartado; o campo continua sem a marca de senha e só
-        vira a senha do cofre num login confirmado (``finish_logins``).
+        O valor gravado é descartado; o campo continua sem a marca de senha e vira
+        uma entrada obrigatória (nunca um segredo do cofre).
         """
         element = event.element
         if element.sensitive or not password_by_name(element):
@@ -643,7 +636,8 @@ class _Lowering:
         label = element_label(element)
         title = f"Digitar {article(label)} {lower_first(clip_label(label))}"
         secret_input: str | None = None
-        pending: str | None = None
+        pending = False
+        role = self.logins.roles.get(event.index)
         value: dict[str, Any]
         if element.is_password:
             value = {
@@ -657,28 +651,26 @@ class _Lowering:
                 "credential": self.credential(url, CredentialKind.TOTP),
                 "field": "totp",
             }
-        elif element.sensitive and element.is_username and declared_username(element):
+        elif declared_username(element) and (element.sensitive or role == "username"):
             # A própria página declara o campo como usuário (autocomplete="username").
             value = {
                 "source": "secret",
                 "credential": self.credential(url, CredentialKind.PASSWORD),
                 "field": "username",
             }
-        elif event.index in self.username_groups or (
-            event.index in self.password_groups and password_by_name(element)
-        ):
+        elif role == "username":
             # Depende do envio do login: ``finish_logins`` decide depois da classificação.
-            pending = "username" if event.index in self.username_groups else "password"
+            pending = True
             value = {"source": "text", "template": ""}
-        elif element.sensitive:
-            # O gravador escondeu o valor sem que o campo seja credencial de um login
-            # confirmado: quem chama informa o valor.
-            if element.is_username:
-                warning = _login_warning
-            elif password_by_name(element):
+        elif role == "other" or element.sensitive:
+            # Campo de uma página com senha ou código (ou que o gravador escondeu) que
+            # não é credencial: quem chama informa o valor.
+            if password_by_name(element):
                 warning = _named_password_warning
+            elif element.is_username and role is None:
+                warning = _login_warning
             else:
-                warning = _hidden_warning
+                warning = _secret_page_warning
             value, secret_input = self.hidden_input(key, label, warning)
         elif event.value is None:
             self.warn(f"O valor do campo {quoted(label)} não foi gravado; o passo ficou de fora.")
@@ -723,66 +715,42 @@ class _Lowering:
         )
 
     def finish_logins(self) -> None:
-        """Usuário e senha dos logins, depois que a classificação confirmou os envios.
+        """Usuário dos logins, depois que a classificação confirmou os envios.
 
-        Num login confirmado, o campo vira o usuário do cofre (e a senha só pelo nome
-        acessível, a senha do cofre). Sem confirmação o cofre nunca é digitado nele:
-        um valor que já saiu da gravação (antes de uma senha de transação, com forma
-        de usuário ou marcado pelo script) vira entrada obrigatória com aviso, e o
-        resto fica literal.
+        Num login confirmado, o campo vira o usuário do cofre, com a credencial da
+        senha que vai com ele. Sem confirmação o cofre nunca é digitado nele: o valor,
+        que o gravador tira da gravação, vira uma entrada obrigatória com aviso.
         """
-        groups = self.logins.groups
         for draft in self.drafts:
             source = draft.source
-            if draft.pending is None or source is None or draft.field_key is None:
+            if not draft.pending or source is None or draft.field_key is None:
                 continue
-            key = draft.field_key
-            element = source.element
-            label = element_label(element)
-            by_field = self.username_groups if draft.pending == "username" else self.password_groups
-            numbers = sorted({n for i in draft.absorbed for n in by_field.get(i, [])})
-            confirmed = [n for n in numbers if n in self.confirmed]
+            submits = {s for i in draft.absorbed for s in self.username_submits.get(i, ())}
+            confirmed = sorted(submits & self.confirmed)
             secret_input: str | None = None
-            if draft.pending == "password":
-                if confirmed:
-                    self.warn(
-                        f"O nome do campo {quoted(label)} fala em senha; o valor gravado foi "
-                        "descartado e o robô digita a senha do cofre."
-                    )
-                    value: dict[str, Any] = {
-                        "source": "secret",
-                        "credential": self.credential(draft.url, CredentialKind.PASSWORD),
-                        "field": "password",
-                    }
-                else:
-                    value, secret_input = self.hidden_input(key, label, _named_password_warning)
-            elif confirmed or declared_username(element):
+            if confirmed:
                 # A credencial da senha que vai com o usuário (mesma origem, em geral).
                 url = draft.url
-                for number in confirmed or numbers:
-                    owner = self.draft_by_event.get(groups[number].password[0].index)
+                for submit in confirmed:
+                    login = self.login_by_submit[submit]
+                    owner = (
+                        self.draft_by_event.get(login.password[0].index) if login.password else None
+                    )
                     if owner is not None and owner.url:
                         url = owner.url
                         break
-                value = {
+                value: dict[str, Any] = {
                     "source": "secret",
                     "credential": self.credential(url, CredentialKind.PASSWORD),
                     "field": "username",
                 }
-            elif any(groups[n].transaction for n in numbers):
-                value, secret_input = self.hidden_input(key, label, _hidden_warning)
-            elif element.sensitive or any(groups[n].login for n in numbers):
-                # O gravador tira da gravação o valor de um login com essa forma.
-                value, secret_input = self.hidden_input(key, label, _login_warning)
-            elif source.value is None:
-                value, secret_input = self.hidden_input(key, label, _login_warning)
-            else:
-                value, secret_input = self.literal(source, key, label)
-            draft.step["value"] = value
-            if value["source"] == "secret":
                 draft.step.pop("sequential", None)
+            else:
+                label = element_label(source.element)
+                value, secret_input = self.hidden_input(draft.field_key, label, _login_warning)
+            draft.step["value"] = value
             draft.secret_input = secret_input
-            draft.pending = None
+            draft.pending = False
 
     def on_select(self, event: SelectEvent) -> None:
         element = event.element
@@ -939,21 +907,17 @@ class _Lowering:
     # -- efeitos e verificações ------------------------------------------------
 
     def classify(self) -> None:
-        """Efeito de cada passo e logins confirmados, depois o usuário e a senha do login.
+        """Efeito de cada passo e logins confirmados, depois o usuário do login.
 
-        Começa supondo que todo login com a forma da regra se confirma (o "Continuar"
-        de um login em duas etapas também é autenticação). O login cujo envio não
-        passa (algo gravou antes, inclusive o próprio "Continuar") cai, e a
-        classificação recomeça sem ele: cair só sobe efeitos, então termina.
+        O envio de um login pela regra é leitura quando nada gravou antes. O
+        "Continuar" de um login em duas etapas também é, supondo que o envio se
+        confirme; se não se confirmar (algo gravou entre os dois), a classificação
+        recomeça sem o login: cair só sobe efeitos, então termina.
         """
         failed: set[int] = set()
         while True:
-            confirmed, notes = self.classify_pass(failed)
-            dropped = {
-                number
-                for number, group in enumerate(self.logins.groups)
-                if group.login and number not in failed and number not in confirmed
-            }
+            confirmed, notes, assumed = self.classify_pass(failed)
+            dropped = assumed - confirmed
             if not dropped:
                 break
             failed |= dropped
@@ -962,14 +926,14 @@ class _Lowering:
             self.warn(message)
         self.finish_logins()
 
-    def classify_pass(self, failed: set[int]) -> tuple[set[int], list[str]]:
-        """Uma passada da classificação, com os logins ``failed`` fora da regra."""
-        alive = {
-            number
-            for number, group in enumerate(self.logins.groups)
-            if group.login and number not in failed
-        }
+    def classify_pass(self, failed: set[int]) -> tuple[set[int], list[str], set[int]]:
+        """Uma passada da classificação, sem contar as pontes dos logins ``failed``.
+
+        Devolve os envios de login confirmados, os avisos e os envios cuja ponte
+        ("Continuar") foi tratada como autenticação.
+        """
         confirmed: set[int] = set()
+        assumed: set[int] = set()
         notes: list[str] = []
         wrote_before = False
         for draft in self.drafts:
@@ -982,18 +946,25 @@ class _Lowering:
             requests = [r for index in draft.absorbed for r in self.requests_of(index)]
             if kind in ("click", "download", "press"):
                 index = draft.action_index
+                authentication = False
+                if not wrote_before and kind == "click":
+                    bridge_of = self.login_by_bridge.get(index)
+                    if index in self.login_by_submit:
+                        authentication = True
+                    elif bridge_of is not None and bridge_of.submit.index not in failed:
+                        authentication = True
+                        assumed.add(bridge_of.submit.index)
                 result = classify_action(
                     ActionContext(
                         element=draft.element,
                         requests=requests,
                         navigated_to_form=self.navigated_to_form(index),
-                        authentication=not wrote_before
-                        and self.authenticates(draft, alive, confirmed),
+                        authentication=authentication,
                     )
                 )
                 effect = result.effect
-                if result.reason == AUTHENTICATION:
-                    confirmed.update(n for n in self.submit_groups.get(index, []) if n in alive)
+                if result.reason == AUTHENTICATION and index in self.login_by_submit:
+                    confirmed.add(index)
                 if (
                     effect is Effect.READ
                     and result.reason.startswith("link")
@@ -1009,26 +980,7 @@ class _Lowering:
             if effect is not Effect.READ:
                 draft.step["effect"] = effect.value
                 wrote_before = True
-        return confirmed, notes
-
-    def authenticates(self, draft: _Draft, alive: set[int], confirmed: set[int]) -> bool:
-        """O clique ou Enter envia credenciais pela regra do login (sem contar o que gravou).
-
-        É o envio de um login com a forma da regra, o "Continuar" (ou o Enter) que
-        leva do usuário à senha num login em duas etapas, ou o envio de um código de
-        uso único numa página em que o resto são credenciais de logins já confirmados.
-        """
-        index = draft.action_index
-        if index is None:
-            return False
-        if any(n in alive for n in self.submit_groups.get(index, [])):
-            return True
-        if any(n in alive for n in self.bridge_groups.get(index, [])):
-            if draft.step["kind"] == "press":
-                return True
-            return plain_label(action_label(draft.element)) in LOGIN_WORDS
-        owners = self.logins.one_time_codes.get(index)
-        return owners is not None and all(ids & confirmed for ids in owners)
+        return confirmed, notes, assumed
 
     def navigated_to_form(self, action_index: int) -> bool:
         navigation = self.navigation_by_trigger.get(action_index)
