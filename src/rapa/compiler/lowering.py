@@ -9,10 +9,13 @@ Regras principais:
 - a primeira navegação vira ``navigate``; as seguintes causadas por clique viram
   ``click.expect_navigation``; as digitadas viram ``navigate``; as feitas pela
   própria página (redirecionamentos) são ignoradas;
-- entradas seguidas no mesmo campo viram um ``fill`` com o valor final; as
-  requisições feitas enquanto a pessoa editava o campo, depois de cada edição e
-  depois do Tab que deixa o campo contam no efeito do passo, como num
-  salvamento automático;
+- entradas seguidas no mesmo campo (a identidade de
+  ``rapa.recorder.sensitivity.field_key``, com os hospedeiros dos shadow roots e o
+  que a pessoa vê do campo), no mesmo documento, viram um ``fill`` com o valor
+  final; edições, marcações e escolhas de campos diferentes nunca se juntam, então
+  o alvo e o valor de um passo sempre vêm do mesmo campo; as requisições feitas
+  enquanto a pessoa editava o campo, depois de cada edição e depois do Tab que
+  deixa o campo contam no efeito do passo, como num salvamento automático;
 - campo de senha → ``SecretValue(field="password")`` de uma credencial por
   origem; código de uso único → ``SecretValue(field="totp")`` de outra
   credencial;
@@ -24,8 +27,9 @@ Regras principais:
   confirmado (ou quando a página o declara no ``autocomplete``). No login em duas
   páginas o usuário também vira o do cofre, mas a ponte e o envio ficam com o
   efeito das requisições deles. Qualquer outro campo de texto de uma página com
-  senha ou código, e o usuário de um login não confirmado, vira uma entrada
-  obrigatória com aviso, nunca um literal nem um segredo do cofre;
+  senha ou código, o usuário de um login não confirmado e o campo de um shadow
+  root (nunca credencial de login) viram uma entrada obrigatória com aviso, nunca
+  um literal nem um segredo do cofre;
 - campo de texto com cara de senha (rótulo, nome, id ou placeholder de senha,
   ``rapa.recorder.sensitivity``) é tratado como senha, e o valor gravado é
   descartado; o que só o ``aria-label`` ou o ``aria-labelledby`` diz ser senha
@@ -147,6 +151,9 @@ class _Draft:
     #: Última entrada do campo (já sem o valor, se ele era sigiloso) e o endereço dela.
     source: InputEvent | None = None
     url: str = ""
+    #: Documento carregado (navegação do quadro principal que não é no mesmo
+    #: documento) em que o passo nasceu: edições só se juntam no mesmo.
+    load: int = 0
 
     def __post_init__(self) -> None:
         if self.action_index is not None and self.action_index not in self.absorbed:
@@ -233,6 +240,8 @@ class _Lowering:
         self.var_names: set[str] = set()
         self.postconditions: list[dict[str, Any]] = []
         self.document = _Document(index=None, url="")
+        #: Documentos carregados até aqui em cada aba (o mesmo corte de ``analyze_logins``).
+        self.loads: dict[int, int] = {}
         self.navigated = False
         #: Logins da gravação (pela regra), os campos das páginas com senha e os
         #: logins que a classificação confirmou (pelo índice do envio).
@@ -394,6 +403,8 @@ class _Lowering:
         self.add_host(event.url)
         if not event.main_frame:
             return
+        if not event.same_document:
+            self.loads[event.page_id] = self.loads.get(event.page_id, 0) + 1
         self.document = _Document(index=event.index, url=event.url)
         url = _JSESSIONID.sub("", event.url)
         navigate = {"kind": "navigate", "url": templates.escape(url)}
@@ -508,9 +519,19 @@ class _Lowering:
         self.var_names.add(name)
         return name
 
-    def merge_target(self, key: tuple[Any, ...], kind: str) -> _Draft | None:
+    def merge_target(self, key: tuple[Any, ...], kind: str, page_id: int) -> _Draft | None:
+        """O passo anterior, se for do mesmo campo (``field_key``), do mesmo tipo e documento.
+
+        Só edições, marcações ou escolhas seguidas do mesmo elemento viram um passo
+        só: o alvo e o valor do passo sempre vêm do mesmo campo.
+        """
         last = self.drafts[-1] if self.drafts else None
-        if last is not None and last.field_key == key and last.step["kind"] == kind:
+        if (
+            last is not None
+            and last.field_key == key
+            and last.step["kind"] == kind
+            and last.load == self.loads.get(page_id, 0)
+        ):
             return last
         return None
 
@@ -666,7 +687,7 @@ class _Lowering:
         else:
             value, secret_input = self.literal(event, key, label)
         masked = event.script_modified or (event.typed is not None and event.typed != event.value)
-        existing = self.merge_target(key, "fill")
+        existing = self.merge_target(key, "fill", event.page_id)
         if existing is not None:
             existing.step["value"] = value
             existing.step["sequential"] = bool(existing.step.get("sequential")) or masked
@@ -695,6 +716,7 @@ class _Lowering:
                 field_key=key,
                 action_index=event.index,
                 document_index=self.document.index,
+                load=self.loads.get(event.page_id, 0),
                 secret_input=secret_input,
                 pending=pending,
                 source=event,
@@ -752,7 +774,7 @@ class _Lowering:
             self.warn(f"A opção escolhida em {quoted(element_label(element))} não tem rótulo.")
             return
         option = templates.escape(event.label)
-        existing = self.merge_target(key, "select")
+        existing = self.merge_target(key, "select", event.page_id)
         if existing is not None:
             existing.step["option"] = option
             existing.event_index = event.index
@@ -774,6 +796,7 @@ class _Lowering:
                 field_key=key,
                 action_index=event.index,
                 document_index=self.document.index,
+                load=self.loads.get(event.page_id, 0),
             )
         )
 
@@ -782,7 +805,7 @@ class _Lowering:
         key = _field_key(event)
         label = element_label(element)
         verb = "Marcar" if event.checked else "Desmarcar"
-        existing = self.merge_target(key, "check")
+        existing = self.merge_target(key, "check", event.page_id)
         if existing is not None:
             existing.step["checked"] = event.checked
             existing.step["title"] = f"{verb} {quoted(label)}"
@@ -804,6 +827,7 @@ class _Lowering:
                 field_key=key,
                 action_index=event.index,
                 document_index=self.document.index,
+                load=self.loads.get(event.page_id, 0),
             )
         )
 

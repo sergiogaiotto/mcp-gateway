@@ -30,6 +30,7 @@ from rapa.core.robot import (
 from rapa.fixtures.server import HOST_RESOLVER_ARG
 from rapa.llm.generalize import build_user_prompt
 from rapa.recorder import REDACTED, InputEvent, Recorder, Recording
+from tests.recorder.texts import has_text
 
 pytestmark = pytest.mark.browser
 
@@ -186,8 +187,8 @@ async def test_a_transaction_with_a_password_is_never_a_login(
     assert usernames_in(result) == []
     value = next(s.value for s in result.manifest.steps if isinstance(s, FillStep))
     assert isinstance(value, TextValue) and value.template.startswith("{{ inputs.")
-    assert "12345678909" not in recording.model_dump_json()
-    assert "12345678909" not in result.model_dump_json()
+    assert not has_text(recording, "12345678909")
+    assert not has_text(result, "12345678909")
 
 
 async def test_the_show_password_button_is_not_the_submit(browser: Browser) -> None:
@@ -467,8 +468,7 @@ async def test_a_field_named_like_a_password_never_reaches_the_recording(
         await p.get_by_role("heading", name="Comprovante").wait_for()
 
     recording = await record_site(browser, {"/entrar": entrar}, "/entrar", scenario)
-    dumped = recording.model_dump_json()
-    assert "918273" not in dumped and "12345678909" not in dumped
+    assert not has_text(recording, "918273") and not has_text(recording, "12345678909")
     inputs = {e.element.name_attr: e for e in recording.events if isinstance(e, InputEvent)}
     assert inputs["cod"].element.sensitive and not inputs["cod"].element.is_password
     assert inputs["cpf"].element.is_username
@@ -479,7 +479,7 @@ async def test_a_field_named_like_a_password_never_reaches_the_recording(
     assert isinstance(cod.value, TextValue) and cod.value.template.startswith("{{ inputs.")
     assert click_effect(result, "clicar_entrar") is Effect.WRITE
     assert result.manifest.credentials == []
-    assert "918273" not in result.model_dump_json()
+    assert not has_text(result, "918273")
 
 
 async def test_an_aria_label_of_a_password_hides_the_field_beside_aria_labelledby(
@@ -501,8 +501,7 @@ async def test_an_aria_label_of_a_password_hides_the_field_beside_aria_labelledb
         await p.get_by_role("heading", name="Comprovante").wait_for()
 
     recording = await record_site(browser, {"/entrar": entrar}, "/entrar", scenario)
-    dumped = recording.model_dump_json()
-    assert "918273" not in dumped and "12345678909" not in dumped
+    assert not has_text(recording, "918273") and not has_text(recording, "12345678909")
     cod = input_of(recording, "cod")
     assert cod.element.aria_mentions_password and cod.element.name == "Código pessoal"
     assert cod.element.sensitive and not cod.element.is_password
@@ -510,7 +509,7 @@ async def test_an_aria_label_of_a_password_hides_the_field_beside_aria_labelledb
     assert fill_value(result, "digitar_cpf") == an_input("cpf")
     assert click_effect(result, "clicar_entrar") is Effect.WRITE
     prompt = build_user_prompt(result.manifest, result.observed_texts)
-    assert "918273" not in result.model_dump_json() and "918273" not in prompt
+    assert not has_text(result, "918273") and "918273" not in prompt
     assert "12345678909" not in prompt
 
 
@@ -853,9 +852,15 @@ async def test_fields_inside_shadow_roots_are_captured_and_never_recorded(
     assert inputs["usuario"].element.is_username and inputs["usuario"].value is None
     assert inputs["senha"].element.is_password
     assert any(f"Olá, {REDACTED}" in text for text in recording.observed_texts())
+    assert inputs["senha"].element.shadow_path == ["body > x-pass"]
+    assert inputs["senha"].element.css == "body > x-pass > #p"
     result = compile_(recording)
-    assert usernames_in(result) == ["digitar_usuario"]
-    assert click_effect(result, "clicar_entrar") is Effect.READ
+    # Campo de shadow root nunca é credencial de login: o envio grava (POST) e o
+    # usuário vira uma entrada; a senha (type=password) continua a do cofre.
+    assert usernames_in(result) == []
+    assert fill_value(result, "digitar_usuario") == an_input("usuario")
+    assert fill_value(result, "digitar_senha") == SecretValue(credential="banco", field="password")
+    assert click_effect(result, "clicar_entrar") is Effect.WRITE
     manifest, prompt = dumps(result)
     assert USER not in manifest.lower() and USER not in prompt.lower()
 
@@ -936,7 +941,7 @@ document.getElementById('b').onclick = async () => {
         await p.get_by_text("Pix enviado").wait_for()
 
     recording = await record_site(browser, {"/app": app}, "/app", scenario)
-    assert "481516" not in recording.model_dump_json()
+    assert not has_text(recording, "481516")
     result = compile_(recording)
     assert click_effect(result, "clicar_entrar") is Effect.READ
     assert click_effect(result, "clicar_confirmar") is Effect.WRITE
@@ -966,16 +971,15 @@ async def test_a_payee_and_a_code_without_a_password_is_write(browser: Browser) 
         scenario,
         redirects={"/ted": "/ok"},
     )
-    dumped = recording.model_dump_json()
-    assert "11122233344" not in dumped and "481516" not in dumped
+    assert not has_text(recording, "11122233344") and not has_text(recording, "481516")
     favorecido = input_of(recording, "cpf_favorecido")
     assert favorecido.element.sensitive and not favorecido.element.is_username
     result = compile_(recording)
     assert click_effect(result, "clicar_continuar") is Effect.WRITE
     assert usernames_in(result) == []
     assert fill_value(result, "digitar_cpf_do_favorecido") == an_input("cpf_do_favorecido")
-    manifest, prompt = dumps(result)
-    assert "11122233344" not in manifest and "11122233344" not in prompt
+    _, prompt = dumps(result)
+    assert not has_text(result.manifest, "11122233344") and "11122233344" not in prompt
 
 
 async def test_a_sign_up_with_a_new_password_is_write(browser: Browser) -> None:

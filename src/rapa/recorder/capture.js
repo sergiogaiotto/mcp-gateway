@@ -9,7 +9,13 @@
 // roots abertos) que tem senha ou código: o usuário (pelo próprio campo) e os
 // outros; o valor final de cada campo sai no change/blur (ou antes da próxima
 // ação), com há quanto tempo a edição começou. Campos dentro de shadow roots
-// abertos também contam (o alvo é o primeiro elemento do composedPath).
+// abertos também contam: o alvo é o primeiro elemento do composedPath, listas,
+// caixas de seleção e arquivos de um shadow root saem pelo evento input (que,
+// ao contrário do change, atravessa o shadow root), e o elemento leva o caminho
+// dos hospedeiros (shadow_path) e um seletor CSS que atravessa os shadow roots
+// abertos ("#hospedeiro > #campo"), para que dois componentes iguais (o mesmo id
+// por dentro) nunca virem o mesmo campo. Nada da página é trocado: nenhum
+// método nativo é embrulhado para isso.
 (() => {
   'use strict';
   const CONFIG = __RAPA_CONFIG__;
@@ -65,6 +71,51 @@
 
   const styleOf = (el) => {
     try { return el.ownerDocument.defaultView.getComputedStyle(el); } catch (e) { return null; }
+  };
+
+  // -- shadow roots -------------------------------------------------------------
+
+  const MAX_SHADOW_DEPTH = 16;
+  // A raiz do nó (o documento ou um shadow root) e o hospedeiro de um shadow root.
+  const rootOf = (node) => (node.getRootNode ? node.getRootNode() : node.ownerDocument);
+  const hostOf = (root) =>
+    (root && root.nodeType === 11 && root.host && root.host.nodeType === 1 ? root.host : null);
+  const inShadow = (el) => hostOf(rootOf(el)) !== null;
+  // Os hospedeiros dos shadow roots em volta do elemento, do mais externo ao mais interno.
+  const shadowHosts = (el) => {
+    const hosts = [];
+    let host = hostOf(rootOf(el));
+    while (host && hosts.length < 64) {
+      hosts.unshift(host);
+      host = hostOf(rootOf(host));
+    }
+    return hosts;
+  };
+  // O ancestral mais próximo que casa com o seletor, atravessando os hospedeiros
+  // (a linha da tabela de uma caixa de seleção que está num componente).
+  const closestComposed = (el, selector) => {
+    let cur = el;
+    for (let depth = 0; cur && depth < 64; depth++) {
+      let found = null;
+      try { found = cur.closest(selector); } catch (e) { return null; }
+      if (found) return found;
+      cur = hostOf(rootOf(cur));
+    }
+    return null;
+  };
+  // O nó e os shadow roots abertos abaixo dele (também os aninhados), ou null se
+  // forem grandes demais para olhar.
+  const rootsUnder = (node) => {
+    const roots = [node];
+    let budget = MAX_SCAN;
+    for (let i = 0; i < roots.length; i++) {
+      let all;
+      try { all = roots[i].querySelectorAll('*'); } catch (e) { return null; }
+      budget -= all.length;
+      if (budget < 0) return null;
+      for (const child of all) if (child.shadowRoot) roots.push(child.shadowRoot);
+    }
+    return roots;
   };
 
   const contentText = (node, skip, depth) => {
@@ -335,48 +386,40 @@
     return all.filter((f) => isTextLike(f) || isPassword(f));
   };
 
-  // O documento e os shadow roots abertos dele (também os aninhados), ou null se
-  // forem grandes demais para olhar.
-  const documentRoots = (doc) => {
-    const roots = [doc];
-    let budget = MAX_SCAN;
-    for (let i = 0; i < roots.length; i++) {
-      let all;
-      try { all = roots[i].querySelectorAll('*'); } catch (e) { return null; }
-      budget -= all.length;
-      if (budget < 0) return null;
-      for (const node of all) if (node.shadowRoot) roots.push(node.shadowRoot);
+  // Um campo visível de senha ou código nas raízes do documento (o documento e os
+  // shadow roots abertos), fora da raiz ``skip``; ``loose``: só os sem <form>.
+  const secretIn = (el, loose, skip) => {
+    const roots = rootsUnder(el.ownerDocument);
+    if (!roots) return false;
+    for (const root of roots) {
+      if (root === skip) continue;
+      let found;
+      try { found = root.querySelectorAll('input'); } catch (e) { continue; }
+      for (const f of found) {
+        if (f !== el && (!loose || !formOf(f)) && !hiddenForAria(f) && isSecretField(f)) return true;
+      }
     }
-    return roots;
+    return false;
   };
 
   // Campo sem <form>: um campo solto e visível de senha ou código noutra raiz do
   // documento (o documento ou outro shadow root aberto) também conta.
-  const looseSecretElsewhere = (el) => {
-    if (formOf(el)) return false;
-    const roots = documentRoots(el.ownerDocument);
-    if (!roots) return false;
-    const own = el.getRootNode ? el.getRootNode() : el.ownerDocument;
-    for (const root of roots) {
-      if (root === own) continue;
-      let found;
-      try { found = root.querySelectorAll('input'); } catch (e) { continue; }
-      for (const f of found) if (!formOf(f) && !hiddenForAria(f) && isSecretField(f)) return true;
-    }
-    return false;
-  };
+  const looseSecretElsewhere = (el) => !formOf(el) && secretIn(el, true, rootOf(el));
 
   // 'username': o usuário pelo próprio campo; 'hidden': outro campo de texto do
   // grupo, que não vai na gravação mas também não é o usuário; null: campo comum
   // (o grupo não tem senha nem código). O campo que a página declara como usuário
   // (autocomplete=username) nunca vai na gravação: é o usuário, a menos que o nome
-  // dele fale de outra pessoa ou de um cadastro.
+  // dele fale de outra pessoa ou de um cadastro. O campo de um shadow root sai da
+  // gravação com qualquer senha ou código visível no documento, em qualquer raiz e
+  // em qualquer <form> (ele nunca é credencial de login: o compilador pede o valor
+  // numa entrada).
   const loginRole = (el) => {
     if (!isTextLike(el) || isSecretField(el)) return null;
     const ac = norm(el.getAttribute('autocomplete')).toLowerCase().split(' ');
     const declared = ac.indexOf('username') >= 0;
     if (!declared && !groupFields(el).some((f) => f !== el && isSecretField(f)) &&
-        !looseSecretElsewhere(el)) return null;
+        !looseSecretElsewhere(el) && !(inShadow(el) && secretIn(el, false, null))) return null;
     return isUsernameField(el) ? 'username' : 'hidden';
   };
 
@@ -386,27 +429,81 @@
   const stableId = (id) => !!id && id.length <= 40 && !GENERATED_ID.test(id);
   const cssEscape = (s) => (W.CSS && W.CSS.escape ? W.CSS.escape(s) : s.replace(/[^a-zA-Z0-9_-]/g, '\\$&'));
 
-  const cssPath = (el) => {
-    const root = el.getRootNode ? el.getRootNode() : el.ownerDocument;
+  const MAX_CSS = 1000;
+  // Caminho do elemento dentro da raiz dele. No documento, como sempre: até um id
+  // estável e único, o <body> ou seis níveis. Num shadow root, até o topo dele (o
+  // id estável e único na raiz entra no lugar da etiqueta, mas o caminho continua):
+  // ``anchored`` diz que ele começa no topo do shadow root (ou num id único do
+  // documento, ou no <body>).
+  const segment = (el) => {
+    const root = rootOf(el);
+    const shadow = hostOf(root) !== null;
     const parts = [];
+    let anchored = false;
     let cur = el;
-    while (cur && cur.nodeType === 1 && parts.length < 6) {
+    while (cur && cur.nodeType === 1 && parts.length < (shadow ? 10 : 6)) {
+      let idPart = null;
       if (stableId(cur.id)) {
         let unique = false;
         try { unique = root.querySelectorAll('#' + cssEscape(cur.id)).length === 1; } catch (e) { /* ignora */ }
-        if (unique) { parts.unshift('#' + cssEscape(cur.id)); break; }
+        if (unique) idPart = '#' + cssEscape(cur.id);
       }
-      let part = cur.tagName.toLowerCase();
+      if (idPart && !shadow) { parts.unshift(idPart); anchored = true; break; }
       const parent = cur.parentElement;
-      if (parent) {
-        const same = Array.from(parent.children).filter((c) => c.tagName === cur.tagName);
-        if (same.length > 1) part += ':nth-of-type(' + (same.indexOf(cur) + 1) + ')';
+      const top = !parent && shadow && cur.parentNode === root;
+      let part = idPart;
+      if (!part) {
+        part = cur.tagName.toLowerCase();
+        const siblings = parent || (top ? root : null);
+        if (siblings) {
+          const same = Array.from(siblings.children).filter((c) => c.tagName === cur.tagName);
+          if (same.length > 1) part += ':nth-of-type(' + (same.indexOf(cur) + 1) + ')';
+        }
       }
       parts.unshift(part);
-      if (cur.tagName === 'BODY') break;
+      if (cur.tagName === 'BODY') { anchored = true; break; }
+      if (top) { anchored = true; break; }
       cur = parent;
     }
-    return parts.join(' > ');
+    return { parts, anchored };
+  };
+
+  // Junta os caminhos dos hospedeiros e o do elemento num seletor que atravessa os
+  // shadow roots abertos (o CSS do Playwright passa do hospedeiro para os filhos do
+  // shadow root com ">"); o que não começa no topo do shadow root vai como
+  // descendente. Longo demais: sobram os trechos de dentro (o seletor deixa de ser
+  // único e o executor recusa, em vez de errar o elemento).
+  const joinSegments = (segs) => {
+    let css = '';
+    segs.forEach((seg, i) => {
+      const path = seg.parts.join(' > ');
+      css = i === 0 ? path : css + (seg.anchored ? ' > ' : ' ') + path;
+    });
+    return css;
+  };
+  const fitCss = (segs) => {
+    let rest = segs;
+    let css = joinSegments(rest);
+    while (css.length > MAX_CSS && rest.length > 1) {
+      rest = rest.slice(1);
+      css = joinSegments(rest);
+    }
+    if (css.length > MAX_CSS) {
+      const parts = rest[0].parts.slice();
+      while (parts.length > 1 && parts.join(' > ').length > MAX_CSS) parts.shift();
+      css = parts.join(' > ').slice(0, MAX_CSS);
+    }
+    return css;
+  };
+
+  const cssPath = (el) => fitCss(shadowHosts(el).concat([el]).map(segment));
+
+  // O caminho de cada hospedeiro, cada um dentro da sua raiz, do mais externo ao
+  // mais interno (null fora de shadow roots): a identidade do campo leva isso.
+  const shadowPath = (el) => {
+    const hosts = shadowHosts(el);
+    if (!hosts.length) return null;
+    return hosts.slice(-MAX_SHADOW_DEPTH).map((host) => fitCss([segment(host)]));
   };
 
   const framePath = () => {
@@ -456,9 +553,23 @@
     return all.length > MAX_SCAN ? null : Array.from(all);
   };
 
-  const countRoleName = (root, role, name) => {
+  // O mesmo em várias raízes (os localizadores do Playwright atravessam os shadow
+  // roots abertos); null se alguma for grande demais ou se não há raízes.
+  const scanAll = (roots, selector) => {
+    if (!roots) return null;
+    let out = [];
+    for (const root of roots) {
+      const found = scan(root, selector);
+      if (!found) return null;
+      out = out.concat(found);
+      if (out.length > MAX_SCAN) return null;
+    }
+    return out;
+  };
+
+  const countRoleName = (roots, role, name) => {
     if (!role || !name) return null;
-    const all = scan(root, ROLE_SELECTORS[role]);
+    const all = scanAll(roots, ROLE_SELECTORS[role]);
     if (!all) return null;
     let n = 0;
     for (const el of all) {
@@ -468,25 +579,25 @@
     return n;
   };
 
-  const countLabel = (root, label) => {
+  const countLabel = (roots, label) => {
     if (!label) return null;
-    const all = scan(root, 'input, select, textarea, button, meter, output, progress, [aria-label], [aria-labelledby]');
+    const all = scanAll(roots, 'input, select, textarea, button, meter, output, progress, [aria-label], [aria-labelledby]');
     if (!all) return null;
     let n = 0;
     for (const el of all) if (labelText(el) === label) n++;
     return n;
   };
 
-  const countAttr = (root, attr, value) => {
+  const countAttr = (roots, attr, value) => {
     if (!value) return null;
-    const all = scan(root, '[' + attr + ']');
+    const all = scanAll(roots, '[' + attr + ']');
     if (!all) return null;
     return all.filter((el) => el.getAttribute(attr) === value).length;
   };
 
-  const countText = (root, text) => {
+  const countText = (roots, text) => {
     if (!text) return null;
-    const all = scan(root, '*');
+    const all = scanAll(roots, '*');
     if (!all) return null;
     let n = 0;
     for (const el of all) {
@@ -570,19 +681,22 @@
     return null;
   };
 
+  // A linha também pode estar fora do shadow root do elemento (a caixa de seleção de
+  // um componente numa célula): as contagens dentro dela atravessam os shadow roots.
   const rowInfo = (el, role, name, text) => {
-    const row = el.closest('tr, [role=row]');
+    const row = closestComposed(el, 'tr, [role=row]');
     if (!row) return null;
     const cellElements = Array.from(row.querySelectorAll('td, th, [role=cell], [role=gridcell], [role=rowheader], [role=columnheader]'))
       .slice(0, 20);
     const cells = cellElements.map((c) => clip(c.innerText || c.textContent, 200));
     const key = rowKey(row, cellElements);
+    const inside = rootsUnder(row);
     return {
       text: clip(row.innerText || row.textContent, 500),
       cells,
       key,
-      role_name_count: countRoleName(row, role, name),
-      text_count: countText(row, text),
+      role_name_count: countRoleName(inside, role, name),
+      text_count: countText(inside, text),
     };
   };
 
@@ -643,7 +757,11 @@
     let text = '';
     if (!isControl) text = clip(el.innerText || el.textContent, MAX_TEXT);
     else if (tag === 'input' && BUTTON_TYPES.has(type)) text = clip(el.getAttribute('value'), MAX_TEXT);
-    const root = el.getRootNode ? el.getRootNode() : el.ownerDocument;
+    // As contagens valem no documento e nos shadow roots abertos dele, como o
+    // executor procura. Documento grande demais: o do documento conta só nele, como
+    // antes; o de um shadow root fica sem contagem (a conferência do Playwright decide).
+    const shadow = inShadow(el);
+    const root = rootsUnder(el.ownerDocument) || (shadow ? null : [el.ownerDocument]);
     const textForCount = text && text.length <= 100 ? text : null;
     return {
       tag,
@@ -656,6 +774,7 @@
       name_attr: orNull(nameAttr),
       id: orNull(id),
       css: cssPath(el),
+      shadow_path: shadow ? shadowPath(el) : null,
       text: orNull(text),
       title: orNull(clip(el.getAttribute('title'), MAX_NAME)),
       href: tag === 'a' && el.getAttribute('href') ? clip(el.href, 500) : null,
@@ -781,9 +900,12 @@
   };
 
   const onInput = (event) => {
-    if (!event.isTrusted) return;
     const el = realTarget(event);
-    if (!el || el.nodeType !== 1 || !isEditable(el)) return;
+    if (!el || el.nodeType !== 1) return;
+    // O change não sai do shadow root (não é composed); o input, sim, e o
+    // navegador o dispara antes do change em listas, caixas de seleção e arquivos.
+    if (isChoice(el) && inShadow(el)) { onChoice(el, event); return; }
+    if (!event.isTrusted || !isEditable(el)) return;
     const st = fieldState(el);
     startSession(el, st, false);
     const type = event.inputType || '';
@@ -807,9 +929,12 @@
   const clearEditing = () => { editing = null; };
 
   const selectSent = new WeakMap();
-  const onChange = (event) => {
-    const el = realTarget(event);
-    if (!el || el.nodeType !== 1) return;
+  // Lista, caixa de seleção, opção ou arquivo: o valor sai na hora (change ou, num
+  // shadow root, input).
+  const isChoice = (el) => el.tagName === 'SELECT' ||
+    (el.tagName === 'INPUT' && ['checkbox', 'radio', 'file'].indexOf(inputType(el)) >= 0);
+
+  const onChoice = (el, event) => {
     const tag = el.tagName;
     const type = inputType(el);
     // Listas e arquivos aceitam eventos sintéticos: é assim que a automação (e a
@@ -840,9 +965,14 @@
       flushPending(el);
       const names = Array.from(el.files || []).slice(0, 10).map((f) => String(f.name).slice(0, 255));
       send({ kind: 'file', element: describe(el), file_names: names });
-      return;
     }
-    if (isEditable(el)) { fieldState(el); sendField(el); }
+  };
+
+  const onChange = (event) => {
+    const el = realTarget(event);
+    if (!el || el.nodeType !== 1) return;
+    if (isChoice(el)) { onChoice(el, event); return; }
+    if (event.isTrusted && isEditable(el)) { fieldState(el); sendField(el); }
   };
 
   const onFocusOut = (event) => {
@@ -891,25 +1021,8 @@
   W.addEventListener('input', clearEditing, { capture: false, passive: true });
   W.addEventListener('pagehide', () => flushPending(null), opts);
   W.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushPending(null); }, opts);
-  // O change não sai do shadow root (não é composed): cada shadow root aberto que a
-  // página cria ganha o mesmo ouvinte (os outros eventos chegam à janela).
-  try {
-    const proto = W.Element && W.Element.prototype;
-    const attach = proto && proto.attachShadow;
-    if (typeof attach === 'function') {
-      Object.defineProperty(proto, 'attachShadow', {
-        configurable: true,
-        writable: true,
-        value: function attachShadow(init) {
-          const root = attach.call(this, init);
-          if (init && init.mode === 'open') {
-            try { root.addEventListener('change', onChange, opts); } catch (e) { /* ignora */ }
-          }
-          return root;
-        },
-      });
-    }
-  } catch (e) { /* ignora */ }
+  // Shadow roots: só eventos que atravessam a fronteira (input, click, keydown,
+  // focusout), com o composedPath; nenhum método da página é embrulhado.
 
   Object.defineProperty(W, Symbol.for('rapa.recorder.stop'), {
     configurable: true,

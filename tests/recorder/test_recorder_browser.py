@@ -44,6 +44,7 @@ from rapa.recorder import (
     RecorderError,
     Recording,
 )
+from tests.recorder.texts import has_text, texts_of
 
 pytestmark = pytest.mark.browser
 
@@ -99,12 +100,15 @@ def compile_(recording: Recording, name: str) -> CompileResult:
     return result
 
 
-def assert_no_secrets(text: str, codes: list[str], *, username: bool = True) -> None:
-    assert DEFAULT_PASSWORD not in text
-    for code in codes:
-        assert not re.search(rf"(?<!\d){code}(?!\d)", text), "código TOTP vazou"
-    if username:
-        assert DEFAULT_USER not in text
+def assert_no_secrets(value: object, codes: list[str], *, username: bool = True) -> None:
+    """Nenhum segredo nos textos de ``value`` (os números e as datas não contam: um código
+    de seis dígitos pode aparecer por acaso num ``t_ms`` ou no ``finished_at``)."""
+    for text in texts_of(value):
+        assert DEFAULT_PASSWORD not in text
+        for code in codes:
+            assert not re.search(rf"(?<!\d){code}(?!\d)", text), "código TOTP vazou"
+        if username:
+            assert DEFAULT_USER not in text
 
 
 def assert_login_steps(result: CompileResult) -> None:
@@ -145,15 +149,15 @@ async def test_login_totp_and_issue_protocol(browser: Browser, portal_v1: Runnin
     recording = await record(browser, scenario)
     assert portal_v1.state.protocolos[0]["cpf"] == "529.982.247-25"
     # Nem o nome de usuário que o portal mostra depois do login ("Olá, ...") fica na gravação.
-    assert_no_secrets(recording.model_dump_json(), codes)
+    assert_no_secrets(recording, codes)
     assert any(f"Olá, {REDACTED}" in text for text in recording.observed_texts())
     sensitive = [e for e in recording.events if isinstance(e, InputEvent) and e.element.sensitive]
     assert len(sensitive) == 3 and all(e.value is None for e in sensitive)
 
     result = compile_(recording, "emitir_protocolo_gravado")
     manifest = result.manifest
-    assert_no_secrets(manifest.model_dump_json(), codes)
-    assert_no_secrets(result.model_dump_json(), codes)
+    assert_no_secrets(manifest, codes)
+    assert_no_secrets(result, codes)
     assert_login_steps(result)
 
     emitir = manifest.step_by_id("clicar_emitir")
@@ -227,7 +231,7 @@ async def test_issue_protocol_on_the_changed_layout(
     assert portal_v2.state.protocolos[0]["uf"] == "RS"
     result = compile_(recording, "emitir_documento_gravado")
     manifest = result.manifest
-    assert_no_secrets(manifest.model_dump_json(), codes)
+    assert_no_secrets(manifest, codes)
     secrets_used = [
         s.value.field
         for s in manifest.steps
@@ -262,10 +266,10 @@ async def test_read_notes_and_download_one_file(browser: Browser, portal_v1: Run
 
     recording = await record(browser, scenario)
     assert portal_v1.state.downloads == ["001003"]
-    assert_no_secrets(recording.model_dump_json(), codes)
+    assert_no_secrets(recording, codes)
     result = compile_(recording, "baixar_nota_gravada")
     manifest = result.manifest
-    assert_no_secrets(manifest.model_dump_json(), codes)
+    assert_no_secrets(manifest, codes)
     # Enter no campo de senha: fica só o clique implícito em "Entrar".
     assert_login_steps(result)
     assert not any(s.kind == "press" for s in manifest.steps)
@@ -299,7 +303,7 @@ async def test_upload_a_file(browser: Browser, portal_v1: RunningPortal) -> None
     assert portal_v1.state.uploads == [{"nome": "comprovante.txt", "tamanho": 8}]
     result = compile_(recording, "enviar_arquivo_gravado")
     manifest = result.manifest
-    assert_no_secrets(manifest.model_dump_json(), codes)
+    assert_no_secrets(manifest, codes)
     assert_login_steps(result)
     upload = next(s for s in manifest.steps if isinstance(s, UploadStep))
     field = next(f for f in manifest.inputs if f.name == upload.file_input)
@@ -323,7 +327,7 @@ async def test_click_inside_iframe(browser: Browser, portal_v1: RunningPortal) -
     recording = await record(browser, scenario)
     result = compile_(recording, "consulta_em_quadro")
     manifest = result.manifest
-    assert_no_secrets(manifest.model_dump_json(), codes)
+    assert_no_secrets(manifest, codes)
     typed = [s for s in manifest.steps if isinstance(s, NavigateStep)]
     assert [s.url.rsplit("/", 1)[-1] for s in typed] == ["login", "quadro"]
     click = manifest.steps[-1]
@@ -678,7 +682,8 @@ async def test_payment_confirmation_with_a_transaction_password_is_irreversible(
 
     recording = await record_routed(browser, payment_page(fields), scenario)
     dumped = recording.model_dump_json()
-    assert "4829" not in dumped
+    # Só nos textos: "4829" aparece por acaso num t_ms ou no finished_at (rodada 7, H3).
+    assert not has_text(recording, "4829")
     result = compile_(recording, "pagar_boleto")
     manifest = result.manifest
     confirmar = manifest.step_by_id("clicar_confirmar_pagamento")
@@ -692,7 +697,7 @@ async def test_payment_confirmation_with_a_transaction_password_is_irreversible(
         assert "1250,00" not in dumped
         usuario = next(e for e in recording.events if isinstance(e, InputEvent))
         assert usuario.element.sensitive and not usuario.element.is_username
-    assert "4829" not in result.model_dump_json()
+    assert not has_text(result, "4829")
 
 
 async def test_page_script_and_recorder_agree_that_a_username_named_like_a_password_is_ambiguous(
@@ -717,7 +722,7 @@ async def test_page_script_and_recorder_agree_that_a_username_named_like_a_passw
     cpf_event = inputs["cpf"]
     assert cpf_event.element.sensitive and cpf_event.element.aria_mentions_password
     assert not cpf_event.element.is_username and not cpf_event.element.is_password
-    assert "12345678900" not in recording.model_dump_json()
+    assert not has_text(recording, "12345678900")
     result = compile_(recording, "entrar_com_cpf")
     cpf, senha = (s for s in result.manifest.steps if isinstance(s, FillStep))
     # Nunca credencial: o login grava e o robô pede o valor numa entrada.
@@ -726,7 +731,7 @@ async def test_page_script_and_recorder_agree_that_a_username_named_like_a_passw
     entrar = result.manifest.step_by_id("clicar_entrar")
     assert isinstance(entrar, ClickStep) and entrar.effect is Effect.WRITE
     assert any("fala em senha" in w for w in result.warnings)
-    assert "12345678900" not in result.model_dump_json()
+    assert not has_text(result, "12345678900")
 
 
 @pytest.mark.parametrize("leave", ["tab", "clique"])

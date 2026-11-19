@@ -217,11 +217,11 @@ def test_confirm_only_counts_when_only_codes_were_filled() -> None:
 
 @pytest.mark.parametrize("label", ["Confirmar", "Continuar", "Próximo", "Avançar", "Entrar"])
 @pytest.mark.parametrize("form", [None, OTP_FORM, LOGIN_FORM], ids=["sem_form", "codigo", "login"])
-def test_a_code_alone_is_a_login_and_confirm_only_in_the_form_of_the_code(
+def test_a_code_alone_is_a_login_only_in_the_form_of_the_code(
     label: str, form: FormInfo | None
 ) -> None:
-    # Só o código foi preenchido: os botões de login valem em qualquer formulário;
-    # "Confirmar" (que confirma qualquer coisa) só no <form> que só tem o código.
+    # Só o código foi preenchido: qualquer botão de login (e "Confirmar") só vale no
+    # <form> que só tem o código; sem <form> ou noutro <form>, o envio grava.
     rec = RecordingBuilder()
     rec.navigate("/codigo")
     rec.fill(otp(id="codigo", form=form), None)
@@ -229,10 +229,10 @@ def test_a_code_alone_is_a_login_and_confirm_only_in_the_form_of_the_code(
     rec.request("POST", "/api/codigo", "fetch")
     result = compile_(rec.build())
     click = next(s for s in result.manifest.steps if isinstance(s, ClickStep))
-    if label == "Confirmar" and form is not OTP_FORM:
-        assert click.effect is Effect.WRITE
-    else:
+    if form is OTP_FORM:
         assert click.effect is Effect.READ
+    else:
+        assert click.effect is Effect.WRITE
 
 
 @pytest.mark.parametrize(

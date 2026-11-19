@@ -28,17 +28,26 @@ fica fora da gravação. As regras:
   obrigatória, com aviso (``analyze_logins``, ``secret_page_inputs``). O campo de
   usuário de uma página cujo clique leva (por navegação de documento) a uma
   página onde se preenche uma senha ``type=password`` também sai;
+- campo dentro de um shadow root (``in_shadow_root``): nunca é credencial de um
+  login (o envio depois dele na página não é autenticação); numa página com
+  senha ou código o valor sai da gravação e o compilador pede o valor numa
+  entrada. A identidade do campo (``field_key``) leva o caminho dos hospedeiros:
+  dois componentes iguais, com o mesmo id por dentro, nunca viram o mesmo campo;
 - login (``analyze_logins``): o envio só é autenticação quando todos os campos
   preenchidos desde a última navegação que carregou documento (ou desde o login
   anterior) são credenciais de uma credencial só: o usuário com uma senha
   ``type=password`` de verdade (que não é ``new-password``) e, se houver, o
-  código de uso único que não é de transação; ou só códigos. O envio é um
-  clique cujo texto inteiro é de login ("Entrar", "Acessar", "Continuar"...; ou
-  "Confirmar" quando só códigos foram preenchidos e o botão está num
-  ``<form>`` cujos campos de texto são só o código), ou o Enter que aciona esse
-  botão no mesmo ``<form>`` (sem ``<form>``, o Enter nunca é login); nenhum
-  verbo irreversível e nenhum segredo de transação (token ou código da
-  transação, CVV, código de segurança, assinatura) na página. Fora isso, só
+  código de uso único que não é de transação; ou só códigos, e então só com o
+  botão num ``<form>`` cujos campos de texto são só códigos, os mesmos que foram
+  preenchidos (sem esse ``<form>``, só códigos nunca é login, qualquer que seja o
+  texto do botão). O envio é um clique cujo texto inteiro é de login ("Entrar",
+  "Acessar", "Continuar"...; ou "Confirmar" quando só códigos foram
+  preenchidos), ou o Enter que aciona esse botão no mesmo ``<form>`` (sem
+  ``<form>``, o Enter nunca é login); nenhum verbo irreversível e nenhum segredo
+  de transação (token ou código da transação, CVV, código de segurança,
+  assinatura) na página. Resíduo, como em d746ee2: só códigos num ``<form>`` só
+  com o código continua autenticação mesmo que a página use o código para
+  confirmar uma operação. Fora isso, só
   caixas de seleção e o botão de mostrar a senha no meio. Nada pode ter gravado
   antes no robô (a mesma conta do compilador: requisição que não é GET de
   documento, XHR ou fetch, ou botão com verbo irreversível); um envio com cara de
@@ -93,6 +102,7 @@ __all__ = [
     "declared_username",
     "field_key",
     "focus_only",
+    "in_shadow_root",
     "irreversible_click",
     "irreversible_verb",
     "is_password_field",
@@ -336,14 +346,21 @@ def is_transaction_secret(element: ElementDescriptor) -> bool:
     return any(_TRANSACTION_WORDS.search(_plain(text)) for text in texts if text)
 
 
+def in_shadow_root(element: ElementDescriptor) -> bool:
+    """O elemento está dentro de um shadow root aberto (o script manda os hospedeiros)."""
+    return bool(element.shadow_path)
+
+
 def credential_kind(element: ElementDescriptor) -> str | None:
     """ "username", "password" (``type=password`` de verdade) ou "code"; None: não é credencial.
 
     Nenhum campo de uma operação (``is_transaction_secret``) é credencial de login,
     nem a senha nova de um cadastro ou de uma troca de senha
-    (``autocomplete="new-password"``).
+    (``autocomplete="new-password"``), nem campo de dentro de um shadow root (na
+    dúvida, o envio grava: o componente pode juntar campos que a página não mostra
+    como um login).
     """
-    if is_transaction_secret(element):
+    if is_transaction_secret(element) or in_shadow_root(element):
         return None
     if element.is_one_time_code:
         return "code"
@@ -388,10 +405,10 @@ def action_label(element: ElementDescriptor | None) -> str | None:
 def declared_username(element: ElementDescriptor) -> bool:
     """A página declara o campo como usuário (``autocomplete="username"``).
 
-    Menos o campo que o nome diz ser senha e o que fala de outra pessoa ou de um
-    cadastro: esses nunca são o usuário.
+    Menos o campo que o nome diz ser senha, o que fala de outra pessoa ou de um
+    cadastro e o de dentro de um shadow root: esses nunca são o usuário do cofre.
     """
-    if "username" not in _autocomplete(element):
+    if "username" not in _autocomplete(element) or in_shadow_root(element):
         return False
     return not password_by_name(element) and not names_another_party(element)
 
@@ -419,9 +436,30 @@ def looks_secret(element: ElementDescriptor) -> bool:
 
 
 def field_key(page_id: int, element: ElementDescriptor) -> tuple[Any, ...]:
-    """Identidade de um campo na gravação: aba, iframes, seletor, id e nome."""
+    """Identidade de um campo na gravação.
+
+    Aba, iframes, hospedeiros dos shadow roots, seletor, id e nome, e também o que
+    a pessoa vê do campo (etiqueta, tipo, nome acessível, rótulo, placeholder e a
+    chave da linha da tabela): dois campos que só coincidem no seletor (o mesmo
+    ``#input`` dentro de dois componentes, um caminho CSS cortado antes da linha)
+    nunca viram o mesmo campo, e edições, marcações e escolhas de campos diferentes
+    nunca se juntam num passo só.
+    """
     frames = tuple(f.css or f.id or f.name or "" for f in element.frame_path or [])
-    return (page_id, frames, element.css, element.id, element.name_attr)
+    return (
+        page_id,
+        frames,
+        tuple(element.shadow_path or ()),
+        element.css,
+        element.id,
+        element.name_attr,
+        element.tag,
+        element.input_type,
+        element.name,
+        element.label,
+        element.placeholder,
+        element.row.key if element.row is not None else None,
+    )
 
 
 def focus_only(element: ElementDescriptor) -> bool:
@@ -737,6 +775,17 @@ def _submit_ok(
     return event
 
 
+def _codes_form(form: FormInfo | None, codes: list[_Step]) -> bool:
+    """O botão está num ``<form>`` só de códigos, e os códigos preenchidos são desse ``<form>``.
+
+    Resíduo, como em d746ee2: a página que usa um ``<form>`` só com o código para
+    confirmar uma operação continua tendo o envio tratado como autenticação.
+    """
+    return _only_one_time_code(form) and all(
+        s.element is not None and s.element.form == form for s in codes
+    )
+
+
 def _login_at(
     steps: list[_Step], at: int, start: int, previous: dict[int, RecordingEvent | None]
 ) -> Login | None:
@@ -767,9 +816,12 @@ def _login_at(
         return None  # depois de um login na mesma página, só o código
     label = plain_label(action_label(event.element))
     only_codes = not users and not passwords
-    # "Confirmar" com só códigos vale só no <form> cujos campos de texto são o código.
-    confirm = only_codes and label == CODE_WORD and _only_one_time_code(event.element.form)
-    if label not in LOGIN_WORDS and not confirm:
+    # Só códigos: só com o botão no <form> cujos campos de texto são só códigos, os
+    # mesmos que a pessoa preencheu, qualquer que seja o texto do botão ("Continuar"
+    # depois do login de uma SPA confirma um Pix com o token; sem <form>, nunca é login).
+    if only_codes and not _codes_form(event.element.form, codes):
+        return None
+    if label not in LOGIN_WORDS and not (only_codes and label == CODE_WORD):
         return None
     bridge = _two_step(window) if extra else None
     if extra and (bridge is None or codes):

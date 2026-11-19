@@ -22,7 +22,13 @@ from rapa.recorder import (
     SelectEvent,
 )
 from rapa.recorder.recorder import redact_url
-from rapa.recorder.sensitivity import is_password_like_text, password_by_name, username_by_signal
+from rapa.recorder.sensitivity import (
+    field_key,
+    is_password_like_text,
+    password_by_name,
+    username_by_signal,
+)
+from tests.recorder.texts import has_text
 
 
 def test_redact_url_masks_sensitive_params_and_drops_fragment() -> None:
@@ -546,3 +552,45 @@ def test_the_username_of_a_page_that_leads_to_the_password_leaves_the_recording(
     assert usuario.element.is_username and usuario.element.sensitive
     navigation = events[3]
     assert isinstance(navigation, NavigationEvent) and f"u={REDACTED}" in navigation.url
+
+
+def test_a_short_numeric_secret_is_searched_only_in_the_texts_of_the_recording() -> None:
+    # H3 (rodada 7): o "4829" que um teste achou uma vez sob carga estava num número
+    # da gravação (o t_ms de um evento ou os microssegundos do finished_at), não num
+    # texto: sob carga, 7 de 900 gravações tinham "4829" assim, nenhuma num texto.
+    events = [
+        NavigationEvent(
+            index=0,
+            t_ms=276.62648299883585,
+            page_id=0,
+            url="https://portal.exemplo.com.br/login",
+            cause=NavigationCause.TYPED,
+        ),
+        PageTextEvent(
+            index=1, t_ms=463.6024829997041, page_id=0, url="https://portal.exemplo.com.br/"
+        ),
+    ]
+    recording = Recording(
+        started_at=datetime(2026, 11, 19, 6, 46, 37, 100000, tzinfo=UTC),
+        finished_at=datetime(2026, 11, 19, 6, 46, 37, 864829, tzinfo=UTC),
+        events=events,
+    )
+    assert "4829" in recording.model_dump_json()
+    assert not has_text(recording, "4829")
+    leaked = recording.model_copy(
+        update={"events": [events[0], events[1].model_copy(update={"text": "PIN 4829"})]}
+    )
+    assert has_text(leaked, "4829")
+
+
+def test_the_identity_of_a_field_has_the_hosts_of_its_shadow_roots() -> None:
+    def field(**extra: object) -> ElementDescriptor:
+        return ElementDescriptor.model_validate(
+            {"tag": "input", "input_type": "text", "label": "Valor", "css": "#input", **extra}
+        )
+
+    assert field_key(0, field(shadow_path=["#fa"])) != field_key(0, field(shadow_path=["#fb"]))
+    assert field_key(0, field()) != field_key(0, field(shadow_path=["#fa"]))
+    # O que a pessoa vê do campo também conta (seletor cortado, gravação sem hospedeiros).
+    assert field_key(0, field()) != field_key(0, field(label="Quantidade"))
+    assert field_key(0, field(shadow_path=["#fa"])) == field_key(0, field(shadow_path=["#fa"]))

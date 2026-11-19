@@ -123,7 +123,16 @@ class ElementDescriptor(_Model):
     test_id: str | None = Field(default=None, max_length=300)
     name_attr: str | None = Field(default=None, max_length=300)
     id: str | None = Field(default=None, max_length=300)
+    #: Seletor CSS; dentro de shadow roots abertos, ele os atravessa a partir do
+    #: documento ("#hospedeiro > #campo"), como o CSS do Playwright.
     css: str = Field(max_length=1000)
+    #: Hospedeiros dos shadow roots abertos em volta do elemento, do mais externo ao
+    #: mais interno, cada um pelo caminho dentro da sua raiz (None: fora de shadow
+    #: root). Faz parte da identidade do campo: dois componentes iguais (o mesmo id
+    #: por dentro) são campos diferentes.
+    shadow_path: list[Annotated[str, Field(max_length=1000)]] | None = Field(
+        default=None, max_length=16
+    )
     #: Texto visível (nunca o valor digitado num campo).
     text: str | None = Field(default=None, max_length=300)
     title: str | None = Field(default=None, max_length=300)

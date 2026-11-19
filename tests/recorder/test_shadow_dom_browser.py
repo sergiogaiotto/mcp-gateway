@@ -1,0 +1,450 @@
+"""Componentes com shadow root gravados num Chromium de verdade, e compilados (rodada 7).
+
+Duas instâncias do mesmo componente (``<x-field>``, ``<x-check>``, ``<x-select>``)
+têm o mesmo ``<input id="input">`` por dentro, como nas bibliotecas de
+componentes. Cada campo leva o caminho do hospedeiro e um seletor que atravessa o
+shadow root; edições, marcações e escolhas de campos diferentes nunca se juntam; o
+alvo e o valor de cada passo vêm do mesmo campo (conferido resolvendo os
+localizadores do robô na página, como o executor faz); um campo de componente nunca
+é credencial de login; e o gravador não embrulha nenhum método da página.
+"""
+
+from collections.abc import AsyncIterator
+from typing import Any
+
+import pytest
+from playwright.async_api import Browser, Page, async_playwright
+from playwright.async_api import Locator as PwLocator
+
+from rapa.compiler import CompileResult
+from rapa.core.robot import (
+    CheckStep,
+    ClickStep,
+    Effect,
+    FillStep,
+    Locator,
+    LocatorBy,
+    SecretValue,
+    SelectStep,
+    TextValue,
+)
+from rapa.fixtures.server import HOST_RESOLVER_ARG
+from rapa.recorder import CheckEvent, InputEvent, Recording, SelectEvent
+from tests.recorder.test_login_rule_browser import (
+    PASSWORD,
+    USER,
+    an_input,
+    click_effect,
+    compile_,
+    dumps,
+    page,
+    record_site,
+    usernames_in,
+)
+from tests.recorder.texts import has_text
+
+pytestmark = pytest.mark.browser
+
+#: Campo de texto num componente: o rótulo e o <input id="input"> no shadow root aberto.
+XFIELD = """<script>
+customElements.define('x-field', class extends HTMLElement { connectedCallback() {
+  if (this.shadowRoot) return;
+  this.attachShadow({mode: 'open'}).innerHTML = '<label for="input">' +
+    this.getAttribute('label') + '</label><input id="input" type="' +
+    (this.getAttribute('type') || 'text') + '">'; } });
+</script>"""
+#: Caixa de seleção num componente, numa célula da tabela.
+XCHECK = """<script>
+customElements.define('x-check', class extends HTMLElement { connectedCallback() {
+  if (this.shadowRoot) return;
+  this.attachShadow({mode: 'open'}).innerHTML = '<input id="input" type="checkbox"' +
+    (this.hasAttribute('checked') ? ' checked' : '') + ' aria-label="Selecionar ' +
+    this.getAttribute('row') + '">'; } });
+</script>"""
+#: Lista num componente.
+XSELECT = """<script>
+customElements.define('x-select', class extends HTMLElement { connectedCallback() {
+  if (this.shadowRoot) return;
+  this.attachShadow({mode: 'open'}).innerHTML = '<label for="input">' +
+    this.getAttribute('label') + '</label><select id="input"><option>Escolha</option>' +
+    '<option>Corrente 1</option><option>Poupança 2</option></select>'; } });
+</script>"""
+PIX_JS = """<script>
+document.getElementById('b').onclick = async () => {
+  await fetch('/api/pix', {method: 'POST', body: '{}'});
+  document.body.insertAdjacentHTML('beforeend', '<p>Pix enviado</p>');
+};
+</script>"""
+
+
+@pytest.fixture
+async def browser(chromium_path: str) -> AsyncIterator[Browser]:
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
+            executable_path=chromium_path, args=[HOST_RESOLVER_ARG]
+        )
+        try:
+            yield browser
+        finally:
+            await browser.close()
+
+
+def locate(page: Page, locator: Locator) -> PwLocator:
+    """O localizador do robô na página, como o executor o monta."""
+    match locator.by:
+        case LocatorBy.ROLE:
+            role: Any = locator.value
+            if locator.name is None:
+                return page.get_by_role(role)
+            return page.get_by_role(role, name=locator.name, exact=locator.exact)
+        case LocatorBy.LABEL:
+            return page.get_by_label(locator.value, exact=locator.exact)
+        case LocatorBy.PLACEHOLDER:
+            return page.get_by_placeholder(locator.value, exact=locator.exact)
+        case LocatorBy.TEXT:
+            return page.get_by_text(locator.value, exact=locator.exact)
+        case LocatorBy.TEST_ID:
+            return page.get_by_test_id(locator.value)
+        case _:
+            return page.locator(f"css={locator.value}")
+
+
+async def hosts_of(
+    browser: Browser, html: str, steps: list[FillStep] | list[CheckStep] | list[SelectStep]
+) -> list[str]:
+    """O hospedeiro do campo que cada passo acha, por todos os localizadores dele.
+
+    Abre a página de novo e resolve cada localizador do alvo: cada um tem de achar um
+    elemento só, e todos o mesmo; devolve o id do hospedeiro (ou do próprio campo, fora
+    de shadow root).
+    """
+    context = await browser.new_context()
+    try:
+        p = await context.new_page()
+        await p.set_content(html)
+        found: list[str] = []
+        for s in steps:
+            ids = set()
+            for locator in s.target.locators:
+                located = locate(p, locator)
+                assert await located.count() == 1, (s.id, locator)
+                ids.add(
+                    await located.evaluate(
+                        "(el) => { const r = el.getRootNode(); return r.host ? r.host.id : el.id; }"
+                    )
+                )
+            assert len(ids) == 1, (s.id, ids)
+            found.append(ids.pop())
+        return found
+    finally:
+        await context.close()
+
+
+def fill_steps(result: CompileResult) -> list[FillStep]:
+    return [s for s in result.manifest.steps if isinstance(s, FillStep)]
+
+
+def inputs_of(recording: Recording) -> list[InputEvent]:
+    return [e for e in recording.events if isinstance(e, InputEvent)]
+
+
+# -- C1: login com usuário e senha em dois componentes iguais -------------------------
+
+LOGIN = page(
+    "Login",
+    XFIELD
+    + """<h1>Login</h1><x-field id="fu" label="Usuário"></x-field>
+<x-field id="fp" label="Senha" type="password"></x-field><button id="b">Entrar</button>
+<script>
+document.getElementById('b').onclick = async () => {
+  const u = document.getElementById('fu').shadowRoot.getElementById('input').value;
+  await fetch('/api/login', {method: 'POST', body: '{}'});
+  document.body.innerHTML = '<h1>Início</h1><p>Olá, ' + u + '</p><button>Sair</button>';
+};
+</script>""",
+)
+
+
+async def test_a_login_in_two_components_of_the_same_kind_never_mixes_the_fields(
+    browser: Browser,
+) -> None:
+    async def scenario(p: Page) -> None:
+        await p.locator("#fu").locator("input").fill(USER)
+        await p.locator("#fp").locator("input").fill(PASSWORD)
+        await p.get_by_role("button", name="Entrar").click()
+        await p.get_by_role("heading", name="Início").wait_for()
+        await p.get_by_role("button", name="Sair").click()
+
+    recording = await record_site(browser, {"/login": LOGIN}, "/login", scenario)
+    assert not has_text(recording, USER, ignore_case=True)
+    assert not has_text(recording, PASSWORD)
+    usuario, senha = inputs_of(recording)
+    assert (usuario.element.css, usuario.element.shadow_path) == ("#fu > #input", ["#fu"])
+    assert (senha.element.css, senha.element.shadow_path) == ("#fp > #input", ["#fp"])
+    result = compile_(recording)
+    found = fill_steps(result)
+    # Dois passos, cada um no seu campo: o cofre nunca digita a senha na caixa do
+    # usuário, e o usuário (campo de componente) nunca é credencial: vira uma entrada.
+    assert [s.id for s in found] == ["digitar_usuario", "digitar_senha"]
+    assert found[0].value == an_input("usuario")
+    assert found[1].value == SecretValue(credential="banco", field="password")
+    assert await hosts_of(browser, LOGIN, found) == ["fu", "fp"]
+    assert usernames_in(result) == []
+    assert click_effect(result, "clicar_entrar") is Effect.WRITE
+    # Nenhum aviso fala de uma entrada que não existe (o campo juntado a outro).
+    named = {spec.name for spec in result.manifest.inputs}
+    assert named == {"usuario"}
+    assert all(f"entrada “{n}”" not in w for w in result.warnings for n in ("senha", "usuario_2"))
+    manifest, prompt = dumps(result)
+    assert USER not in manifest.lower() and USER not in prompt.lower()
+
+
+# -- C7 e C8: Pix com campos de componentes e a senha ---------------------------------
+
+PIX_C7 = page(
+    "Pix",
+    XFIELD
+    + """<h1>Pix por CPF</h1><x-field id="fc" label="CPF"></x-field>
+<x-field id="fv" label="Valor"></x-field>
+<label for="s">Senha</label><input id="s" type="password"><button id="b">Continuar</button>"""
+    + PIX_JS,
+)
+PIX_C8 = page(
+    "Pix",
+    XFIELD
+    + """<h1>Pix por CPF</h1><label for="c">CPF</label><input id="c">
+<x-field id="fs" label="Senha" type="password"></x-field>
+<x-field id="fv" label="Valor"></x-field><button id="b">Continuar</button>"""
+    + PIX_JS,
+)
+
+
+@pytest.mark.parametrize("variant", ["C7", "C8"])
+async def test_a_pix_with_fields_of_components_is_write_and_never_mixes_the_fields(
+    browser: Browser, variant: str
+) -> None:
+    html = PIX_C7 if variant == "C7" else PIX_C8
+
+    async def scenario(p: Page) -> None:
+        if variant == "C7":
+            await p.locator("#fc").locator("input").fill("11122233344")
+            await p.locator("#fv").locator("input").fill("1250,00")
+            await p.locator("#s").fill("1234")
+        else:
+            await p.locator("#c").fill("11122233344")
+            await p.locator("#fs").locator("input").fill("1234")
+            await p.locator("#fv").locator("input").fill("1250,00")
+        await p.get_by_role("button", name="Continuar").click()
+        await p.get_by_text("Pix enviado").wait_for()
+
+    recording = await record_site(browser, {"/pix": html}, "/pix", scenario)
+    for secret in ("11122233344", "1250,00", "1234"):
+        assert not has_text(recording, secret)
+    result = compile_(recording)
+    # O "Continuar" que faz o Pix nunca é autenticação.
+    assert click_effect(result, "clicar_continuar") is Effect.WRITE
+    assert result.manifest.effect() is Effect.WRITE
+    assert usernames_in(result) == []
+    found = {s.id: s for s in fill_steps(result)}
+    vault = SecretValue(credential="banco", field="password")
+    if variant == "C7":
+        assert [s.value for s in found.values()] == [an_input("cpf"), an_input("valor"), vault]
+        expected = ["fc", "fv", "s"]
+    else:
+        assert [s.value for s in found.values()] == [an_input("cpf"), vault, an_input("valor")]
+        expected = ["c", "fs", "fv"]
+    # O valor digitado em cada passo vai para o campo de onde ele veio.
+    assert await hosts_of(browser, html, list(found.values())) == expected
+    manifest, prompt = dumps(result)
+    for secret in ("11122233344", "1250,00"):
+        assert secret not in manifest and secret not in prompt
+
+
+# -- C2 e C9: dados em dois componentes iguais (sem senha na página) -----------------
+
+
+@pytest.mark.parametrize(
+    ("labels", "values", "button"),
+    [
+        (("Chave Pix", "Valor"), ("11122233344", "1250,00"), "Continuar"),
+        (("Quantidade", "Preço unitário"), ("10", "25"), "Salvar pedido"),
+    ],
+    ids=["C2", "C9"],
+)
+async def test_values_of_two_components_of_the_same_kind_go_to_their_own_fields(
+    browser: Browser, labels: tuple[str, str], values: tuple[str, str], button: str
+) -> None:
+    html = page(
+        "Pedido",
+        XFIELD
+        + f"""<h1>Pedido</h1><x-field id="fa" label="{labels[0]}"></x-field>
+<x-field id="fb" label="{labels[1]}"></x-field><button id="b">{button}</button>"""
+        + PIX_JS,
+    )
+
+    async def scenario(p: Page) -> None:
+        await p.locator("#fa").locator("input").fill(values[0])
+        await p.locator("#fb").locator("input").fill(values[1])
+        await p.get_by_role("button", name=button).click()
+        await p.get_by_text("Pix enviado").wait_for()
+
+    recording = await record_site(browser, {"/pedido": html}, "/pedido", scenario)
+    result = compile_(recording)
+    found = fill_steps(result)
+    assert [s.value for s in found] == [TextValue(template=v) for v in values]
+    assert await hosts_of(browser, html, found) == ["fa", "fb"]
+    clicks = [s for s in result.manifest.steps if isinstance(s, ClickStep)]
+    assert [s.effect for s in clicks] == [Effect.WRITE]
+
+
+# -- C10 e C11: caixas de seleção de componentes nas linhas de uma tabela -----------
+
+ROWS = """<h1>Boletos</h1><table>
+<tr><td><x-check id="k1" row="Boleto 1001"{c1}></x-check></td><td>Boleto 1001</td></tr>
+<tr><td><x-check id="k2" row="Boleto 1002"></x-check></td><td>Boleto 1002</td></tr>
+<tr><td><x-check id="k3" row="Boleto 1003"></x-check></td><td>Boleto 1003</td></tr>
+</table>
+<button id="x" onclick="fetch('/api/excluir', {method: 'POST', body: '{}'})
+  .then(() => document.body.insertAdjacentHTML('beforeend', '<p>Removidos</p>'))">
+Remover selecionados</button>"""
+
+
+@pytest.mark.parametrize("variant", ["C10", "C11"])
+async def test_checks_of_components_in_rows_act_on_their_own_rows(
+    browser: Browser, variant: str
+) -> None:
+    html = page("Boletos", XCHECK + ROWS.replace("{c1}", " checked" if variant == "C11" else ""))
+
+    async def scenario(p: Page) -> None:
+        if variant == "C10":
+            await p.get_by_role("checkbox", name="Selecionar Boleto 1002").check()
+            await p.get_by_role("checkbox", name="Selecionar Boleto 1003").check()
+        else:
+            await p.get_by_role("checkbox", name="Selecionar Boleto 1003").check()
+            await p.get_by_role("checkbox", name="Selecionar Boleto 1001").uncheck()
+        await p.get_by_role("button", name="Remover selecionados").click()
+        await p.get_by_text("Removidos").wait_for()
+
+    recording = await record_site(browser, {"/boletos": html}, "/boletos", scenario)
+    events = [e for e in recording.events if isinstance(e, CheckEvent)]
+    assert len({e.element.css for e in events}) == 2
+    assert all(e.element.shadow_path for e in events)
+    result = compile_(recording)
+    checks = [s for s in result.manifest.steps if isinstance(s, CheckStep)]
+    if variant == "C10":
+        expected = [
+            ("Marcar “Selecionar Boleto 1002”", True),
+            ("Marcar “Selecionar Boleto 1003”", True),
+        ]
+        hosts = ["k2", "k3"]
+    else:
+        expected = [
+            ("Marcar “Selecionar Boleto 1003”", True),
+            ("Desmarcar “Selecionar Boleto 1001”", False),
+        ]
+        hosts = ["k3", "k1"]
+    assert [(s.title, s.checked) for s in checks] == expected
+    assert await hosts_of(browser, html, checks) == hosts
+    assert click_effect(result, "clicar_remover_selecionados") is Effect.WRITE
+
+
+# -- listas em componentes e shadow DOM declarativo ----------------------------------
+
+
+async def test_selects_and_checks_inside_shadow_roots_are_captured_without_wrappers(
+    browser: Browser,
+) -> None:
+    # Duas listas do mesmo componente e uma caixa de seleção num shadow root
+    # declarativo (sem attachShadow): o change não sai do shadow root, o input sai.
+    html = page(
+        "Transferir",
+        XSELECT
+        + """<h1>Transferir</h1><x-select id="so" label="Conta de origem"></x-select>
+<x-select id="sd" label="Conta de destino"></x-select>
+<div id="dk"><template shadowrootmode="open"><input id="input" type="checkbox"
+  aria-label="Agendar"></template></div>
+<button id="b" onclick="fetch('/api/transferir', {method: 'POST', body: '{}'})
+  .then(() => document.body.insertAdjacentHTML('beforeend', '<p>Feito</p>'))">Transferir</button>""",
+    )
+
+    async def scenario(p: Page) -> None:
+        # Nenhum método nativo é trocado pelo gravador (scripts antifraude olham isso).
+        assert await p.evaluate(
+            """() => [Element.prototype.attachShadow, HTMLElement.prototype.attachShadow]
+                .every((f) => Function.prototype.toString.call(f).includes('[native code]'))"""
+        )
+        assert await p.evaluate(
+            "() => !Object.prototype.hasOwnProperty.call(HTMLElement.prototype, 'attachShadow')"
+        )
+        await p.locator("#so").locator("select").select_option("Corrente 1")
+        await p.locator("#sd").locator("select").select_option("Poupança 2")
+        await p.get_by_role("checkbox", name="Agendar").check()
+        await p.get_by_role("button", name="Transferir").click()
+        await p.get_by_text("Feito").wait_for()
+
+    recording = await record_site(browser, {"/transferir": html}, "/transferir", scenario)
+    selects = [e for e in recording.events if isinstance(e, SelectEvent)]
+    assert [(e.element.css, e.label) for e in selects] == [
+        ("#so > #input", "Corrente 1"),
+        ("#sd > #input", "Poupança 2"),
+    ]
+    (agendar,) = [e for e in recording.events if isinstance(e, CheckEvent)]
+    assert agendar.element.css == "#dk > #input" and agendar.checked
+    result = compile_(recording)
+    steps = [s for s in result.manifest.steps if isinstance(s, SelectStep)]
+    assert [s.option for s in steps] == ["Corrente 1", "Poupança 2"]
+    assert await hosts_of(browser, html, steps) == ["so", "sd"]
+    (check,) = [s for s in result.manifest.steps if isinstance(s, CheckStep)]
+    assert await hosts_of(browser, html, [check]) == ["dk"]
+
+
+# -- H2: só o código depois do login de uma SPA, sem <form> ---------------------------
+
+
+@pytest.mark.parametrize("button", ["Continuar", "Avançar", "Entrar"])
+async def test_a_token_after_the_login_of_a_spa_without_a_form_is_write(
+    browser: Browser, button: str
+) -> None:
+    # G2a: login na SPA; no mesmo documento, "Token" e o botão (sem <form>) que faz o Pix.
+    app = page(
+        "Banco",
+        """<h1>Banco</h1><div id="login">
+<label for="u">Usuário</label><input id="u">
+<label for="p">Senha</label><input id="p" type="password">
+<button id="b">Entrar</button></div><p id="ok"></p>
+<script>
+document.getElementById('b').onclick = async () => {
+  await fetch('/api/login', {method: 'POST', body: '{}'});
+  history.pushState({}, '', '/app/pix/confirmar');
+  document.getElementById('login').outerHTML = '<h2>Confirme o Pix de R$ 900,00</h2>' +
+    '<label for="t">Token</label><input id="t" autocomplete="one-time-code">' +
+    '<button id="c">BOTAO</button>';
+  document.getElementById('c').onclick = async () => {
+    await fetch('/api/pix', {method: 'POST', body: '{}'});
+    document.getElementById('ok').textContent = 'Pix enviado';
+  };
+};
+</script>""".replace("BOTAO", button),
+    )
+
+    async def scenario(p: Page) -> None:
+        await p.get_by_label("Usuário").fill(USER)
+        await p.get_by_label("Senha").fill(PASSWORD)
+        await p.get_by_role("button", name="Entrar").click()
+        await p.get_by_label("Token").wait_for()
+        # A edição do token começa bem depois do POST do login (que, na folga do
+        # começo da edição, faria o campo gravar e esconderia a regra).
+        await p.wait_for_timeout(600)
+        await p.get_by_label("Token").fill("481516")
+        await p.get_by_role("button", name=button).click()
+        await p.get_by_text("Pix enviado").wait_for()
+
+    recording = await record_site(browser, {"/app": app}, "/app", scenario)
+    assert not has_text(recording, "481516")
+    result = compile_(recording)
+    effects = {s.id: s.effect for s in result.manifest.steps}
+    assert effects["digitar_token"] is Effect.READ
+    assert effects["clicar_entrar"] is Effect.READ
+    clicks = [s for s in result.manifest.steps if isinstance(s, ClickStep)]
+    assert [s.effect for s in clicks] == [Effect.READ, Effect.WRITE]
+    assert result.manifest.effect() is Effect.WRITE

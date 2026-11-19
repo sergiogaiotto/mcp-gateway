@@ -16,7 +16,9 @@ outros textos. O gravador repete as regras do lado do Python
 (``rapa.recorder.sensitivity``): marca de senha pelo rótulo e pelo nome
 acessível e, ao fechar a gravação, os campos das páginas com senha ou código que
 o script não viu (a senha que só aparece depois, numa SPA, ou noutro shadow root,
-e o usuário de uma página que leva à página da senha). A limpeza ignora
+e o usuário de uma página que leva à página da senha). Campos de shadow roots
+abertos chegam com o caminho dos hospedeiros (``shadow_path``) e um seletor que
+atravessa o shadow root, que a conferência do Playwright usa. A limpeza ignora
 maiúsculas em tudo o que pode chegar ao robô ou ao modelo de linguagem: o texto
 livre da página (títulos, texto, iframes) e, nos elementos, nomes acessíveis,
 rótulos, placeholders, títulos, textos, seletores e o texto e as células da linha
