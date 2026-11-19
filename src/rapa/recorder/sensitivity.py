@@ -39,14 +39,18 @@ fica fora da gravação. As regras:
   shadow roots abertos, como o Playwright procura. O valor de um campo de texto
   sai no ``change`` do próprio shadow root (o script põe ouvintes de ``change``,
   ``blur`` e ``focusout`` em cada shadow root que aparece no caminho de um evento),
-  antes do blur e na ordem da pessoa; se o componente para o ``change``, sai antes
-  da próxima ação (``pointerdown``, ``keydown``, ``beforeinput``) ou no ``blur`` na
-  fase de captura (da janela e do shadow root), antes do ouvinte de blur do campo;
-  se o componente já tirou o campo da página quando o ``change``, o ``blur`` ou o
-  ``focusout`` chega (ou quando a janela perde o foco para um iframe), sai o
-  descritor guardado no primeiro foco ou input do campo com o último valor que a
-  pessoa digitou, com a mesma marca de sigilo (ou mais: com uma senha ou um código
-  no documento, o valor só sai como segredo);
+  antes do blur e na ordem da pessoa, ou no ``focusout``; se o componente para o
+  ``change``, sai antes da próxima ação (``pointerdown``, ``keydown``,
+  ``beforeinput``) ou no ``blur`` na fase de captura (da janela e do shadow root):
+  nesses eventos o script só tira um retrato do campo e decide num ``setTimeout``,
+  depois dos ouvintes de blur do componente (o campo que virou senha ou código só
+  sai como segredo; o que saiu da página sai com o retrato). Se o componente já
+  tirou o campo da página quando o ``change``, o ``blur`` ou o ``focusout`` chega
+  (ou quando a janela perde o foco para um iframe), sai o retrato que o script
+  tirou depois da última tecla da pessoa (o descritor e o valor do mesmo momento,
+  com a tecla aplicada); o campo que saiu antes desse retrato é esquecido. As
+  marcas de sigilo do campo só sobem até o valor sair (com uma senha ou um código
+  no documento, o valor do campo que saiu da página só sai como segredo);
 - identidade do campo (``field_key``): aba, iframes, hospedeiros, seletor, id,
   nome e tudo o que a pessoa vê ou o compilador usa como localizador (etiqueta,
   tipo, papel, nome acessível, rótulo, placeholder, ``data-testid`` e a chave da
@@ -55,9 +59,12 @@ fica fora da gravação. As regras:
   DOM), então o alvo e o valor de um passo sempre vêm do mesmo elemento, mesmo
   quando dois campos coincidem em tudo o que se descreve deles (o caminho CSS
   para em seis níveis da luz). Gravações sem esse número ficam só com a descrição.
-  O segundo clique de um clique duplo (``second_click``) só some no passo do
-  primeiro quando é no mesmo elemento, ou quando um dos dois cliques não gravou
-  nada (o robô nunca clica duas vezes onde a pessoa agiu uma vez);
+  O segundo clique de um clique duplo (``second_click``) some no passo do primeiro
+  no mesmo elemento e noutro elemento sem prova de outro alvo (``other_target``:
+  outra chave da linha, texto, nome, rótulo ou ``data-testid``); com a prova, só é
+  outro passo quando os dois cliques gravaram. Resíduo (o robô age menos que a
+  pessoa, nunca mais): o botão de outra linha que sobe para o lugar do clicado, sem
+  nada diferente além do número, continua absorvido;
 - login (``analyze_logins``): o envio só é autenticação quando todos os campos
   preenchidos desde a última navegação que carregou documento (ou desde o login
   anterior) são credenciais de uma credencial só: o usuário com uma senha
@@ -140,6 +147,7 @@ __all__ = [
     "looks_secret",
     "mentions_password",
     "names_another_party",
+    "other_target",
     "password_by_name",
     "password_toggle",
     "plain_label",
@@ -576,20 +584,43 @@ def second_click(
 ) -> bool:
     """O clique com ``detail`` 2 ou mais é o segundo clique do clique anterior (não vira passo).
 
-    Precisa do mesmo seletor e do mesmo elemento (``same_element``; gravações sem o
-    número do elemento ficam só com o seletor). Noutro elemento com o mesmo seletor
-    (a linha de baixo que sobe para o lugar da que a pessoa excluiu) o clique é outro
-    passo só quando cada um dos dois cliques gravou algo (``writes_in`` nas
-    requisições entre ele e a ação seguinte); senão continua absorvido, como antes,
-    e as requisições dele contam no passo do primeiro: o robô nunca clica duas vezes
-    onde o segundo clique da pessoa não fez nada (um botão que a página recriou
-    entre os dois cliques).
+    Precisa do mesmo seletor. No mesmo elemento (``same_element``; gravações sem o
+    número do elemento ficam só com o seletor), é sempre o segundo clique. Noutro
+    elemento com o mesmo seletor, o clique só é outro passo com prova de um segundo
+    alvo (``other_target``: outra chave da linha, outro texto, outro nome acessível,
+    outro rótulo ou outro ``data-testid``) e quando cada um dos dois cliques gravou
+    algo (``writes_in`` nas requisições entre ele e a ação seguinte). Sem essa prova,
+    o número do elemento sozinho não separa os cliques: o clique duplo num botão sem
+    trava que a página recria entre os dois cliques (cada clique grava) continua um
+    passo só, e as requisições do segundo contam no passo do primeiro; o robô nunca
+    age mais vezes que a pessoa. Resíduo (agir menos, nunca mais): o botão de outra
+    linha que sobe para o lugar do que a pessoa clicou, com o mesmo seletor cortado e
+    nada mais diferente, também continua absorvido, e o robô age uma vez onde a pessoa
+    agiu duas.
     """
     if first.css != second.css:
         return False
-    if same_element(first, second):
+    if same_element(first, second) or not other_target(first, second):
         return True
     return not (writes_in(first_requests) and writes_in(second_requests))
+
+
+def other_target(first: ElementDescriptor, second: ElementDescriptor) -> bool:
+    """Os dois descritores mostram dois alvos diferentes.
+
+    Prova de um segundo alvo: outra chave da linha, outro texto, outro nome
+    acessível, outro rótulo ou outro ``data-testid``. O número do elemento
+    (``serial``) e o seletor não contam.
+    """
+    first_key = first.row.key if first.row is not None else None
+    second_key = second.row.key if second.row is not None else None
+    return (first_key, first.text, first.name, first.label, first.test_id) != (
+        second_key,
+        second.text,
+        second.name,
+        second.label,
+        second.test_id,
+    )
 
 
 def requests_while_editing(events: Sequence[RecordingEvent], position: int) -> list[RequestEvent]:

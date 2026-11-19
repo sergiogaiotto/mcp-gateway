@@ -16,8 +16,10 @@ Regras principais:
   a gravação tem), no mesmo documento, viram um ``fill`` com o valor final;
   edições, marcações e escolhas de elementos diferentes nunca se juntam, então o
   alvo e o valor de um passo sempre vêm do mesmo elemento; o segundo clique de um
-  clique duplo só some no passo do primeiro no mesmo elemento ou quando um dos
-  dois cliques não gravou nada (``second_click``); as requisições feitas
+  clique duplo some no passo do primeiro no mesmo elemento e noutro elemento sem
+  prova de outro alvo (outra chave da linha, texto, nome, rótulo ou
+  ``data-testid``), e com a prova só é outro passo quando os dois cliques gravaram
+  (``second_click``); as requisições feitas
   enquanto a pessoa editava o campo, depois de cada edição e depois do Tab que
   deixa o campo contam no efeito do passo, como num salvamento automático;
 - campo de senha → ``SecretValue(field="password")`` de uma credencial por

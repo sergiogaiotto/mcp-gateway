@@ -11,6 +11,10 @@ elemento (o número que o script dá a cada um) se juntam num passo.
 
 Rodada 9: o segundo clique de um clique duplo só some no primeiro passo quando é no
 mesmo elemento ou quando um dos dois cliques não gravou nada.
+
+Rodada 10: noutro elemento, ele também some sem prova de outro alvo (outra chave da
+linha, texto, nome, rótulo ou ``data-testid``): o número do elemento sozinho não
+separa os cliques.
 """
 
 from collections.abc import Callable
@@ -37,6 +41,7 @@ from rapa.recorder.sensitivity import (
     declared_username,
     field_key,
     in_shadow_root,
+    other_target,
     second_click,
     secret_page_inputs,
 )
@@ -376,36 +381,45 @@ def row_button(name: str, serial: int | None, **kw: Any) -> ElementDescriptor:
 
 
 @pytest.mark.parametrize(
-    ("serials", "writes", "steps"),
+    ("serials", "keys", "writes", "steps"),
     [
-        ((1, 2), (True, True), 2),
-        ((1, 1), (True, True), 1),
-        ((None, None), (True, True), 1),
-        ((1, 2), (True, False), 1),
-        ((1, 2), (False, True), 1),
+        ((1, 2), (None, None), (True, True), 1),
+        ((1, 2), ("Boleto 1", "Boleto 2"), (True, True), 2),
+        ((1, 1), (None, None), (True, True), 1),
+        ((None, None), (None, None), (True, True), 1),
+        ((1, 2), ("Boleto 1", "Boleto 2"), (True, False), 1),
+        ((1, 2), ("Boleto 1", "Boleto 2"), (False, True), 1),
     ],
     ids=[
         "outra_linha_que_gravou",
+        "outra_linha_com_outra_chave",
         "o_mesmo_botao",
         "gravacao_antiga",
         "segundo_nao_gravou",
         "primeiro_nao_gravou",
     ],
 )
-def test_a_second_click_on_another_element_is_a_step_only_when_both_clicks_wrote(
-    serials: tuple[int | None, int | None], writes: tuple[bool, bool], steps: int
+def test_a_second_click_on_another_element_is_a_step_only_with_another_target_and_both_writes(
+    serials: tuple[int | None, int | None],
+    keys: tuple[str | None, str | None],
+    writes: tuple[bool, bool],
+    steps: int,
 ) -> None:
     # D1: o "Excluir" do boleto 2 sobe para o lugar do 1, que a pessoa excluiu, e o
-    # segundo clique vem com detail 2 e o mesmo caminho CSS. Antes ele sempre virava
-    # parte do primeiro passo (o robô excluía um só). Noutro elemento, só é outro passo
-    # quando cada clique gravou algo; senão (um botão recriado entre os dois cliques,
-    # e o segundo não fez nada) continua absorvido: o robô nunca clica duas vezes onde
-    # a pessoa agiu uma vez.
+    # segundo clique vem com detail 2 e o mesmo caminho CSS. Só é outro passo com
+    # prova de outro alvo (aqui, a chave da linha) e quando cada clique gravou algo.
+    # Só o número do elemento não basta: um botão sem trava que a página recria
+    # entre os dois cliques de um clique duplo também tem outro número, e o robô
+    # pagaria duas vezes (W11). Sem a chave da linha, o D1 continua um passo só (o
+    # robô age menos que a pessoa, nunca mais).
+    def row(key: str | None) -> dict[str, Any]:
+        return {} if key is None else {"row": RowInfo(text=f"{key} Excluir", key=key)}
+
     rec = RecordingBuilder()
     rec.navigate("/boletos")
-    first = rec.click(row_button("Excluir", serials[0]))
+    first = rec.click(row_button("Excluir", serials[0], **row(keys[0])))
     after_first = [rec.request("POST", "/api/excluir?i=1", "fetch")] if writes[0] else []
-    second = rec.click(row_button("Excluir", serials[1]), detail=2)
+    second = rec.click(row_button("Excluir", serials[1], **row(keys[1])), detail=2)
     after_second = [rec.request("POST", "/api/excluir?i=2", "fetch")] if writes[1] else []
     result = compile_(rec.build())
     clicks = [s for s in result.manifest.steps if isinstance(s, ClickStep)]
@@ -415,6 +429,16 @@ def test_a_second_click_on_another_element_is_a_step_only_when_both_clicks_wrote
     # O gravador (analyze_logins) decide pela mesma regra.
     absorbed = second_click(first.element, after_first, second.element, after_second)
     assert absorbed is (steps == 1)
+
+
+@pytest.mark.parametrize("field", ["text", "name", "label", "test_id"])
+def test_another_text_name_label_or_test_id_is_another_target(field: str) -> None:
+    # Prova de um segundo alvo além da chave da linha; o número e o seletor não contam.
+    base = row_button("Excluir", 1, label="Excluir", test_id="excluir")
+    other = base.model_copy(update={"serial": 2, field: "Outro"})
+    assert other_target(base, other)
+    assert not other_target(base, base.model_copy(update={"serial": 2}))
+    assert not other_target(base, base.model_copy(update={"serial": 2, "css": "#outro"}))
 
 
 def test_a_second_click_that_lands_on_another_button_after_a_login_is_its_own_step() -> None:

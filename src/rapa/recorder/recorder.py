@@ -21,11 +21,12 @@ abertos chegam com o caminho dos hospedeiros (``shadow_path``) e um seletor que
 atravessa o shadow root, que a conferência do Playwright usa; o valor de um campo
 de texto de shadow root sai no ``change`` dele (que o script escuta em cada shadow
 root que aparece no caminho de um evento), antes do blur e na ordem da pessoa, ou
-no ``blur`` na fase de captura, antes do ouvinte de blur do campo; o campo que o
-componente já tirou da página sai com o descritor e o último valor que o script
-guardou dele, com a mesma marca de sigilo; e um campo de shadow root nunca é
-credencial de login. Cada elemento leva um número (``serial``) que dois elementos
-nunca têm igual: só edições do mesmo elemento viram um passo. A limpeza ignora
+no ``blur`` na fase de captura e antes da próxima ação, quando o script decide
+depois dos ouvintes de blur do componente; o campo que o componente já tirou da
+página sai com o retrato (o descritor e o valor) que o script tirou depois da
+última tecla da pessoa, e as marcas de sigilo só sobem; e um campo de shadow root
+nunca é credencial de login. Cada elemento leva um número (``serial``) que dois
+elementos nunca têm igual: só edições do mesmo elemento viram um passo. A limpeza ignora
 maiúsculas em tudo o que pode chegar ao robô ou ao modelo de linguagem: o texto
 livre da página (títulos, texto, iframes) e, nos elementos, nomes acessíveis,
 rótulos, placeholders, títulos, textos, seletores e o texto e as células da linha

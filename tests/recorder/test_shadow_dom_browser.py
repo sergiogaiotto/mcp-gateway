@@ -1,4 +1,4 @@
-"""Componentes com shadow root gravados num Chromium de verdade, e compilados (rodadas 7 a 9).
+"""Componentes com shadow root gravados num Chromium de verdade, e compilados (rodadas 7 a 10).
 
 Duas instâncias do mesmo componente (``<x-field>``, ``<x-check>``, ``<x-select>``)
 têm o mesmo ``<input id="input">`` por dentro, como nas bibliotecas de
@@ -18,8 +18,16 @@ fundos, o mesmo rótulo e caminho) viram dois passos.
 
 Rodada 9: o valor também sai no blur na fase de captura (o usuário que vira "chip"
 quando a pessoa sai para um iframe); o campo que o componente tira da página antes
-do gravador sai com o descritor e o valor guardados (com a marca de sigilo); e dois
-cliques rápidos em botões de duas linhas, cada um gravando, são dois passos.
+do gravador sai com o descritor e o valor guardados (com a marca de sigilo).
+
+Rodada 10: o descritor e o valor guardados são os de depois de cada tecla, tirados
+juntos (a linha certa, a máscara e o rótulo de código que aparecem depois do primeiro
+foco, a tecla que a máscara põe por script), e as marcas de sigilo só sobem; no blur
+e antes da próxima ação o gravador decide depois dos ouvintes de blur do componente
+(o campo que vira senha no blur só sai como segredo); o caminho do blur da janela
+vale só para campos de shadow roots; e o segundo clique de um clique duplo só vira
+outro passo com prova de outro alvo (os dois botões de duas linhas sem nada que os
+separe, o "Pagar" e o "Entrar" que a página recria, ficam um passo só).
 """
 
 from collections.abc import AsyncIterator
@@ -42,7 +50,15 @@ from rapa.core.robot import (
     TextValue,
 )
 from rapa.fixtures.server import HOST_RESOLVER_ARG
-from rapa.recorder import CheckEvent, ClickEvent, InputEvent, Recorder, Recording, SelectEvent
+from rapa.recorder import (
+    CheckEvent,
+    ClickEvent,
+    InputEvent,
+    Recorder,
+    Recording,
+    RequestEvent,
+    SelectEvent,
+)
 from tests.recorder.test_login_rule_browser import (
     PASSWORD,
     SITE,
@@ -104,7 +120,7 @@ async def browser(chromium_path: str) -> AsyncIterator[Browser]:
             await browser.close()
 
 
-def locate(page: Page, locator: Locator) -> PwLocator:
+def locate(page: Page | PwLocator, locator: Locator) -> PwLocator:
     """O localizador do robô na página, como o executor o monta."""
     match locator.by:
         case LocatorBy.ROLE:
@@ -1092,11 +1108,16 @@ async def test_a_username_the_component_takes_away_before_the_recorder_sees_it_s
     assert email not in manifest.lower() and email not in prompt.lower()
 
 
-async def test_two_fast_clicks_on_the_buttons_of_two_rows_are_two_steps(browser: Browser) -> None:
+async def test_two_fast_clicks_on_the_buttons_of_two_rows_without_another_target_are_one_step(
+    browser: Browser,
+) -> None:
     # D1: a pessoa exclui o boleto 1, a linha some e o "Excluir" do boleto 2 sobe para
     # o mesmo lugar; o segundo clique vem com detail 2 e o mesmo caminho CSS (as
-    # linhas são fundas demais). São dois elementos e cada clique gravou: dois passos,
-    # não um clique duplo (o robô excluía um boleto só).
+    # linhas são fundas demais). São dois elementos e cada clique gravou, mas nada
+    # mais os separa (o mesmo texto, o mesmo nome e nenhuma linha de tabela): para o
+    # gravador, é o mesmo que um clique duplo num botão sem trava que a página recria
+    # (W11). Um passo só (resíduo: o robô exclui um boleto onde a pessoa excluiu dois;
+    # age menos, nunca mais).
     rows = "".join(
         f'<li data-gt="i{k}"><article><div><div><div><div><span>Boleto {k}</span>'
         f"<button onclick=\"fetch('/api/excluir?i={k}', {{method: 'POST', body: '{{}}'}}); "
@@ -1126,10 +1147,7 @@ async def test_two_fast_clicks_on_the_buttons_of_two_rows_are_two_steps(browser:
     assert clicks[0].element.serial != clicks[1].element.serial
     result = compile_(recording)
     steps = [s for s in result.manifest.steps if isinstance(s, ClickStep)]
-    assert [(s.id, s.effect) for s in steps] == [
-        ("clicar_excluir", Effect.IRREVERSIBLE),
-        ("clicar_excluir_2", Effect.IRREVERSIBLE),
-    ]
+    assert [(s.id, s.effect) for s in steps] == [("clicar_excluir", Effect.IRREVERSIBLE)]
 
 
 async def test_a_double_click_on_a_button_the_page_recreates_is_still_one_click(
@@ -1167,3 +1185,554 @@ render();
     result = compile_(recording)
     steps = [s for s in result.manifest.steps if isinstance(s, ClickStep)]
     assert [(s.id, s.effect) for s in steps] == [("clicar_pagar", Effect.IRREVERSIBLE)]
+
+
+# -- rodada 10: o descritor e o valor guardados depois de cada tecla, as decisões ------
+# -- depois dos ouvintes do componente e o clique duplo sem prova de outro alvo --------
+
+QUADRO_IFRAME = "<iframe src='/quadro' title='Ações' style='width:400px;height:120px'></iframe>"
+
+
+async def leave_to_the_iframe(p: Page) -> None:
+    """A pessoa sai do campo clicando num iframe (sem pointerdown nem keydown neste documento)."""
+    frame = p.frame_locator("iframe")
+    await frame.get_by_role("button", name="Ver").click()
+    await frame.get_by_text("Visto").wait_for()
+
+
+async def marks_after(
+    browser: Browser, html: str, before: Scenario, steps: list[FillStep]
+) -> list[str]:
+    """Como ``marks_of``, depois de ``before`` (o que o robô faz antes) e dentro da linha do passo.
+
+    A linha é escolhida como o executor escolhe: o contêiner com um elemento cujo
+    texto inteiro é ``within_has_text``.
+    """
+    context = await browser.new_context()
+    try:
+        p = await context.new_page()
+        await p.set_content(html)
+        await before(p)
+        found: list[str] = []
+        for s in steps:
+            root: Page | PwLocator = p
+            if s.target.within is not None:
+                within = locate(p, s.target.within)
+                if s.target.within_has_text is not None:
+                    within = within.filter(has=p.get_by_text(s.target.within_has_text, exact=True))
+                assert await within.count() == 1, (s.id, s.target.within)
+                root = within
+            marks = set()
+            for locator in s.target.locators:
+                located = locate(root, locator)
+                assert await located.count() == 1, (s.id, locator)
+                marks.add(await located.evaluate(MARK_JS))
+            assert len(marks) == 1, (s.id, marks)
+            found.append(marks.pop())
+        return found
+    finally:
+        await context.close()
+
+
+#: Linhas que a lista reaproveita no "Ordenar" (como uma lista sem chave): o mesmo
+#: input passa a ser o da outra linha. Cada célula é um componente que troca o input
+#: por texto (e grava) no próprio change, antes do gravador.
+ROWS_REUSED = (
+    """<script>
+customElements.define('x-cell', class extends HTMLElement { connectedCallback() {
+  if (this.shadowRoot) return;
+  const r = this.attachShadow({mode: 'open'});
+  r.innerHTML = '<input aria-label="Valor">';
+  r.addEventListener('change', (e) => {
+    const inp = e.composedPath()[0];
+    if (!inp || inp.tagName !== 'INPUT') return;
+    const s = document.createElement('span'); s.textContent = inp.value; inp.replaceWith(s);
+    fetch('/api/celula?id=' + this.closest('tr').dataset.gt, {method: 'POST', body: inp.value});
+  }, true);
+} });
+</script><h1>Boletos</h1><button id="ord" onclick="sortRows()">Ordenar</button>
+"""
+    + QUADRO_IFRAME
+    + """
+<table><tbody id="tb">
+<tr data-gt="rA"><td class="n">Boleto A</td><td><x-cell></x-cell></td></tr>
+<tr data-gt="rB"><td class="n">Boleto B</td><td><x-cell></x-cell></td></tr>
+</tbody></table>
+<script>
+let data = [{id: 'A', n: 'Boleto A'}, {id: 'B', n: 'Boleto B'}];
+function sortRows() { data.reverse(); document.querySelectorAll('#tb tr').forEach((tr, i) => {
+  tr.dataset.gt = 'r' + data[i].id; tr.querySelector('.n').textContent = data[i].n; }); }
+</script>"""
+)
+
+
+async def test_a_reused_row_input_keeps_the_row_the_person_typed_in(browser: Browser) -> None:
+    # W1s: a pessoa foca o campo da linha A, clica em "Ordenar" (o mesmo input passa a
+    # ser o da linha B), digita 99 e sai para o iframe; o componente tira o input da
+    # página no próprio change. Antes, o descritor guardado no primeiro foco (linha A)
+    # saía com o valor, e o robô digitava 99 na linha A.
+    html = page("Boletos", ROWS_REUSED)
+
+    async def scenario(p: Page) -> None:
+        cell = p.locator("tr").nth(0).locator("x-cell").locator("input")
+        await cell.click()
+        await p.get_by_role("button", name="Ordenar").click()
+        await cell.click()
+        await p.keyboard.type("99")
+        await leave_to_the_iframe(p)
+
+    recording = await record_site(
+        browser, {"/boletos": html, "/quadro": QUADRO_VER}, "/boletos", scenario
+    )
+    (valor,) = inputs_of(recording)
+    assert valor.value == "99"
+    assert valor.element.row is not None and valor.element.row.key == "Boleto B"
+    result = compile_(recording)
+    found = fill_steps(result)
+    assert [(s.id, s.value, s.target.within_has_text) for s in found] == [
+        ("digitar_valor", TextValue(template="99"), "Boleto B")
+    ]
+
+    async def ordenar(p: Page) -> None:
+        await p.get_by_role("button", name="Ordenar").click()
+
+    assert await marks_after(browser, html, ordenar, found) == ["rB"]
+
+
+def masked_signature(mask: str) -> str:
+    """Assinatura eletrônica de componente cuja máscara por CSS só aparece depois da primeira tecla.
+
+    ``classe``: o componente põe a classe da máscara no input; ``placeholder``: o CSS
+    mascara o input sem o placeholder à mostra. O componente troca o input no próprio
+    change, antes do gravador.
+    """
+    style = {
+        "classe": "<style>.m { -webkit-text-security: disc; }</style>",
+        "placeholder": (
+            "<style>input:not(:placeholder-shown) { -webkit-text-security: disc; }</style>"
+        ),
+    }[mask]
+    on_input = (
+        "inp.addEventListener('input', () => inp.classList.add('m'));" if mask == "classe" else ""
+    )
+    return (
+        """<script>
+customElements.define('x-sig', class extends HTMLElement { connectedCallback() {
+  if (this.shadowRoot) return;
+  const r = this.attachShadow({mode: 'open'});
+  r.innerHTML = '"""
+        + style
+        + """<label for="s">Assinatura eletrônica</label><input id="s" placeholder="Digite">';
+  const inp = r.getElementById('s'); """
+        + on_input
+        + """
+  r.addEventListener('change', (e) => {
+    const t = e.composedPath()[0];
+    if (!t || t.tagName !== 'INPUT') return;
+    const s = document.createElement('span'); s.textContent = '••••'; t.replaceWith(s);
+    fetch('/api/assinar', {method: 'POST', body: t.value});
+  }, true);
+} });
+</script>"""
+    )
+
+
+@pytest.mark.parametrize("mask", ["classe", "placeholder"])
+async def test_a_mask_that_appears_after_the_first_key_keeps_the_signature_secret(
+    browser: Browser, mask: str
+) -> None:
+    # W2a/W2b: a máscara por CSS aparece depois da primeira tecla; o componente tira o
+    # input da página no change e a pessoa sai para o iframe. O descritor guardado é o
+    # de depois da última tecla (com a máscara), e as marcas de sigilo só sobem: a
+    # assinatura só sai como segredo. Antes, saía como texto (o descritor do primeiro
+    # foco, sem a máscara).
+    secret = "8642"
+    html = page(
+        "Transferência",
+        masked_signature(mask)
+        + "<h1>Confirmar transferência</h1>"
+        + QUADRO_IFRAME
+        + "<div style='height:40px'><x-sig></x-sig></div>",
+    )
+
+    async def scenario(p: Page) -> None:
+        await p.locator("x-sig").locator("#s").click()
+        await p.keyboard.type(secret)
+        await leave_to_the_iframe(p)
+
+    recording = await record_site(
+        browser, {"/transferencia": html, "/quadro": QUADRO_VER}, "/transferencia", scenario
+    )
+    assert not has_text(recording, secret)
+    (assinatura,) = inputs_of(recording)
+    assert assinatura.element.sensitive and assinatura.element.is_password
+    assert assinatura.value is None
+    result = compile_(recording)
+    assert [(s.id, s.value) for s in fill_steps(result)] == [
+        ("digitar_assinatura_eletronica", SecretValue(credential="banco", field="password"))
+    ]
+    manifest, prompt = dumps(result)
+    assert secret not in manifest and secret not in prompt
+
+
+#: O mesmo input do componente serve ao nome e, depois do "Continuar", ao código de
+#: verificação (só o rótulo muda); no código, o componente troca o input no change.
+XWIZARD = """<script>
+customElements.define('x-wiz', class extends HTMLElement { connectedCallback() {
+  if (this.shadowRoot) return;
+  const r = this.attachShadow({mode: 'open'});
+  r.innerHTML = '<label for="u" id="lb">Nome completo</label><input id="u">';
+  const inp = r.getElementById('u');
+  this.step2 = () => {
+    r.getElementById('lb').textContent = 'Código de verificação'; inp.value = '';
+  };
+  r.addEventListener('change', (e) => {
+    const t = e.composedPath()[0];
+    if (!this.done2 || !t || t.tagName !== 'INPUT') return;
+    const s = document.createElement('span'); s.textContent = 'Verificando...'; t.replaceWith(s);
+    fetch('/api/verificar', {method: 'POST', body: t.value});
+  }, true);
+} });
+</script>"""
+
+
+async def test_a_component_input_reused_for_a_code_keeps_the_code_secret(
+    browser: Browser,
+) -> None:
+    # W3: o input do "Nome completo" vira o do "Código de verificação"; o componente o
+    # tira da página no change e a pessoa sai para o iframe. Antes, o código saía como
+    # texto, com o descritor do primeiro foco (o rótulo do nome).
+    code = "482913"
+    html = page(
+        "Cadastro",
+        XWIZARD
+        + "<h1>Cadastro</h1>"
+        + QUADRO_IFRAME
+        + "<div style='height:40px'><x-wiz></x-wiz></div><button id='c' onclick=\""
+        "const w = document.querySelector('x-wiz'); w.step2(); w.done2 = true;\">"
+        "Continuar</button>",
+    )
+
+    async def scenario(p: Page) -> None:
+        field = p.locator("x-wiz").locator("#u")
+        await field.click()
+        await p.keyboard.type("Ana Souza")
+        await p.get_by_role("button", name="Continuar").click()
+        await field.click()
+        await p.keyboard.type(code)
+        await leave_to_the_iframe(p)
+
+    recording = await record_site(
+        browser, {"/cadastro": html, "/quadro": QUADRO_VER}, "/cadastro", scenario
+    )
+    assert not has_text(recording, code)
+    codes = [e for e in inputs_of(recording) if e.element.label == "Código de verificação"]
+    assert codes and all(e.element.is_one_time_code and e.value is None for e in codes)
+    result = compile_(recording)
+    assert {s.id: s.value for s in fill_steps(result)} == {
+        "digitar_nome_completo": an_input("nome_completo"),
+        "digitar_codigo_de_verificacao": SecretValue(credential="banco_otp", field="totp"),
+    }
+    manifest, prompt = dumps(result)
+    assert code not in manifest and code not in prompt
+
+
+#: Máscara de componente que cancela o beforeinput de uma tecla sim, outra não, e põe
+#: o caractere por script (sem evento input); troca o input no change.
+XAMOUNT = """<script>
+customElements.define('x-amt', class extends HTMLElement { connectedCallback() {
+  if (this.shadowRoot) return;
+  const r = this.attachShadow({mode: 'open'});
+  r.innerHTML = '<label for="t">Valor</label><input id="t" data-gt="c">';
+  const inp = r.getElementById('t');
+  let n = 0;
+  inp.addEventListener('beforeinput', (e) => {
+    if (e.inputType === 'insertText' && (n++ % 2 === 1)) {
+      e.preventDefault(); inp.value = inp.value + e.data;
+    }
+  });
+  r.addEventListener('change', (e) => {
+    const t = e.composedPath()[0];
+    if (!t || t.tagName !== 'INPUT') return;
+    const s = document.createElement('span'); s.textContent = t.value; t.replaceWith(s);
+    fetch('/api/valor', {method: 'POST', body: t.value});
+  }, true);
+} });
+</script>"""
+
+
+async def test_a_component_mask_that_types_by_script_keeps_the_last_key(browser: Browser) -> None:
+    # W9s: a pessoa digita 1234 no ritmo de uma pessoa (120 ms por tecla) e sai para o
+    # iframe; o componente tira o input da página no change. O valor guardado é o de
+    # depois de cada tecla (no beforeinput ele fica desconhecido). Antes, saía 123.
+    html = page(
+        "Grade",
+        XAMOUNT
+        + "<h1>Grade</h1>"
+        + QUADRO_IFRAME
+        + "<div style='height:40px'><x-amt></x-amt></div>",
+    )
+
+    async def scenario(p: Page) -> None:
+        await p.locator("x-amt").locator("#t").click()
+        await p.keyboard.type("1234", delay=120)
+        await leave_to_the_iframe(p)
+
+    recording = await record_site(
+        browser, {"/grade": html, "/quadro": QUADRO_VER}, "/grade", scenario
+    )
+    assert [(e.element.label, e.value) for e in inputs_of(recording)] == [("Valor", "1234")]
+    result = compile_(recording)
+    found = fill_steps(result)
+    assert [(s.id, s.value) for s in found] == [("digitar_valor", TextValue(template="1234"))]
+    assert await marks_of(browser, html, found) == ["c"]
+
+
+#: Editor rico da luz: cancela o beforeinput e põe o texto por script (sem input); no
+#: blur, grava e troca o editor por um novo.
+LIGHT_EDITOR = (
+    "<h1>Notas</h1>"
+    + QUADRO_IFRAME
+    + """
+<div id="wrap"><div id="ed" contenteditable="true" aria-label="Nota"
+  style="min-height:30px;border:1px solid"></div></div>
+<script>
+function wire(ed) {
+  ed.addEventListener('beforeinput', (e) => {
+    if (e.inputType === 'insertText') {
+      e.preventDefault(); ed.textContent = ed.textContent + e.data;
+      const r = document.createRange(); r.selectNodeContents(ed); r.collapse(false);
+      const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+    }
+  });
+  ed.addEventListener('blur', () => {
+    fetch('/api/nota', {method: 'POST', body: ed.textContent});
+    const fresh = document.createElement('div'); fresh.id = 'ed'; fresh.contentEditable = 'true';
+    fresh.setAttribute('aria-label', 'Nota'); fresh.style.cssText = ed.style.cssText;
+    fresh.textContent = ed.textContent; ed.replaceWith(fresh); wire(fresh);
+  });
+}
+wire(document.getElementById('ed'));
+</script>"""
+)
+
+
+async def test_a_light_editor_replaced_on_blur_never_gets_a_value_one_key_behind(
+    browser: Browser,
+) -> None:
+    # W9i: o editor da luz some no próprio blur quando a pessoa sai para o iframe (sem
+    # change nem focusout). O caminho do blur da janela vale só para campos de shadow
+    # roots: o valor deste se perde (falha fechada, como antes da rodada 9), nunca sai
+    # uma tecla atrás ("Pagar 123", como na rodada 9).
+    html = page("Notas", LIGHT_EDITOR)
+
+    async def scenario(p: Page) -> None:
+        await p.locator("#ed").click()
+        await p.keyboard.type("Pagar 1234")
+        await leave_to_the_iframe(p)
+
+    recording = await record_site(
+        browser, {"/notas": html, "/quadro": QUADRO_VER}, "/notas", scenario
+    )
+    # O texto da página (o editor mostra "Pagar 1234") vai na gravação; o valor, não.
+    assert inputs_of(recording) == []
+    assert fill_steps(compile_(recording)) == []
+
+
+#: Assinatura de componente que mostra o texto enquanto a pessoa digita e vira
+#: type=password no próprio blur; o componente para o change no shadow root.
+XPIN = """<script>
+customElements.define('x-pin', class extends HTMLElement { connectedCallback() {
+  if (this.shadowRoot) return;
+  const r = this.attachShadow({mode: 'open'});
+  r.addEventListener('change', (e) => e.stopImmediatePropagation(), true);
+  r.innerHTML = '<label for="s">Assinatura eletrônica</label><input id="s">';
+  const inp = r.getElementById('s');
+  inp.addEventListener('blur', () => { inp.type = 'password'; });
+  inp.addEventListener('focus', () => { inp.type = 'text'; });
+} });
+</script>"""
+
+
+@pytest.mark.parametrize("leave", ["iframe", "botao"])
+async def test_a_signature_that_becomes_a_password_on_blur_stays_secret(
+    browser: Browser, leave: str
+) -> None:
+    # W10a (sai para o iframe) e W10b (clica no botão): no blur e no pointerdown o
+    # gravador só guarda o campo e decide num setTimeout, depois dos ouvintes de blur
+    # do componente. O campo que virou type=password só sai como segredo. Antes, o
+    # valor saía como texto no blur na captura (W10a) ou no pointerdown (W10b).
+    secret = "7531"
+    html = page(
+        "Transferência",
+        XPIN
+        + "<h1>Confirmar transferência</h1>"
+        + QUADRO_IFRAME
+        + "<div style='height:40px'><x-pin></x-pin></div>"
+        "<button id='b' onclick=\"fetch('/api/transferir', {method: 'POST', body: '{}'})"
+        ".then(() => document.body.insertAdjacentHTML('beforeend', '<p>Ok</p>'))\">"
+        "Transferir</button>",
+    )
+
+    async def scenario(p: Page) -> None:
+        await p.locator("x-pin").locator("#s").click()
+        await p.keyboard.type(secret)
+        if leave == "iframe":
+            await leave_to_the_iframe(p)
+        await p.get_by_role("button", name="Transferir").click()
+        await p.get_by_text("Ok").wait_for()
+
+    recording = await record_site(
+        browser, {"/transferencia": html, "/quadro": QUADRO_VER}, "/transferencia", scenario
+    )
+    assert not has_text(recording, secret)
+    (assinatura,) = inputs_of(recording)
+    assert assinatura.element.sensitive and assinatura.element.is_password
+    assert assinatura.value is None
+    result = compile_(recording)
+    assert [(s.id, s.value) for s in fill_steps(result)] == [
+        ("digitar_assinatura_eletronica", SecretValue(credential="banco", field="password"))
+    ]
+    assert click_effect(result, "clicar_transferir") is Effect.IRREVERSIBLE
+    manifest, prompt = dumps(result)
+    assert secret not in manifest and secret not in prompt
+
+
+#: O contrário: type=password enquanto a pessoa digita, texto no próprio blur.
+XPIN_SHOWN = XPIN.replace(
+    "inp.type = 'password'; });\n  inp.addEventListener('focus', () => { inp.type = 'text'; });",
+    "inp.type = 'text'; });\n  inp.addEventListener('focus', () => { inp.type = 'password'; });",
+)
+
+
+@pytest.mark.parametrize("leave", ["iframe", "botao"])
+async def test_a_signature_that_shows_the_text_on_blur_stays_secret(
+    browser: Browser, leave: str
+) -> None:
+    # As marcas de sigilo só sobem: o retrato de depois de cada tecla (type=password)
+    # conta quando o gravador decide depois do blur do componente, que já mostrou o
+    # texto. O valor só sai como segredo.
+    assert XPIN_SHOWN != XPIN
+    secret = "9753"
+    html = page(
+        "Transferência",
+        XPIN_SHOWN
+        + "<h1>Confirmar transferência</h1>"
+        + QUADRO_IFRAME
+        + "<div style='height:40px'><x-pin></x-pin></div>"
+        "<button id='b' onclick=\"fetch('/api/transferir', {method: 'POST', body: '{}'})"
+        ".then(() => document.body.insertAdjacentHTML('beforeend', '<p>Ok</p>'))\">"
+        "Transferir</button>",
+    )
+
+    async def scenario(p: Page) -> None:
+        await p.locator("x-pin").locator("#s").click()
+        await p.keyboard.type(secret)
+        if leave == "iframe":
+            await leave_to_the_iframe(p)
+        await p.get_by_role("button", name="Transferir").click()
+        await p.get_by_text("Ok").wait_for()
+
+    recording = await record_site(
+        browser, {"/transferencia": html, "/quadro": QUADRO_VER}, "/transferencia", scenario
+    )
+    assert not has_text(recording, secret)
+    (assinatura,) = inputs_of(recording)
+    assert assinatura.element.sensitive and assinatura.element.is_password
+    assert assinatura.value is None
+    manifest, prompt = dumps(compile_(recording))
+    assert secret not in manifest and secret not in prompt
+
+
+#: "Pagar" que a página recria no próprio clique, sem trava: cada clique grava.
+PAY_UNGUARDED = """<h1>Boleto</h1><div id="box"></div><script>
+const render = () => {
+  document.getElementById('box').innerHTML =
+    '<div><div><div><div><div><button id="pg">Pagar</button></div></div></div></div></div>';
+  document.getElementById('pg').onclick = () => {
+    fetch('/api/pagar', {method: 'POST', body: '{}'})
+      .then(() => document.body.insertAdjacentHTML('beforeend', '<p>Pago</p>'));
+    render();
+  };
+};
+render();
+</script>"""
+
+
+async def double_click(p: Page, css: str) -> None:
+    """Clique duplo de uma pessoa: dois cliques no mesmo ponto, o segundo com detail 2."""
+    box = await p.locator(css).bounding_box()
+    assert box is not None
+    x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+    await p.mouse.click(x, y, click_count=2, delay=20)
+
+
+async def test_a_double_click_on_an_unguarded_button_the_page_recreates_is_one_click(
+    browser: Browser,
+) -> None:
+    # W11: a pessoa clica duas vezes no "Pagar" por hábito; a página recria o botão no
+    # clique, sem trava, e cada clique paga. Os dois botões só diferem no número do
+    # elemento: um passo só (na rodada 9, dois passos irreversíveis, e o robô pagava
+    # duas vezes em cada execução).
+    html = page("Boleto", PAY_UNGUARDED)
+
+    async def scenario(p: Page) -> None:
+        await double_click(p, "#pg")
+        await p.get_by_text("Pago").first.wait_for()
+        await p.wait_for_timeout(400)
+
+    recording = await record_site(browser, {"/boleto": html}, "/boleto", scenario)
+    clicks = [e for e in recording.events if isinstance(e, ClickEvent)]
+    assert [c.detail for c in clicks] == [1, 2]
+    assert clicks[0].element.serial != clicks[1].element.serial
+    paid = [e for e in recording.events if isinstance(e, RequestEvent) and e.method == "POST"]
+    assert len(paid) == 2
+    result = compile_(recording)
+    steps = [s for s in result.manifest.steps if isinstance(s, ClickStep)]
+    assert [(s.id, s.effect) for s in steps] == [("clicar_pagar", Effect.IRREVERSIBLE)]
+
+
+LOGIN_UNGUARDED = """<h1>Entrar</h1>
+<label>Usuário <input id="u" name="usuario" autocomplete="username"></label>
+<label>Senha <input id="p" type="password"></label><div id="box"></div>
+<script>
+const render = () => {
+  document.getElementById('box').innerHTML =
+    '<div><div><div><div><div><button id="en">Entrar</button></div></div></div></div></div>';
+  document.getElementById('en').onclick = () => {
+    fetch('/api/login', {method: 'POST', body: '{}'})
+      .then(() => setTimeout(() => { location.href = '/inicio'; }, 400));
+    render();
+  };
+};
+render();
+</script>"""
+
+
+async def test_a_double_click_on_a_login_button_the_page_recreates_is_one_click(
+    browser: Browser,
+) -> None:
+    # W12: o mesmo no "Entrar" de um login: um clique só, o login (leitura). Na rodada
+    # 9, um segundo passo clicar_entrar_2 (gravando) clicava de novo depois de entrar.
+    html = page("Login", LOGIN_UNGUARDED)
+    inicio = page("Início", "<h1>Início</h1><p>Sua conta</p>")
+
+    async def scenario(p: Page) -> None:
+        await p.locator("#u").click()
+        await p.keyboard.type(USER)
+        await p.locator("#p").click()
+        await p.keyboard.type(PASSWORD)
+        await double_click(p, "#en")
+        await p.get_by_role("heading", name="Início").wait_for()
+
+    recording = await record_site(browser, {"/login": html, "/inicio": inicio}, "/login", scenario)
+    assert not has_text(recording, USER, ignore_case=True)
+    assert not has_text(recording, PASSWORD)
+    clicks = [e for e in recording.events if isinstance(e, ClickEvent)]
+    assert [c.detail for c in clicks] == [1, 2]
+    logins = [e for e in recording.events if isinstance(e, RequestEvent) and e.method == "POST"]
+    assert len(logins) == 2
+    result = compile_(recording)
+    steps = [s for s in result.manifest.steps if isinstance(s, ClickStep)]
+    assert [(s.id, s.effect) for s in steps] == [("clicar_entrar", Effect.READ)]
+    assert usernames_in(result) == ["digitar_usuario"]
