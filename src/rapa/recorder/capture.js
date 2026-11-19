@@ -12,14 +12,22 @@
 // abertos também contam: o alvo é o primeiro elemento do composedPath, listas,
 // caixas de seleção e arquivos de um shadow root saem pelo evento input (que,
 // ao contrário do change, atravessa o shadow root), os campos de texto saem no
-// change e no focusout do próprio shadow root (cada shadow root que aparece no
-// composedPath de um evento ganha esses ouvintes, uma vez) ou antes da próxima
-// ação noutro elemento, e o elemento leva o caminho dos hospedeiros
-// (shadow_path) e um seletor CSS que atravessa os shadow roots abertos
-// ("#hospedeiro > #campo"), para que dois componentes iguais (o mesmo id por
-// dentro) nunca virem o mesmo campo. Cada elemento também leva um número
-// (serial) que dois elementos nunca têm igual. Nada da página é trocado:
-// nenhum método nativo é embrulhado para isso.
+// change, no blur e no focusout do próprio shadow root (cada shadow root que
+// aparece no composedPath de um evento ganha esses ouvintes, uma vez), no blur
+// na captura da janela (antes do ouvinte de blur do campo, também quando a
+// pessoa sai para um iframe) ou antes da próxima ação noutro elemento
+// (pointerdown, keydown, beforeinput); o campo que o componente já tirou da
+// página quando o change, o blur ou o focusout chega (ou quando a janela perde
+// o foco) sai com o descritor guardado no primeiro foco ou input dele e o último
+// valor que a pessoa digitou, com a mesma marca de sigilo. O elemento leva o
+// caminho dos hospedeiros (shadow_path) e um seletor CSS que atravessa os
+// shadow roots abertos ("#hospedeiro > #campo"), para que dois componentes
+// iguais (o mesmo id por dentro) nunca virem o mesmo campo. Cada elemento
+// também leva um número (serial) que dois elementos nunca têm igual. Nenhum
+// método de shadow DOM ou de eventos é embrulhado para isso; o único nativo
+// trocado é o setter de value de HTMLInputElement e HTMLTextAreaElement
+// (hookValueSetter), que só marca o valor que a página muda enquanto a pessoa
+// digita.
 (() => {
   'use strict';
   const CONFIG = __RAPA_CONFIG__;
@@ -886,12 +894,63 @@
     return el.value;
   };
 
-  const sendField = (el) => {
+  // elemento -> {desc, value}: o descritor tirado no primeiro foco ou input
+  // confiável do campo e o último valor visto num beforeinput ou input confiável
+  // (e logo depois dele). Só serve para o campo que já saiu da página quando o
+  // change, o blur ou o focusout chega (o componente trocou o input antes do
+  // ouvinte do gravador): o valor da pessoa sai com esse descritor.
+  const lastSeen = new WeakMap();
+  // O último campo em que a pessoa digitou (beforeinput ou input confiável).
+  let lastTyped = null;
+  const seeField = (el, withValue) => {
+    try {
+      let seen = lastSeen.get(el);
+      if (!seen) {
+        seen = { desc: describe(el), value: undefined };
+        lastSeen.set(el, seen);
+      }
+      if (withValue) seen.value = currentValue(el);
+    } catch (e) { /* ignora */ }
+  };
+
+  // O descritor guardado de um campo que saiu da página, com pelo menos a marca de
+  // sigilo que um envio com o campo na página teria agora (as marcas só sobem): o
+  // próprio campo é senha ou código, ou é o usuário ou outro campo de um login, ou
+  // há uma senha ou um código em qualquer raiz do documento (ou o documento é
+  // grande demais para olhar). Então o valor só sai como segredo.
+  const goneDescriptor = (el, desc) => {
+    const out = Object.assign({}, desc);
+    let secret = true;
+    try {
+      if (isPassword(el)) out.is_password = true;
+      if (isOneTimeCode(el)) out.is_one_time_code = true;
+      secret = out.is_password || out.is_one_time_code || isSecretField(el) ||
+        loginRole(el) !== null || !rootsUnder(el.ownerDocument) || secretIn(el, false, null);
+    } catch (e) { /* na dúvida, sigiloso */ }
+    if (secret) out.sensitive = true;
+    return out;
+  };
+
+  // ``gone``: o campo pode ter saído da página (change, blur ou focusout dele, ou a
+  // janela perdeu o foco); então o valor sai com o descritor e o valor guardados,
+  // se a pessoa digitou nele desde o último envio. Fora disso, o campo que saiu da
+  // página é esquecido, como antes.
+  const sendField = (el, gone) => {
     const st = fields.get(el);
-    if (!st || !el.isConnected) { fields.delete(el); return; }
-    const value = currentValue(el);
-    if (value === st.lastSent) return;
-    const desc = describe(el);
+    if (!st) return;
+    let value;
+    let desc;
+    if (el.isConnected) {
+      value = currentValue(el);
+      if (value === st.lastSent) return;
+      desc = describe(el);
+    } else {
+      fields.delete(el);
+      const seen = gone ? lastSeen.get(el) : null;
+      if (!seen || !seen.desc || !st.session || seen.value === undefined || seen.value === st.lastSent) return;
+      value = seen.value;
+      desc = goneDescriptor(el, seen.desc);
+    }
     const sensitive = desc.sensitive;
     send({
       kind: 'input',
@@ -941,6 +1000,15 @@
     if (!el || el.nodeType !== 1 || !isEditable(el)) return;
     const st = fieldState(el);
     startSession(el, st, el.isContentEditable ? false : currentValue(el) === '' || allSelected(el));
+    seeField(el, true);
+    lastTyped = el;
+  };
+
+  // O primeiro foco confiável de um campo: o descritor fica guardado (seeField).
+  const onFocusIn = (event) => {
+    if (!event.isTrusted) return;
+    const el = realTarget(event);
+    if (el && el.nodeType === 1 && isEditable(el) && !lastSeen.has(el)) seeField(el, false);
   };
 
   const onInput = (event) => {
@@ -956,10 +1024,14 @@
     if (type.indexOf('insert') === 0 && typeof event.data === 'string') st.typed += event.data;
     else st.typedKnown = false;
     editing = el;
+    seeField(el, true);
+    lastTyped = el;
     const before = currentValue(el);
     setTimeout(() => {
       if (editing === el) editing = null;
       if (currentValue(el) !== before) st.scriptSet = true;
+      // O valor como a página o deixou depois da tecla (máscara), com o campo na página.
+      if (el.isConnected) seeField(el, true);
     }, 0);
   };
 
@@ -1016,12 +1088,34 @@
     const el = realTarget(event);
     if (!el || el.nodeType !== 1) return;
     if (isChoice(el)) { onChoice(el, event); return; }
-    if (event.isTrusted && isEditable(el)) { fieldState(el); sendField(el); }
+    if (event.isTrusted && isEditable(el)) { fieldState(el); sendField(el, true); }
   };
 
+  // focusout e blur (o blur de um campo de shadow root, na fase de captura da janela
+  // e do shadow root: chega antes do ouvinte de blur do próprio campo, que pode
+  // trocá-lo por um "chip", e não depende de um pointerdown ou keydown neste
+  // documento, que não há quando a pessoa sai para um iframe).
   const onFocusOut = (event) => {
     const el = realTarget(event);
-    if (el && fields.has(el)) sendField(el);
+    if (el && fields.has(el)) sendField(el, event.isTrusted);
+  };
+
+  // O blur na captura da janela vale para os campos de shadow roots (o change de um
+  // campo da luz já chega primeiro ao gravador, na janela; ele continua saindo no
+  // change ou no focusout, como antes). O blur da própria janela (o foco foi para
+  // um iframe ou para fora): o campo em que a pessoa digitou por último, se já saiu
+  // da página sem change, blur nem focusout que o gravador visse (o componente o
+  // trocou no próprio change, antes do gravador), sai com o descritor e o valor
+  // guardados.
+  const onBlur = (event) => {
+    if (event.target !== W) {
+      const el = realTarget(event);
+      if (el && el.nodeType === 1 && inShadow(el)) onFocusOut(event);
+      return;
+    }
+    if (!event.isTrusted) return;
+    const el = lastTyped;
+    if (el && !el.isConnected && fields.has(el)) sendField(el, true);
   };
 
   // O change de um campo de texto num shadow root aberto: ele não sai do shadow
@@ -1031,15 +1125,15 @@
   const onShadowChange = (event) => {
     const el = realTarget(event);
     if (!el || el.nodeType !== 1 || isChoice(el)) return;
-    if (event.isTrusted && isEditable(el)) { fieldState(el); sendField(el); }
+    if (event.isTrusted && isEditable(el)) { fieldState(el); sendField(el, true); }
   };
 
   // Shadow roots abertos: cada um que aparece no composedPath de um evento que
   // atravessa a fronteira (focusin, pointerdown, mousedown, keydown, beforeinput,
-  // input) ganha, uma vez só, ouvintes de change e focusout na fase de captura (o
-  // focusout entre dois campos do mesmo shadow root não chega à janela). Vale para
-  // os shadow roots declarativos e os criados antes deste script; nenhum método
-  // nativo é embrulhado.
+  // input) ganha, uma vez só, ouvintes de change, blur e focusout na fase de
+  // captura (o blur e o focusout entre dois campos do mesmo shadow root não chegam
+  // à janela). Vale para os shadow roots declarativos e os criados antes deste
+  // script; nenhum método nativo é embrulhado.
   const watchedRoots = new WeakSet();
   const watchRoots = (event) => {
     let path;
@@ -1049,6 +1143,7 @@
       watchedRoots.add(node);
       try {
         node.addEventListener('change', onShadowChange, { capture: true, passive: true });
+        node.addEventListener('blur', onFocusOut, { capture: true, passive: true });
         node.addEventListener('focusout', onFocusOut, { capture: true, passive: true });
       } catch (e) { /* ignora */ }
     }
@@ -1095,7 +1190,9 @@
   W.addEventListener('keyup', onKeyFlag, opts);
   W.addEventListener('keypress', onKeyFlag, opts);
   W.addEventListener('keydown', onKeyDown, opts);
+  W.addEventListener('focusin', onFocusIn, opts);
   W.addEventListener('change', onChange, opts);
+  W.addEventListener('blur', onBlur, opts);
   W.addEventListener('focusout', onFocusOut, opts);
   W.addEventListener('click', onClick, opts);
   // Depois de todos os ouvintes da página: fim da janela em que ela pode mascarar o valor.
@@ -1103,8 +1200,8 @@
   W.addEventListener('pagehide', () => flushPending(null), opts);
   W.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushPending(null); }, opts);
   // Shadow roots: os eventos que atravessam a fronteira chegam à janela com o
-  // composedPath; o change e o focusout que ficam dentro de um shadow root aberto
-  // chegam pelos ouvintes que watchRoots põe nele. Nenhum método da página é
+  // composedPath; o change, o blur e o focusout que ficam dentro de um shadow root
+  // aberto chegam pelos ouvintes que watchRoots põe nele. Nenhum método da página é
   // embrulhado.
 
   Object.defineProperty(W, Symbol.for('rapa.recorder.stop'), {

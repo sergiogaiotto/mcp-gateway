@@ -8,6 +8,9 @@ códigos só autenticam com o botão num ``<form>`` só de códigos.
 
 Rodada 8: o ``data-testid`` entra na identidade do campo, e só edições do mesmo
 elemento (o número que o script dá a cada um) se juntam num passo.
+
+Rodada 9: o segundo clique de um clique duplo só some no primeiro passo quando é no
+mesmo elemento ou quando um dos dois cliques não gravou nada.
 """
 
 from collections.abc import Callable
@@ -34,6 +37,7 @@ from rapa.recorder.sensitivity import (
     declared_username,
     field_key,
     in_shadow_root,
+    second_click,
     secret_page_inputs,
 )
 from tests.compiler.builders import (
@@ -358,6 +362,85 @@ def test_the_login_rule_sees_two_elements_of_the_same_kind_as_two_steps() -> Non
     assert [e.value for e in login.username] == ["ana", "ana.souza"]
     result = compile_(recording)
     assert usernames_in(result) == ["digitar_usuario", "digitar_usuario_2"]
+
+
+# -- rodada 9: o segundo clique de um clique duplo noutro elemento -------------------
+
+#: O botão de uma linha funda: o caminho CSS cortado é o mesmo em todas as linhas.
+ROW_BUTTON_CSS = "article > div > div > div > div > button"
+
+
+def row_button(name: str, serial: int | None, **kw: Any) -> ElementDescriptor:
+    extra: dict[str, Any] = {} if serial is None else {"serial": serial}
+    return button(name, css=ROW_BUTTON_CSS, counts={"role_name": 3, "text": 3}, **extra, **kw)
+
+
+@pytest.mark.parametrize(
+    ("serials", "writes", "steps"),
+    [
+        ((1, 2), (True, True), 2),
+        ((1, 1), (True, True), 1),
+        ((None, None), (True, True), 1),
+        ((1, 2), (True, False), 1),
+        ((1, 2), (False, True), 1),
+    ],
+    ids=[
+        "outra_linha_que_gravou",
+        "o_mesmo_botao",
+        "gravacao_antiga",
+        "segundo_nao_gravou",
+        "primeiro_nao_gravou",
+    ],
+)
+def test_a_second_click_on_another_element_is_a_step_only_when_both_clicks_wrote(
+    serials: tuple[int | None, int | None], writes: tuple[bool, bool], steps: int
+) -> None:
+    # D1: o "Excluir" do boleto 2 sobe para o lugar do 1, que a pessoa excluiu, e o
+    # segundo clique vem com detail 2 e o mesmo caminho CSS. Antes ele sempre virava
+    # parte do primeiro passo (o robô excluía um só). Noutro elemento, só é outro passo
+    # quando cada clique gravou algo; senão (um botão recriado entre os dois cliques,
+    # e o segundo não fez nada) continua absorvido: o robô nunca clica duas vezes onde
+    # a pessoa agiu uma vez.
+    rec = RecordingBuilder()
+    rec.navigate("/boletos")
+    first = rec.click(row_button("Excluir", serials[0]))
+    after_first = [rec.request("POST", "/api/excluir?i=1", "fetch")] if writes[0] else []
+    second = rec.click(row_button("Excluir", serials[1]), detail=2)
+    after_second = [rec.request("POST", "/api/excluir?i=2", "fetch")] if writes[1] else []
+    result = compile_(rec.build())
+    clicks = [s for s in result.manifest.steps if isinstance(s, ClickStep)]
+    assert len(clicks) == steps
+    assert all(s.effect is Effect.IRREVERSIBLE for s in clicks)
+    assert result.manifest.effect() is Effect.IRREVERSIBLE
+    # O gravador (analyze_logins) decide pela mesma regra.
+    absorbed = second_click(first.element, after_first, second.element, after_second)
+    assert absorbed is (steps == 1)
+
+
+def test_a_second_click_that_lands_on_another_button_after_a_login_is_its_own_step() -> None:
+    # Login de SPA com clique duplo no "Entrar": o primeiro clique entra (POST), a página
+    # troca de tela e o segundo cai no "Transferir" do mesmo lugar (o mesmo caminho
+    # CSS), que também grava. Antes, a transferência ficava dentro do passo do login
+    # (leitura) e o robô não a refazia; agora é o seu passo, irreversível. O login
+    # continua o mesmo na conta do gravador.
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(textbox("Usuário", id="u", name_attr="usuario", form=LOGIN_FORM, serial=1), "ana")
+    rec.fill(password(id="p", serial=2), "segredo-123")
+    entrar = rec.click(row_button("Entrar", 3, form=LOGIN_FORM))
+    rec.request("POST", "/api/login", "xhr")
+    rec.click(row_button("Transferir", 4), detail=2)
+    rec.request("POST", "/api/transferir", "xhr")
+    recording = rec.build()
+    (login,) = analyze_logins(recording.events).logins
+    assert login.submit == entrar
+    result = compile_(recording)
+    assert [(s.id, s.effect) for s in result.manifest.steps if isinstance(s, ClickStep)] == [
+        ("clicar_entrar", Effect.READ),
+        ("clicar_transferir", Effect.IRREVERSIBLE),
+    ]
+    assert usernames_in(result) == ["digitar_usuario"]
+    assert result.manifest.effect() is Effect.IRREVERSIBLE
 
 
 # -- campo de shadow root nunca é credencial -----------------------------------------

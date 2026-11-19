@@ -15,7 +15,9 @@ Regras principais:
   mesmo elemento (``same_element``: o número que o script dá a cada elemento, quando
   a gravação tem), no mesmo documento, viram um ``fill`` com o valor final;
   edições, marcações e escolhas de elementos diferentes nunca se juntam, então o
-  alvo e o valor de um passo sempre vêm do mesmo elemento; as requisições feitas
+  alvo e o valor de um passo sempre vêm do mesmo elemento; o segundo clique de um
+  clique duplo só some no passo do primeiro no mesmo elemento ou quando um dos
+  dois cliques não gravou nada (``second_click``); as requisições feitas
   enquanto a pessoa editava o campo, depois de cada edição e depois do Tab que
   deixa o campo contam no efeito do passo, como num salvamento automático;
 - campo de senha → ``SecretValue(field="password")`` de uma credencial por
@@ -104,6 +106,7 @@ from rapa.recorder.sensitivity import (
     password_by_name,
     requests_while_editing,
     same_element,
+    second_click,
     writes_in,
 )
 
@@ -454,7 +457,12 @@ class _Lowering:
             and previous is not None
             and previous.element is not None
             and previous.step["kind"] in ("click", "download")
-            and previous.element.css == element.css
+            and second_click(
+                previous.element,
+                self.requests_after(previous.absorbed[-1]),
+                element,
+                self.requests_after(event.index),
+            )
         ):
             # Segundo clique de um clique duplo: o que ele gravou conta no mesmo passo.
             previous.absorbed.append(event.index)

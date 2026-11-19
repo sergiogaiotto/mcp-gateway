@@ -37,8 +37,16 @@ fica fora da gravação. As regras:
   atravessa os shadow roots abertos ("#hospedeiro > #campo"), além do papel, do
   rótulo, do placeholder e do ``data-testid``, contados no documento e em todos os
   shadow roots abertos, como o Playwright procura. O valor de um campo de texto
-  sai no ``change`` do próprio shadow root (o script põe o ouvinte em cada shadow
-  root que aparece no caminho de um evento), antes do blur e na ordem da pessoa;
+  sai no ``change`` do próprio shadow root (o script põe ouvintes de ``change``,
+  ``blur`` e ``focusout`` em cada shadow root que aparece no caminho de um evento),
+  antes do blur e na ordem da pessoa; se o componente para o ``change``, sai antes
+  da próxima ação (``pointerdown``, ``keydown``, ``beforeinput``) ou no ``blur`` na
+  fase de captura (da janela e do shadow root), antes do ouvinte de blur do campo;
+  se o componente já tirou o campo da página quando o ``change``, o ``blur`` ou o
+  ``focusout`` chega (ou quando a janela perde o foco para um iframe), sai o
+  descritor guardado no primeiro foco ou input do campo com o último valor que a
+  pessoa digitou, com a mesma marca de sigilo (ou mais: com uma senha ou um código
+  no documento, o valor só sai como segredo);
 - identidade do campo (``field_key``): aba, iframes, hospedeiros, seletor, id,
   nome e tudo o que a pessoa vê ou o compilador usa como localizador (etiqueta,
   tipo, papel, nome acessível, rótulo, placeholder, ``data-testid`` e a chave da
@@ -46,7 +54,10 @@ fica fora da gravação. As regras:
   mesmo elemento (``same_element``: o número que o script dá a cada elemento do
   DOM), então o alvo e o valor de um passo sempre vêm do mesmo elemento, mesmo
   quando dois campos coincidem em tudo o que se descreve deles (o caminho CSS
-  para em seis níveis da luz). Gravações sem esse número ficam só com a descrição;
+  para em seis níveis da luz). Gravações sem esse número ficam só com a descrição.
+  O segundo clique de um clique duplo (``second_click``) só some no passo do
+  primeiro quando é no mesmo elemento, ou quando um dos dois cliques não gravou
+  nada (o robô nunca clica duas vezes onde a pessoa agiu uma vez);
 - login (``analyze_logins``): o envio só é autenticação quando todos os campos
   preenchidos desde a última navegação que carregou documento (ou desde o login
   anterior) são credenciais de uma credencial só: o usuário com uma senha
@@ -134,6 +145,7 @@ __all__ = [
     "plain_label",
     "requests_while_editing",
     "same_element",
+    "second_click",
     "secret_page_inputs",
     "username_by_signal",
     "writes_in",
@@ -556,6 +568,30 @@ def writes_in(requests: Sequence[RequestEvent]) -> list[RequestEvent]:
     ]
 
 
+def second_click(
+    first: ElementDescriptor,
+    first_requests: Sequence[RequestEvent],
+    second: ElementDescriptor,
+    second_requests: Sequence[RequestEvent],
+) -> bool:
+    """O clique com ``detail`` 2 ou mais é o segundo clique do clique anterior (não vira passo).
+
+    Precisa do mesmo seletor e do mesmo elemento (``same_element``; gravações sem o
+    número do elemento ficam só com o seletor). Noutro elemento com o mesmo seletor
+    (a linha de baixo que sobe para o lugar da que a pessoa excluiu) o clique é outro
+    passo só quando cada um dos dois cliques gravou algo (``writes_in`` nas
+    requisições entre ele e a ação seguinte); senão continua absorvido, como antes,
+    e as requisições dele contam no passo do primeiro: o robô nunca clica duas vezes
+    onde o segundo clique da pessoa não fez nada (um botão que a página recriou
+    entre os dois cliques).
+    """
+    if first.css != second.css:
+        return False
+    if same_element(first, second):
+        return True
+    return not (writes_in(first_requests) and writes_in(second_requests))
+
+
 def requests_while_editing(events: Sequence[RecordingEvent], position: int) -> list[RequestEvent]:
     """Requisições entre o começo da edição do campo ``events[position]`` e o envio do valor.
 
@@ -637,10 +673,10 @@ def _documents(events: Sequence[RecordingEvent]) -> list[_Document]:
 
     Cada aba tem os seus documentos, na ordem em que foram carregados. Edições
     seguidas do mesmo campo (``field_key``) e do mesmo elemento (``same_element``)
-    são um passo só; Tab, cliques que só focam um campo, o
-    Enter que o formulário transforma em clique e o segundo clique de um clique
-    duplo não viram passo. Navegações no mesmo documento não abrem página nova; o
-    clique que abre outra aba não é envio.
+    são um passo só; Tab, cliques que só focam um campo, o Enter que o formulário
+    transforma em clique e o segundo clique de um clique duplo (``second_click``)
+    não viram passo. Navegações no mesmo documento não abrem página nova; o clique
+    que abre outra aba não é envio.
     """
     actions = [e for e in events if e.type in USER_ACTION_TYPES]
     following = {
@@ -655,6 +691,17 @@ def _documents(events: Sequence[RecordingEvent]) -> list[_Document]:
         and e.cause is NavigationCause.POPUP
         and e.trigger_index is not None
     }
+    #: Requisições entre cada ação da pessoa e a ação seguinte (como no compilador).
+    after: dict[int, list[RequestEvent]] = {}
+    last_action: int | None = None
+    for event in events:
+        if event.type in USER_ACTION_TYPES:
+            last_action = event.index
+            after[event.index] = []
+        elif isinstance(event, RequestEvent) and last_action is not None:
+            after[last_action].append(event)
+    #: Passo de clique → o último clique que ele absorveu (o segundo de um clique duplo).
+    latest: dict[int, int] = {}
     documents: list[_Document] = []
     current: dict[int, list[_Step]] = {}
     for event in events:
@@ -691,8 +738,14 @@ def _documents(events: Sequence[RecordingEvent]) -> list[_Document]:
                 and last is not None
                 and last.kind == "click"
                 and last.element is not None
-                and last.element.css == element.css
+                and second_click(
+                    last.element,
+                    after.get(latest.get(last.event.index, last.event.index), []),
+                    element,
+                    after.get(event.index, []),
+                )
             ):
+                latest[last.event.index] = event.index
                 continue
             steps.append(_Step("click", event, element))
         elif isinstance(event, InputEvent):
