@@ -95,13 +95,18 @@ def test_format_value_matches_render() -> None:
 
 
 def test_render_encodes_only_the_values() -> None:
-    context = {Scope.INPUTS: {"n": "12/3"}}
-    rendered = render("/notas/{{ inputs.n }}/ver?{{{{", context, encode=lambda text: f"<{text}>")
-    assert rendered == "/notas/<12/3>/ver?{{"
+    context = {Scope.INPUTS: {"n": "12/3", "q": "a"}}
+    rendered = render(
+        "/notas/{{ inputs.n }}/ver?q={{ inputs.q }}&{{{{",
+        context,
+        encode=lambda index, text: f"<{index}:{text}>",
+    )
+    # A posição é a da referência em parse(): o encode sabe onde o valor cai.
+    assert rendered == "/notas/<1:12/3>/ver?q=<3:a>&{{"
 
 
 def test_render_encode_errors_name_the_reference() -> None:
-    def refuse(text: str) -> str:
+    def refuse(index: int, text: str) -> str:
         raise TemplateError("valor recusado")
 
     with pytest.raises(TemplateError, match=r"inputs\.n: valor recusado"):

@@ -14,12 +14,16 @@ principais:
   deixa a execução "indeterminada", nunca "falhou";
 - valores de entradas, variáveis e itens nunca mudam o alvo de um passo: não
   entram em seletores CSS/XPath, cada um vira um único trecho codificado do
-  endereço, e o texto que escolhe uma linha precisa ser o de uma célula inteira;
+  endereço (no caminho, sem barras e nunca vazio), e o texto que escolhe uma
+  linha precisa ser o texto inteiro de um elemento dela (uma célula, por
+  exemplo), sem contar maiúsculas;
 - o que faria a execução falhar no meio por causa das entradas (campo de item
-  ausente, número que não pode ser digitado, lista maior que a repetição) falha
-  antes do primeiro passo;
+  ausente, número que não pode ser digitado, lista maior que a repetição, valor
+  que não pode ir no caminho do endereço, texto vazio para escolher a linha)
+  falha antes do primeiro passo;
 - eventos, mensagens, saídas e nomes de artefatos nunca contêm valores de
-  credenciais.
+  credenciais; as chaves dos eventos e os valores que são constantes do
+  executor (efeito, estado, código de erro, id de passo) nunca são mascarados.
 """
 
 import asyncio
@@ -29,6 +33,7 @@ import re
 import weakref
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any, Literal, Self, assert_never, cast
 from urllib.parse import quote, urlsplit
 from uuid import UUID
@@ -79,6 +84,7 @@ from rapa.core.robot import (
     UrlContainsCondition,
     VisibleCondition,
     WaitForStep,
+    child_blocks,
 )
 from rapa.runner.errors import ErrorCode, StepError
 from rapa.runner.ports import (
@@ -104,14 +110,43 @@ _MIN_MASKED_LENGTH = 4
 #: Campos de evento com hashes que o próprio executor calcula (nunca dados da página).
 _HASH_KEYS = frozenset({"sha256", "fingerprint"})
 _HEX_DIGEST = re.compile(r"[0-9a-f]{64}")
+#: Campos de evento cujo valor é uma constante do executor, quando é um destes.
+_EVENT_CONSTANTS: dict[str, frozenset[str]] = {
+    "efeito": frozenset(effect.value for effect in Effect),
+    "estado": frozenset(state.value for state in RunState),
+    "codigo": frozenset(code.value for code in ErrorCode),
+    "modo": frozenset(mode.value for mode in RunMode),
+    "estrategia": frozenset(by.value for by in LocatorBy),
+    "estrategias": frozenset(by.value for by in LocatorBy),
+    "ramo": frozenset({"entao", "senao"}),
+    "origem": frozenset({"texto", "segredo"}),
+}
+#: Campos de evento com o id de um passo do robô.
+_STEP_ID_KEYS = ("passo", "passo_irreversivel", "passo_interno")
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 #: Problemas de entrada listados na mensagem de erro (o resto só é contado).
 _MAX_PROBLEMS = 20
 #: Maior inteiro que um float guarda sem perder precisão.
 _MAX_EXACT_FLOAT_INT = 2**53
 
+#: Brancos do JavaScript (os de ``trim()`` e de ``\s``), que o Playwright usa ao comparar
+#: textos. Não são os do Python: U+FEFF entra, U+001C a U+001F e U+0085 não.
+_JS_SPACES = re.compile(
+    "[\t\n\x0b\x0c\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+"
+)
+#: Caracteres que o Playwright descarta antes de comparar textos.
+_IGNORED_IN_TEXT = re.compile("[\u200b\u00ad]")
+# Trechos da expressão do texto inteiro de um elemento (avaliada no navegador).
+_TEXT_EDGE = r"[\s\u200b\u00ad]*"
+_INSIDE_WORD = r"[\u200b\u00ad]*"
+_BETWEEN_WORDS = r"[\u200b\u00ad]*\s[\s\u200b\u00ad]*"
+
 type _Root = Page | FrameLocator | PwLocator
 type _Action = Callable[[], Awaitable[dict[str, Any]]]
+#: Onde uma referência cai no endereço de um ``navigate``.
+type _UrlSlot = Literal["autoridade", "caminho", "consulta", "fragmento"]
+#: Itens de uma repetição sobre uma entrada de lista: o nome da lista e as linhas.
+type _Rows = tuple[str, list[Mapping[str, object]]]
 
 #: Contextos já usados por alguma execução: nunca se reaproveita um contexto.
 _claimed_contexts: weakref.WeakSet[BrowserContext] = weakref.WeakSet()
@@ -247,21 +282,44 @@ def _host(url: str) -> str:
         return ""
 
 
+def _number_source(kind: FieldType, text: str) -> str:
+    """O texto que vira número: sem separadores de milhar e com ponto decimal."""
+    if kind is FieldType.INTEGER:
+        return text.replace(".", "").replace(" ", "")
+    number = text.replace(" ", "")
+    if "," in number:
+        number = number.replace(".", "").replace(",", ".")
+    return number
+
+
+def _number_texts(kind: FieldType, raw: str, converted: int | float) -> list[str]:
+    """Textos em que um número convertido pode mostrar um segredo.
+
+    Os dígitos de onde ele veio (um float arredonda o último dígito de um número
+    longo) e as suas formas decimais exatas: ``str()`` de um float grande usa
+    expoente (``1.2345678901234568e+16``) e esconderia os dígitos da conferência.
+    """
+    texts = [_number_source(kind, raw.strip()), str(converted)]
+    if isinstance(converted, float):
+        texts.append(format(Decimal(repr(converted)), "f"))
+        if converted.is_integer():
+            texts.append(str(int(converted)))
+    return texts
+
+
 def _coerce_output(kind: FieldType, value: Any) -> Any:
     """Converte o texto extraído no tipo declarado da saída, quando possível."""
     if not isinstance(value, str):
         return value
     text = value.strip()
     if kind is FieldType.INTEGER:
-        digits = text.replace(".", "").replace(" ", "")
+        digits = _number_source(kind, text)
         try:
             return int(digits)
         except ValueError:
             return value
     if kind is FieldType.NUMBER:
-        number = text.replace(" ", "")
-        if "," in number:
-            number = number.replace(".", "").replace(",", ".")
+        number = _number_source(kind, text)
         try:
             converted = float(number)
         except ValueError:
@@ -292,12 +350,100 @@ def _prepare_simple(spec: InputField, value: object, where: str, problems: list[
     return value
 
 
-def _encode_url_value(text: str) -> str:
-    """Codifica um valor como um único trecho de endereço (caminho, consulta ou fragmento)."""
-    # "." e ".." são trechos especiais do caminho mesmo codificados (%2e%2e).
+def _url_slots(parts: list[templates.Part]) -> dict[int, _UrlSlot]:
+    """Em que trecho do endereço cai cada referência, pela posição dela em ``parts``.
+
+    Os valores são codificados e nunca trazem ``/``, ``?`` nem ``#``: só os trechos
+    literais antes de cada referência decidem onde ela cai. Sem ``//`` no começo,
+    vale a regra mais estrita (caminho).
+    """
+    slots: dict[int, _UrlSlot] = {}
+    before = ""
+    for index, part in enumerate(parts):
+        if isinstance(part, str):
+            before += part
+            continue
+        if "#" in before:
+            slots[index] = "fragmento"
+        elif "?" in before:
+            slots[index] = "consulta"
+        elif (start := before.find("//")) != -1 and not any(
+            separator in before[start + 2 :] for separator in "/\\"
+        ):
+            slots[index] = "autoridade"
+        else:
+            slots[index] = "caminho"
+        before += "x"  # o valor ocupa o lugar, mas não muda o trecho
+    return slots
+
+
+def _path_value_problem(text: str) -> str | None:
+    """Por que um valor não pode ser um trecho do caminho do endereço (``None`` se pode).
+
+    Codificar não basta: muitos servidores (ASGI, WSGI, Laravel...) decodificam o
+    caminho antes de escolher a rota, e ``%2F`` volta a ser uma barra. Um valor
+    vazio some e junta os trechos vizinhos (``/notas//cancelar``), e ``.`` e
+    ``..`` mudam de pasta mesmo codificados.
+    """
+    if not text:
+        return "está vazio"
     if text in (".", ".."):
-        raise templates.TemplateError(f"'{text}' não pode ser usado num endereço")
+        return f"é '{text}', que mudaria de pasta"
+    if "/" in text or "\\" in text:
+        return "contém '/' ou '\\', que mudariam o caminho"
+    return None
+
+
+def _encode_url_value(text: str, slot: _UrlSlot) -> str:
+    """Codifica um valor como um único trecho do endereço.
+
+    No caminho, recusa os valores que mudariam a rota mesmo codificados.
+    """
+    if slot == "caminho" and (problem := _path_value_problem(text)) is not None:
+        raise templates.TemplateError(f"não pode ir no caminho do endereço: {problem}")
     return quote(text, safe="")
+
+
+def _normalize_text(text: str) -> str:
+    """O texto como o Playwright o compara.
+
+    Sem U+200B e U+00AD, sem brancos do JavaScript nas pontas (U+FEFF inclusive) e
+    com cada sequência deles virando um espaço. Uma chave que fica vazia assim
+    escolheria qualquer elemento sem texto (uma célula vazia, um botão só com ícone).
+    """
+    return _JS_SPACES.sub(" ", _IGNORED_IN_TEXT.sub("", text)).strip(" ")
+
+
+def _js_escape(char: str) -> str:
+    # Letras e dígitos ASCII vão como estão; o resto do ASCII vira \xHH, que vale
+    # igual no Python e no JavaScript e nunca é aspas, barra ou ">>" para o seletor.
+    if char.isascii() and not char.isalnum():
+        return f"\\x{ord(char):02x}"
+    return char
+
+
+def _whole_text(key: str) -> re.Pattern[str]:
+    """Expressão, avaliada no navegador, do texto inteiro de um elemento igual a ``key``.
+
+    ``key`` já vem normalizada. O Playwright testa expressões no texto cru
+    (``textContent``), então a expressão aceita o que ele ignora ao comparar
+    textos: brancos nas pontas e repetidos, U+200B e U+00AD. Os caracteres
+    precisam ser os mesmos, mas maiúsculas e minúsculas não contam: a chave
+    gravada vem de ``innerText``, que já aplicou o ``text-transform`` do CSS.
+    """
+    words = (_INSIDE_WORD.join(_js_escape(char) for char in word) for word in key.split(" "))
+    body = _BETWEEN_WORDS.join(words)
+    return re.compile(f"^{_TEXT_EDGE}{body}{_TEXT_EDGE}$", re.IGNORECASE)
+
+
+def _step_targets(step: Step) -> list[Target]:
+    """Alvos de um passo, inclusive o da condição de ``if`` e ``assert``."""
+    targets: list[Target] = []
+    for holder in (step, getattr(step, "condition", None)):
+        target = getattr(holder, "target", None)
+        if isinstance(target, Target):
+            targets.append(target)
+    return targets
 
 
 def _has_references(template: str) -> bool:
@@ -379,6 +525,13 @@ class Interpreter:
 
         self._credentials: dict[str, CredentialRef] = {c.name: c for c in manifest.credentials}
         self._allowed_hosts = frozenset(manifest.allowed_domains)
+        steps = [step for step, _ in manifest.iter_steps()]
+        step_ids = frozenset(step.id for step in steps)
+        self._event_constants: dict[str, frozenset[str]] = {
+            **_EVENT_CONSTANTS,
+            **dict.fromkeys(_STEP_ID_KEYS, step_ids),
+            "tipo": frozenset(step.kind for step in steps) | {kind.value for kind in ArtifactKind},
+        }
         # A numeração dos eventos é da execução: cada tentativa continua a anterior.
         self._seq = first_seq
         self._used = False
@@ -582,8 +735,9 @@ class Interpreter:
 
         O que faria a execução falhar no meio por causa das entradas (campo de
         item ausente, número que não pode ser digitado, lista maior que a
-        repetição aceita) falha aqui, antes de qualquer passo gravar. As entradas
-        recebidas não são alteradas.
+        repetição aceita, valor que não pode ir no caminho de um endereço, texto
+        vazio para escolher um contêiner) falha aqui, antes de qualquer passo
+        gravar. As entradas recebidas não são alteradas.
         """
         values = dict(self._raw_inputs)
         problems: list[str] = []
@@ -611,6 +765,7 @@ class Interpreter:
                     )
             else:
                 values[spec.name] = _prepare_simple(spec, value, spec.name, problems)
+        self._check_input_uses(values, problems)
         if problems:
             shown = problems[:_MAX_PROBLEMS]
             if len(problems) > _MAX_PROBLEMS:
@@ -645,6 +800,131 @@ class Interpreter:
                 row[field.name] = _prepare_simple(field, current, where, problems)
             prepared.append(row)
         return prepared
+
+    def _check_input_uses(self, values: Mapping[str, Any], problems: list[str]) -> None:
+        """Confere os usos que só dependem das entradas e dos itens de listas de entrada.
+
+        São os valores que vão no caminho de um endereço e o texto que escolhe um
+        contêiner. Se um deles não serve, a execução pararia nesse passo, talvez
+        depois de outros já terem gravado. Variáveis só existem durante a
+        execução: essas são conferidas quando o passo roda. Vale para todos os
+        passos, inclusive os de ramos de ``if`` que podem nem rodar.
+        """
+        found: list[str] = []
+
+        def walk(steps: Iterable[Step], rows: _Rows | None) -> None:
+            for step in steps:
+                if isinstance(step, NavigateStep):
+                    found.extend(self._url_value_problems(step, values, rows))
+                for target in _step_targets(step):
+                    found.extend(self._row_key_problems(step, target, values, rows))
+                if isinstance(step, ForEachStep):
+                    walk(step.steps, self._loop_rows(step, values))
+                else:
+                    for block in child_blocks(step):
+                        walk(block, rows)
+
+        walk(self._manifest.steps, None)
+        for condition in self._manifest.postconditions:
+            target = getattr(condition, "target", None)
+            if isinstance(target, Target):
+                found.extend(self._row_key_problems(None, target, values, None))
+        seen = set(problems)
+        for problem in found:
+            if problem not in seen:  # a mesma entrada pode aparecer em vários passos
+                seen.add(problem)
+                problems.append(problem)
+
+    @staticmethod
+    def _loop_rows(step: ForEachStep, values: Mapping[str, Any]) -> _Rows | None:
+        """Os itens de uma repetição, quando ela percorre uma entrada de lista."""
+        scope, name = step.items.split(".", 1)
+        rows = values.get(name) if scope == "inputs" else None
+        if isinstance(rows, list) and all(isinstance(row, Mapping) for row in rows):
+            return name, rows
+        return None
+
+    @staticmethod
+    def _ref_values(
+        ref: templates.Ref, values: Mapping[str, Any], rows: _Rows | None
+    ) -> list[tuple[str, object]]:
+        """Os valores que uma referência pode ter, com a descrição de cada um."""
+        if ref.scope is templates.Scope.INPUTS and ref.name in values:
+            return [(f"a entrada '{ref.name}'", values[ref.name])]
+        if ref.scope is templates.Scope.ITEM and rows is not None:
+            name, items = rows
+            return [
+                (f"o campo '{name}[{index}].{ref.name}'", row[ref.name])
+                for index, row in enumerate(items)
+                if ref.name in row
+            ]
+        return []  # variáveis (e referências sem valor, recusadas ao montar o passo)
+
+    def _url_value_problems(
+        self, step: NavigateStep, values: Mapping[str, Any], rows: _Rows | None
+    ) -> list[str]:
+        try:
+            parts = templates.parse(step.url)
+        except templates.TemplateError:
+            return []  # recusado ao montar o passo
+        found: list[str] = []
+        for index, slot in _url_slots(parts).items():
+            ref = parts[index]
+            if slot != "caminho" or not isinstance(ref, templates.Ref):
+                continue
+            for where, value in self._ref_values(ref, values, rows):
+                try:
+                    text = templates.format_value(value)
+                except templates.TemplateError:
+                    continue  # já recusado como valor que não pode ser digitado
+                problem = _path_value_problem(text)
+                if problem is not None:
+                    found.append(
+                        f"{where} não pode ir no caminho do endereço do passo "
+                        f"'{step.id}': {problem}"
+                    )
+        return found
+
+    @staticmethod
+    def _row_key_problems(
+        step: Step | None, target: Target, values: Mapping[str, Any], rows: _Rows | None
+    ) -> list[str]:
+        template = target.within_has_text
+        if template is None:
+            return []
+        try:
+            scopes = {ref.scope for ref in templates.references(template)}
+        except templates.TemplateError:
+            return []  # recusado ao montar o passo
+        if not scopes or templates.Scope.VARS in scopes:
+            return []  # texto fixo, ou que só existe durante a execução
+        contexts: list[tuple[str, dict[templates.Scope, Mapping[str, object]]]]
+        if templates.Scope.ITEM in scopes:
+            if rows is None:
+                return []  # itens de uma tabela lida da página
+            name, items = rows
+            contexts = [
+                (
+                    f" para '{name}[{index}]'",
+                    {templates.Scope.INPUTS: values, templates.Scope.ITEM: row},
+                )
+                for index, row in enumerate(items)
+            ]
+        else:
+            contexts = [("", {templates.Scope.INPUTS: values})]
+        where = f"no passo '{step.id}'" if step is not None else "nas pós-condições"
+        found: list[str] = []
+        for suffix, context in contexts:
+            try:
+                key = templates.render(template, context)
+            except templates.TemplateError:
+                continue
+            if not _normalize_text(key):
+                found.append(
+                    f"o texto que escolhe o contêiner de '{target.intent}' {where} "
+                    f"ficaria vazio{suffix}"
+                )
+        return found
 
     def _check_list_limits(self, values: Mapping[str, Any]) -> None:
         """Recusa, antes do primeiro passo, uma lista maior que a repetição que a percorre."""
@@ -694,7 +974,14 @@ class Interpreter:
         if masked != raw:
             return masked
         converted = _coerce_output(kind, raw)
-        if converted is not raw and self._redactor.text(str(converted)) != str(converted):
+        if (
+            isinstance(raw, str)
+            and isinstance(converted, (int, float))
+            and not isinstance(converted, bool)
+            and any(
+                self._redactor.text(text) != text for text in _number_texts(kind, raw, converted)
+            )
+        ):
             # A conversão juntou um segredo (por exemplo, tirando os pontos de um número).
             return MASK
         return converted
@@ -746,20 +1033,31 @@ class Interpreter:
     def _mask_event_data(self, data: Mapping[str, Any]) -> dict[str, Any]:
         """Mascara os dados de um evento.
 
-        As chaves de primeiro nível são sempre do executor; só os hashes que ele
-        mesmo calcula (``sha256`` e ``fingerprint``, em hexadecimal) ficam
-        intactos, porque um segredo curto poderia aparecer neles por acaso.
+        As chaves de primeiro nível são constantes do executor e nunca são
+        mascaradas: o plano de controle decide por elas, e um segredo que fosse um
+        pedaço de uma delas (``vers`` em ``irreversivel``) apagaria o aviso do passo
+        irreversível, e o executor agiria sem esperar a confirmação. Também ficam
+        intactos os valores que são constantes do executor (efeito, estado, código
+        de erro, id de passo...) e os hashes que ele mesmo calcula, onde um segredo
+        curto poderia aparecer por acaso. O resto, inclusive as chaves de dentro,
+        que podem vir da página, é mascarado.
         """
-        hashes = {
-            key: item
+        return {
+            key: item if self._is_event_constant(key, item) else self._redactor.value(item)
             for key, item in data.items()
-            if key in _HASH_KEYS and isinstance(item, str) and _HEX_DIGEST.fullmatch(item)
         }
-        masked: dict[str, Any] = self._redactor.value(
-            {key: item for key, item in data.items() if key not in hashes}
+
+    def _is_event_constant(self, key: str, item: Any) -> bool:
+        if key in _HASH_KEYS:
+            return isinstance(item, str) and _HEX_DIGEST.fullmatch(item) is not None
+        allowed = self._event_constants.get(key)
+        if allowed is None:
+            return False
+        if isinstance(item, str):
+            return item in allowed
+        return isinstance(item, list) and all(
+            isinstance(value, str) and value in allowed for value in item
         )
-        masked.update(hashes)
-        return masked
 
     async def _emit_step_started(self, step: Step, *, irreversible: bool = False) -> None:
         data: dict[str, Any] = {
@@ -1126,10 +1424,20 @@ class Interpreter:
     def _render_url(self, step: NavigateStep) -> str:
         """Monta o endereço codificando cada valor como um único trecho.
 
-        Barras, ``?``, ``#`` ou ``..`` num valor nunca mudam o caminho nem a
-        consulta, e domínio, porta e usuário vêm só do trecho literal do começo.
+        ``?``, ``#`` ou ``&`` num valor nunca mudam o caminho nem a consulta; no
+        caminho, valores vazios, com ``/`` ou ``\\`` ou iguais a ``.`` e ``..``
+        são recusados. Domínio, porta e usuário vêm só do trecho literal do começo.
+        Valores de entradas e itens já foram conferidos antes do primeiro passo;
+        aqui a conferência pega os de variáveis.
         """
-        url = self._render(step.url, encode=_encode_url_value)
+        try:
+            slots = _url_slots(templates.parse(step.url))
+        except templates.TemplateError:
+            slots = {}  # _render recusa o template antes de codificar qualquer valor
+        url = self._render(
+            step.url,
+            encode=lambda index, text: _encode_url_value(text, slots.get(index, "caminho")),
+        )
         parts = templates.parse(step.url)  # já conferido por _render
         prefix = parts[0] if parts and isinstance(parts[0], str) else ""
         try:
@@ -1409,7 +1717,7 @@ class Interpreter:
     # Templates, localizadores e condições
     # ------------------------------------------------------------------
 
-    def _render(self, template: str, *, encode: Callable[[str], str] | None = None) -> str:
+    def _render(self, template: str, *, encode: Callable[[int, str], str] | None = None) -> str:
         scopes: dict[templates.Scope, Mapping[str, object]] = {
             templates.Scope.INPUTS: self._inputs,
             templates.Scope.VARS: self._vars,
@@ -1455,18 +1763,23 @@ class Interpreter:
         if target.within is not None:
             within = self._build(root, target.within)
             if target.within_has_text is not None:
-                key = self._render(target.within_has_text)
-                if not key.strip():
-                    # Sem texto, o filtro sumiria e qualquer contêiner serviria.
+                # Normalizada como o Playwright normaliza: um texto só de U+200B,
+                # U+00AD ou U+FEFF (a célula vazia de um CSV do Excel) fica vazio.
+                key = _normalize_text(self._render(target.within_has_text))
+                if not key:
+                    # Sem texto, qualquer elemento vazio (uma célula, um botão só com
+                    # ícone) serviria, e qualquer contêiner seria escolhido.
                     raise StepError(
                         ErrorCode.TEMPLATE_INVALIDO,
                         f"O texto que escolhe o contêiner de '{target.intent}' ficou vazio; "
                         "sem ele não há como saber qual usar.",
                     )
-                # O texto precisa ser o de um elemento inteiro do contêiner (uma
-                # célula, por exemplo), com as mesmas maiúsculas: "12" não escolhe a
-                # linha da nota "120" nem a do valor "12,00".
-                within = within.filter(has=self.page.get_by_text(key, exact=True))
+                # O texto precisa ser o texto inteiro de um elemento do contêiner (uma
+                # célula, por exemplo), com os mesmos caracteres: "12" não escolhe a
+                # linha da nota "120" nem a do valor "12,00". Maiúsculas não contam,
+                # porque a chave gravada já passou pelo text-transform do CSS. Mais de
+                # um contêiner com o texto continua ambíguo.
+                within = within.filter(has=self.page.get_by_text(_whole_text(key)))
             container = within
         return [self._build(container, locator) for locator in target.locators]
 

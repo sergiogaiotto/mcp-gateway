@@ -139,17 +139,19 @@ def render(
     template: str,
     context: Mapping[Scope, Mapping[str, object]],
     *,
-    encode: Callable[[str], str] | None = None,
+    encode: Callable[[int, str], str] | None = None,
 ) -> str:
     """Substitui as referências pelos valores do contexto.
 
     Falha se alguma referência não tiver valor: um robô nunca digita um campo
     vazio por engano. ``encode``, quando dado, transforma o texto de cada valor
-    (nunca os trechos literais), por exemplo para codificá-lo num endereço; ele
-    pode recusar o valor levantando :class:`TemplateError`.
+    (nunca os trechos literais), por exemplo para codificá-lo num endereço. Ele
+    recebe a posição da referência na lista de :func:`parse` (o trecho do
+    endereço onde ela cai pode mudar a regra) e o texto, e pode recusar o valor
+    levantando :class:`TemplateError`.
     """
     out: list[str] = []
-    for part in parse(template):
+    for index, part in enumerate(parse(template)):
         if isinstance(part, str):
             out.append(part)
             continue
@@ -158,7 +160,7 @@ def render(
             raise TemplateError(f"sem valor para {part}")
         try:
             text = format_value(scope_values[part.name])
-            out.append(encode(text) if encode is not None else text)
+            out.append(encode(index, text) if encode is not None else text)
         except TemplateError as exc:
             raise TemplateError(f"{part}: {exc}") from None
     return "".join(out)
