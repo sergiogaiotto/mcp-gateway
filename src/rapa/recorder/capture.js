@@ -3,11 +3,13 @@
 //
 // Regras: só eventos confiáveis (isTrusted); nunca envia o valor de campos de
 // senha (inclusive campo de texto mascarado por CSS, com rótulo de senha ou cujo
-// aria-label ou aria-labelledby fala em senha), de código de uso único, nem de
-// nenhum outro campo de texto do grupo (o <form> ou, sem <form>, os campos soltos
-// visíveis) que tem senha ou código: o usuário (pelo próprio campo) e os outros;
-// o valor final de cada campo sai no change/blur (ou antes da próxima ação), com
-// há quanto tempo a edição começou.
+// aria-label ou aria-labelledby fala em senha, mesmo que ele também diga ser o
+// usuário), de código de uso único, nem de nenhum outro campo de texto do grupo
+// (o <form> ou, sem <form>, os campos soltos visíveis do documento e dos shadow
+// roots abertos) que tem senha ou código: o usuário (pelo próprio campo) e os
+// outros; o valor final de cada campo sai no change/blur (ou antes da próxima
+// ação), com há quanto tempo a edição começou. Campos dentro de shadow roots
+// abertos também contam (o alvo é o primeiro elemento do composedPath).
 (() => {
   'use strict';
   const CONFIG = __RAPA_CONFIG__;
@@ -159,9 +161,11 @@
   const labelledByText = (el) => {
     const ids = norm(el.getAttribute('aria-labelledby'));
     if (!ids) return '';
-    const doc = el.ownerDocument;
+    // Os ids valem na mesma árvore (o documento ou o shadow root do campo).
+    const root = el.getRootNode ? el.getRootNode() : el.ownerDocument;
+    const scope = root && typeof root.getElementById === 'function' ? root : el.ownerDocument;
     return norm(ids.split(' ').map((id) => {
-      const ref = doc.getElementById(id);
+      const ref = scope.getElementById(id);
       return ref ? (norm(ref.getAttribute('aria-label')) || contentText(ref, null, 0)) : '';
     }).join(' '));
   };
@@ -266,33 +270,45 @@
 
   const isPassword = (el) => el.tagName === 'INPUT' && (inputType(el) === 'password' || isPasswordLikeText(el));
 
-  // Usuário só pelo próprio campo (rapa/recorder/sensitivity.py,
-  // username_by_signal): autocomplete de usuário ou e-mail, type=email, ou rótulo,
-  // atributo name, id ou placeholder com uma palavra inteira de usuário. O texto
-  // da página (títulos, parágrafos) não conta.
-  const USERNAME_WORDS = /(?:^|[^a-z0-9])(?:usuario|user|username|login|e-mail|email|cpf|cnpj|matricula|codigo do usuario)(?:[^a-z0-9]|$)/;
-  const USERNAME_TYPES = new Set(['text', 'email', 'tel', 'number', '']);
-  const isUsernameField = (el) => {
-    if (el.tagName !== 'INPUT' || !USERNAME_TYPES.has(inputType(el))) return false;
-    if (isPassword(el) || isOneTimeCode(el)) return false;
-    const ac = norm(el.getAttribute('autocomplete')).toLowerCase().split(' ');
-    if (ac.indexOf('username') >= 0 || ac.indexOf('email') >= 0 || inputType(el) === 'email') return true;
-    return [labelText(el), el.getAttribute('name'), el.id, el.getAttribute('placeholder')]
-      .some((s) => { const t = plainWords(s); return !!t && USERNAME_WORDS.test(t); });
-  };
-
   // O aria-label ou o texto do aria-labelledby fala em senha: os dois, porque o
   // nome acessível guarda só um deles (o aria-labelledby, quando há).
   const ariaMentionsPassword = (el) =>
     mentionsPassword(el.getAttribute('aria-label')) || mentionsPassword(labelledByText(el));
 
-  // Campo que só o aria-label ou o aria-labelledby diz ser senha: o valor não sai,
-  // mas o campo não vira senha (rapa/recorder/sensitivity.py, password_by_name), e
-  // o usuário pelo próprio campo continua usuário.
+  // Campo que só o nome (aria-label, aria-labelledby ou o nome acessível) diz ser
+  // senha: o valor nunca sai, mas o campo não vira senha nem usuário, mesmo que o
+  // próprio campo também diga ser o usuário (rapa/recorder/sensitivity.py,
+  // password_by_name).
+  const USERNAME_TYPES = new Set(['text', 'email', 'tel', 'number', '']);
   const isPasswordByName = (el) => {
     if (el.tagName !== 'INPUT' || isPassword(el) || isOneTimeCode(el)) return false;
-    if (!PASSWORD_LABEL_TYPES.has(inputType(el)) || isUsernameField(el)) return false;
-    return ariaMentionsPassword(el);
+    const type = inputType(el);
+    if (!PASSWORD_LABEL_TYPES.has(type) && !USERNAME_TYPES.has(type)) return false;
+    return ariaMentionsPassword(el) || mentionsPassword(clip(accessibleName(el, roleOf(el)), MAX_NAME));
+  };
+
+  // Os textos do próprio campo falam de outra pessoa ou de um cadastro ("CPF do
+  // favorecido", "Chave Pix (CPF)", "Login do novo usuário"): não é o usuário
+  // (rapa/recorder/sensitivity.py, names_another_party).
+  const OTHER_PARTY_WORDS = /(?:^|[^a-z0-9])(?:favorecid[oa]s?|destinatari[oa]s?|beneficiari[oa]s?|pagador(?:es|as?)?|recebedor(?:es|as?)?|titular(?:es)?|clientes?|contatos?|convidad[oa]s?|nov[oa]s?|cadastr(?:os?|ar|e)|chaves?)(?:[^a-z0-9]|$)/;
+  const namesAnotherParty = (el) =>
+    [labelText(el), accessibleName(el, roleOf(el)), el.getAttribute('title'),
+      el.getAttribute('placeholder'), el.getAttribute('name'), el.id]
+      .some((s) => { const t = plainWords(clip(s, MAX_NAME)); return !!t && OTHER_PARTY_WORDS.test(t); });
+
+  // Usuário só pelo próprio campo (rapa/recorder/sensitivity.py,
+  // username_by_signal): autocomplete de usuário ou e-mail, type=email, ou rótulo,
+  // atributo name, id ou placeholder com uma palavra inteira de usuário. O texto
+  // da página (títulos, parágrafos) não conta; o campo que o nome diz ser senha e o
+  // que fala de outra pessoa não são o usuário.
+  const USERNAME_WORDS = /(?:^|[^a-z0-9])(?:usuario|user|username|login|e-mail|email|cpf|cnpj|matricula|codigo do usuario)(?:[^a-z0-9]|$)/;
+  const isUsernameField = (el) => {
+    if (el.tagName !== 'INPUT' || !USERNAME_TYPES.has(inputType(el))) return false;
+    if (isPassword(el) || isOneTimeCode(el) || isPasswordByName(el) || namesAnotherParty(el)) return false;
+    const ac = norm(el.getAttribute('autocomplete')).toLowerCase().split(' ');
+    if (ac.indexOf('username') >= 0 || ac.indexOf('email') >= 0 || inputType(el) === 'email') return true;
+    return [labelText(el), el.getAttribute('name'), el.id, el.getAttribute('placeholder')]
+      .some((s) => { const t = plainWords(s); return !!t && USERNAME_WORDS.test(t); });
   };
 
   const isSecretField = (el) => isPassword(el) || isOneTimeCode(el) || isPasswordByName(el);
@@ -319,15 +335,48 @@
     return all.filter((f) => isTextLike(f) || isPassword(f));
   };
 
+  // O documento e os shadow roots abertos dele (também os aninhados), ou null se
+  // forem grandes demais para olhar.
+  const documentRoots = (doc) => {
+    const roots = [doc];
+    let budget = MAX_SCAN;
+    for (let i = 0; i < roots.length; i++) {
+      let all;
+      try { all = roots[i].querySelectorAll('*'); } catch (e) { return null; }
+      budget -= all.length;
+      if (budget < 0) return null;
+      for (const node of all) if (node.shadowRoot) roots.push(node.shadowRoot);
+    }
+    return roots;
+  };
+
+  // Campo sem <form>: um campo solto e visível de senha ou código noutra raiz do
+  // documento (o documento ou outro shadow root aberto) também conta.
+  const looseSecretElsewhere = (el) => {
+    if (formOf(el)) return false;
+    const roots = documentRoots(el.ownerDocument);
+    if (!roots) return false;
+    const own = el.getRootNode ? el.getRootNode() : el.ownerDocument;
+    for (const root of roots) {
+      if (root === own) continue;
+      let found;
+      try { found = root.querySelectorAll('input'); } catch (e) { continue; }
+      for (const f of found) if (!formOf(f) && !hiddenForAria(f) && isSecretField(f)) return true;
+    }
+    return false;
+  };
+
   // 'username': o usuário pelo próprio campo; 'hidden': outro campo de texto do
   // grupo, que não vai na gravação mas também não é o usuário; null: campo comum
   // (o grupo não tem senha nem código). O campo que a página declara como usuário
-  // (autocomplete=username) é sempre o usuário.
+  // (autocomplete=username) nunca vai na gravação: é o usuário, a menos que o nome
+  // dele fale de outra pessoa ou de um cadastro.
   const loginRole = (el) => {
     if (!isTextLike(el) || isSecretField(el)) return null;
     const ac = norm(el.getAttribute('autocomplete')).toLowerCase().split(' ');
-    if (ac.indexOf('username') >= 0) return 'username';
-    if (!groupFields(el).some((f) => f !== el && isSecretField(f))) return null;
+    const declared = ac.indexOf('username') >= 0;
+    if (!declared && !groupFields(el).some((f) => f !== el && isSecretField(f)) &&
+        !looseSecretElsewhere(el)) return null;
     return isUsernameField(el) ? 'username' : 'hidden';
   };
 
@@ -544,9 +593,16 @@
     '[role=tab], [role=checkbox], [role=radio], [role=switch], [role=option], [role=treeitem], ' +
     '[onclick], [contenteditable=""], [contenteditable=true]';
 
-  const actionTarget = (event) => {
+  // O elemento em que o evento aconteceu: dentro de um shadow root aberto, o
+  // primeiro do composedPath (o event.target da janela é o hospedeiro).
+  const realTarget = (event) => {
     const path = event.composedPath ? event.composedPath() : [];
-    const raw = path.length && path[0].nodeType === 1 ? path[0] : event.target;
+    const first = path.length ? path[0] : null;
+    return first && first.nodeType === 1 ? first : event.target;
+  };
+
+  const actionTarget = (event) => {
+    const raw = realTarget(event);
     if (!raw || raw.nodeType !== 1) return null;
     return raw.closest(INTERACTIVE) || raw;
   };
@@ -718,7 +774,7 @@
 
   const onBeforeInput = (event) => {
     if (!event.isTrusted) return;
-    const el = event.target;
+    const el = realTarget(event);
     if (!el || el.nodeType !== 1 || !isEditable(el)) return;
     const st = fieldState(el);
     startSession(el, st, el.isContentEditable ? false : currentValue(el) === '' || allSelected(el));
@@ -726,7 +782,7 @@
 
   const onInput = (event) => {
     if (!event.isTrusted) return;
-    const el = event.target;
+    const el = realTarget(event);
     if (!el || el.nodeType !== 1 || !isEditable(el)) return;
     const st = fieldState(el);
     startSession(el, st, false);
@@ -742,7 +798,7 @@
   };
 
   const onKeyFlag = (event) => {
-    const el = event.target;
+    const el = realTarget(event);
     if (el && el.nodeType === 1 && isEditable(el)) {
       editing = el;
       setTimeout(() => { if (editing === el) editing = null; }, 0);
@@ -752,7 +808,7 @@
 
   const selectSent = new WeakMap();
   const onChange = (event) => {
-    const el = event.target;
+    const el = realTarget(event);
     if (!el || el.nodeType !== 1) return;
     const tag = el.tagName;
     const type = inputType(el);
@@ -790,7 +846,7 @@
   };
 
   const onFocusOut = (event) => {
-    const el = event.target;
+    const el = realTarget(event);
     if (el && fields.has(el)) sendField(el);
   };
 
@@ -815,7 +871,8 @@
   const onKeyDown = (event) => {
     onKeyFlag(event);
     if (!event.isTrusted || event.isComposing || !KEYS.has(event.key)) return;
-    const el = event.target && event.target.nodeType === 1 ? event.target : null;
+    const target = realTarget(event);
+    const el = target && target.nodeType === 1 ? target : null;
     flushPending(null);
     const onPage = !el || el === el.ownerDocument.body || el === el.ownerDocument.documentElement;
     send({ kind: 'key', key: event.key, element: onPage ? null : describe(el) });
@@ -834,6 +891,25 @@
   W.addEventListener('input', clearEditing, { capture: false, passive: true });
   W.addEventListener('pagehide', () => flushPending(null), opts);
   W.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushPending(null); }, opts);
+  // O change não sai do shadow root (não é composed): cada shadow root aberto que a
+  // página cria ganha o mesmo ouvinte (os outros eventos chegam à janela).
+  try {
+    const proto = W.Element && W.Element.prototype;
+    const attach = proto && proto.attachShadow;
+    if (typeof attach === 'function') {
+      Object.defineProperty(proto, 'attachShadow', {
+        configurable: true,
+        writable: true,
+        value: function attachShadow(init) {
+          const root = attach.call(this, init);
+          if (init && init.mode === 'open') {
+            try { root.addEventListener('change', onChange, opts); } catch (e) { /* ignora */ }
+          }
+          return root;
+        },
+      });
+    }
+  } catch (e) { /* ignora */ }
 
   Object.defineProperty(W, Symbol.for('rapa.recorder.stop'), {
     configurable: true,

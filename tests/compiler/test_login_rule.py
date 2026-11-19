@@ -19,7 +19,12 @@ from rapa.recorder.models import (
     NavigationCause,
     Recording,
 )
-from rapa.recorder.sensitivity import secret_page_inputs, username_by_signal
+from rapa.recorder.sensitivity import (
+    analyze_logins,
+    password_by_name,
+    secret_page_inputs,
+    username_by_signal,
+)
 from tests.compiler.builders import (
     BASE,
     LOGIN_FORM,
@@ -212,10 +217,11 @@ def test_confirm_only_counts_when_only_codes_were_filled() -> None:
 
 @pytest.mark.parametrize("label", ["Confirmar", "Continuar", "Próximo", "Avançar", "Entrar"])
 @pytest.mark.parametrize("form", [None, OTP_FORM, LOGIN_FORM], ids=["sem_form", "codigo", "login"])
-def test_a_code_alone_is_a_login_judged_by_what_was_filled(
+def test_a_code_alone_is_a_login_and_confirm_only_in_the_form_of_the_code(
     label: str, form: FormInfo | None
 ) -> None:
-    # Só o código foi preenchido: vale o que a pessoa preencheu, não o formulário do botão.
+    # Só o código foi preenchido: os botões de login valem em qualquer formulário;
+    # "Confirmar" (que confirma qualquer coisa) só no <form> que só tem o código.
     rec = RecordingBuilder()
     rec.navigate("/codigo")
     rec.fill(otp(id="codigo", form=form), None)
@@ -223,7 +229,50 @@ def test_a_code_alone_is_a_login_judged_by_what_was_filled(
     rec.request("POST", "/api/codigo", "fetch")
     result = compile_(rec.build())
     click = next(s for s in result.manifest.steps if isinstance(s, ClickStep))
-    assert click.effect is Effect.READ
+    if label == "Confirmar" and form is not OTP_FORM:
+        assert click.effect is Effect.WRITE
+    else:
+        assert click.effect is Effect.READ
+
+
+@pytest.mark.parametrize(
+    "form",
+    [None, LOGIN_FORM, PIX_FORM, FormInfo(action=f"{BASE}/pix", method="post", text_fields=1)],
+    ids=["sem_form", "login", "pix", "com_outro_campo"],
+)
+def test_confirm_with_a_token_after_a_login_of_a_spa_is_write(form: FormInfo | None) -> None:
+    # S7: login na SPA e, no mesmo documento, "Token" e "Confirmar" (paga o Pix).
+    rec = RecordingBuilder()
+    rec.navigate("/app")
+    rec.fill(textbox("Usuário", id="usuario"), "ana.souza")
+    rec.fill(password(id="senha", form=None), None)
+    rec.click(button("Entrar", id="entrar"))
+    rec.request("POST", "/api/login", "fetch")
+    rec.navigate("/app/pix/confirmar", cause=NavigationCause.SCRIPT, same_document=True)
+    token = otp("Token", id="token", form=form, autocomplete="one-time-code")
+    rec.fill(token, None)
+    rec.click(button("Confirmar", id="confirmar", form=form))
+    rec.request("POST", "/api/pix", "fetch")
+    result = compile_(rec.build())
+    assert step(result, "clicar_entrar").effect is Effect.READ
+    assert step(result, "clicar_confirmar").effect is Effect.WRITE
+    assert result.manifest.effect() is Effect.WRITE
+
+
+def test_confirm_with_a_token_in_a_form_of_only_the_code_stays_a_login() -> None:
+    # Resíduo (como em d746ee2): o mesmo "Confirmar" num <form> que só tem o código é
+    # login, ainda que a página use o código para confirmar uma operação.
+    rec = RecordingBuilder()
+    rec.navigate("/app")
+    rec.fill(textbox("Usuário", id="usuario"), "ana.souza")
+    rec.fill(password(id="senha", form=None), None)
+    rec.click(button("Entrar", id="entrar"))
+    rec.request("POST", "/api/login", "fetch")
+    rec.fill(otp("Token", id="token"), None)
+    rec.click(button("Confirmar", id="confirmar", form=OTP_FORM))
+    rec.request("POST", "/api/pix", "fetch")
+    result = compile_(rec.build())
+    assert step(result, "clicar_confirmar").effect is Effect.READ
 
 
 def test_confirm_in_the_form_of_the_code_after_a_value_and_a_password_is_write() -> None:
@@ -410,6 +459,72 @@ def test_after_a_login_only_codes_may_follow_on_the_same_page() -> None:
     assert fill_value(result, "digitar_usuario") == USERNAME
 
 
+@pytest.mark.parametrize("before", ["outra_pagina", "mesma_pagina"])
+def test_a_login_shaped_submit_after_a_write_does_not_split_the_page(before: str) -> None:
+    # B3: algo gravou antes ("Gerar boleto"); o envio com cara de login não vale e não
+    # divide a página: o valor preenchido depois continua numa página com senha.
+    rec = RecordingBuilder()
+    if before == "outra_pagina":
+        rec.navigate("/inicio")
+        boleto = rec.click(button("Gerar boleto", id="boleto"))
+        rec.request("POST", "/api/boleto", "fetch")
+        rec.request("GET", "/app")
+        rec.navigate("/app", cause=NavigationCause.CLICK, trigger=boleto)
+    else:
+        rec.navigate("/app")
+        rec.click(button("Gerar boleto", id="boleto"))
+        rec.request("POST", "/api/boleto", "fetch")
+    rec.fill(textbox("Usuário", id="usuario", form=LOGIN_FORM), "ana.souza")
+    rec.fill(password(id="senha"), None)
+    rec.click(button("Entrar", id="entrar", form=LOGIN_FORM))
+    rec.request("POST", "/api/login", "fetch")
+    rec.fill(textbox("Valor", id="valor"), "1250,00")
+    rec.click(button("Salvar", id="salvar"))
+    rec.request("POST", "/api/salvar", "fetch")
+    recording = rec.build()
+    analysis = analyze_logins(recording.events)
+    assert analysis.logins == ()
+    found = secret_page_inputs(recording.events)
+    assert [e.value for e in found.usernames] == ["ana.souza"]
+    assert [e.value for e in found.others] == ["1250,00"]
+    result = compile_(recording)
+    assert step(result, "clicar_entrar").effect is Effect.WRITE
+    assert fill_value(result, "digitar_usuario") == an_input("usuario")
+    assert fill_value(result, "digitar_valor") == an_input("valor")
+    assert any("Valor" in w and "senha ou código" in w for w in result.warnings)
+    dumped = result.manifest.model_dump_json()
+    assert "1250,00" not in dumped and "ana.souza" not in dumped
+
+
+def test_a_write_anywhere_before_keeps_the_recorder_and_the_compiler_together() -> None:
+    # O que grava conta do mesmo jeito no gravador e no compilador: o Tab que deixa o
+    # campo, a edição com salvamento automático e o botão com verbo irreversível.
+    for variant in ("tab", "edicao", "verbo"):
+        rec = RecordingBuilder()
+        rec.navigate("/app")
+        nota = textbox("Observação", id="obs")
+        if variant == "edicao":
+            started = rec.page_text("App")
+            rec.request("POST", "/api/rascunho", "fetch")
+            rec.fill(nota, "rascunho", editing_since=started)
+        elif variant == "tab":
+            rec.fill(nota, "rascunho")
+            rec.key("Tab", nota)
+            rec.request("POST", "/api/rascunho", "fetch")
+        else:
+            rec.click(button("Excluir rascunho", id="excluir"))
+        rec.navigate("/login")
+        rec.fill(textbox("Usuário", id="usuario", form=LOGIN_FORM), "ana.souza")
+        rec.fill(password(id="senha"), None)
+        rec.click(button("Entrar", id="entrar", form=LOGIN_FORM))
+        rec.request("POST", "/api/login", "fetch")
+        recording = rec.build()
+        assert analyze_logins(recording.events).logins == (), variant
+        result = compile_(recording)
+        assert step(result, "clicar_entrar").effect is Effect.WRITE, variant
+        assert fill_value(result, "digitar_usuario") == an_input("usuario"), variant
+
+
 def test_a_field_filled_after_the_login_on_the_same_page_stays_literal() -> None:
     rec = RecordingBuilder()
     rec.navigate("/app")
@@ -424,6 +539,146 @@ def test_a_field_filled_after_the_login_on_the_same_page_stays_literal() -> None
     assert fill_value(result, "digitar_usuario") == USERNAME
     assert fill_value(result, "digitar_nome_completo") == TextValue(template="Maria da Silva")
     assert step(result, "clicar_salvar").effect is Effect.WRITE
+
+
+@pytest.mark.parametrize("button_label", ["Continuar", "Avançar", "Entrar", "Confirmar"])
+@pytest.mark.parametrize("with_form", [True, False], ids=["formulario", "sem_formulario"])
+@pytest.mark.parametrize("field_label", ["CPF do favorecido", "Usuário", "E-mail"])
+def test_a_username_and_a_code_without_a_password_is_not_a_login(
+    button_label: str, with_form: bool, field_label: str
+) -> None:
+    # S8 (t2, t2b): um campo com palavra de usuário e o código do SMS, sem senha.
+    form = FormInfo(action=f"{BASE}/ted", method="post", has_one_time_code=True, text_fields=1)
+    rec = RecordingBuilder()
+    rec.navigate("/ted")
+    rec.fill(textbox(field_label, id="campo", form=form if with_form else None), "11122233344")
+    rec.fill(otp("Código enviado por SMS", id="sms", form=form if with_form else None), None)
+    rec.click(button(button_label, id="ok", form=form if with_form else None))
+    rec.request("POST", "/ted")
+    recording = rec.build()
+    assert analyze_logins(recording.events).logins == ()
+    found = secret_page_inputs(recording.events)
+    assert [e.value for e in found.usernames + found.others] == ["11122233344"]
+    result = compile_(recording)
+    click = next(s for s in result.manifest.steps if isinstance(s, ClickStep))
+    assert click.effect is Effect.WRITE
+    assert usernames_in(result) == []
+    value = next(s.value for s in result.manifest.steps if isinstance(s, FillStep))
+    assert isinstance(value, TextValue) and value.template.startswith("{{ inputs.")
+    assert "11122233344" not in result.manifest.model_dump_json()
+
+
+ANOTHER_PARTY = [
+    textbox("CPF do favorecido", id="campo"),
+    textbox("Chave Pix (CPF)", id="campo"),
+    textbox("E-mail do destinatário", input_type="email", id="campo"),
+    textbox("Login do novo usuário", id="campo"),
+    textbox("CPF do beneficiário", id="campo"),
+    textbox("CPF do pagador", id="campo"),
+    textbox("E-mail do recebedor", id="campo"),
+    textbox("CPF do titular", id="campo"),
+    textbox("E-mail do cliente", id="campo"),
+    textbox("E-mail de contato", input_type="email", id="campo"),
+    textbox("E-mail do convidado", id="campo"),
+    textbox("Usuário", id="campo", name_attr="cadastro_usuario"),
+    textbox("Usuário", id="campo", placeholder="Cadastre o seu usuário"),
+    textbox("Acesso", id="cpfFavorecido"),
+    textbox("Usuário", id="campo", autocomplete="username").model_copy(
+        update={"name": "Nova conta"}
+    ),
+]
+
+
+@pytest.mark.parametrize("field", ANOTHER_PARTY, ids=lambda f: f.label + "|" + (f.id or ""))
+@pytest.mark.parametrize("password_first", [False, True], ids=["usuario_antes", "senha_antes"])
+def test_a_field_that_names_another_party_is_never_the_username(
+    field: ElementDescriptor, password_first: bool
+) -> None:
+    # t1, t3, t5, t10: o campo tem palavra de usuário, mas é o dado de outra pessoa
+    # (ou de quem está sendo cadastrado): numa página com senha, vira uma entrada.
+    assert not username_by_signal(field)
+    rec = RecordingBuilder()
+    rec.navigate("/pix")
+    if password_first:
+        rec.fill(password(id="senha", form=None), None)
+    rec.fill(field, "12345678909")
+    if not password_first:
+        rec.fill(password(id="senha", form=None), None)
+    rec.click(button("Continuar", id="continuar"))
+    rec.request("POST", "/api/pix", "fetch")
+    recording = rec.build()
+    found = secret_page_inputs(recording.events)
+    assert found.usernames == [] and [e.value for e in found.others] == ["12345678909"]
+    result = compile_(recording)
+    assert step(result, "clicar_continuar").effect is Effect.WRITE
+    assert usernames_in(result) == []
+    (value,) = (
+        s.value
+        for s in result.manifest.steps
+        if isinstance(s, FillStep) and not isinstance(s.value, SecretValue)
+    )
+    assert isinstance(value, TextValue) and value.template.startswith("{{ inputs.")
+    assert "12345678909" not in result.manifest.model_dump_json()
+
+
+def test_a_declared_username_that_names_another_party_is_an_input() -> None:
+    # t9: o script esconde o campo (autocomplete=username), mas ele não é o usuário.
+    favorecido = script_username("Favorecido", id="fav", autocomplete="username", form=PIX_FORM)
+    rec = RecordingBuilder()
+    rec.navigate("/pix")
+    rec.fill(favorecido.model_copy(update={"is_username": False}), None)
+    rec.fill(password(id="senha", form=PIX_FORM), None)
+    rec.click(button("Continuar", id="ok", form=PIX_FORM))
+    rec.request("POST", "/pix")
+    result = compile_(rec.build())
+    assert usernames_in(result) == []
+    assert fill_value(result, "digitar_favorecido") == an_input("favorecido")
+    assert step(result, "clicar_continuar").effect is Effect.WRITE
+
+
+@pytest.mark.parametrize("button_label", ["Continuar", "Próximo", "Entrar"])
+@pytest.mark.parametrize(
+    "user",
+    [
+        textbox("E-mail", input_type="email", id="email", autocomplete="email"),
+        textbox("Login do novo usuário", id="login"),
+        textbox("Usuário", id="usuario"),
+    ],
+    ids=["e-mail", "novo-usuario", "usuario"],
+)
+def test_a_new_password_is_never_a_login(button_label: str, user: ElementDescriptor) -> None:
+    # S9, t5, t6: cadastro (ou troca de senha) com autocomplete=new-password.
+    signup = FormInfo(action=f"{BASE}/cadastro", method="post", has_password=True, text_fields=1)
+    rec = RecordingBuilder()
+    rec.navigate("/cadastro")
+    rec.fill(user.model_copy(update={"form": signup}), "novo@exemplo.com")
+    rec.fill(password("Crie uma senha", id="nova", form=signup, autocomplete="new-password"), None)
+    click = rec.click(button(button_label, id="ok", form=signup))
+    rec.request("POST", "/cadastro")
+    rec.navigate("/ok", cause=NavigationCause.CLICK, trigger=click)
+    recording = rec.build()
+    assert analyze_logins(recording.events).logins == ()
+    result = compile_(recording)
+    assert next(s for s in result.manifest.steps if isinstance(s, ClickStep)).effect is (
+        Effect.WRITE
+    )
+    assert usernames_in(result) == []
+    value = next(s.value for s in result.manifest.steps if isinstance(s, FillStep))
+    assert isinstance(value, TextValue) and value.template.startswith("{{ inputs.")
+    assert "novo@exemplo.com" not in result.manifest.model_dump_json()
+
+
+def test_a_new_password_never_bridges_a_two_step_login() -> None:
+    rec = RecordingBuilder()
+    rec.navigate("/cadastro")
+    rec.fill(textbox("E-mail", input_type="email", id="email"), "novo@exemplo.com")
+    rec.click(button("Continuar", id="continuar"))
+    rec.fill(password("Crie uma senha", id="nova", form=None, autocomplete="new-password"), None)
+    rec.click(button("Entrar", id="entrar"))
+    rec.request("POST", "/api/cadastro", "fetch")
+    result = compile_(rec.build())
+    assert step(result, "clicar_entrar").effect is Effect.WRITE
+    assert usernames_in(result) == []
 
 
 def test_a_password_without_a_username_is_not_a_login() -> None:
@@ -690,6 +945,102 @@ def test_two_step_login_needs_the_exact_shape(variant: str) -> None:
     assert "ana.souza" not in result.manifest.model_dump_json()
 
 
+# -- login em duas páginas: o usuário sai da gravação; vira o do cofre só na forma exata
+
+
+def _two_pages(variant: str) -> Recording:
+    """Usuário e "Continuar" numa página; a ponte carrega a página da senha e "Entrar"."""
+    rec = RecordingBuilder()
+    if variant == "gravou_antes":
+        rec.navigate("/inicio")
+        rec.click(button("Aceitar termos", id="termos"))
+        rec.request("POST", "/api/termos", "fetch")
+    rec.navigate("/login")
+    rec.fill(textbox("Usuário", id="usuario", name_attr="usuario"), "ana.souza")
+    if variant == "lembrar":
+        rec.check(checkbox("Lembrar meu usuário", id="lembrar"))
+    if variant == "outro_campo":
+        rec.fill(textbox("Empresa", id="empresa"), "ACME")
+    bridge = "Entrar" if variant == "ponte_entrar" else "Continuar"
+    continuar = rec.click(button(bridge, id="continuar"))
+    method = "POST" if variant == "ponte_post" else "GET"
+    rec.request(method, "/login/senha")
+    cause = NavigationCause.TYPED if variant == "digitado" else NavigationCause.CLICK
+    rec.navigate(
+        "/login/senha", cause=cause, trigger=continuar if cause is NavigationCause.CLICK else None
+    )
+    if variant == "senha_de_texto":
+        rec.fill(textbox("Senha", id="senha", sensitive=True, is_password=True), None)
+    else:
+        rec.fill(password(id="senha", form=LOGIN_FORM), None)
+    if variant == "codigo":
+        rec.fill(otp(id="codigo"), None)
+    final = "Confirmar" if variant == "confirmar" else "Entrar"
+    entrar = rec.click(button(final, id="entrar", form=LOGIN_FORM))
+    rec.request("POST", "/login/senha")
+    rec.navigate("/inicio", cause=NavigationCause.CLICK, trigger=entrar)
+    rec.page_text("Início", text="Olá, ana.souza")
+    return rec.build()
+
+
+@pytest.mark.parametrize("variant", ["simples", "lembrar", "ponte_post"])
+def test_a_login_over_two_pages_gives_the_vault_username(variant: str) -> None:
+    recording = _two_pages(variant)
+    found = secret_page_inputs(recording.events)
+    assert [e.value for e in found.usernames] == ["ana.souza"] and found.others == []
+    (login,) = analyze_logins(recording.events).logins
+    assert login.cross_document
+    result = compile_(recording)
+    assert fill_value(result, "digitar_usuario") == USERNAME
+    assert fill_value(result, "digitar_senha") == PASSWORD
+    # A ponte e o envio ficam com o efeito das requisições deles (na dúvida, gravam).
+    expected = Effect.WRITE if variant == "ponte_post" else Effect.READ
+    assert step(result, "clicar_continuar").effect is expected
+    assert step(result, "clicar_entrar").effect is Effect.WRITE
+    assert "ana.souza" not in result.manifest.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "gravou_antes",
+        "outro_campo",
+        "ponte_entrar",
+        "senha_de_texto",
+        "codigo",
+        "confirmar",
+    ],
+)
+def test_a_login_over_two_pages_needs_the_exact_shape(variant: str) -> None:
+    recording = _two_pages(variant)
+    # O usuário (pelo próprio campo) leva à página da senha: sai da gravação.
+    found = secret_page_inputs(recording.events)
+    assert [e.value for e in found.usernames] == ["ana.souza"]
+    result = compile_(recording)
+    assert usernames_in(result) == []
+    assert fill_value(result, "digitar_usuario") == an_input("usuario")
+    assert any("Usuário" in w and "entrada" in w for w in result.warnings)
+    assert "ana.souza" not in result.manifest.model_dump_json()
+
+
+def test_a_typed_address_between_the_pages_keeps_the_field_literal() -> None:
+    recording = _two_pages("digitado")
+    assert secret_page_inputs(recording.events).usernames == []
+    result = compile_(recording)
+    assert fill_value(result, "digitar_usuario") == TextValue(template="ana.souza")
+    assert usernames_in(result) == []
+
+
+def test_a_login_over_two_pages_never_lowers_an_effect() -> None:
+    # Mesmo na forma exata, o envio com POST grava: o login em duas páginas só decide
+    # o usuário do cofre.
+    recording = _two_pages("simples")
+    result = compile_(recording)
+    effects = {s.id: s.effect for s in result.manifest.steps}
+    assert effects["clicar_entrar"] is Effect.WRITE
+    assert result.manifest.effect() is Effect.WRITE
+
+
 @pytest.mark.parametrize("final", ["Confirmar", "Confirmar transação", "Concluir", "OK", "Entrar"])
 @pytest.mark.parametrize("with_form", [True, False], ids=["formulario", "sem_formulario"])
 def test_a_payment_wizard_is_not_a_two_step_login(final: str, with_form: bool) -> None:
@@ -829,6 +1180,53 @@ def test_a_field_named_like_a_password_is_always_an_input(
     dumped = result.model_dump_json()
     assert "918273" not in dumped and "12345678909" not in dumped
     assert result.manifest.credentials == []
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["marcado", "sem_marca"])
+@pytest.mark.parametrize("with_password", [False, True], ids=["sozinho", "com_senha"])
+@pytest.mark.parametrize(
+    "field",
+    [
+        # F1: rótulo "CPF" e aria-labelledby "Digite a senha numérica".
+        textbox("CPF", id="campo", name_attr="cpf").model_copy(
+            update={"name": "Digite a senha numérica", "aria_mentions_password": True}
+        ),
+        # F2: rótulo "Usuário" e aria-label "Senha do usuário".
+        textbox("Usuário", id="campo").model_copy(
+            update={"name": "Senha do usuário", "aria_mentions_password": True}
+        ),
+        # Só o sinal do script (o nome acessível veio do aria-labelledby).
+        textbox("E-mail", input_type="email", id="campo").model_copy(
+            update={"aria_mentions_password": True}
+        ),
+    ],
+    ids=["cpf", "usuario", "e-mail"],
+)
+def test_a_field_named_like_a_password_is_never_a_credential(
+    field: ElementDescriptor, with_password: bool, marked: bool
+) -> None:
+    # O campo diz ser o usuário e o nome diz ser senha: ambíguo, nunca credencial
+    # (sem a marca do script, o compilador descarta o valor gravado).
+    assert password_by_name(field) and not username_by_signal(field)
+    form = FormInfo(action=f"{BASE}/login", method="post", has_password=with_password)
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(field.model_copy(update={"form": form, "sensitive": marked}), "918273")
+    if with_password:
+        rec.fill(password(id="senha", form=form), None)
+    click = rec.click(button("Entrar", id="entrar", form=form))
+    rec.request("POST", "/login")
+    rec.navigate("/inicio", cause=NavigationCause.CLICK, trigger=click)
+    recording = rec.build()
+    assert analyze_logins(recording.events).logins == ()
+    result = compile_(recording)
+    assert step(result, "clicar_entrar").effect is Effect.WRITE
+    assert usernames_in(result) == []
+    value = next(s.value for s in result.manifest.steps if isinstance(s, FillStep))
+    assert isinstance(value, TextValue) and value.template.startswith("{{ inputs.")
+    assert [f.required for f in result.manifest.inputs] == [True]
+    assert any("fala em senha" in w for w in result.warnings)
+    assert "918273" not in result.model_dump_json()
 
 
 def test_an_assertion_never_uses_a_heading_with_a_removed_value() -> None:

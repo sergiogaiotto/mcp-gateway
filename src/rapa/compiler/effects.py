@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 from rapa.core.robot import Effect
 from rapa.recorder.models import ElementDescriptor, RequestEvent
-from rapa.recorder.sensitivity import action_label, irreversible_verb
+from rapa.recorder.sensitivity import action_label, irreversible_verb, writes_in
 
 __all__ = [
     "AUTHENTICATION",
@@ -30,17 +30,8 @@ __all__ = [
     "writes_in",
 ]
 
-_WRITE_TYPES = frozenset({"document", "xhr", "fetch"})
-_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 #: Motivo da classificação de um envio de login.
 AUTHENTICATION = "autenticação"
-
-
-def writes_in(requests: Sequence[RequestEvent]) -> list[RequestEvent]:
-    """Requisições que gravam algo (documento, XHR ou fetch que não é GET)."""
-    return [
-        r for r in requests if r.resource_type in _WRITE_TYPES and r.method not in _SAFE_METHODS
-    ]
 
 
 @dataclass(frozen=True)

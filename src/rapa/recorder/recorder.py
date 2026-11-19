@@ -13,13 +13,16 @@ o dos outros campos de texto preenchidos numa página que pede senha ou código
 em campo de texto mascarado por CSS e campo cujo ``aria-label`` ou
 ``aria-labelledby`` fala em senha) e manda o valor só para o gravador apagá-lo dos
 outros textos. O gravador repete as regras do lado do Python
-(``rapa.recorder.sensitivity``): marca de senha pelo rótulo e, ao fechar a
-gravação, os campos das páginas com senha ou código que o script não viu (a senha
-que só aparece depois, numa SPA). A limpeza ignora maiúsculas no texto livre da
-página (títulos, texto, iframes) e nos textos de elementos que vêm do
-``innerText`` (texto do elemento e da linha da tabela, que já passaram pelo
-``text-transform`` do CSS); valores digitados, nomes de elementos, rótulos,
-chaves de linha e endereços só perdem o valor exato.
+(``rapa.recorder.sensitivity``): marca de senha pelo rótulo e pelo nome
+acessível e, ao fechar a gravação, os campos das páginas com senha ou código que
+o script não viu (a senha que só aparece depois, numa SPA, ou noutro shadow root,
+e o usuário de uma página que leva à página da senha). A limpeza ignora
+maiúsculas em tudo o que pode chegar ao robô ou ao modelo de linguagem: o texto
+livre da página (títulos, texto, iframes) e, nos elementos, nomes acessíveis,
+rótulos, placeholders, títulos, textos, seletores e o texto e as células da linha
+da tabela (de onde sai o retrato do alvo). Só perdem o valor exato o que o
+executor compara com a página do jeito que está: valores digitados ou
+escolhidos, a chave da linha e endereços.
 """
 
 import asyncio
@@ -75,10 +78,28 @@ _MAX_SECRET_VALUES = 256
 _MAX_FIT_ROUNDS = 3
 #: Edição mais longa que o script pode informar (um dia, em milissegundos).
 _MAX_EDITING_MS = 86_400_000
-#: Campos do texto livre da página, em que a limpeza ignora maiúsculas.
-_FREE_TEXT_FIELDS = frozenset({"title", "headings", "text", "frame_texts"})
-#: Campos da linha de tabela que vêm do ``innerText`` (a chave vem do texto do DOM).
-_ROW_TEXT_FIELDS = frozenset({"text", "cells"})
+#: Campos do evento que a limpeza só troca com o valor exato: o que a pessoa digitou
+#: ou escolheu, endereços e marcas de estrutura (no resto ela ignora maiúsculas).
+_EXACT_EVENT_FIELDS = frozenset(
+    {
+        "type",
+        "url",
+        "frame_url",
+        "value",
+        "typed",
+        "label",
+        "file_names",
+        "key",
+        "method",
+        "resource_type",
+        "cause",
+    }
+)
+#: Campos do elemento trocados só com o valor exato: o endereço do link e as marcas de
+#: estrutura (etiqueta, tipo, papel, autocomplete), que não são texto da página.
+_EXACT_ELEMENT_FIELDS = frozenset({"tag", "input_type", "role", "autocomplete", "href"})
+#: Campos de iframe trocados só com o valor exato (o endereço e a etiqueta).
+_EXACT_FRAME_FIELDS = frozenset({"tag", "src"})
 _STOP_JS = "() => { const stop = window[Symbol.for('rapa.recorder.stop')]; if (stop) stop(); }"
 _FRAME_INFO_JS = """(el) => ({
   tag: el.tagName.toLowerCase(),
@@ -370,13 +391,15 @@ class Recorder:
         """Tira da gravação os campos de páginas com senha que o script não viu (segunda camada).
 
         O script só vê o grupo de campos da página no momento em que manda o valor:
-        no login em duas etapas de uma SPA a senha ainda está escondida. Aqui a
-        mesma regra do compilador (``secret_page_inputs``) apaga, depois do fato, o
-        valor dos campos de texto preenchidos numa página que pede senha ou código:
-        o usuário (pelo próprio campo) com a marca de usuário, os outros sem ela (o
-        compilador os transforma em entradas). O campo fica sensível, o valor fica
-        guardado para ``_scrub`` apagá-lo dos textos e os endereços já gravados são
-        mascarados de novo com o nome do campo.
+        no login em duas etapas de uma SPA a senha ainda está escondida, e no login
+        em duas páginas ela está na página seguinte. Aqui a mesma regra do compilador
+        (``secret_page_inputs``) apaga, depois do fato, o valor dos campos de texto
+        preenchidos numa página que pede senha ou código (desde a última navegação
+        de documento ou o último login confirmado) e o do usuário de uma página que
+        leva à página da senha: o usuário (pelo próprio campo) com a marca de
+        usuário, os outros sem ela (o compilador os transforma em entradas). O campo
+        fica sensível, o valor fica guardado para ``_scrub`` apagá-lo dos textos e os
+        endereços já gravados são mascarados de novo com o nome do campo.
         """
         found = secret_page_inputs(self._events)
         if not found.usernames and not found.others:
@@ -402,9 +425,10 @@ class Recorder:
         """Os valores sigilosos numa busca só, exata ou sem caixa.
 
         As duas cobrem as normalizações Unicode do valor (é composto ou "e" +
-        acento). A busca sem caixa, só para o texto livre da página, também leva as
-        formas em maiúsculas e minúsculas, que cobrem o que muda de tamanho ao
-        trocar de caixa ("ß" → "SS"). Os mais longos vêm primeiro.
+        acento). A busca sem caixa, para tudo o que não é valor digitado, chave da
+        linha ou endereço, também leva as formas em maiúsculas e minúsculas, que
+        cobrem o que muda de tamanho ao trocar de caixa ("ß" → "SS"). Os mais longos
+        vêm primeiro.
         """
         if self._pattern_for != self._secret_values:
             self._patterns.clear()
@@ -430,19 +454,23 @@ class Recorder:
     def _scrub(self, event: RecordingEvent) -> RecordingEvent:
         """Troca por ``REMOVIDO`` os valores sigilosos que aparecerem em qualquer texto do evento.
 
-        O nome de usuário costuma aparecer na página depois do login ("Olá, ana.souza")
-        e chegaria às pós-condições e ao prompt do modelo de linguagem. Nos textos
-        que vêm do ``innerText``, que já passou pelo ``text-transform`` do CSS
-        ("ANA.SOUZA"), a busca não olha maiúsculas e cobre as formas Unicode do
-        valor ("weiß" em maiúsculas é "WEISS"): o texto livre da página (título,
-        cabeçalhos, texto e iframes) e, no descritor do elemento, o texto dele e o
-        texto e as células da linha da tabela (de onde sai o retrato do alvo).
-        Valores digitados, nomes e rótulos de elementos, a chave da linha e
-        endereços só perdem o valor exato: o usuário "financeiro" não apaga o nome do
-        menu "Financeiro" nem o departamento "Financeiro Corporativo". Quando um
-        campo sigiloso só foi descoberto ao fechar a gravação, os endereços do evento
-        são mascarados de novo com os nomes dos campos sigilosos da aba. Um texto que
-        a troca deixou maior que o limite do campo é cortado no limite.
+        O nome de usuário costuma aparecer na página depois do login ("Olá, ana.souza",
+        um menu "Menu de ANA.SOUZA") e chegaria às pós-condições, aos localizadores e
+        ao prompt do modelo de linguagem. Em tudo o que pode chegar ao robô ou ao
+        prompt a busca não olha maiúsculas e cobre as formas Unicode do valor ("weiß"
+        em maiúsculas é "WEISS"): o texto livre da página (título, cabeçalhos, texto e
+        iframes), o nome do arquivo baixado e, no descritor do elemento, o nome
+        acessível, o rótulo, o placeholder, o título, o texto, o id, o atributo
+        ``name``, o seletor, a conferência do Playwright, os iframes e o texto e as
+        células da linha da tabela (de onde sai o retrato do alvo). Um localizador com
+        ``REMOVIDO`` (que não seja CSS) não entra no robô. Só perdem o valor exato o
+        que o executor compara com a página como está (valores digitados ou
+        escolhidos, a chave da linha e endereços) e as marcas de estrutura do
+        elemento: o usuário "financeiro" não apaga o departamento "Financeiro
+        Corporativo" digitado. Quando um campo sigiloso só foi descoberto ao fechar a
+        gravação, os endereços do evento são mascarados de novo com os nomes dos
+        campos sigilosos da aba. Um texto que a troca deixou maior que o limite do
+        campo é cortado no limite.
         """
         if not self._secret_values and not self._redact_again:
             return event
@@ -462,20 +490,37 @@ class Recorder:
                 return {key: clean(item, pattern) for key, item in value.items()}
             return value
 
+        def clean_frames(value: Any) -> Any:
+            if not isinstance(value, list):
+                return clean(value, exact)
+            return [
+                {
+                    key: clean(item, exact if key in _EXACT_FRAME_FIELDS else loose)
+                    for key, item in frame.items()
+                }
+                if isinstance(frame, dict)
+                else clean(frame, exact)
+                for frame in value
+            ]
+
         def clean_element(value: Any) -> Any:
             if not isinstance(value, dict):
-                return clean(value, exact)
+                return clean(value, loose)
             cleaned_element: dict[str, Any] = {}
             for key, item in value.items():
-                if key == "text":
-                    cleaned_element[key] = clean(item, loose)
+                if key in _EXACT_ELEMENT_FIELDS or key == "form":
+                    # O formulário só tem o endereço, o método e contagens.
+                    cleaned_element[key] = clean(item, exact)
                 elif key == "row" and isinstance(item, dict):
+                    # A chave da linha o executor compara inteira, com maiúsculas.
                     cleaned_element[key] = {
-                        part: clean(text, loose if part in _ROW_TEXT_FIELDS else exact)
+                        part: clean(text, exact if part == "key" else loose)
                         for part, text in item.items()
                     }
+                elif key == "frame_path":
+                    cleaned_element[key] = clean_frames(item)
                 else:
-                    cleaned_element[key] = clean(item, exact)
+                    cleaned_element[key] = clean(item, loose)
             return cleaned_element
 
         data = event.model_dump(mode="json")
@@ -485,15 +530,14 @@ class Recorder:
                 url = redacted.get(key)
                 if isinstance(url, str) and url:
                     redacted[key] = redact_url(url, names)
-        free_text = isinstance(event, PageTextEvent)
-        cleaned = {
-            key: (
-                clean_element(item)
-                if key == "element"
-                else clean(item, loose if free_text and key in _FREE_TEXT_FIELDS else exact)
-            )
-            for key, item in redacted.items()
-        }
+        cleaned: dict[str, Any] = {}
+        for key, item in redacted.items():
+            if key == "element":
+                cleaned[key] = clean_element(item)
+            elif key == "frame_path":
+                cleaned[key] = clean_frames(item)
+            else:
+                cleaned[key] = clean(item, exact if key in _EXACT_EVENT_FIELDS else loose)
         if cleaned == data:
             return event
         for _ in range(_MAX_FIT_ROUNDS):

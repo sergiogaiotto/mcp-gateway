@@ -19,11 +19,13 @@ Regras principais:
 - usuário e envio do login pela regra de
   ``rapa.recorder.sensitivity.analyze_logins``: o envio só é leitura quando só
   credenciais de uma credencial foram preenchidas, o botão é de login e nada
-  gravou antes no robô (confirmado na classificação); o campo que é o usuário
-  pelo próprio campo vira o usuário do cofre só num login confirmado (ou quando a
-  página o declara no ``autocomplete``). Qualquer outro campo de texto de uma
-  página com senha ou código, e o usuário de um login não confirmado, vira uma
-  entrada obrigatória com aviso, nunca um literal nem um segredo do cofre;
+  gravou antes no robô (a mesma conta do gravador, confirmada na classificação);
+  o campo que é o usuário pelo próprio campo vira o usuário do cofre só num login
+  confirmado (ou quando a página o declara no ``autocomplete``). No login em duas
+  páginas o usuário também vira o do cofre, mas a ponte e o envio ficam com o
+  efeito das requisições deles. Qualquer outro campo de texto de uma página com
+  senha ou código, e o usuário de um login não confirmado, vira uma entrada
+  obrigatória com aviso, nunca um literal nem um segredo do cofre;
 - campo de texto com cara de senha (rótulo, nome, id ou placeholder de senha,
   ``rapa.recorder.sensitivity``) é tratado como senha, e o valor gravado é
   descartado; o que só o ``aria-label`` ou o ``aria-labelledby`` diz ser senha
@@ -46,7 +48,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from rapa.compiler.effects import AUTHENTICATION, ActionContext, classify_action, writes_in
+from rapa.compiler.effects import AUTHENTICATION, ActionContext, classify_action
 from rapa.compiler.generalize import ParameterCandidate, generalize_inputs
 from rapa.compiler.locators import (
     BuiltTarget,
@@ -85,6 +87,7 @@ from rapa.recorder.models import (
     SelectEvent,
 )
 from rapa.recorder.sensitivity import (
+    Login,
     analyze_logins,
     clickable,
     declared_username,
@@ -93,15 +96,14 @@ from rapa.recorder.sensitivity import (
     is_password_like_text,
     looks_secret,
     password_by_name,
+    requests_while_editing,
+    writes_in,
 )
 
 __all__ = ["CompileError", "CompileResult", "lower"]
 
 #: Sessão de servidores Java no caminho: não vale numa nova execução.
 _JSESSIONID = re.compile(r";jsessionid=[^?#/]*", re.IGNORECASE)
-#: Folga no começo da edição de um campo: o aviso do script e a requisição chegam
-#: ao gravador por caminhos diferentes. Uma requisição a mais só sobe o efeito.
-_EDITING_SLACK_MS = 250.0
 
 
 class CompileError(ValueError):
@@ -236,10 +238,20 @@ class _Lowering:
         #: logins que a classificação confirmou (pelo índice do envio).
         self.logins = analyze_logins(self.events)
         self.confirmed: set[int] = set()
-        self.login_by_submit = {login.submit.index: login for login in self.logins.logins}
-        self.login_by_bridge = {
-            login.bridge.index: login for login in self.logins.logins if login.bridge is not None
+        #: Todos os logins pelo envio; os que dão autenticação (os de uma página e os
+        #: em duas etapas na mesma página) e os em duas páginas, que só dão o usuário.
+        self.all_logins: dict[int, Login] = {
+            login.submit.index: login for login in self.logins.logins
         }
+        self.login_by_submit = {
+            index: login for index, login in self.all_logins.items() if not login.cross_document
+        }
+        self.login_by_bridge = {
+            login.bridge.index: login
+            for login in self.login_by_submit.values()
+            if login.bridge is not None
+        }
+        self.cross_logins = [login for login in self.logins.logins if login.cross_document]
         #: Entrada do usuário → envios dos logins de que ela faz parte.
         self.username_submits: dict[int, set[int]] = {}
         for login in self.logins.logins:
@@ -261,9 +273,10 @@ class _Lowering:
                 self.requests_by_action[event.index] = []
             elif isinstance(event, RequestEvent) and last_action is not None:
                 self.requests_by_action[last_action].append(event)
-        #: Requisições feitas enquanto a pessoa editava o campo, antes de o valor sair.
+        #: Requisições feitas enquanto a pessoa editava o campo, antes de o valor sair
+        #: (a mesma conta de ``rapa.recorder.sensitivity``).
         self.requests_while_editing: dict[int, list[RequestEvent]] = {
-            event.index: self.requests_during_edit(position, event)
+            event.index: requests_while_editing(self.events, position)
             for position, event in enumerate(self.events)
             if isinstance(event, InputEvent) and event.editing_since_ms is not None
         }
@@ -317,31 +330,6 @@ class _Lowering:
 
     def requests_after(self, action_index: int) -> list[RequestEvent]:
         return self.requests_by_action.get(action_index, [])
-
-    def requests_during_edit(self, position: int, event: InputEvent) -> list[RequestEvent]:
-        """Requisições entre o começo da edição do campo e o envio do valor.
-
-        O script só manda o valor quando a pessoa deixa o campo; um salvamento
-        automático com atraso acontece antes, com o campo ainda em foco. Vale o
-        que veio depois da ação anterior da pessoa e na mesma página (o que a
-        navegação até ela pediu fica de fora).
-        """
-        since = (event.editing_since_ms or 0.0) - _EDITING_SLACK_MS
-        found: list[RequestEvent] = []
-        for earlier in reversed(self.events[:position]):
-            if earlier.type in USER_ACTION_TYPES or earlier.t_ms < since:
-                break
-            if (
-                isinstance(earlier, NavigationEvent)
-                and earlier.main_frame
-                and not earlier.same_document
-                and earlier.page_id == event.page_id
-            ):
-                break
-            if isinstance(earlier, RequestEvent):
-                found.append(earlier)
-        found.reverse()
-        return found
 
     def requests_of(self, action_index: int) -> list[RequestEvent]:
         """Requisições que contam no efeito de uma ação: durante a edição e depois dela."""
@@ -732,7 +720,7 @@ class _Lowering:
                 # A credencial da senha que vai com o usuário (mesma origem, em geral).
                 url = draft.url
                 for submit in confirmed:
-                    login = self.login_by_submit[submit]
+                    login = self.all_logins[submit]
                     owner = (
                         self.draft_by_event.get(login.password[0].index) if login.password else None
                     )
@@ -916,25 +904,44 @@ class _Lowering:
         """
         failed: set[int] = set()
         while True:
-            confirmed, notes, assumed = self.classify_pass(failed)
+            confirmed, notes, assumed, writers = self.classify_pass(failed)
             dropped = assumed - confirmed
             if not dropped:
                 break
             failed |= dropped
-        self.confirmed = confirmed
+        self.confirmed = confirmed | self.confirm_cross_logins(writers)
         for message in notes:
             self.warn(message)
         self.finish_logins()
 
-    def classify_pass(self, failed: set[int]) -> tuple[set[int], list[str], set[int]]:
+    def confirm_cross_logins(self, writers: list[int]) -> set[int]:
+        """Os logins em duas páginas em que nada gravou antes do envio, a não ser a ponte.
+
+        ``writers``: as ações (na ordem dos passos) dos passos que gravaram. A ponte e
+        o envio ficam com o efeito que tiveram; o login só decide o usuário do cofre.
+        """
+        position = {index: n for n, draft in enumerate(self.drafts) for index in draft.absorbed}
+        confirmed: set[int] = set()
+        for login in self.cross_logins:
+            bridge = login.bridge.index if login.bridge is not None else None
+            submit = position.get(login.submit.index)
+            if bridge is None or submit is None or bridge not in position:
+                continue
+            before = {position[index] for index in writers if position[index] < submit}
+            if before <= {position[bridge]}:
+                confirmed.add(login.submit.index)
+        return confirmed
+
+    def classify_pass(self, failed: set[int]) -> tuple[set[int], list[str], set[int], list[int]]:
         """Uma passada da classificação, sem contar as pontes dos logins ``failed``.
 
-        Devolve os envios de login confirmados, os avisos e os envios cuja ponte
-        ("Continuar") foi tratada como autenticação.
+        Devolve os envios de login confirmados, os avisos, os envios cuja ponte
+        ("Continuar") foi tratada como autenticação e as ações dos passos que gravaram.
         """
         confirmed: set[int] = set()
         assumed: set[int] = set()
         notes: list[str] = []
+        writers: list[int] = []
         wrote_before = False
         for draft in self.drafts:
             draft.step.pop("effect", None)
@@ -980,7 +987,8 @@ class _Lowering:
             if effect is not Effect.READ:
                 draft.step["effect"] = effect.value
                 wrote_before = True
-        return confirmed, notes, assumed
+                writers.append(draft.action_index)
+        return confirmed, notes, assumed, writers
 
     def navigated_to_form(self, action_index: int) -> bool:
         navigation = self.navigation_by_trigger.get(action_index)

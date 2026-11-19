@@ -10,33 +10,47 @@ fica fora da gravação. As regras:
   script), título, placeholder, atributo ``name`` ou id que falam em senha, PIN
   ou password (o script também olha a máscara por CSS,
   ``-webkit-text-security``, que só a página conhece);
-- campo cujo ``aria-label`` ou ``aria-labelledby`` fala em senha, mas o rótulo
-  não (``password_by_name``): o valor sai da gravação e o robô pede o valor numa
-  entrada; nunca desfaz a marca de usuário;
+- campo cujo ``aria-label`` ou ``aria-labelledby`` (ou o nome acessível) fala em
+  senha, mas o rótulo não (``password_by_name``): o valor sempre sai da gravação,
+  mesmo que o próprio campo também diga ser o usuário e que nada mais no grupo
+  seja sigiloso; o campo, ambíguo, nunca é credencial (nem usuário, nem senha) e
+  o robô pede o valor numa entrada;
 - usuário (``username_by_signal``): só pelo próprio campo, ``autocomplete`` de
   usuário ou e-mail, ``type=email``, ou rótulo, atributo ``name``, id ou
   placeholder com uma palavra inteira de usuário (usuário, user, login, e-mail,
-  CPF, CNPJ, matrícula...). Nada mais vira o usuário do cofre;
+  CPF, CNPJ, matrícula...). O campo cujos textos também falam de outra pessoa ou
+  de um cadastro (favorecido, destinatário, beneficiário, pagador, recebedor,
+  titular, cliente, contato, convidado, novo, cadastro, chave) não é o usuário.
+  Nada mais vira o usuário do cofre;
 - página com senha ou código: desde a última navegação que carregou documento (ou
-  desde o último envio de login), qualquer outro campo de texto preenchido sai da
-  gravação; o compilador o transforma numa entrada obrigatória, com aviso
-  (``analyze_logins``, ``secret_page_inputs``);
+  desde o último login confirmado na página), qualquer outro campo de texto
+  preenchido sai da gravação; o compilador o transforma numa entrada
+  obrigatória, com aviso (``analyze_logins``, ``secret_page_inputs``). O campo de
+  usuário de uma página cujo clique leva (por navegação de documento) a uma
+  página onde se preenche uma senha ``type=password`` também sai;
 - login (``analyze_logins``): o envio só é autenticação quando todos os campos
   preenchidos desde a última navegação que carregou documento (ou desde o login
-  anterior) são credenciais de uma credencial só (um usuário, uma senha
-  ``type=password`` de verdade e o código de uso único que não é de transação),
-  com pelo menos uma senha ou código (e, com senha, o usuário); o envio é um
+  anterior) são credenciais de uma credencial só: o usuário com uma senha
+  ``type=password`` de verdade (que não é ``new-password``) e, se houver, o
+  código de uso único que não é de transação; ou só códigos. O envio é um
   clique cujo texto inteiro é de login ("Entrar", "Acessar", "Continuar"...; ou
-  "Confirmar" quando só códigos foram preenchidos), ou o Enter que aciona esse
+  "Confirmar" quando só códigos foram preenchidos e o botão está num
+  ``<form>`` cujos campos de texto são só o código), ou o Enter que aciona esse
   botão no mesmo ``<form>`` (sem ``<form>``, o Enter nunca é login); nenhum
   verbo irreversível e nenhum segredo de transação (token ou código da
   transação, CVV, código de segurança, assinatura) na página. Fora isso, só
-  caixas de seleção e o botão de mostrar a senha no meio. O compilador ainda
-  exige que nada tenha gravado antes;
+  caixas de seleção e o botão de mostrar a senha no meio. Nada pode ter gravado
+  antes no robô (a mesma conta do compilador: requisição que não é GET de
+  documento, XHR ou fetch, ou botão com verbo irreversível); um envio com cara de
+  login que não passa nisso não divide a página;
 - login em duas etapas: usuário, depois um clique cujo texto inteiro é
   "Continuar", "Avançar", "Próximo", "Seguinte" ou "Next", depois uma senha
   ``type=password`` e um envio que passa na regra acima; só caixas de seleção no
   meio (navegações no mesmo documento não atrapalham);
+- login em duas páginas: a mesma forma, com a ponte na primeira página levando
+  (por navegação de documento) à página da senha, e nada gravado antes, a não ser
+  a própria ponte. Só decide que o campo vira o usuário do cofre: os efeitos da
+  ponte e do envio ficam os das requisições deles (na dúvida, gravam);
 - literal com cara de segredo (cartão, token, chave): o mesmo padrão que a
   generalização usa para ocultar valores do modelo de linguagem.
 """
@@ -51,11 +65,13 @@ from rapa.recorder.models import (
     USER_ACTION_TYPES,
     ClickEvent,
     ElementDescriptor,
+    FormInfo,
     InputEvent,
     KeyEvent,
     NavigationCause,
     NavigationEvent,
     RecordingEvent,
+    RequestEvent,
     SelectEvent,
 )
 
@@ -63,6 +79,7 @@ __all__ = [
     "BRIDGE_WORDS",
     "BUTTON_INPUT_TYPES",
     "CODE_WORD",
+    "EDITING_SLACK_MS",
     "LOGIN_WORDS",
     "SENSITIVE_TEXT",
     "TEXT_INPUT_TYPES",
@@ -76,6 +93,7 @@ __all__ = [
     "declared_username",
     "field_key",
     "focus_only",
+    "irreversible_click",
     "irreversible_verb",
     "is_password_field",
     "is_password_like_text",
@@ -83,11 +101,14 @@ __all__ = [
     "is_transaction_secret",
     "looks_secret",
     "mentions_password",
+    "names_another_party",
     "password_by_name",
     "password_toggle",
     "plain_label",
+    "requests_while_editing",
     "secret_page_inputs",
     "username_by_signal",
+    "writes_in",
 ]
 
 TEXT_INPUT_TYPES = frozenset({"text", "email", "tel", "url", "search", "number", ""})
@@ -96,6 +117,9 @@ BUTTON_INPUT_TYPES = frozenset({"submit", "button", "reset", "image"})
 _PASSWORD_LABEL_TYPES = frozenset({"text", "", "tel", "number"})
 #: Tipos de campo que podem ser o usuário de um login.
 _USERNAME_TYPES = frozenset({"text", "email", "tel", "number", ""})
+#: Tipos em que o ``aria-label`` ou o ``aria-labelledby`` de senha esconde o valor
+#: (os do usuário: um campo de e-mail que o nome diz ser senha também é ambíguo).
+_NAMED_PASSWORD_TYPES = _PASSWORD_LABEL_TYPES | _USERNAME_TYPES
 #: "senha" (mas não "resenha"), "password", "passwd", "passphrase" e as palavras
 #: "pwd" e "pin". Igual a ``PASSWORD_WORDS`` em ``capture.js``.
 _PASSWORD_WORDS = re.compile(
@@ -105,6 +129,16 @@ _PASSWORD_WORDS = re.compile(
 _USERNAME_WORDS = re.compile(
     r"(?:^|[^a-z0-9])"
     r"(?:usuario|user|username|login|e-mail|email|cpf|cnpj|matricula|codigo do usuario)"
+    r"(?:[^a-z0-9]|$)"
+)
+#: Palavra inteira que fala de outra pessoa ou de um cadastro ("CPF do favorecido",
+#: "Chave Pix (CPF)", "Login do novo usuário"): o campo não é o usuário do login.
+#: Igual a ``OTHER_PARTY_WORDS`` em ``capture.js``.
+_OTHER_PARTY_WORDS = re.compile(
+    r"(?:^|[^a-z0-9])"
+    r"(?:favorecid[oa]s?|destinatari[oa]s?|beneficiari[oa]s?|pagador(?:es|as?)?"
+    r"|recebedor(?:es|as?)?|titular(?:es)?|clientes?|contatos?|convidad[oa]s?|nov[oa]s?"
+    r"|cadastr(?:os?|ar|e)|chaves?)"
     r"(?:[^a-z0-9]|$)"
 )
 _CAMEL = re.compile(r"([a-z])([A-Z])")
@@ -217,6 +251,26 @@ def is_password_field(element: ElementDescriptor) -> bool:
     return element.is_password or (not element.sensitive and is_password_like_text(element))
 
 
+def names_another_party(element: ElementDescriptor) -> bool:
+    """Os textos do próprio campo falam de outra pessoa ou de um cadastro.
+
+    "CPF do favorecido", "E-mail do destinatário", "Chave Pix (CPF)", "Login do
+    novo usuário": o campo tem palavra de usuário, mas é o dado de outra pessoa (ou
+    de quem está sendo cadastrado), nunca o usuário do login. Olha o rótulo, o nome
+    acessível, o título, o placeholder, o atributo ``name`` e o id. Igual a
+    ``namesAnotherParty`` em ``capture.js``.
+    """
+    texts = (
+        element.label,
+        element.name,
+        element.title,
+        element.placeholder,
+        element.name_attr,
+        element.id,
+    )
+    return any(_OTHER_PARTY_WORDS.search(_plain(text)) for text in texts if text)
+
+
 def username_by_signal(element: ElementDescriptor) -> bool:
     """O próprio campo diz que é o usuário de um login (regra A).
 
@@ -224,12 +278,16 @@ def username_by_signal(element: ElementDescriptor) -> bool:
     endereço), que não é senha nem código, com ``autocomplete`` de usuário ou
     e-mail, ``type=email``, ou rótulo, atributo ``name``, id ou placeholder com uma
     palavra inteira de usuário. O texto da página (títulos, parágrafos) não conta.
-    Igual a ``isUsernameField`` em ``capture.js``.
+    Não é o usuário o campo que o nome diz ser senha (``password_by_name``: é
+    ambíguo) nem o que fala de outra pessoa ou de um cadastro
+    (``names_another_party``). Igual a ``isUsernameField`` em ``capture.js``.
     """
     input_type = element.input_type or ""
     if element.tag != "input" or input_type not in _USERNAME_TYPES:
         return False
-    if is_password_field(element) or element.is_one_time_code:
+    if is_password_field(element) or element.is_one_time_code or password_by_name(element):
+        return False
+    if names_another_party(element):
         return False
     autocomplete = _autocomplete(element)
     if "username" in autocomplete or "email" in autocomplete or input_type == "email":
@@ -244,15 +302,17 @@ def username_by_signal(element: ElementDescriptor) -> bool:
 def password_by_name(element: ElementDescriptor) -> bool:
     """Campo de texto que só o ``aria-label`` ou o ``aria-labelledby`` diz ser senha.
 
-    O valor sai da gravação (o campo fica sensível), sem a marca de senha: o robô
-    pede o valor numa entrada. O script manda o sinal à parte
-    (``aria_mentions_password``), porque o nome acessível guarda só um dos dois;
-    o nome acessível vale para gravações sem o sinal. Um campo que é o usuário pelo
-    próprio campo continua usuário. Igual a ``isPasswordByName`` em ``capture.js``.
+    O valor sempre sai da gravação (o campo fica sensível), sem a marca de senha: o
+    robô pede o valor numa entrada. Vale também para o campo que diz ser o usuário
+    (rótulo "CPF", ``type=email``...) e mesmo sozinho no grupo: o campo é ambíguo e
+    nunca é credencial de um login. O script manda o sinal à parte
+    (``aria_mentions_password``), porque o nome acessível guarda só um dos dois; o
+    nome acessível vale para gravações sem o sinal. Igual a ``isPasswordByName`` em
+    ``capture.js``.
     """
     if element.tag != "input" or element.is_password or element.is_one_time_code:
         return False
-    if (element.input_type or "") not in _PASSWORD_LABEL_TYPES or username_by_signal(element):
+    if (element.input_type or "") not in _NAMED_PASSWORD_TYPES:
         return False
     named = element.aria_mentions_password or mentions_password(element.name)
     return named and not is_password_like_text(element)
@@ -279,14 +339,16 @@ def is_transaction_secret(element: ElementDescriptor) -> bool:
 def credential_kind(element: ElementDescriptor) -> str | None:
     """ "username", "password" (``type=password`` de verdade) ou "code"; None: não é credencial.
 
-    Nenhum campo de uma operação (``is_transaction_secret``) é credencial de login.
+    Nenhum campo de uma operação (``is_transaction_secret``) é credencial de login,
+    nem a senha nova de um cadastro ou de uma troca de senha
+    (``autocomplete="new-password"``).
     """
     if is_transaction_secret(element):
         return None
     if element.is_one_time_code:
         return "code"
     if element.is_password and element.input_type == "password":
-        return "password"
+        return None if "new-password" in _autocomplete(element) else "password"
     if username_by_signal(element):
         return "username"
     return None
@@ -324,8 +386,22 @@ def action_label(element: ElementDescriptor | None) -> str | None:
 
 
 def declared_username(element: ElementDescriptor) -> bool:
-    """A página declara o campo como usuário (``autocomplete="username"``)."""
-    return "username" in _autocomplete(element)
+    """A página declara o campo como usuário (``autocomplete="username"``).
+
+    Menos o campo que o nome diz ser senha e o que fala de outra pessoa ou de um
+    cadastro: esses nunca são o usuário.
+    """
+    if "username" not in _autocomplete(element):
+        return False
+    return not password_by_name(element) and not names_another_party(element)
+
+
+def irreversible_click(element: ElementDescriptor | None) -> bool:
+    """Botão, link ou item de menu cujo texto tem um verbo irreversível."""
+    if element is None:
+        return False
+    is_control = element.role == "menuitem" or clickable(element)
+    return is_control and irreversible_verb(action_label(element)) is not None
 
 
 def looks_secret(element: ElementDescriptor) -> bool:
@@ -382,6 +458,86 @@ def _bridge_button(element: ElementDescriptor | None) -> bool:
     return clickable(element) and plain_label(action_label(element)) in BRIDGE_WORDS
 
 
+def _only_one_time_code(form: FormInfo | None) -> bool:
+    """``<form>`` cujos campos de texto são só o código de uso único (sem senha)."""
+    return (
+        form is not None
+        and form.has_one_time_code
+        and not form.has_password
+        and not form.text_fields
+    )
+
+
+# -- requisições que gravam (a mesma conta do compilador) ---------------------------
+
+_WRITE_TYPES = frozenset({"document", "xhr", "fetch"})
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+#: Folga no começo da edição de um campo: o aviso do script e a requisição chegam
+#: ao gravador por caminhos diferentes. Uma requisição a mais só sobe o efeito.
+EDITING_SLACK_MS = 250.0
+
+
+def writes_in(requests: Sequence[RequestEvent]) -> list[RequestEvent]:
+    """Requisições que gravam algo (documento, XHR ou fetch que não é GET)."""
+    return [
+        r for r in requests if r.resource_type in _WRITE_TYPES and r.method not in _SAFE_METHODS
+    ]
+
+
+def requests_while_editing(events: Sequence[RecordingEvent], position: int) -> list[RequestEvent]:
+    """Requisições entre o começo da edição do campo ``events[position]`` e o envio do valor.
+
+    O script só manda o valor quando a pessoa deixa o campo; um salvamento
+    automático com atraso acontece antes, com o campo ainda em foco. Vale o que
+    veio depois da ação anterior da pessoa e na mesma página (o que a navegação
+    até ela pediu fica de fora). Sem o começo da edição, nada.
+    """
+    event = events[position]
+    if not isinstance(event, InputEvent) or event.editing_since_ms is None:
+        return []
+    since = event.editing_since_ms - EDITING_SLACK_MS
+    found: list[RequestEvent] = []
+    for earlier in reversed(events[:position]):
+        if earlier.type in USER_ACTION_TYPES or earlier.t_ms < since:
+            break
+        if (
+            isinstance(earlier, NavigationEvent)
+            and earlier.main_frame
+            and not earlier.same_document
+            and earlier.page_id == event.page_id
+        ):
+            break
+        if isinstance(earlier, RequestEvent):
+            found.append(earlier)
+    found.reverse()
+    return found
+
+
+def _writing_actions(events: Sequence[RecordingEvent]) -> set[int]:
+    """Ações da pessoa que gravam algo, na conta do compilador ou numa conta maior.
+
+    Gravam a ação seguida (até a próxima ação) de uma requisição que grava, o campo
+    em cuja edição uma requisição gravou, e o clique ou a tecla num botão, link ou
+    item de menu com verbo irreversível. Também contam as ações que o compilador não
+    transforma em passo: errar para mais só faz o login não valer (o envio grava).
+    """
+    writing: set[int] = set()
+    last: int | None = None
+    for position, event in enumerate(events):
+        if event.type in USER_ACTION_TYPES:
+            last = event.index
+            if writes_in(requests_while_editing(events, position)):
+                writing.add(event.index)
+            if isinstance(event, ClickEvent | KeyEvent) and irreversible_click(event.element):
+                writing.add(event.index)
+        elif isinstance(event, RequestEvent) and last is not None and writes_in([event]):
+            writing.add(last)
+    return writing
+
+
+# -- passos e documentos, como o compilador os faz ----------------------------------
+
+
 @dataclass
 class _Step:
     """Um passo que o compilador vai fazer, na simulação de ``analyze_logins``."""
@@ -394,13 +550,24 @@ class _Step:
     inputs: list[InputEvent] = field(default_factory=list)
 
 
-def _pages(events: Sequence[RecordingEvent]) -> list[list[_Step]]:
+@dataclass
+class _Document:
+    """Um documento do quadro principal de uma aba e os passos feitos nele."""
+
+    page_id: int
+    #: A navegação que carregou o documento.
+    navigation: NavigationEvent
+    steps: list[_Step] = field(default_factory=list)
+
+
+def _documents(events: Sequence[RecordingEvent]) -> list[_Document]:
     """Os passos de cada documento do quadro principal, como o compilador os faz.
 
-    Cada aba tem os seus documentos. Edições seguidas do mesmo campo são um passo
-    só; Tab, cliques que só focam um campo, o Enter que o formulário transforma em
-    clique e o segundo clique de um clique duplo não viram passo. Navegações no
-    mesmo documento não abrem página nova; o clique que abre outra aba não é envio.
+    Cada aba tem os seus documentos, na ordem em que foram carregados. Edições
+    seguidas do mesmo campo são um passo só; Tab, cliques que só focam um campo, o
+    Enter que o formulário transforma em clique e o segundo clique de um clique
+    duplo não viram passo. Navegações no mesmo documento não abrem página nova; o
+    clique que abre outra aba não é envio.
     """
     actions = [e for e in events if e.type in USER_ACTION_TYPES]
     following = {
@@ -415,13 +582,14 @@ def _pages(events: Sequence[RecordingEvent]) -> list[list[_Step]]:
         and e.cause is NavigationCause.POPUP
         and e.trigger_index is not None
     }
-    pages: list[list[_Step]] = []
+    documents: list[_Document] = []
     current: dict[int, list[_Step]] = {}
     for event in events:
         if isinstance(event, NavigationEvent):
             if event.main_frame and (event.page_id not in current or not event.same_document):
-                current[event.page_id] = []
-                pages.append(current[event.page_id])
+                document = _Document(page_id=event.page_id, navigation=event)
+                current[event.page_id] = document.steps
+                documents.append(document)
             continue
         steps = current.get(event.page_id)
         if steps is None or event.type not in USER_ACTION_TYPES:
@@ -467,7 +635,7 @@ def _pages(events: Sequence[RecordingEvent]) -> list[list[_Step]]:
                 steps.append(_Step("select", event, event.element))
         else:
             steps.append(_Step(event.type, event, getattr(event, "element", None)))
-    return pages
+    return documents
 
 
 @dataclass(frozen=True)
@@ -480,6 +648,9 @@ class Login:
     username: tuple[InputEvent, ...]
     password: tuple[InputEvent, ...]
     codes: tuple[InputEvent, ...]
+    #: Login em duas páginas (a ponte carrega outro documento): só decide que o campo
+    #: vira o usuário do cofre; a ponte e o envio não viram autenticação.
+    cross_document: bool = False
 
 
 @dataclass(frozen=True)
@@ -488,7 +659,8 @@ class LoginAnalysis:
 
     logins: tuple[Login, ...]
     #: Entrada → "username" (o usuário pelo próprio campo) ou "other" (outro campo),
-    #: quando a página, desde a última navegação ou o último login, pede senha ou código.
+    #: quando a página, desde a última navegação ou o último login, pede senha ou
+    #: código (ou leva à página que pede a senha).
     roles: dict[int, str]
 
 
@@ -507,6 +679,18 @@ def _keyboard_submit_ok(click: ClickEvent, previous: RecordingEvent | None) -> b
     return field_form is not None and click.element.form == field_form
 
 
+def _fills_of(steps: list[_Step], kind: str) -> bool:
+    """Os passos são edições de um campo só, credencial do tipo ``kind``."""
+    return (
+        bool(steps)
+        and len({s.key for s in steps}) == 1
+        and all(
+            s.kind == "fill" and s.element is not None and credential_kind(s.element) == kind
+            for s in steps
+        )
+    )
+
+
 def _two_step(window: list[_Step]) -> ClickEvent | None:
     """O clique do login em duas etapas: usuário, "Continuar", senha de verdade.
 
@@ -521,32 +705,25 @@ def _two_step(window: list[_Step]) -> ClickEvent | None:
     before, after = steps[:at], steps[at + 1 :]
     while after and after[-1].kind == "click" and password_toggle(after[-1].element):
         after.pop()
-    if not before or not after:
-        return None
-    if len({s.key for s in before}) != 1 or len({s.key for s in after}) != 1:
-        return None
-    user_ok = all(
-        s.kind == "fill" and s.element is not None and credential_kind(s.element) == "username"
-        for s in before
-    )
-    password_ok = all(
-        s.kind == "fill" and s.element is not None and credential_kind(s.element) == "password"
-        for s in after
-    )
     bridge = steps[at].event
-    return bridge if user_ok and password_ok and isinstance(bridge, ClickEvent) else None
+    if not _fills_of(before, "username") or not _fills_of(after, "password"):
+        return None
+    return bridge if isinstance(bridge, ClickEvent) else None
 
 
-def _login_at(
-    steps: list[_Step], at: int, start: int, previous: dict[int, RecordingEvent | None]
-) -> Login | None:
-    """O login enviado pelo clique no passo ``at``, olhando os passos depois de ``start``."""
+def _submit_ok(
+    steps: list[_Step], at: int, previous: dict[int, RecordingEvent | None]
+) -> ClickEvent | None:
+    """O clique no passo ``at``, se ele pode enviar um login (senão, None).
+
+    Botão ou link sem verbo irreversível; do teclado, só pelo envio implícito do
+    mesmo ``<form>``; nenhum segredo de transação preenchido antes na página.
+    """
     submit = steps[at]
     event = submit.event
-    element = submit.element
-    if submit.kind != "click" or not isinstance(event, ClickEvent) or not clickable(element):
+    if submit.kind != "click" or not isinstance(event, ClickEvent) or not clickable(event.element):
         return None
-    if irreversible_verb(action_label(element)) is not None:
+    if irreversible_verb(action_label(event.element)) is not None:
         return None
     if not _keyboard_submit_ok(event, previous.get(event.index)):
         return None
@@ -556,6 +733,16 @@ def _login_at(
         and is_transaction_secret(s.element)
         for s in steps[:at]
     ):
+        return None
+    return event
+
+
+def _login_at(
+    steps: list[_Step], at: int, start: int, previous: dict[int, RecordingEvent | None]
+) -> Login | None:
+    """O login enviado pelo clique no passo ``at``, olhando os passos depois de ``start``."""
+    event = _submit_ok(steps, at, previous)
+    if event is None:
         return None
     window = steps[start + 1 : at]
     found: dict[str, list[_Step]] = {"username": [], "password": [], "code": []}
@@ -571,15 +758,18 @@ def _login_at(
     if any(len({s.key for s in group}) > 1 for group in found.values()):
         return None
     users, passwords, codes = found["username"], found["password"], found["code"]
+    # O usuário só com uma senha de verdade (e, se houver, o código); ou só códigos.
     if not passwords and not codes:
         return None
-    if passwords and not users:
+    if bool(users) != bool(passwords):
         return None
     if start >= 0 and (users or passwords):
         return None  # depois de um login na mesma página, só o código
-    label = plain_label(action_label(element))
+    label = plain_label(action_label(event.element))
     only_codes = not users and not passwords
-    if label not in LOGIN_WORDS and not (only_codes and label == CODE_WORD):
+    # "Confirmar" com só códigos vale só no <form> cujos campos de texto são o código.
+    confirm = only_codes and label == CODE_WORD and _only_one_time_code(event.element.form)
+    if label not in LOGIN_WORDS and not confirm:
         return None
     bridge = _two_step(window) if extra else None
     if extra and (bridge is None or codes):
@@ -593,32 +783,157 @@ def _login_at(
     )
 
 
-def analyze_logins(events: Sequence[RecordingEvent]) -> LoginAnalysis:
-    """Os logins da gravação e os campos das páginas com senha (ver o começo do módulo).
+def _previous_document(documents: list[_Document], d: int) -> int | None:
+    """O documento que a mesma aba tinha logo antes do documento ``d``."""
+    page_id = documents[d].page_id
+    return next((k for k in range(d - 1, -1, -1) if documents[k].page_id == page_id), None)
 
-    Cada página (documento do quadro principal) se divide nos envios de login: os
-    campos de um trecho com senha, código de uso único ou campo que o nome diz ser
-    senha saem da gravação, como usuário (pelo próprio campo) ou como outro campo.
-    O gravador usa ``roles`` para tirar os valores; o compilador, para decidir que
-    campo vira o usuário do cofre (só num login confirmado) e que envio é leitura
-    (ele ainda confere que nada gravou antes).
+
+def _cross_document_login(
+    documents: list[_Document],
+    d: int,
+    at: int,
+    starts: list[int],
+    previous: dict[int, RecordingEvent | None],
+) -> Login | None:
+    """O login em duas páginas enviado pelo clique no passo ``at`` do documento ``d``.
+
+    A forma exata: o documento anterior da aba só tem o usuário (pelo próprio
+    campo, um campo só) e caixas de seleção, e termina no clique cujo texto inteiro
+    é de ponte ("Continuar", "Avançar"...), que carregou este documento; aqui, antes
+    do envio, só a senha ``type=password`` de verdade (um campo só), caixas de
+    seleção e o botão de mostrar a senha, e o envio passa na regra do login.
+    Nenhuma das duas páginas teve login antes.
     """
-    actions = [e for e in events if e.type in USER_ACTION_TYPES]
-    previous: dict[int, RecordingEvent | None] = {
-        action.index: actions[i - 1] if i > 0 else None for i, action in enumerate(actions)
+    document = documents[d]
+    event = _submit_ok(document.steps, at, previous)
+    if event is None or starts[d] != -1:
+        return None
+    if plain_label(action_label(event.element)) not in LOGIN_WORDS:
+        return None
+    navigation = document.navigation
+    if navigation.cause is not NavigationCause.CLICK or navigation.same_document:
+        return None
+    first = _previous_document(documents, d)
+    if first is None or starts[first] != -1:
+        return None
+    before = [s for s in documents[first].steps if s.kind != "check"]
+    if len(before) < 2:
+        return None
+    bridge = before[-1]
+    bridge_event = bridge.event
+    if (
+        bridge.kind != "click"
+        or not isinstance(bridge_event, ClickEvent)
+        or bridge_event.index != navigation.trigger_index
+        or not _bridge_button(bridge.element)
+        or not _keyboard_submit_ok(bridge_event, previous.get(bridge_event.index))
+    ):
+        return None
+    users = before[:-1]
+    after = [
+        s
+        for s in document.steps[:at]
+        if s.kind != "check" and not (s.kind == "click" and password_toggle(s.element))
+    ]
+    if not _fills_of(users, "username") or not _fills_of(after, "password"):
+        return None
+    return Login(
+        submit=event,
+        bridge=bridge_event,
+        username=tuple(e for s in users for e in s.inputs),
+        password=tuple(e for s in after for e in s.inputs),
+        codes=(),
+        cross_document=True,
+    )
+
+
+def _scan(
+    documents: list[_Document],
+    actions: list[RecordingEvent],
+    previous: dict[int, RecordingEvent | None],
+    writing: set[int],
+    failed: set[int],
+) -> tuple[list[Login], set[int]]:
+    """Os logins, na ordem das ações, com a conta do que gravou antes de cada um.
+
+    Um envio só é login se nada gravou antes no robô (a não ser os logins e as
+    pontes deles). O clique de ponte ("Continuar") de um login em duas etapas
+    conta como sem gravação enquanto pode ser a ponte (como no compilador); os de
+    ``failed`` contam como qualquer outro. No login em duas páginas nada pode ter
+    gravado, a não ser a própria ponte. Devolve os logins e as pontes supostas.
+    """
+    place = {
+        s.event.index: (d, at)
+        for d, document in enumerate(documents)
+        for at, s in enumerate(document.steps)
     }
+    starts = [-1] * len(documents)
     logins: list[Login] = []
+    assumed: set[int] = set()
+    writes: list[int] = []
+    for action in actions:
+        found = place.get(action.index)
+        if found is not None and documents[found[0]].steps[found[1]].kind == "click":
+            d, at = found
+            steps = documents[d].steps
+            if not writes:
+                login = _login_at(steps, at, starts[d], previous)
+                if login is not None:
+                    logins.append(login)
+                    starts[d] = at
+                    continue
+                if _bridge_button(steps[at].element) and action.index not in failed:
+                    assumed.add(action.index)
+                    continue
+            cross = _cross_document_login(documents, d, at, starts, previous)
+            if cross is not None and cross.bridge is not None:
+                if set(writes) <= {cross.bridge.index}:
+                    logins.append(cross)
+        if action.index in writing:
+            writes.append(action.index)
+    return logins, assumed
+
+
+def _leads_to_secret(documents: list[_Document], d: int) -> bool:
+    """O documento ``d`` leva, na mesma aba, a uma página onde se preenche senha ou código.
+
+    Vale o próximo documento da aba em que a pessoa fez alguma coisa, desde que
+    nenhum endereço tenha sido digitado no caminho.
+    """
+    page_id = documents[d].page_id
+    for following in documents[d + 1 :]:
+        if following.page_id != page_id:
+            continue
+        if following.navigation.cause is NavigationCause.TYPED:
+            return False
+        if following.steps:
+            return any(
+                s.kind == "fill" and s.element is not None and is_secret_field(s.element)
+                for s in following.steps
+            )
+    return False
+
+
+def _roles(documents: list[_Document], logins: list[Login]) -> dict[int, str]:
+    """Os campos que saem da gravação: os de cada trecho com senha ou código.
+
+    Cada documento se divide nos envios dos logins que dão autenticação. Num trecho
+    com senha, código ou campo que o nome diz ser senha, os outros campos saem,
+    como usuário (pelo próprio campo) ou como outro campo. No último trecho de um
+    documento que leva à página da senha (login em duas páginas), o usuário (pelo
+    próprio campo) também sai.
+    """
+    submits = {login.submit.index for login in logins if not login.cross_document}
     roles: dict[int, str] = {}
-    for steps in _pages(events):
+    for d, document in enumerate(documents):
         start = -1
         windows: list[list[_Step]] = []
-        for at, step in enumerate(steps):
-            login = _login_at(steps, at, start, previous) if step.kind == "click" else None
-            if login is not None:
-                logins.append(login)
-                windows.append(steps[start + 1 : at])
+        for at, step in enumerate(document.steps):
+            if step.kind == "click" and step.event.index in submits:
+                windows.append(document.steps[start + 1 : at])
                 start = at
-        windows.append(steps[start + 1 :])
+        windows.append(document.steps[start + 1 :])
         for window in windows:
             fields = [s.inputs[0].element for s in window if s.kind == "fill"]
             if not any(is_secret_field(element) for element in fields):
@@ -630,7 +945,48 @@ def analyze_logins(events: Sequence[RecordingEvent]) -> LoginAnalysis:
                 role = "username" if username_by_signal(element) else "other"
                 for entry in s.inputs:
                     roles[entry.index] = role
-    return LoginAnalysis(logins=tuple(logins), roles=roles)
+        if _leads_to_secret(documents, d):
+            for s in windows[-1]:
+                if s.kind == "fill" and username_by_signal(s.inputs[0].element):
+                    for entry in s.inputs:
+                        roles.setdefault(entry.index, "username")
+    return roles
+
+
+def analyze_logins(events: Sequence[RecordingEvent]) -> LoginAnalysis:
+    """Os logins da gravação e os campos das páginas com senha (ver o começo do módulo).
+
+    Os logins são os que o compilador confirma: além da forma, nada gravou antes no
+    robô, na mesma conta que ele faz (``_writing_actions``, que pode contar a
+    mais). Cada página (documento do quadro principal) se divide só nesses envios:
+    um envio com cara de login que não vale não divide a página, e os campos depois
+    dele continuam na página com senha. Os campos de um trecho com senha, código de
+    uso único ou campo que o nome diz ser senha saem da gravação, como usuário (pelo
+    próprio campo) ou como outro campo. O gravador usa ``roles`` para tirar os
+    valores; o compilador, para decidir que campo vira o usuário do cofre (só num
+    login confirmado) e que envio é leitura.
+    """
+    actions = [e for e in events if e.type in USER_ACTION_TYPES]
+    previous: dict[int, RecordingEvent | None] = {
+        action.index: actions[i - 1] if i > 0 else None for i, action in enumerate(actions)
+    }
+    documents = _documents(events)
+    writing = _writing_actions(events)
+    failed: set[int] = set()
+    while True:
+        logins, assumed = _scan(documents, actions, previous, writing, failed)
+        bridges = {
+            login.bridge.index
+            for login in logins
+            if login.bridge is not None and not login.cross_document
+        }
+        # Uma ponte suposta que não é de nenhum login conta como qualquer clique: a
+        # conta recomeça (cada volta tira pontes, então termina).
+        dropped = assumed - bridges
+        if not dropped:
+            break
+        failed |= dropped
+    return LoginAnalysis(logins=tuple(logins), roles=_roles(documents, logins))
 
 
 @dataclass(frozen=True)

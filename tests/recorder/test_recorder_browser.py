@@ -695,7 +695,7 @@ async def test_payment_confirmation_with_a_transaction_password_is_irreversible(
     assert "4829" not in result.model_dump_json()
 
 
-async def test_page_script_and_recorder_agree_on_a_username_named_like_a_password(
+async def test_page_script_and_recorder_agree_that_a_username_named_like_a_password_is_ambiguous(
     browser: Browser,
 ) -> None:
     page_html = """<!doctype html><html><head><meta charset="utf-8"><title>Entrar</title></head>
@@ -713,14 +713,20 @@ async def test_page_script_and_recorder_agree_on_a_username_named_like_a_passwor
 
     recording = await record_routed(browser, page_html, scenario)
     inputs = {e.element.name_attr: e for e in recording.events if isinstance(e, InputEvent)}
-    assert inputs["cpf"].element.is_username and not inputs["cpf"].element.is_password
+    # O rótulo diz CPF (usuário) e o aria-labelledby fala em senha: o campo é ambíguo.
+    cpf_event = inputs["cpf"]
+    assert cpf_event.element.sensitive and cpf_event.element.aria_mentions_password
+    assert not cpf_event.element.is_username and not cpf_event.element.is_password
     assert "12345678900" not in recording.model_dump_json()
     result = compile_(recording, "entrar_com_cpf")
     cpf, senha = (s for s in result.manifest.steps if isinstance(s, FillStep))
-    assert cpf.value == SecretValue(credential="portal", field="username")
+    # Nunca credencial: o login grava e o robô pede o valor numa entrada.
+    assert isinstance(cpf.value, TextValue) and cpf.value.template.startswith("{{ inputs.")
     assert senha.value == SecretValue(credential="portal", field="password")
     entrar = result.manifest.step_by_id("clicar_entrar")
-    assert isinstance(entrar, ClickStep) and entrar.effect is Effect.READ
+    assert isinstance(entrar, ClickStep) and entrar.effect is Effect.WRITE
+    assert any("fala em senha" in w for w in result.warnings)
+    assert "12345678900" not in result.model_dump_json()
 
 
 @pytest.mark.parametrize("leave", ["tab", "clique"])
