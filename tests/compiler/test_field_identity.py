@@ -5,7 +5,13 @@ dentro de cada shadow root) nunca viram o mesmo campo, edições, marcações e
 escolhas de campos diferentes nunca se juntam num passo (o alvo e o valor sempre
 vêm do mesmo campo), um campo de shadow root nunca é credencial de login, e só
 códigos só autenticam com o botão num ``<form>`` só de códigos.
+
+Rodada 8: o ``data-testid`` entra na identidade do campo, e só edições do mesmo
+elemento (o número que o script dá a cada um) se juntam num passo.
 """
+
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -237,6 +243,121 @@ def test_edits_never_merge_across_a_document_load() -> None:
         TextValue(template="um"),
         TextValue(template="dois"),
     ]
+
+
+# -- rodada 8: o test_id e o número do elemento ---------------------------------------
+
+#: Caminho CSS cortado em seis níveis da luz: o mesmo nos cartões fundos (N10).
+DEEP_CSS = "div > div > div > span > label > input"
+
+
+def deep(make: Callable[..., ElementDescriptor], label: str, **kw: Any) -> ElementDescriptor:
+    """Campo de um cartão fundo: o mesmo caminho, rótulo, id e nome nos dois cartões."""
+    return make(label, css=DEEP_CSS, id="qtd", name_attr="qtd", **kw)
+
+
+def test_two_deep_fields_that_differ_only_in_the_test_id_are_two_steps() -> None:
+    # N10 numa gravação sem o número do elemento: o test_id, que vira localizador,
+    # separa os campos; cada passo leva o localizador e o valor do mesmo cartão.
+    repeated = {"role_name": 2, "label": 2, "id": 2, "name_attr": 2}
+    um = deep(textbox, "Quantidade", test_id="qtd-1", counts=repeated)
+    dois = deep(textbox, "Quantidade", test_id="qtd-2", counts=repeated)
+    assert field_key(0, um) != field_key(0, dois)
+    rec = RecordingBuilder()
+    rec.navigate("/carrinho")
+    rec.fill(um, "3")
+    rec.fill(dois, "7")
+    rec.click(button("Salvar", id="b"))
+    rec.request("POST", "/api/salvar", "fetch")
+    result = compile_(rec.build())
+    found = fills(result)
+    assert [(s.target.locators[0].value, s.value) for s in found] == [
+        ("qtd-1", TextValue(template="3")),
+        ("qtd-2", TextValue(template="7")),
+    ]
+
+
+@pytest.mark.parametrize("kind", ["fill", "check", "select"])
+def test_two_elements_with_the_same_description_never_merge(kind: str) -> None:
+    # O mesmo rótulo, caminho, id, nome e test_id: só o número que o script dá a cada
+    # elemento separa. Antes, um passo só (alvo de um, valor do outro).
+    make = {"fill": textbox, "check": checkbox, "select": select_box}[kind]
+    um = deep(make, "Quantidade", serial=11)
+    dois = deep(make, "Quantidade", serial=12)
+    assert field_key(0, um) == field_key(0, dois)
+    rec = RecordingBuilder()
+    rec.navigate("/carrinho")
+    if kind == "fill":
+        rec.fill(um, "3")
+        rec.fill(dois, "7")
+    elif kind == "check":
+        rec.check(um, True)
+        rec.check(dois, False)
+    else:
+        rec.select(um, "Pagar")
+        rec.select(dois, "Cancelar")
+    rec.click(button("Salvar", id="b"))
+    rec.request("POST", "/api/salvar", "fetch")
+    result = compile_(rec.build())
+    if kind == "fill":
+        assert [s.value for s in fills(result)] == [
+            TextValue(template="3"),
+            TextValue(template="7"),
+        ]
+    elif kind == "check":
+        checks = [s for s in result.manifest.steps if isinstance(s, CheckStep)]
+        assert [s.checked for s in checks] == [True, False]
+    else:
+        selects = [s for s in result.manifest.steps if isinstance(s, SelectStep)]
+        assert [s.option for s in selects] == ["Pagar", "Cancelar"]
+    assert step(result, "clicar_salvar").effect is Effect.WRITE
+
+
+@pytest.mark.parametrize("serial", [7, None], ids=["com_numero", "gravacao_antiga"])
+def test_edits_of_the_same_element_still_merge(serial: int | None) -> None:
+    # O mesmo número (ou nenhum, nas gravações antigas): um passo só, com o valor final.
+    numbers: list[dict[str, Any]] = (
+        [{}, {}]
+        if serial is None
+        else [
+            {"serial": serial},
+            {"serial": serial + 1},
+        ]
+    )
+    campo = deep(textbox, "Quantidade", **numbers[0])
+    caixa = deep(checkbox, "Incluir", **numbers[1])
+    rec = RecordingBuilder()
+    rec.navigate("/carrinho")
+    rec.fill(campo, "3")
+    rec.fill(campo, "30")
+    rec.check(caixa, True)
+    rec.check(caixa, False)
+    rec.click(button("Salvar", id="b"))
+    rec.request("POST", "/api/salvar", "fetch")
+    result = compile_(rec.build())
+    assert [s.value for s in fills(result)] == [TextValue(template="30")]
+    checks = [s for s in result.manifest.steps if isinstance(s, CheckStep)]
+    assert [s.checked for s in checks] == [False]
+
+
+def test_the_login_rule_sees_two_elements_of_the_same_kind_as_two_steps() -> None:
+    # O gravador (analyze_logins) junta edições como o compilador: com números
+    # diferentes, dois passos; o usuário e a senha continuam um login.
+    um = textbox("Usuário", id="u", name_attr="usuario", form=LOGIN_FORM, serial=1)
+    outro = um.model_copy(update={"serial": 2})
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(um, "ana")
+    rec.fill(outro, "ana.souza")
+    rec.fill(password(id="p", serial=3), "segredo-123")
+    rec.click(button("Entrar", id="b", form=LOGIN_FORM))
+    rec.request("POST", "/login", "document")
+    rec.navigate("/inicio", cause=NavigationCause.CLICK)
+    recording = rec.build()
+    (login,) = analyze_logins(recording.events).logins
+    assert [e.value for e in login.username] == ["ana", "ana.souza"]
+    result = compile_(recording)
+    assert usernames_in(result) == ["digitar_usuario", "digitar_usuario_2"]
 
 
 # -- campo de shadow root nunca é credencial -----------------------------------------

@@ -26,6 +26,7 @@ from rapa.recorder.sensitivity import (
     field_key,
     is_password_like_text,
     password_by_name,
+    same_element,
     username_by_signal,
 )
 from tests.recorder.texts import has_text
@@ -594,3 +595,48 @@ def test_the_identity_of_a_field_has_the_hosts_of_its_shadow_roots() -> None:
     # O que a pessoa vê do campo também conta (seletor cortado, gravação sem hospedeiros).
     assert field_key(0, field()) != field_key(0, field(label="Quantidade"))
     assert field_key(0, field(shadow_path=["#fa"])) == field_key(0, field(shadow_path=["#fa"]))
+
+
+def test_the_identity_of_a_field_has_everything_a_locator_can_use() -> None:
+    # N10: o data-testid vira localizador, então separa os campos; os iframes também
+    # contam por tudo o que os localiza (id, nome, título, endereço, seletor).
+    def field(**extra: object) -> ElementDescriptor:
+        return ElementDescriptor.model_validate(
+            {
+                "tag": "input",
+                "input_type": "text",
+                "label": "Quantidade",
+                "css": "li input",
+                **extra,
+            }
+        )
+
+    def framed(**frame: object) -> ElementDescriptor:
+        return field(frame_path=[{"tag": "iframe", "css": "div > iframe", **frame}])
+
+    assert field_key(0, field(test_id="qtd-1")) != field_key(0, field(test_id="qtd-2"))
+    assert field_key(0, field(role="textbox")) != field_key(0, field(role="combobox"))
+    assert field_key(0, framed(title="Cartão 1")) != field_key(0, framed(title="Cartão 2"))
+    assert field_key(0, framed(src="/a")) != field_key(0, framed(src="/b"))
+    assert field_key(0, framed(title="Cartão 1")) == field_key(0, framed(title="Cartão 1"))
+
+
+def test_only_the_same_element_merges_when_the_recording_numbers_them() -> None:
+    def field(**extra: object) -> ElementDescriptor:
+        return ElementDescriptor.model_validate(
+            {
+                "tag": "input",
+                "input_type": "text",
+                "label": "Quantidade",
+                "css": "li input",
+                **extra,
+            }
+        )
+
+    assert same_element(field(serial=1), field(serial=1))
+    assert not same_element(field(serial=1), field(serial=2))
+    # Gravação antiga (sem número): só a descrição conta.
+    assert same_element(field(), field())
+    # Um com número e outro sem: nunca o mesmo (na dúvida, dois passos).
+    assert not same_element(field(serial=1), field())
+    assert same_element(None, None) and not same_element(field(), None)

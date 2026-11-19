@@ -28,30 +28,47 @@ fica fora da gravação. As regras:
   obrigatória, com aviso (``analyze_logins``, ``secret_page_inputs``). O campo de
   usuário de uma página cujo clique leva (por navegação de documento) a uma
   página onde se preenche uma senha ``type=password`` também sai;
-- campo dentro de um shadow root (``in_shadow_root``): nunca é credencial de um
-  login (o envio depois dele na página não é autenticação); numa página com
-  senha ou código o valor sai da gravação e o compilador pede o valor numa
-  entrada. A identidade do campo (``field_key``) leva o caminho dos hospedeiros:
-  dois componentes iguais, com o mesmo id por dentro, nunca viram o mesmo campo;
+- campo dentro de um shadow root aberto (``in_shadow_root``): nunca é credencial
+  de um login (o envio depois dele na página não é autenticação); numa página
+  com senha ou código, em qualquer raiz e em qualquer ``<form>``, o valor sai da
+  gravação e o compilador pede o valor numa entrada (só o ``type=password`` de um
+  componente continua a senha do cofre, no campo dele). O script o identifica
+  pelo caminho dos hospedeiros (``shadow_path``) e o localiza por um seletor que
+  atravessa os shadow roots abertos ("#hospedeiro > #campo"), além do papel, do
+  rótulo, do placeholder e do ``data-testid``, contados no documento e em todos os
+  shadow roots abertos, como o Playwright procura. O valor de um campo de texto
+  sai no ``change`` do próprio shadow root (o script põe o ouvinte em cada shadow
+  root que aparece no caminho de um evento), antes do blur e na ordem da pessoa;
+- identidade do campo (``field_key``): aba, iframes, hospedeiros, seletor, id,
+  nome e tudo o que a pessoa vê ou o compilador usa como localizador (etiqueta,
+  tipo, papel, nome acessível, rótulo, placeholder, ``data-testid`` e a chave da
+  linha). Para juntar edições, marcações ou escolhas num passo também é preciso o
+  mesmo elemento (``same_element``: o número que o script dá a cada elemento do
+  DOM), então o alvo e o valor de um passo sempre vêm do mesmo elemento, mesmo
+  quando dois campos coincidem em tudo o que se descreve deles (o caminho CSS
+  para em seis níveis da luz). Gravações sem esse número ficam só com a descrição;
 - login (``analyze_logins``): o envio só é autenticação quando todos os campos
   preenchidos desde a última navegação que carregou documento (ou desde o login
   anterior) são credenciais de uma credencial só: o usuário com uma senha
   ``type=password`` de verdade (que não é ``new-password``) e, se houver, o
-  código de uso único que não é de transação; ou só códigos, e então só com o
-  botão num ``<form>`` cujos campos de texto são só códigos, os mesmos que foram
-  preenchidos (sem esse ``<form>``, só códigos nunca é login, qualquer que seja o
-  texto do botão). O envio é um clique cujo texto inteiro é de login ("Entrar",
-  "Acessar", "Continuar"...; ou "Confirmar" quando só códigos foram
-  preenchidos), ou o Enter que aciona esse botão no mesmo ``<form>`` (sem
-  ``<form>``, o Enter nunca é login); nenhum verbo irreversível e nenhum segredo
-  de transação (token ou código da transação, CVV, código de segurança,
-  assinatura) na página. Resíduo, como em d746ee2: só códigos num ``<form>`` só
-  com o código continua autenticação mesmo que a página use o código para
-  confirmar uma operação. Fora isso, só
-  caixas de seleção e o botão de mostrar a senha no meio. Nada pode ter gravado
-  antes no robô (a mesma conta do compilador: requisição que não é GET de
-  documento, XHR ou fetch, ou botão com verbo irreversível); um envio com cara de
-  login que não passa nisso não divide a página;
+  código de uso único que não é de transação (usuário e código sem senha nunca é
+  login); ou só códigos, e então só com o botão num ``<form>`` cujos campos de
+  texto são só códigos, os mesmos que foram preenchidos (sem esse ``<form>``, só
+  códigos nunca é login, qualquer que seja o texto do botão). O envio é um clique
+  cujo texto inteiro é de login ("Entrar", "Acessar", "Continuar"...; ou
+  "Confirmar" quando só códigos foram preenchidos), ou o Enter que aciona esse
+  botão no mesmo ``<form>`` (sem ``<form>``, o Enter nunca é login); nenhum verbo
+  irreversível e nenhum segredo de transação (token ou código da transação, CVV,
+  código de segurança, assinatura) na página. Resíduo, como em d746ee2: só
+  códigos num ``<form>`` só com o código continua autenticação mesmo que a página
+  use o código para confirmar uma operação; só os campos de texto contam, então
+  isso inclui o ``<form>`` do código com o valor num ``<input type=hidden>`` ou
+  com uma lista (``<select>``) que a pessoa não mexeu, e dois ``<form>`` iguais só
+  com o código na mesma página não se distinguem. Fora isso, só caixas de seleção
+  e o botão de mostrar a senha no meio. Nada pode ter gravado antes no robô (a
+  mesma conta do compilador: requisição que não é GET de documento, XHR ou fetch,
+  ou botão com verbo irreversível); um envio com cara de login que não passa
+  nisso não divide a página;
 - login em duas etapas: usuário, depois um clique cujo texto inteiro é
   "Continuar", "Avançar", "Próximo", "Seguinte" ou "Next", depois uma senha
   ``type=password`` e um envio que passa na regra acima; só caixas de seleção no
@@ -116,6 +133,7 @@ __all__ = [
     "password_toggle",
     "plain_label",
     "requests_while_editing",
+    "same_element",
     "secret_page_inputs",
     "username_by_signal",
     "writes_in",
@@ -438,14 +456,16 @@ def looks_secret(element: ElementDescriptor) -> bool:
 def field_key(page_id: int, element: ElementDescriptor) -> tuple[Any, ...]:
     """Identidade de um campo na gravação.
 
-    Aba, iframes, hospedeiros dos shadow roots, seletor, id e nome, e também o que
-    a pessoa vê do campo (etiqueta, tipo, nome acessível, rótulo, placeholder e a
-    chave da linha da tabela): dois campos que só coincidem no seletor (o mesmo
-    ``#input`` dentro de dois componentes, um caminho CSS cortado antes da linha)
-    nunca viram o mesmo campo, e edições, marcações e escolhas de campos diferentes
-    nunca se juntam num passo só.
+    Aba, iframes (com tudo o que os localiza), hospedeiros dos shadow roots,
+    seletor, id e nome, e também o que a pessoa vê do campo e o que pode virar
+    localizador (etiqueta, tipo, papel, nome acessível, rótulo, placeholder,
+    ``data-testid`` e a chave da linha da tabela): dois campos que só
+    coincidem no seletor (o mesmo ``#input`` dentro de dois componentes, um caminho
+    CSS cortado antes da linha) nunca viram o mesmo campo. Para juntar edições,
+    marcações e escolhas num passo só também é preciso o mesmo elemento
+    (``same_element``).
     """
-    frames = tuple(f.css or f.id or f.name or "" for f in element.frame_path or [])
+    frames = tuple((f.tag, f.id, f.name, f.title, f.src, f.css) for f in element.frame_path or [])
     return (
         page_id,
         frames,
@@ -455,11 +475,25 @@ def field_key(page_id: int, element: ElementDescriptor) -> tuple[Any, ...]:
         element.name_attr,
         element.tag,
         element.input_type,
+        element.role,
         element.name,
         element.label,
         element.placeholder,
+        element.test_id,
         element.row.key if element.row is not None else None,
     )
+
+
+def same_element(a: ElementDescriptor | None, b: ElementDescriptor | None) -> bool:
+    """Os dois descritores podem ser do mesmo elemento do DOM.
+
+    O script dá a cada elemento um número (``serial``) que dois elementos nunca
+    têm igual: com ele, só o mesmo número é o mesmo elemento. Gravações antigas
+    (sem número) ficam só com a descrição (``field_key``).
+    """
+    if a is None or b is None:
+        return a is b
+    return a.serial == b.serial
 
 
 def focus_only(element: ElementDescriptor) -> bool:
@@ -602,7 +636,8 @@ def _documents(events: Sequence[RecordingEvent]) -> list[_Document]:
     """Os passos de cada documento do quadro principal, como o compilador os faz.
 
     Cada aba tem os seus documentos, na ordem em que foram carregados. Edições
-    seguidas do mesmo campo são um passo só; Tab, cliques que só focam um campo, o
+    seguidas do mesmo campo (``field_key``) e do mesmo elemento (``same_element``)
+    são um passo só; Tab, cliques que só focam um campo, o
     Enter que o formulário transforma em clique e o segundo clique de um clique
     duplo não viram passo. Navegações no mesmo documento não abrem página nova; o
     clique que abre outra aba não é envio.
@@ -664,7 +699,12 @@ def _documents(events: Sequence[RecordingEvent]) -> list[_Document]:
             if not event.element.sensitive and event.value is None:
                 continue  # o compilador não faz passo sem o valor
             key = field_key(event.page_id, event.element)
-            if last is not None and last.kind == "fill" and last.key == key:
+            if (
+                last is not None
+                and last.kind == "fill"
+                and last.key == key
+                and same_element(last.element, event.element)
+            ):
                 last.inputs.append(event)
             else:
                 steps.append(_Step("fill", event, event.element, key, [event]))

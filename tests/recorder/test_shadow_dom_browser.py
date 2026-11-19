@@ -1,4 +1,4 @@
-"""Componentes com shadow root gravados num Chromium de verdade, e compilados (rodada 7).
+"""Componentes com shadow root gravados num Chromium de verdade, e compilados (rodadas 7 e 8).
 
 Duas instâncias do mesmo componente (``<x-field>``, ``<x-check>``, ``<x-select>``)
 têm o mesmo ``<input id="input">`` por dentro, como nas bibliotecas de
@@ -7,13 +7,20 @@ shadow root; edições, marcações e escolhas de campos diferentes nunca se jun
 alvo e o valor de cada passo vêm do mesmo campo (conferido resolvendo os
 localizadores do robô na página, como o executor faz); um campo de componente nunca
 é credencial de login; e o gravador não embrulha nenhum método da página.
+
+Rodada 8: o valor de um campo de texto de shadow root sai no change do próprio
+shadow root, ou antes da próxima ação noutro elemento (salvamento automático,
+ordem dos campos, input que some no blur, usuário que vira "chip", componente que
+para o change), também em shadow roots declarativos e nos que já existiam antes
+do gravador; e dois campos que coincidem em tudo o que se descreve deles (cartões
+fundos, o mesmo rótulo e caminho) viram dois passos.
 """
 
 from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
-from playwright.async_api import Browser, Page, async_playwright
+from playwright.async_api import Browser, Page, Route, async_playwright
 from playwright.async_api import Locator as PwLocator
 
 from rapa.compiler import CompileResult
@@ -29,10 +36,12 @@ from rapa.core.robot import (
     TextValue,
 )
 from rapa.fixtures.server import HOST_RESOLVER_ARG
-from rapa.recorder import CheckEvent, InputEvent, Recording, SelectEvent
+from rapa.recorder import CheckEvent, InputEvent, Recorder, Recording, SelectEvent
 from tests.recorder.test_login_rule_browser import (
     PASSWORD,
+    SITE,
     USER,
+    Scenario,
     an_input,
     click_effect,
     compile_,
@@ -448,3 +457,421 @@ document.getElementById('b').onclick = async () => {
     clicks = [s for s in result.manifest.steps if isinstance(s, ClickStep)]
     assert [s.effect for s in clicks] == [Effect.READ, Effect.WRITE]
     assert result.manifest.effect() is Effect.WRITE
+
+
+# -- rodada 8: o change de campos de texto em shadow roots e a identidade do elemento -
+
+#: Marca do campo que um elemento é (nele, num ancestral ou num hospedeiro).
+MARK_JS = """(el) => {
+  let cur = el;
+  while (cur) {
+    if (cur.getAttribute && cur.getAttribute('data-gt')) return cur.getAttribute('data-gt');
+    const root = cur.getRootNode();
+    cur = cur.parentElement || (root && root.host) || null;
+  }
+  return null;
+}"""
+
+
+async def marks_of(
+    browser: Browser, html: str, steps: list[FillStep] | list[CheckStep] | list[SelectStep]
+) -> list[str]:
+    """A marca ``data-gt`` do campo que cada passo acha, por todos os localizadores dele.
+
+    Como ``hosts_of``, mas pela marca mais próxima do elemento: os campos destes
+    testes têm o mesmo id (e o mesmo rótulo) nos dois lugares.
+    """
+    context = await browser.new_context()
+    try:
+        p = await context.new_page()
+        await p.set_content(html)
+        found: list[str] = []
+        for s in steps:
+            marks = set()
+            for locator in s.target.locators:
+                located = locate(p, locator)
+                assert await located.count() == 1, (s.id, locator)
+                marks.add(await located.evaluate(MARK_JS))
+            assert len(marks) == 1, (s.id, marks)
+            found.append(marks.pop())
+        return found
+    finally:
+        await context.close()
+
+
+async def record_open_page(browser: Browser, html: str, scenario: Scenario) -> Recording:
+    """Grava numa aba que já estava aberta: os shadow roots existem antes do script."""
+    context = await browser.new_context()
+
+    async def handle(route: Route) -> None:
+        if "/api/" in route.request.url:
+            await route.fulfill(status=200, content_type="application/json", body="{}")
+            return
+        await route.fulfill(status=200, content_type="text/html; charset=utf-8", body=html)
+
+    await context.route("**/*", handle)
+    try:
+        p = await context.new_page()
+        await p.goto(f"{SITE}/editor")
+        await p.locator("x-form").locator("#b").wait_for()
+        recorder = Recorder()
+        await recorder.start(context)
+        await scenario(p)
+        return await recorder.stop()
+    finally:
+        await context.close()
+
+
+#: "Rascunho" salva sozinho (POST) no change; "Título" fica no mesmo shadow root.
+XFORM = """<script>
+customElements.define('x-form', class extends HTMLElement { connectedCallback() {
+  if (this.shadowRoot) return;
+  const r = this.attachShadow({mode: 'open'});
+  r.innerHTML = '<label for="a">Rascunho</label><input id="a" data-gt="ra">' +
+    '<label for="b">Título</label><input id="b" data-gt="tb">';
+  r.getElementById('a').addEventListener('change',
+    () => fetch('/api/rascunho', {method: 'POST', body: '{}'}));
+} });
+</script><x-form></x-form>"""
+#: O mesmo, num shadow root declarativo (sem attachShadow).
+XFORM_DECLARATIVE = """<x-form><template shadowrootmode="open">
+<label for="a">Rascunho</label><input id="a" data-gt="ra">
+<label for="b">Título</label><input id="b" data-gt="tb"></template></x-form>
+<script>
+document.querySelector('x-form').shadowRoot.getElementById('a')
+  .addEventListener('change', () => fetch('/api/rascunho', {method: 'POST', body: '{}'}));
+</script>"""
+PREVIEW = """<button id="pv" onclick="fetch('/api/previa?x=1')
+  .then(() => document.body.insertAdjacentHTML('beforeend', '<p>Prévia</p>'))">
+Pré-visualizar</button>"""
+
+
+@pytest.mark.parametrize("variant", ["componente", "declarativo", "antes_do_gravador"])
+async def test_an_autosave_in_a_shadow_field_before_another_field_of_the_root_is_write(
+    browser: Browser, variant: str
+) -> None:
+    # R1: o change não sai do shadow root, e o focusout entre dois campos do mesmo
+    # shadow root não chega à janela. Sem o change do shadow root, o valor do
+    # "Rascunho" saía depois do POST (e depois do "Título") e o robô ficava de leitura.
+    form = XFORM_DECLARATIVE if variant == "declarativo" else XFORM
+    html = page("Editor", "<h1>Editor</h1>" + form + PREVIEW)
+
+    async def scenario(p: Page) -> None:
+        # Nenhum método nativo é trocado pelo gravador.
+        assert await p.evaluate(
+            """() => [Element.prototype.attachShadow, EventTarget.prototype.addEventListener,
+                      Event.prototype.composedPath, HTMLElement.prototype.focus]
+                .every((f) => Function.prototype.toString.call(f).includes('[native code]'))"""
+        )
+        host = p.locator("x-form")
+        await host.locator("#a").click()
+        await p.keyboard.type("texto do rascunho")
+        await host.locator("#b").click()
+        await p.wait_for_timeout(900)
+        await p.keyboard.type("meu título")
+        await p.get_by_role("button", name="Pré-visualizar").click()
+        await p.get_by_text("Prévia").wait_for()
+
+    if variant == "antes_do_gravador":
+        recording = await record_open_page(browser, html, scenario)
+    else:
+        recording = await record_site(browser, {"/editor": html}, "/editor", scenario)
+    assert [(e.element.label, e.value) for e in inputs_of(recording)] == [
+        ("Rascunho", "texto do rascunho"),
+        ("Título", "meu título"),
+    ]
+    result = compile_(recording)
+    found = fill_steps(result)
+    assert [(s.id, s.value, s.effect) for s in found] == [
+        ("digitar_rascunho", TextValue(template="texto do rascunho"), Effect.WRITE),
+        ("digitar_titulo", TextValue(template="meu título"), Effect.READ),
+    ]
+    assert result.manifest.effect() is Effect.WRITE
+    assert await marks_of(browser, html, found) == ["ra", "tb"]
+
+
+async def test_fields_of_one_shadow_root_keep_the_order_the_person_typed(
+    browser: Browser,
+) -> None:
+    # R2: o change do CEP preenche o logradouro e a pessoa corrige o logradouro. O
+    # robô digita o CEP antes do logradouro, como a pessoa (senão o CEP desfaria a
+    # correção).
+    html = page(
+        "Endereço",
+        """<script>
+customElements.define('x-end', class extends HTMLElement { connectedCallback() {
+  if (this.shadowRoot) return;
+  const r = this.attachShadow({mode: 'open'});
+  r.innerHTML = '<label for="c">CEP</label><input id="c" data-gt="cep">' +
+    '<label for="l">Logradouro</label><input id="l" data-gt="log">';
+  r.getElementById('c').addEventListener('change',
+    () => { r.getElementById('l').value = 'Rua do CEP'; });
+} });
+</script><h1>Endereço</h1><x-end></x-end>
+<button id="s" onclick="fetch('/api/salvar', {method: 'POST', body: '{}'})
+  .then(() => document.body.insertAdjacentHTML('beforeend', '<p>Salvo</p>'))">Salvar</button>""",
+    )
+
+    async def scenario(p: Page) -> None:
+        host = p.locator("x-end")
+        await host.locator("#c").click()
+        await p.keyboard.type("01001000")
+        await host.locator("#l").click()
+        await p.keyboard.press("Control+A")
+        await p.keyboard.type("Praça da Sé")
+        await p.get_by_role("button", name="Salvar").click()
+        await p.get_by_text("Salvo").wait_for()
+
+    recording = await record_site(browser, {"/endereco": html}, "/endereco", scenario)
+    result = compile_(recording)
+    found = fill_steps(result)
+    assert [(s.id, s.value) for s in found] == [
+        ("digitar_cep", TextValue(template="01001000")),
+        ("digitar_logradouro", TextValue(template="Praça da Sé")),
+    ]
+    assert await marks_of(browser, html, found) == ["cep", "log"]
+
+
+async def test_an_inline_editor_that_replaces_the_input_on_blur_keeps_both_values(
+    browser: Browser,
+) -> None:
+    # R3: o input da célula some no blur (que grava a célula). O valor sai no change,
+    # antes do blur, enquanto o campo ainda existe.
+    html = page(
+        "Grade",
+        """<script>
+customElements.define('x-grid', class extends HTMLElement { connectedCallback() {
+  if (this.shadowRoot) return;
+  const r = this.attachShadow({mode: 'open'});
+  r.innerHTML = '<div class="c" data-k="a">10</div><div class="c" data-k="b">20</div>';
+  for (const cell of r.querySelectorAll('.c')) cell.addEventListener('click', () => {
+    if (cell.querySelector('input')) return;
+    const old = cell.textContent; cell.textContent = '';
+    const inp = document.createElement('input');
+    inp.setAttribute('aria-label', 'Valor ' + cell.dataset.k); inp.value = old;
+    cell.appendChild(inp); inp.focus(); inp.select();
+    inp.addEventListener('blur', () => {
+      const v = inp.value; cell.textContent = v;
+      fetch('/api/celula?k=' + cell.dataset.k, {method: 'POST', body: v});
+    });
+  });
+} });
+</script><h1>Grade</h1><x-grid></x-grid>
+<button id="pv" onclick="fetch('/api/ver')
+  .then(() => document.body.insertAdjacentHTML('beforeend', '<p>Visto</p>'))">Ver</button>""",
+    )
+
+    async def scenario(p: Page) -> None:
+        grid = p.locator("x-grid")
+        await grid.locator(".c >> nth=0").click()
+        await p.keyboard.type("42")
+        await grid.locator(".c >> nth=1").click()
+        await p.wait_for_timeout(700)
+        await p.keyboard.type("43")
+        await p.get_by_role("button", name="Ver").click()
+        await p.get_by_text("Visto").wait_for()
+
+    recording = await record_site(browser, {"/grade": html}, "/grade", scenario)
+    result = compile_(recording)
+    found = fill_steps(result)
+    assert [(s.id, s.value) for s in found] == [
+        ("digitar_valor_a", TextValue(template="42")),
+        ("digitar_valor_b", TextValue(template="43")),
+    ]
+    # O POST do blur de cada célula grava no passo do campo ou no clique seguinte (o
+    # que tira o foco, como no robô): a requisição pode chegar antes ou depois do
+    # clique, conforme o navegador. Nunca fica sem um passo que grava.
+    effects = {s.id: s.effect for s in result.manifest.steps}
+    assert Effect.WRITE in (effects["digitar_valor_a"], effects["clicar_20"])
+    assert Effect.WRITE in (effects["digitar_valor_b"], effects["clicar_ver"])
+    assert result.manifest.effect() is Effect.WRITE
+
+
+async def test_a_value_leaves_before_the_next_action_even_if_the_component_stops_the_change(
+    browser: Browser,
+) -> None:
+    # O componente para o change no próprio shadow root (antes do ouvinte do gravador)
+    # e troca o input por texto no blur: o valor sai no pointerdown do botão, antes
+    # do blur, enquanto o campo ainda existe. (O botão fica acima do componente, que
+    # muda de tamanho no blur.)
+    html = page(
+        "Etiquetas",
+        """<script>
+customElements.define('x-tag', class extends HTMLElement { connectedCallback() {
+  if (this.shadowRoot) return;
+  const r = this.attachShadow({mode: 'open'});
+  r.addEventListener('change', (e) => e.stopImmediatePropagation(), true);
+  r.innerHTML = '<label for="t">Etiqueta</label><input id="t">';
+  const inp = r.getElementById('t');
+  inp.addEventListener('blur', () => {
+    const s = document.createElement('span'); s.textContent = inp.value; inp.replaceWith(s);
+  });
+} });
+</script><h1>Etiquetas</h1>
+<p><button id="b" onclick="fetch('/api/etiqueta', {method: 'POST', body: '{}'})
+  .then(() => document.body.insertAdjacentHTML('beforeend', '<p>Salvo</p>'))">Salvar</button></p>
+<div><x-tag></x-tag></div>""",
+    )
+
+    async def scenario(p: Page) -> None:
+        await p.locator("x-tag").locator("#t").click()
+        await p.keyboard.type("urgente")
+        await p.get_by_role("button", name="Salvar").click()
+        await p.get_by_text("Salvo").wait_for()
+
+    recording = await record_site(browser, {"/etiquetas": html}, "/etiquetas", scenario)
+    result = compile_(recording)
+    assert [(s.id, s.value) for s in fill_steps(result)] == [
+        ("digitar_etiqueta", TextValue(template="urgente"))
+    ]
+    assert click_effect(result, "clicar_salvar") is Effect.WRITE
+
+
+async def test_a_username_that_becomes_a_chip_on_blur_never_reaches_the_robot(
+    browser: Browser,
+) -> None:
+    # R4b: o e-mail do componente vira um "chip" no blur, e a página ecoa "Entrando
+    # como <e-mail>" na luz. O valor sai (só como segredo) antes do blur, e a limpeza
+    # tira o eco da gravação.
+    email = "ana.chip@exemplo.com"
+    html = page(
+        "Login",
+        """<script>
+customElements.define('x-user', class extends HTMLElement { connectedCallback() {
+  if (this.shadowRoot) return;
+  const r = this.attachShadow({mode: 'open'});
+  r.innerHTML = '<label for="e">E-mail</label>' +
+    '<input id="e" type="email" autocomplete="username">';
+  const inp = r.getElementById('e');
+  inp.addEventListener('blur', () => {
+    if (!inp.value) return;
+    const chip = document.createElement('span'); chip.textContent = inp.value;
+    inp.replaceWith(chip);
+    document.getElementById('quem').textContent = 'Entrando como ' + inp.value;
+  });
+} });
+</script><h1>Entrar no banco</h1><p id="quem"></p><x-user></x-user>
+<label>Senha <input id="p" type="password"></label><button id="b">Entrar</button>
+<script>document.getElementById('b').onclick = async () => {
+  await fetch('/api/login', {method: 'POST', body: '{}'});
+  await new Promise((r) => setTimeout(r, 300)); location.href = '/inicio';
+};</script>""",
+    )
+    inicio = page("Início", "<h1>Início</h1><p>Sua conta</p><button>Sair</button>")
+
+    async def scenario(p: Page) -> None:
+        await p.locator("x-user").locator("#e").click()
+        await p.keyboard.type(email)
+        await p.locator("#p").click()
+        await p.keyboard.type(PASSWORD)
+        await p.wait_for_timeout(300)
+        await p.get_by_role("button", name="Entrar").click()
+        await p.get_by_role("heading", name="Início").wait_for()
+
+    recording = await record_site(browser, {"/login": html, "/inicio": inicio}, "/login", scenario)
+    assert not has_text(recording, email, ignore_case=True)
+    assert not has_text(recording, PASSWORD)
+    usuario = next(e for e in inputs_of(recording) if e.element.label == "E-mail")
+    assert usuario.element.sensitive and usuario.value is None
+    result = compile_(recording)
+    # Campo de componente: nunca credencial; o valor vira uma entrada.
+    assert {s.id: s.value for s in fill_steps(result)} == {
+        "digitar_e_mail": an_input("e_mail"),
+        "digitar_senha": SecretValue(credential="banco", field="password"),
+    }
+    assert usernames_in(result) == []
+    manifest, prompt = dumps(result)
+    assert email not in manifest.lower() and email not in prompt.lower()
+
+
+#: Componentes dos cartões fundos: o rótulo, o id e o nome iguais; o data-testid muda.
+XCARDS = """<script>
+customElements.define('x-qty', class extends HTMLElement { connectedCallback() {
+  if (this.shadowRoot) return;
+  this.attachShadow({mode: 'open'}).innerHTML = '<label for="input">Quantidade</label>' +
+    '<input id="input" name="qtd" data-testid="' + this.getAttribute('tid') + '">'; } });
+customElements.define('x-inc', class extends HTMLElement { connectedCallback() {
+  if (this.shadowRoot) return;
+  this.attachShadow({mode: 'open'}).innerHTML = '<label for="input">Incluir</label>' +
+    '<input id="input" name="inc" type="checkbox" data-testid="' + this.getAttribute('tid') +
+    '"' + (this.hasAttribute('checked') ? ' checked' : '') + '>'; } });
+</script>"""
+SAVE = """<button id="b" onclick="fetch('/api/salvar', {method: 'POST', body: '{}'})
+  .then(() => document.body.insertAdjacentHTML('beforeend', '<p>Salvo</p>'))">Salvar</button>"""
+
+
+def deep_cards(light: bool, check: bool) -> str:
+    """Dois cartões com mais de seis níveis da luz até o campo (ou o hospedeiro).
+
+    O caminho CSS (e o do hospedeiro) para em seis níveis, então é o mesmo nos dois;
+    o rótulo, o id e o nome também. Só o ``data-testid`` muda.
+    """
+    cards = []
+    for k in (1, 2):
+        if check:
+            checked = " checked" if k == 2 else ""
+            inner = (
+                f'<label>Incluir <input type="checkbox" id="inc" name="inc" '
+                f'data-testid="inc-{k}"{checked}></label>'
+                if light
+                else f'<x-inc tid="inc-{k}"{checked}></x-inc>'
+            )
+        else:
+            inner = (
+                f'<label>Quantidade <input id="qtd" name="qtd" data-testid="qtd-{k}"></label>'
+                if light
+                else f'<x-qty tid="qtd-{k}"></x-qty>'
+            )
+        cards.append(
+            f'<li data-gt="q{k}"><article><div><div><div><div><span>{inner}</span></div>'
+            "</div></div></div></article></li>"
+        )
+    return XCARDS + "<h1>Carrinho</h1><ul>" + "".join(cards) + "</ul>" + SAVE
+
+
+@pytest.mark.parametrize("light", [True, False], ids=["luz", "shadow"])
+async def test_two_deep_fields_with_the_same_label_and_path_are_two_steps(
+    browser: Browser, light: bool
+) -> None:
+    # N10: antes, um passo só, com o localizador do cartão 1 (test_id "qtd-1") e o
+    # valor digitado no cartão 2: o robô digitava 7 no cartão errado.
+    html = page("Carrinho", deep_cards(light, check=False))
+
+    async def scenario(p: Page) -> None:
+        await p.locator("[data-gt=q1]").locator("input").fill("3")
+        await p.locator("[data-gt=q2]").locator("input").fill("7")
+        await p.get_by_role("button", name="Salvar").click()
+        await p.get_by_text("Salvo").wait_for()
+
+    recording = await record_site(browser, {"/carrinho": html}, "/carrinho", scenario)
+    first, second = inputs_of(recording)
+    assert first.element.css == second.element.css
+    result = compile_(recording)
+    found = fill_steps(result)
+    assert [s.value for s in found] == [TextValue(template="3"), TextValue(template="7")]
+    assert await marks_of(browser, html, found) == ["q1", "q2"]
+    # Cada elemento tem o seu número na gravação.
+    serials = {first.element.serial, second.element.serial}
+    assert None not in serials and len(serials) == 2
+
+
+@pytest.mark.parametrize("light", [True, False], ids=["luz", "shadow"])
+async def test_a_check_and_an_uncheck_in_two_deep_cards_are_two_steps(
+    browser: Browser, light: bool
+) -> None:
+    html = page("Carrinho", deep_cards(light, check=True))
+
+    async def scenario(p: Page) -> None:
+        await p.locator("[data-gt=q1]").locator("input").check()
+        await p.locator("[data-gt=q2]").locator("input").uncheck()
+        await p.get_by_role("button", name="Salvar").click()
+        await p.get_by_text("Salvo").wait_for()
+
+    recording = await record_site(browser, {"/carrinho": html}, "/carrinho", scenario)
+    events = [e for e in recording.events if isinstance(e, CheckEvent)]
+    assert [e.checked for e in events] == [True, False]
+    assert events[0].element.css == events[1].element.css
+    result = compile_(recording)
+    checks = [s for s in result.manifest.steps if isinstance(s, CheckStep)]
+    assert [s.checked for s in checks] == [True, False]
+    assert await marks_of(browser, html, checks) == ["q1", "q2"]

@@ -18,7 +18,12 @@ acessível e, ao fechar a gravação, os campos das páginas com senha ou códig
 o script não viu (a senha que só aparece depois, numa SPA, ou noutro shadow root,
 e o usuário de uma página que leva à página da senha). Campos de shadow roots
 abertos chegam com o caminho dos hospedeiros (``shadow_path``) e um seletor que
-atravessa o shadow root, que a conferência do Playwright usa. A limpeza ignora
+atravessa o shadow root, que a conferência do Playwright usa; o valor de um campo
+de texto de shadow root sai no ``change`` dele (que o script escuta em cada shadow
+root que aparece no caminho de um evento), antes do blur e na ordem da pessoa, e
+um campo de shadow root nunca é credencial de login. Cada elemento leva um número
+(``serial``) que dois elementos nunca têm igual: só edições do mesmo elemento viram
+um passo. A limpeza ignora
 maiúsculas em tudo o que pode chegar ao robô ou ao modelo de linguagem: o texto
 livre da página (títulos, texto, iframes) e, nos elementos, nomes acessíveis,
 rótulos, placeholders, títulos, textos, seletores e o texto e as células da linha

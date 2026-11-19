@@ -11,11 +11,15 @@
 // ação), com há quanto tempo a edição começou. Campos dentro de shadow roots
 // abertos também contam: o alvo é o primeiro elemento do composedPath, listas,
 // caixas de seleção e arquivos de um shadow root saem pelo evento input (que,
-// ao contrário do change, atravessa o shadow root), e o elemento leva o caminho
-// dos hospedeiros (shadow_path) e um seletor CSS que atravessa os shadow roots
-// abertos ("#hospedeiro > #campo"), para que dois componentes iguais (o mesmo id
-// por dentro) nunca virem o mesmo campo. Nada da página é trocado: nenhum
-// método nativo é embrulhado para isso.
+// ao contrário do change, atravessa o shadow root), os campos de texto saem no
+// change e no focusout do próprio shadow root (cada shadow root que aparece no
+// composedPath de um evento ganha esses ouvintes, uma vez) ou antes da próxima
+// ação noutro elemento, e o elemento leva o caminho dos hospedeiros
+// (shadow_path) e um seletor CSS que atravessa os shadow roots abertos
+// ("#hospedeiro > #campo"), para que dois componentes iguais (o mesmo id por
+// dentro) nunca virem o mesmo campo. Cada elemento também leva um número
+// (serial) que dois elementos nunca têm igual. Nada da página é trocado:
+// nenhum método nativo é embrulhado para isso.
 (() => {
   'use strict';
   const CONFIG = __RAPA_CONFIG__;
@@ -739,6 +743,30 @@
     };
   };
 
+  // Identidade do elemento na gravação: um número por elemento do DOM, o mesmo em
+  // todos os eventos dele (dois elementos nunca têm o mesmo). A parte alta é
+  // sorteada por documento (cada quadro e cada carga da página tem o seu script),
+  // a baixa conta os elementos; passado o limite, o elemento fica sem número (só a
+  // descrição separa os campos, como nas gravações antigas).
+  const ELEMENT_BASE = (() => {
+    try { const a = new Uint32Array(1); W.crypto.getRandomValues(a); return a[0] & 0x7fffffff; } catch (e) {
+      return Math.floor(Math.random() * 0x7fffffff);
+    }
+  })();
+  const MAX_SERIALS = 0x1fffff;
+  const serials = new WeakMap();
+  let serialCount = 0;
+  const serialOf = (el) => {
+    let serial = serials.get(el);
+    if (serial === undefined) {
+      if (serialCount >= MAX_SERIALS) return null;
+      serialCount += 1;
+      serial = ELEMENT_BASE * (MAX_SERIALS + 1) + serialCount;
+      serials.set(el, serial);
+    }
+    return serial;
+  };
+
   const describe = (el) => {
     const role = roleOf(el);
     const name = clip(accessibleName(el, role), MAX_NAME);
@@ -775,6 +803,7 @@
       id: orNull(id),
       css: cssPath(el),
       shadow_path: shadow ? shadowPath(el) : null,
+      serial: serialOf(el),
       text: orNull(text),
       title: orNull(clip(el.getAttribute('title'), MAX_NAME)),
       href: tag === 'a' && el.getAttribute('href') ? clip(el.href, 500) : null,
@@ -888,6 +917,21 @@
     for (const el of Array.from(fields.keys())) if (el !== except) sendField(el);
   };
 
+  // Antes de uma ação noutro elemento (pointerdown, keydown ou beforeinput), o
+  // valor pendente dos campos de shadow roots sai, enquanto o campo ainda existe e
+  // na ordem da pessoa. Não sai o do próprio campo, nem o do campo que contém o
+  // alvo (um trecho de um contenteditable). Os campos da luz já saem no change da
+  // janela.
+  const flushShadowOthers = (event) => {
+    if (!event.isTrusted) return;
+    const target = realTarget(event);
+    const el = target && target.nodeType === 1 ? target : null;
+    for (const f of Array.from(fields.keys())) {
+      if (f === el || (el && f.contains(el)) || !inShadow(f)) continue;
+      sendField(f);
+    }
+  };
+
   const isEditable = (el) => isTextLike(el) || isPassword(el) || el.isContentEditable ||
     (el.tagName === 'INPUT' && ['date', 'time', 'datetime-local', 'month', 'week', 'color', 'range'].indexOf(inputType(el)) >= 0);
 
@@ -980,6 +1024,36 @@
     if (el && fields.has(el)) sendField(el);
   };
 
+  // O change de um campo de texto num shadow root aberto: ele não sai do shadow
+  // root (não é composed), e o navegador o dispara antes do blur, quando o campo
+  // ainda existe. Listas, caixas de seleção e arquivos de shadow roots já saem
+  // pelo input (onInput).
+  const onShadowChange = (event) => {
+    const el = realTarget(event);
+    if (!el || el.nodeType !== 1 || isChoice(el)) return;
+    if (event.isTrusted && isEditable(el)) { fieldState(el); sendField(el); }
+  };
+
+  // Shadow roots abertos: cada um que aparece no composedPath de um evento que
+  // atravessa a fronteira (focusin, pointerdown, mousedown, keydown, beforeinput,
+  // input) ganha, uma vez só, ouvintes de change e focusout na fase de captura (o
+  // focusout entre dois campos do mesmo shadow root não chega à janela). Vale para
+  // os shadow roots declarativos e os criados antes deste script; nenhum método
+  // nativo é embrulhado.
+  const watchedRoots = new WeakSet();
+  const watchRoots = (event) => {
+    let path;
+    try { path = event.composedPath(); } catch (e) { return; }
+    for (const node of path) {
+      if (!node || node.nodeType !== 11 || !hostOf(node) || watchedRoots.has(node)) continue;
+      watchedRoots.add(node);
+      try {
+        node.addEventListener('change', onShadowChange, { capture: true, passive: true });
+        node.addEventListener('focusout', onFocusOut, { capture: true, passive: true });
+      } catch (e) { /* ignora */ }
+    }
+  };
+
   const SKIP_CLICK_TYPES = new Set(['checkbox', 'radio', 'file']);
   const onClick = (event) => {
     if (!event.isTrusted || event.button !== 0) return;
@@ -1009,6 +1083,13 @@
   };
 
   const opts = { capture: true, passive: true };
+  // Primeiro os shadow roots do caminho e o valor pendente de outro campo; depois a ação.
+  for (const type of ['focusin', 'pointerdown', 'mousedown', 'keydown', 'beforeinput', 'input']) {
+    W.addEventListener(type, watchRoots, opts);
+  }
+  for (const type of ['pointerdown', 'keydown', 'beforeinput']) {
+    W.addEventListener(type, flushShadowOthers, opts);
+  }
   W.addEventListener('beforeinput', onBeforeInput, opts);
   W.addEventListener('input', onInput, opts);
   W.addEventListener('keyup', onKeyFlag, opts);
@@ -1021,8 +1102,10 @@
   W.addEventListener('input', clearEditing, { capture: false, passive: true });
   W.addEventListener('pagehide', () => flushPending(null), opts);
   W.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushPending(null); }, opts);
-  // Shadow roots: só eventos que atravessam a fronteira (input, click, keydown,
-  // focusout), com o composedPath; nenhum método da página é embrulhado.
+  // Shadow roots: os eventos que atravessam a fronteira chegam à janela com o
+  // composedPath; o change e o focusout que ficam dentro de um shadow root aberto
+  // chegam pelos ouvintes que watchRoots põe nele. Nenhum método da página é
+  // embrulhado.
 
   Object.defineProperty(W, Symbol.for('rapa.recorder.stop'), {
     configurable: true,

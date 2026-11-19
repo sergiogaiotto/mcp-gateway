@@ -133,6 +133,11 @@ class ElementDescriptor(_Model):
     shadow_path: list[Annotated[str, Field(max_length=1000)]] | None = Field(
         default=None, max_length=16
     )
+    #: Número que o script dá a cada elemento do DOM, o mesmo em todos os eventos
+    #: dele e nunca o mesmo para dois elementos (None: gravação antiga, ou o script
+    #: não deu). Edições, marcações e escolhas só se juntam num passo com o mesmo
+    #: número.
+    serial: int | None = Field(default=None, ge=0)
     #: Texto visível (nunca o valor digitado num campo).
     text: str | None = Field(default=None, max_length=300)
     title: str | None = Field(default=None, max_length=300)

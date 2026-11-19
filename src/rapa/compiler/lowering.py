@@ -10,10 +10,12 @@ Regras principais:
   ``click.expect_navigation``; as digitadas viram ``navigate``; as feitas pela
   própria página (redirecionamentos) são ignoradas;
 - entradas seguidas no mesmo campo (a identidade de
-  ``rapa.recorder.sensitivity.field_key``, com os hospedeiros dos shadow roots e o
-  que a pessoa vê do campo), no mesmo documento, viram um ``fill`` com o valor
-  final; edições, marcações e escolhas de campos diferentes nunca se juntam, então
-  o alvo e o valor de um passo sempre vêm do mesmo campo; as requisições feitas
+  ``rapa.recorder.sensitivity.field_key``, com os hospedeiros dos shadow roots, o
+  que a pessoa vê do campo e o que vira localizador, como o ``data-testid``) e no
+  mesmo elemento (``same_element``: o número que o script dá a cada elemento, quando
+  a gravação tem), no mesmo documento, viram um ``fill`` com o valor final;
+  edições, marcações e escolhas de elementos diferentes nunca se juntam, então o
+  alvo e o valor de um passo sempre vêm do mesmo elemento; as requisições feitas
   enquanto a pessoa editava o campo, depois de cada edição e depois do Tab que
   deixa o campo contam no efeito do passo, como num salvamento automático;
 - campo de senha → ``SecretValue(field="password")`` de uma credencial por
@@ -101,6 +103,7 @@ from rapa.recorder.sensitivity import (
     looks_secret,
     password_by_name,
     requests_while_editing,
+    same_element,
     writes_in,
 )
 
@@ -519,16 +522,20 @@ class _Lowering:
         self.var_names.add(name)
         return name
 
-    def merge_target(self, key: tuple[Any, ...], kind: str, page_id: int) -> _Draft | None:
-        """O passo anterior, se for do mesmo campo (``field_key``), do mesmo tipo e documento.
+    def merge_target(
+        self, key: tuple[Any, ...], kind: str, page_id: int, element: ElementDescriptor
+    ) -> _Draft | None:
+        """O passo anterior, se for do mesmo campo (``field_key``), elemento, tipo e documento.
 
-        Só edições, marcações ou escolhas seguidas do mesmo elemento viram um passo
+        Só edições, marcações ou escolhas seguidas do mesmo elemento (o mesmo
+        ``serial`` do script, quando a gravação tem, ``same_element``) viram um passo
         só: o alvo e o valor do passo sempre vêm do mesmo campo.
         """
         last = self.drafts[-1] if self.drafts else None
         if (
             last is not None
             and last.field_key == key
+            and same_element(last.element, element)
             and last.step["kind"] == kind
             and last.load == self.loads.get(page_id, 0)
         ):
@@ -687,7 +694,7 @@ class _Lowering:
         else:
             value, secret_input = self.literal(event, key, label)
         masked = event.script_modified or (event.typed is not None and event.typed != event.value)
-        existing = self.merge_target(key, "fill", event.page_id)
+        existing = self.merge_target(key, "fill", event.page_id, event.element)
         if existing is not None:
             existing.step["value"] = value
             existing.step["sequential"] = bool(existing.step.get("sequential")) or masked
@@ -774,7 +781,7 @@ class _Lowering:
             self.warn(f"A opção escolhida em {quoted(element_label(element))} não tem rótulo.")
             return
         option = templates.escape(event.label)
-        existing = self.merge_target(key, "select", event.page_id)
+        existing = self.merge_target(key, "select", event.page_id, event.element)
         if existing is not None:
             existing.step["option"] = option
             existing.event_index = event.index
@@ -805,7 +812,7 @@ class _Lowering:
         key = _field_key(event)
         label = element_label(element)
         verb = "Marcar" if event.checked else "Desmarcar"
-        existing = self.merge_target(key, "check", event.page_id)
+        existing = self.merge_target(key, "check", event.page_id, event.element)
         if existing is not None:
             existing.step["checked"] = event.checked
             existing.step["title"] = f"{verb} {quoted(label)}"
