@@ -9,7 +9,7 @@ import sys
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -22,12 +22,13 @@ from sqlalchemy import text
 from rapa.control.auth import TokenVerifier
 from rapa.control.db import Database
 from rapa.control.mcp import McpGateway
-from rapa.control.services import PgPlatform
+from rapa.control.services import Dispatcher, PgPlatform, ReapReport
 from rapa.core.contracts import Forbidden, Role, VersionStatus
 from rapa.core.ids import new_id
 from rapa.server import (
     DispatcherSupervisor,
     ServerSettings,
+    _DispatcherHealth,
     create_server_app,
     dispatcher_pool_size,
     load_dev_tokens,
@@ -147,6 +148,10 @@ class FakeDispatcher:
         self.crashes = crashes
         self.runs = 0
         self.running = asyncio.Event()
+        # O que o supervisor lê do despachante de verdade para a saúde.
+        self.healthy = True
+        self.stalled = False
+        self.failing: dict[str, datetime] = {}
 
     async def run(self, stop: asyncio.Event) -> None:
         self.runs += 1
@@ -234,6 +239,74 @@ async def test_health_reports_a_stopped_dispatcher(monkeypatch: pytest.MonkeyPat
                 response = await client.get("/saude")
                 assert response.status_code == 200
                 assert response.json() == {"estado": "ok"}
+
+
+class _HangingQueue:
+    """Fila em que a criação de partições espera para sempre (trava no banco) ou falha."""
+
+    def __init__(self, *, hang: bool) -> None:
+        self.hang = hang
+        self.claims = 0
+
+    async def ensure_event_partitions(self, months_ahead: int = 2) -> int:
+        if self.hang:
+            await asyncio.Event().wait()
+        raise PermissionError("sem permissão para criar partição: detalhe interno")
+
+    async def reap_expired(self, *, now: Any = None, skip: Any = ()) -> ReapReport:
+        return ReapReport(requeued=[], indeterminate=[], failed=[])
+
+    async def claim_next(self, *, now: Any = None) -> None:
+        self.claims += 1
+        return None
+
+
+async def _never_launch(job: Any) -> dict[str, Any]:  # pragma: no cover - a fila está vazia
+    raise AssertionError("nada para lançar")
+
+
+@pytest.mark.parametrize("hang", [False, True], ids=["falha_sem_parar", "volta_presa"])
+async def test_health_reports_a_failing_or_stuck_dispatcher(hang: bool) -> None:
+    queue = _HangingQueue(hang=hang)
+    dispatcher = Dispatcher(
+        queue,  # type: ignore[arg-type]
+        _never_launch,
+        poll_interval=0.01,
+        unhealthy_after_s=0.1,
+    )
+    supervisor = DispatcherSupervisor(dispatcher)
+    inner = FastAPI()
+
+    @inner.get("/saude")
+    async def health() -> dict[str, str]:
+        return {"estado": "ok"}
+
+    app = _DispatcherHealth(inner, supervisor)
+    stop = asyncio.Event()
+    task = supervisor.start(stop)
+    try:
+        await _until(lambda: not supervisor.healthy)
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://t"
+        ) as client:
+            response = await client.get("/saude")
+        assert response.status_code == 503
+        body = response.json()
+        assert body["estado"] == "despachante_com_falha"
+        if hang:
+            # A manutenção não falhou, só não terminou: a volta presa é que acusa.
+            assert body == {"estado": "despachante_com_falha", "volta_presa": True}
+        else:
+            # Uma falha de manutenção não impede de pegar execuções da fila.
+            assert body == {"estado": "despachante_com_falha", "etapas": ["partitions"]}
+            assert queue.claims > 1
+        # Só nomes de etapas, nunca o texto do erro.
+        assert "detalhe interno" not in response.text
+    finally:
+        stop.set()
+        if hang:
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 JWT = {
@@ -330,6 +403,10 @@ class ScriptedDispatcher:
         self.runs = 0
         self.running = asyncio.Event()
         self.die = asyncio.Event()
+        # O que o supervisor lê do despachante de verdade para a saúde.
+        self.healthy = True
+        self.stalled = False
+        self.failing: dict[str, datetime] = {}
 
     async def run(self, stop: asyncio.Event) -> None:
         self.runs += 1

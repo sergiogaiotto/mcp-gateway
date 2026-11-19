@@ -700,3 +700,62 @@ async def test_launcher_reports_failures_before_the_worker_starts(tmp_path: Path
     assert [(r["state"], r["error_code"]) for r in queue.finished] == [
         ("failed", "executor_nao_iniciado")
     ]
+
+
+async def test_partition_lock_wait_does_not_stop_dispatch(
+    app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine
+) -> None:
+    """Criar a partição espera trava exclusiva atrás de uma transação longa: vira erro.
+
+    Sem o limite de espera, a manutenção ficaria parada (sem falhar) e, na fila de
+    travas, seguraria também as leituras de eventos de quem pega execuções.
+    """
+    await reset_queue(superuser_engine, total_slots=5)
+    platform = PgPlatform(app_db)
+    tenant = await make_tenant(app_db, "Trava da partição")
+    await publish(platform, tenant, notas())
+    async with superuser_engine.begin() as conn:
+        name = await conn.scalar(
+            text(
+                "SELECT 'run_events_' || to_char(date_trunc('month', now() AT TIME ZONE 'UTC')"
+                " + interval '2 month', 'YYYY_MM')"
+            )
+        )
+        await conn.execute(text(f'DROP TABLE IF EXISTS public."{name}"'))
+    run = await platform.start(tenant.operator, "baixar_notas", {}, RunTrigger.REST)
+
+    async def launch(job: RunnerJob) -> Mapping[str, Any]:
+        return result(job.run_id, job.attempt, outputs={"notas": []})
+
+    queue = PgRunQueue(dispatcher_db, maintenance_lock_timeout=timedelta(milliseconds=300))
+    dispatcher = Dispatcher(queue, launch, poll_interval=0.05, unhealthy_after_s=0.5)
+    blocker = await superuser_engine.connect()
+    transaction = await blocker.begin()
+    # Uma leitura de eventos numa transação aberta (relatório lento, pg_dump, sessão parada).
+    await blocker.execute(text("SELECT count(*) FROM run_events"))
+    stop = asyncio.Event()
+    loop = asyncio.create_task(dispatcher.run(stop))
+    try:
+        async with asyncio.timeout(10):
+            while True:
+                status = await platform.get(tenant.operator, run.run_id)
+                if status is not None and status.state is RunState.SUCCEEDED:
+                    break
+                await asyncio.sleep(0.05)
+        assert "partitions" in dispatcher.failing
+        await asyncio.sleep(0.6)  # mais que unhealthy_after_s, com a falha seguindo
+        assert not dispatcher.healthy
+    finally:
+        await transaction.rollback()
+        await blocker.close()
+        stop.set()
+        async with asyncio.timeout(10):
+            await loop
+    # Sem a trava, a partição sai na próxima tentativa e a saúde volta.
+    await dispatcher.maintenance()
+    assert "partitions" not in dispatcher.failing
+
+
+def test_maintenance_limits_must_be_positive(dispatcher_db: Database) -> None:
+    with pytest.raises(ValueError, match="positivos"):
+        PgRunQueue(dispatcher_db, maintenance_lock_timeout=timedelta(0))

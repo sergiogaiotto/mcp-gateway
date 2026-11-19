@@ -377,8 +377,22 @@ class DispatcherSupervisor:
 
     @property
     def healthy(self) -> bool:
-        """O despachante está rodando (não parou, nem espera para reiniciar)."""
-        return self._running and self._task is not None and not self._task.done()
+        """O despachante está rodando e nenhuma etapa do laço falha (ou trava) há tempo demais."""
+        running = self._running and self._task is not None and not self._task.done()
+        return running and self.dispatcher.healthy
+
+    @property
+    def problem(self) -> dict[str, Any]:
+        """O que ``/saude`` mostra quando não está saudável: só nomes, nunca o texto do erro."""
+        if not (self._running and self._task is not None and not self._task.done()):
+            return {"estado": "despachante_parado"}
+        detail: dict[str, Any] = {"estado": "despachante_com_falha"}
+        if self.dispatcher.stalled:
+            detail["volta_presa"] = True
+        failing = sorted(self.dispatcher.failing)
+        if failing:
+            detail["etapas"] = failing
+        return detail
 
     def start(self, stop: asyncio.Event) -> asyncio.Task[None]:
         """Começa a supervisionar; a tarefa termina quando ``stop`` é acionado.
@@ -442,7 +456,8 @@ async def _stop_dispatcher(stop: asyncio.Event, task: asyncio.Task[None]) -> Non
 
 
 class _DispatcherHealth:
-    """Faz ``/saude`` responder 503 enquanto o despachante deste processo estiver parado."""
+    """Faz ``/saude`` responder 503 enquanto o despachante deste processo estiver parado,
+    com uma etapa falhando há tempo demais ou com uma volta do laço presa."""
 
     def __init__(self, app: ASGIApp, supervisor: DispatcherSupervisor) -> None:
         self.app = app
@@ -451,7 +466,7 @@ class _DispatcherHealth:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http" and scope["path"] == "/saude" and not self.supervisor.healthy:
             response = JSONResponse(
-                {"estado": "despachante_parado"},
+                self.supervisor.problem,
                 status_code=503,
                 headers={"Cache-Control": "no-store"},
             )

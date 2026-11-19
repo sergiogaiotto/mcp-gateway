@@ -157,6 +157,8 @@ class Dispatcher:
         self._tasks: dict[asyncio.Task[None], RunnerJob] = {}
         self._steps = {name: _StepState() for name in _STEPS}
         self._wakeup = asyncio.Event()
+        #: Início da volta atual do laço (None antes de começar ou depois de parar).
+        self._loop_started: datetime | None = None
 
     @property
     def in_flight(self) -> int:
@@ -185,7 +187,22 @@ class Dispatcher:
         """
         limit = timedelta(seconds=self.unhealthy_after_s)
         now = self.clock()
+        if self.stalled:
+            return False
         return all(now - since < limit for since in self.failing.values())
+
+    @property
+    def stalled(self) -> bool:
+        """Uma volta do laço está presa há mais de ``unhealthy_after_s`` (mais o intervalo).
+
+        Pega o caso em que uma etapa não falha, mas também não termina (por
+        exemplo, esperando uma trava no banco): sem isto, a saúde seguiria boa.
+        """
+        started = self._loop_started
+        if started is None:
+            return False
+        limit = timedelta(seconds=self.unhealthy_after_s + self.poll_interval)
+        return self.clock() - started > limit
 
     def wake(self) -> None:
         """Acorda o laço antes do próximo intervalo (por exemplo, depois de enfileirar)."""
@@ -307,6 +324,7 @@ class Dispatcher:
         falha sempre não impede de pegar as execuções da fila.
         """
         while not stop.is_set():
+            self._loop_started = self.clock()
             try:
                 await self.maintenance()
             except Exception as exc:  # cada etapa já se protege; isto é só uma rede
@@ -318,6 +336,8 @@ class Dispatcher:
                 self._failed("claim", now, exc, backoff=False)
             else:
                 self._succeeded("claim", now)
+            # A espera entre as voltas não conta como volta presa.
+            self._loop_started = None
             self._wakeup.clear()
             waiters = [
                 asyncio.ensure_future(stop.wait()),

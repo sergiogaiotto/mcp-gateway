@@ -101,6 +101,10 @@ DEFAULT_LEASE = timedelta(seconds=60)
 DEFAULT_MAX_DURATION = timedelta(minutes=30)
 #: Quantas vezes uma execução pode perder a concessão antes de falhar de vez.
 DEFAULT_MAX_ATTEMPTS = 3
+#: Espera máxima por uma trava nas transações de manutenção.
+DEFAULT_MAINTENANCE_LOCK_TIMEOUT = timedelta(seconds=2)
+#: Duração máxima de um comando nas transações de manutenção.
+DEFAULT_MAINTENANCE_STATEMENT_TIMEOUT = timedelta(seconds=60)
 DISPATCHER_ACTOR = "despachante"
 
 _ACTIVE = (RunState.RUNNING.value, RunState.AWAITING_HUMAN.value)
@@ -813,13 +817,34 @@ class PgRunQueue:
         lease: timedelta = DEFAULT_LEASE,
         max_duration: timedelta = DEFAULT_MAX_DURATION,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        maintenance_lock_timeout: timedelta = DEFAULT_MAINTENANCE_LOCK_TIMEOUT,
+        maintenance_statement_timeout: timedelta = DEFAULT_MAINTENANCE_STATEMENT_TIMEOUT,
         clock: Callable[[], datetime] = now_utc,
     ) -> None:
+        """``maintenance_lock_timeout`` e ``maintenance_statement_timeout`` limitam as
+        transações de manutenção (partições e recolhimento): criar uma partição pede
+        trava exclusiva em ``run_events`` e, enquanto espera, enfileira atrás de si
+        as leituras e gravações de eventos. Com o limite, a espera vira erro, e o
+        despachante segue despachando e tenta a manutenção de novo mais tarde."""
+        if maintenance_lock_timeout <= timedelta(0) or maintenance_statement_timeout <= timedelta(
+            0
+        ):
+            raise ValueError("os limites de tempo da manutenção precisam ser positivos")
         self.db = db
         self.lease = lease
         self.max_duration = max_duration
         self.max_attempts = max_attempts
+        self.maintenance_lock_timeout = maintenance_lock_timeout
+        self.maintenance_statement_timeout = maintenance_statement_timeout
         self.clock = clock
+
+    async def _limit_maintenance(self, session: AsyncSession) -> None:
+        """Limita a espera por travas e a duração dos comandos desta transação."""
+        lock_ms = max(1, int(self.maintenance_lock_timeout.total_seconds() * 1000))
+        statement_ms = max(1, int(self.maintenance_statement_timeout.total_seconds() * 1000))
+        # SET não aceita parâmetros; os valores são inteiros calculados aqui.
+        await session.execute(text(f"SET LOCAL lock_timeout = {lock_ms}"))
+        await session.execute(text(f"SET LOCAL statement_timeout = {statement_ms}"))
 
     async def claim_next(self, *, now: datetime | None = None) -> RunnerJob | None:
         async with self.db.dispatcher_session() as session:
@@ -857,10 +882,12 @@ class PgRunQueue:
         self, *, now: datetime | None = None, skip: Collection[UUID] = ()
     ) -> ReapReport:
         async with self.db.dispatcher_session() as session:
+            await self._limit_maintenance(session)
             return await reap_expired(
                 session, now=now or self.clock(), max_attempts=self.max_attempts, skip=skip
             )
 
     async def ensure_event_partitions(self, months_ahead: int = 2) -> int:
         async with self.db.dispatcher_session() as session:
+            await self._limit_maintenance(session)
             return await ensure_event_partitions(session, months_ahead)
