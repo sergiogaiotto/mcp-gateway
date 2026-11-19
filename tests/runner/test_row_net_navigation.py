@@ -840,3 +840,187 @@ async def test_a_click_waiting_for_the_button_never_lands_on_another_page(
     assert result.error_code in (ErrorCode.ACAO_FALHOU, ErrorCode.ELEMENTO_AMBIGUO)
     assert len(outcome.of(RunEventKind.STEP_SUCCEEDED, "cancelar")) == 1
     assert_seq(outcome.events)
+
+
+# -- a página muda enquanto o clique espera o botão, ou na hora do clique -------------------
+
+
+def _spa_sides_app(server: _Server, *, disabled_ms: int) -> _App:
+    """Como em :func:`_sides_app`, mas /notas/a e /notas/c são a mesma aplicação de página
+    única: o botão lê o lado do endereço na hora do clique, e o popup da volta 0, 1,5 s
+    depois, leva a página que o abriu a /notas/a por ``pushState`` (o mesmo documento e os
+    mesmos nós, como numa renderização com chaves). Em /notas/c, o botão fica desabilitado
+    por ``disabled_ms``."""
+    relatorio = _page(
+        "<table aria-label='Notas'><thead><tr><th>numero</th><th>lado</th></tr></thead><tbody>"
+        "<tr><td>120</td><td>a</td></tr><tr><td>120</td><td>c</td></tr></tbody></table>"
+    )
+    script = (
+        "<script>const lado = location.pathname.split('/').pop();"
+        "if (lado === 'c') { const botao = document.getElementById('cancelar');"
+        f" botao.disabled = true; setTimeout(() => {{ botao.disabled = false; }}, {disabled_ms}); }}"
+        "</script>"
+    )
+    rows = (
+        "<tr><td>120</td><td><button id='cancelar' type='button' onclick=\"window.open("
+        "'/popup/cancelar?nota=120&lado=' + location.pathname.split('/').pop())\">Cancelar"
+        "</button></td></tr><tr><td>7</td><td><button type='button'>Cancelar</button></td></tr>"
+    )
+    notas = _page(_table(rows) + script)
+
+    def app(method: str, path: str, form: dict[str, list[str]]) -> tuple[int, dict[str, str], str]:
+        parts = urlsplit(path)
+        if parts.path == "/relatorio":
+            return 200, {}, relatorio
+        if parts.path == "/popup/cancelar":
+            lado = parse_qs(parts.query).get("lado", ["?"])[0]
+            server.writes.append(f"C120@{lado}")
+            back = (
+                "<script>setTimeout(() => { window.opener.history.pushState({}, '', '/notas/a'); "
+                "}, 1500);</script>"
+                if lado == "a"
+                else ""
+            )
+            return 200, {}, _page("<p>Cancelada</p>" + back)
+        if parts.path in ("/notas/a", "/notas/c"):
+            return 200, {}, notas
+        return 404, {}, "nada"
+
+    return app
+
+
+@pytest.mark.parametrize("effect", ["write", "irreversible"])
+async def test_a_click_waiting_for_the_button_never_acts_after_a_same_document_move(
+    run_robot: RobotRunner, server: _Server, effect: str
+) -> None:
+    # Em /notas/c, o botão fica desabilitado por 4 s; nesse meio tempo, o popup da volta 0
+    # muda o endereço da página para /notas/a sem trocar o documento nem o botão, que
+    # cancelaria de novo a nota 120 de /notas/a. A espera pelo botão vem antes da
+    # conferência da hora de agir, que vê a mudança e não age.
+    server.app = _spa_sides_app(server, disabled_ms=4_000)
+    outcome = await _run(run_robot, _sides_manifest(server.base, effect, 10_000))
+    result = outcome.result
+    assert server.writes == ["C120@a"], result.error_message  # nunca duas vezes
+    expected = RunState.INDETERMINATE if effect == "irreversible" else RunState.FAILED
+    assert result.state is expected, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO, result.error_message
+    assert result.failed_step_id == "cancelar"
+    assert "A página mudou" in (result.error_message or "")
+    assert len(outcome.of(RunEventKind.STEP_SUCCEEDED, "cancelar")) == 1
+    assert_seq(outcome.events)
+
+
+def _api_app(server: _Server, html: str) -> _App:
+    """Uma página só, em /notas; cada POST para /api é anotado com o corpo dele."""
+
+    def app(method: str, path: str, form: dict[str, list[str]]) -> tuple[int, dict[str, str], str]:
+        route = urlsplit(path).path
+        if route == "/notas":
+            return 200, {}, html
+        if route == "/api" and method == "POST":
+            server.writes.append(form["_corpo"][0])
+            return 200, {}, "ok"
+        return 404, {}, "nada"
+
+    return app
+
+
+def _cancel_120(base: str) -> Manifest:
+    cancel = _click("cancelar", "Cancelar", effect="write") | {"timeout_ms": 8_000}
+    cancel["target"] |= {"within": {"by": "role", "value": "row"}, "within_has_text": "120"}
+    return _manifest([_navigate(base, "/notas", "abrir"), cancel])
+
+
+# O "Cancelar" cancela a nota da linha em que está na hora do clique.
+_CANCELA_A_LINHA = (
+    "<button type='button' disabled onclick=\"fetch('/api', {method: 'POST', "
+    "body: 'C' + this.closest('tr').cells[0].textContent})\">Cancelar</button>"
+)
+# Enquanto os botões estão desabilitados, a página troca os números das linhas sem trocar os
+# nós (uma lista virtual que reaproveita as linhas).
+_LINHAS_TROCADAS = _page(
+    _table(
+        f"<tr><td>120</td><td>{_CANCELA_A_LINHA}</td></tr>"
+        f"<tr><td>7</td><td>{_CANCELA_A_LINHA}</td></tr>"
+    )
+    + "<script>setTimeout(() => { const cells = [...document.querySelectorAll('tbody tr')]"
+    ".map((row) => row.cells[0]); [cells[0].textContent, cells[1].textContent] = "
+    "[cells[1].textContent, cells[0].textContent]; }, 1500);"
+    "setTimeout(() => { document.querySelectorAll('button').forEach((b) => { "
+    "b.disabled = false; }); }, 3000);</script>"
+)
+# A linha 120 troca o botão desabilitado por outro nó (o mesmo botão montado de novo), que
+# depois fica habilitado.
+_BOTAO_MONTADO_DE_NOVO = _page(
+    _table(
+        "<tr><td>120</td><td id='celula'><button type='button' disabled>Cancelar</button></td>"
+        "</tr><tr><td>7</td><td><button type='button'>Cancelar</button></td></tr>"
+    )
+    + "<script>setTimeout(() => { document.getElementById('celula').innerHTML = "
+    "\"<button type='button' disabled onclick=\\\"fetch('/api', {method: 'POST', "
+    "body: 'C120'})\\\">Cancelar</button>\"; }, 1000);"
+    "setTimeout(() => { document.querySelector('#celula button').disabled = false; }, 2000);"
+    "</script>"
+)
+
+
+async def test_a_row_reused_in_place_while_the_click_waits_is_never_clicked(
+    run_robot: RobotRunner, server: _Server
+) -> None:
+    # O botão conferido continua na página, mas a linha dele passou a ser a da nota 7.
+    # Depois da espera pelo botão, a linha é conferida de novo: nada é cancelado.
+    server.app = _api_app(server, _LINHAS_TROCADAS)
+    outcome = await _run(run_robot, _cancel_120(server.base))
+    result = outcome.result
+    assert server.writes == [], result.error_message  # nunca a nota 7
+    assert result.state is RunState.FAILED
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO, result.error_message
+    assert result.failed_step_id == "cancelar"
+    assert_seq(outcome.events)
+
+
+async def test_a_button_mounted_again_in_the_same_row_is_checked_again_and_clicked(
+    run_robot: RobotRunner, server: _Server
+) -> None:
+    # O botão conferido saiu da página antes de qualquer clique, sem navegação: o alvo, a
+    # página, a linha e a rede são conferidos de novo, uma vez, e o clique vai para o botão
+    # novo da mesma linha.
+    server.app = _api_app(server, _BOTAO_MONTADO_DE_NOVO)
+    outcome = await _run(run_robot, _cancel_120(server.base))
+    result = outcome.result
+    assert result.state is RunState.SUCCEEDED, result.error_message
+    assert server.writes == ["C120"]
+    assert_seq(outcome.events)
+
+
+# Um ouvinte da página, na janela e antes do vigia do executor, muda a página no
+# ``pointerdown`` do clique: o endereço (``pushState``) ou os números das linhas.
+_NO_POINTERDOWN = {
+    "endereco": "history.pushState({}, '', '/notas/outra');",
+    "linha": "const cells = [...document.querySelectorAll('tbody tr')].map((row) => row.cells[0]);"
+    " [cells[0].textContent, cells[1].textContent] = [cells[1].textContent, cells[0].textContent];",
+}
+
+
+@pytest.mark.parametrize("change", list(_NO_POINTERDOWN))
+async def test_a_page_that_changes_in_the_moment_of_the_click_is_never_clicked(
+    run_robot: RobotRunner, server: _Server, change: str
+) -> None:
+    # Na hora do clique, depois de toda a conferência: o vigia vê o primeiro evento do
+    # clique já com outro endereço, ou com a linha do botão mostrando outra nota, e cancela
+    # o clique inteiro. Nada é cancelado no portal.
+    button = _CANCELA_A_LINHA.replace(" disabled", "")
+    html = _page(
+        _table(f"<tr><td>120</td><td>{button}</td></tr><tr><td>7</td><td>{button}</td></tr>")
+        + "<script>let feito = false; window.addEventListener('pointerdown', () => {"
+        f" if (feito) return; feito = true; {_NO_POINTERDOWN[change]} }}, true);</script>"
+    )
+    server.app = _api_app(server, html)
+    outcome = await _run(run_robot, _cancel_120(server.base))
+    result = outcome.result
+    assert server.writes == [], result.error_message
+    assert result.state is RunState.FAILED
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO, result.error_message
+    assert result.failed_step_id == "cancelar"
+    assert "A página mudou" in (result.error_message or "")
+    assert_seq(outcome.events)

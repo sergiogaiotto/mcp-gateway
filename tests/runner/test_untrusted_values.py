@@ -6,6 +6,7 @@ de teste que não precisa de servidor.
 """
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -3490,3 +3491,221 @@ async def test_field_the_page_keeps_rewriting_fails_closed(run_robot: RobotRunne
     assert page.log == ""  # nada foi gravado
     assert page.values == {"codigo": "xyzzy42-2"}  # digitado duas vezes, e só duas
     assert "xyzzy42" not in outcome.dump()
+
+
+# Campos que o navegador ou a página guardam de outro jeito: máscaras de CPF e de moeda, um
+# e-mail com espaços nas pontas, um texto com \r\n numa caixa de texto e espaços repetidos num
+# elemento editável; um campo com maxlength e um que a página põe em maiúsculas. O "Gravar"
+# mostra em #log, em JSON, o valor de cada um.
+_FORMATADOS = (
+    """<!doctype html><meta charset="utf-8"><title>Cadastro</title>
+<label>CPF <input name="cpf"></label>
+<label>Valor <input name="valor"></label>
+<label>Email <input name="email" type="email"></label>
+<label>Obs <textarea name="obs"></textarea></label>
+<div contenteditable="true" role="textbox" aria-label="Editor"></div>
+<label>Curto <input name="curto" maxlength="5"></label>
+<label>Nome <input name="nome"></label>
+<button onclick="const campo = (nome) => document.querySelector('[name=' + nome + ']').value;
+  document.getElementById('log').textContent = JSON.stringify({cpf: campo('cpf'),
+  valor: campo('valor'), email: campo('email'), obs: campo('obs'), curto: campo('curto'),
+  nome: campo('nome'), editor: document.querySelector('[contenteditable]').innerText})">
+Gravar</button>
+<p id="log"></p>
+<script>"""
+    + _MASCARAS.split("<script>", 1)[1].split("</script>", 1)[0]
+    + """
+const nome = document.querySelector('[name=nome]');
+nome.addEventListener('input', () => { nome.value = nome.value.toUpperCase(); });
+</script>"""
+)
+
+_EDITOR = {"by": "role", "value": "textbox", "name": "Editor", "exact": True}
+
+
+def _digitar_formatado(field: str, label: str, text: str, sequential: bool) -> dict[str, Any]:
+    step = _digitar("digitar", label, text, effect="write", sequential=sequential)
+    if field == "editor":
+        step["target"] = _target("editor", _EDITOR)
+    return step
+
+
+@pytest.mark.parametrize(
+    ("field", "label", "text", "sequential", "expected"),
+    [
+        ("cpf", "CPF", "52998224725", False, "529.982.247-25"),
+        ("cpf", "CPF", "52998224725", True, "529.982.247-25"),
+        ("valor", "Valor", "123456", False, "R$ 1.234,56"),
+        ("email", "Email", " a@b.com ", False, "a@b.com"),
+        ("obs", "Obs", "um\r\ndois", False, "um\ndois"),
+        ("editor", "Editor", "Olá  mundo", False, None),
+    ],
+    ids=["cpf", "cpf_tecla_a_tecla", "moeda", "email", "obs_crlf", "editavel"],
+)
+async def test_field_formatted_by_the_browser_or_a_mask_is_accepted_in_a_step_that_writes(
+    run_robot: RobotRunner,
+    field: str,
+    label: str,
+    text: str,
+    sequential: bool,
+    expected: str | None,
+) -> None:
+    # Num passo que grava, o texto não é digitado de novo; o campo vale se tem o texto como o
+    # navegador o guarda (uma cópia do campo com o texto), com os brancos normalizados num
+    # elemento editável, ou com a máscara da página num texto sem letras.
+    manifest = _manifest(
+        [
+            _open("/cadastro"),
+            _digitar_formatado(field, label, text, sequential),
+            _clicar("gravar", "Gravar"),
+        ]
+    )
+    page = _Page()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/cadastro": _FORMATADOS}), after_run=page
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert page.log is not None
+    saved = json.loads(page.log)[field]
+    if expected is None:
+        assert saved.split() == ["Olá", "mundo"]
+    else:
+        assert saved == expected
+
+
+@pytest.mark.parametrize(
+    ("label", "text"), [("Curto", "abcdefgh"), ("Nome", "maria")], ids=["maxlength", "letras"]
+)
+async def test_field_changed_beyond_formatting_fails_closed_in_a_step_that_writes(
+    run_robot: RobotRunner, label: str, text: str
+) -> None:
+    # O maxlength cortou o texto, ou a página trocou as letras: o campo não tem o que o robô
+    # digitou, e o passo falha sem gravar e sem mostrar o valor.
+    manifest = _manifest(
+        [
+            _open("/cadastro"),
+            _digitar("digitar", label, text, effect="write"),
+            _clicar("gravar", "Gravar"),
+        ]
+    )
+    page = _Page()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/cadastro": _FORMATADOS}), after_run=page
+    )
+    result = outcome.result
+    assert result.state is RunState.FAILED
+    assert result.error_code == ErrorCode.ACAO_FALHOU
+    assert result.failed_step_id == "digitar"
+    assert page.log == ""  # nada foi gravado
+    dump = outcome.dump().lower()
+    assert text[:5] not in dump
+
+
+# -- o campo digitado continua com o texto até a gravação ----------------------------------
+
+
+def _cep_assincrono(delay_ms: int) -> str:
+    """O CEP preenche o logradouro ``delay_ms`` depois do ``change`` (uma consulta), e o aviso
+    de endereço conferido aparece 600 ms depois; o "Salvar" mostra o logradouro em #log."""
+    return f"""<!doctype html><meta charset="utf-8"><title>Endereço</title>
+<label>CEP <input name="cep"></label>
+<label>Logradouro <input name="logradouro"></label>
+<label>Número <input name="numero"></label>
+<p id="conferido" hidden>Endereço conferido</p>
+<button onclick="document.getElementById('log').textContent +=
+  document.querySelector('[name=logradouro]').value + '|'">Salvar</button>
+<p id="log"></p>
+<script>
+document.querySelector('[name=cep]').addEventListener('change', () => {{
+  setTimeout(() => {{
+    document.querySelector('[name=logradouro]').value = 'Rua do CEP';
+  }}, {delay_ms});
+  setTimeout(() => {{ document.getElementById('conferido').hidden = false; }}, 600);
+}});
+</script>"""
+
+
+@pytest.mark.parametrize("delay_ms", [40, 150])
+async def test_field_the_page_fills_later_is_checked_again_before_the_step_that_writes(
+    run_robot: RobotRunner, delay_ms: int
+) -> None:
+    # O logradouro foi conferido logo depois de digitado; a consulta do CEP o troca depois.
+    # Antes do "Salvar", que grava, os campos digitados são lidos de novo: o passo falha sem
+    # agir, e nada que a pessoa não digitou é enviado. (Se a página trocar o campo antes da
+    # conferência da digitação, o texto é digitado de novo e o "Salvar" envia o texto.)
+    manifest = _manifest(
+        [
+            _open("/endereco"),
+            _digitar("digitar_cep", "CEP", "01001000"),
+            _digitar("digitar_logradouro", "Logradouro", "Praça da Sé"),
+            _digitar("digitar_numero", "Número", "100"),
+            {
+                "kind": "wait_for",
+                "id": "esperar",
+                "title": "Esperar a conferência do endereço",
+                "target": _target(
+                    "aviso", {"by": "text", "value": "Endereço conferido", "exact": True}
+                ),
+                "timeout_ms": 5_000,
+            },
+            _clicar("salvar", "Salvar"),
+        ]
+    )
+    page = _Page()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/endereco": _cep_assincrono(delay_ms)}), after_run=page
+    )
+    result = outcome.result
+    assert page.log in ("", "Praça da Sé|"), page.log  # nunca 'Rua do CEP'
+    if delay_ms == 150 or page.log == "":
+        assert result.state is RunState.FAILED, result.error_message
+        assert result.error_code == ErrorCode.ACAO_FALHOU
+        assert result.failed_step_id == "salvar"
+        assert page.log == ""
+        assert "campo Logradouro" in (result.error_message or "")
+        assert outcome.of(RunEventKind.STEP_FAILED, "salvar")[0].data["alvo"] == "campo Logradouro"
+    else:
+        assert result.state is RunState.SUCCEEDED, result.error_message
+    dump = outcome.dump()
+    assert "Praça" not in dump
+    assert "Rua do CEP" not in dump
+
+
+_VALOR_NO_BLUR = """<!doctype html><meta charset="utf-8"><title>Pagamento</title>
+<label>Valor <input name="valor"></label>
+<label>Descrição <input name="descricao"></label>
+<button onclick="document.getElementById('log').textContent +=
+  document.querySelector('[name=valor]').value + '|'">Salvar</button>
+<p id="log"></p>
+<script>
+const valor = document.querySelector('[name=valor]');
+valor.addEventListener('blur', () => {
+  const d = valor.value.replace(/\\D/g, '').replace(/^0+/, '').padStart(3, '0');
+  const inteiro = d.slice(0, -2).replace(/\\B(?=(\\d{3})+(?!\\d))/g, '.');
+  valor.value = 'R$ ' + inteiro + ',' + d.slice(-2);
+});
+</script>"""
+
+
+@pytest.mark.parametrize("effect", ["read", "write"])
+async def test_field_masked_when_it_loses_focus_still_holds_before_the_step_that_writes(
+    run_robot: RobotRunner, effect: str
+) -> None:
+    # A página só formata o valor quando o foco sai do campo: na conferência antes do
+    # "Salvar", o valor tem os mesmos dígitos que o texto, e vale. O valor digitado de novo
+    # vale pela última digitação.
+    manifest = _manifest(
+        [
+            _open("/pagamento"),
+            _digitar("digitar_valor_antes", "Valor", "999", effect=effect),
+            _digitar("digitar_valor", "Valor", "123456", effect=effect),
+            _digitar("digitar_descricao", "Descrição", "Aluguel", effect=effect),
+            _clicar("salvar", "Salvar"),
+        ]
+    )
+    page = _Page()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/pagamento": _VALOR_NO_BLUR}), after_run=page
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert page.log == "R$ 1.234,56|"

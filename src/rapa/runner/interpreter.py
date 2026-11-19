@@ -20,7 +20,10 @@ principais:
   passou durante ela, o passo falha sem agir. Depois da confirmação do aviso de
   passo irreversível, a página pode ter mudado: o alvo, a linha única e a rede
   contra ações repetidas são conferidos de novo, na mesma página da primeira
-  conferência, e o passo falha sem agir se a página for outra. Qualquer falha
+  conferência, e o passo falha sem agir se a página for outra. Uma página que sai
+  e volta durante essa espera (vai a outro endereço e volta ao mesmo) também é
+  recusada (perda de disponibilidade aceita): a volta não foi o ``navigate`` do
+  robô e conta como da ação anterior na mesma linha. Qualquer falha
   depois do aviso de passo irreversível e dessa conferência deixa a execução
   "indeterminada", nunca "falhou". Um
   contêiner (``for_each``, ``if``) não age e nunca se anuncia como gravação (o
@@ -32,23 +35,59 @@ principais:
   gravação. O efeito de cada passo é o mesmo em tudo: no anúncio, na rede contra
   ações repetidas, nos localizadores alternativos e na conferência antes do
   primeiro passo;
-- um passo que grava (``write`` ou ``irreversible``) age no elemento conferido,
-  e não no que o localizador encontrar na hora de agir: o do Playwright procura
-  de novo, no documento que estiver carregado, enquanto espera o elemento ficar
-  habilitado, e cairia na mesma linha de outra página. Se a página principal
-  muda de endereço ou de documento entre a conferência e a ação, o passo falha
-  com ``elemento_ambiguo`` sem agir; se ela navega ou troca o elemento depois, o
-  elemento deixa de existir e a ação falha (``acao_falhou``) sem cair em outro
-  (uma linha que a página monta de novo nesse meio tempo também falha fechado);
+- um passo que grava (``write`` ou ``irreversible``) e age num elemento age no
+  elemento conferido, e não no que o localizador encontrar na hora de agir: o do
+  Playwright procura de novo, no documento que estiver carregado, enquanto
+  espera o elemento ficar habilitado, e cairia na mesma linha de outra página. A
+  espera pelo elemento (visível, habilitado e parado; editável para digitar; a
+  opção na lista) vem antes, sem mandar nenhuma entrada à página (o clique de
+  teste do Playwright manda os eventos do mouse); depois dela, na hora de agir,
+  são conferidos de novo o contador de navegações da página principal (que conta
+  as de outro documento e as do mesmo documento: ``pushState``,
+  ``replaceState``, ``#``), a página e, numa linha escolhida pelo texto, que ela
+  ainda é a única com ele e que o elemento conferido ainda está nela (uma lista
+  que reaproveita a linha no lugar, com outro texto, é vista). A ação vai em
+  seguida, sem nova espera; antes dela, um vigia na fase de captura da janela
+  confere o primeiro evento da ação: se ele não cai no alvo (o botão ou link em
+  volta dele, num clique; o campo, ao digitar), se o endereço mudou ou se a linha
+  já não tem a chave, o evento e os seguintes da ação são cancelados e o passo
+  falha. Uma mudança de endereço (também no mesmo documento) ou de linha falha com
+  ``elemento_ambiguo``, e nada é feito; se a página troca de documento durante a
+  espera, o elemento sai da página e o passo falha com ``acao_falhou``. Um
+  elemento que sai da página durante a espera sem navegação (o botão montado de
+  novo na mesma linha) leva a uma nova conferência completa (alvo, página,
+  contador, rede e linha única), uma vez; na segunda vez, o passo falha
+  (``acao_falhou``). Ficam de fora (resíduos conhecidos) os shadow roots fechados,
+  a chave que só o CSS mostra, uma lista virtual que troca o que a linha é sem
+  trocar o texto dela e um ouvinte da própria página, na janela, posto antes do
+  vigia. Perdas de disponibilidade aceitas: qualquer mudança de endereço da
+  página principal entre a conferência do alvo e a ação (também um filtro que
+  muda a consulta do endereço), e uma tecla para um elemento que não recebe o
+  foco. Um segredo vai para o elemento em que a origem foi conferida, sem o
+  vigia;
 - depois de digitar um texto (``fill``, não um segredo), o valor do campo é
   conferido: se a página o mudou (o CEP que preenche o logradouro quando o foco
   sai dele, e o texto iria para o fim do que ela pôs), o texto é digitado de
   novo, e vale se o campo ficar com ele ou exatamente com o que ficou da
   primeira vez (a formatação da própria página, como uma máscara de CPF);
-  senão, o passo falha. Num passo que grava, nada que gravou é repetido: o
-  campo com outro valor faz o passo falhar sem digitar de novo. Os valores do
-  campo nunca vão para eventos nem mensagens. Uma mudança que a página faz
-  depois, sozinha (num temporizador), não é vista;
+  senão, o passo falha. Num passo que grava, nada que gravou é repetido: sem
+  digitar de novo, vale o texto como o navegador o guarda (posto numa cópia solta
+  do campo: ``\\r\\n`` vira ``\\n``, um e-mail ou endereço perde os espaços das
+  pontas), com os brancos e o espaço rígido normalizados num elemento editável,
+  ou, num texto sem letras, com os mesmos dígitos na mesma ordem (a máscara de
+  CPF, CNPJ, CEP, telefone, moeda ou data); qualquer outra diferença (o
+  ``maxlength`` que cortou o texto, uma página que troca letras) faz o passo
+  falhar. Os campos de texto digitados desde a última navegação da página
+  principal (também ``pushState``) são lidos de novo antes de cada passo que
+  grava e age na página: se a página mudou algum depois (uma consulta de CEP que
+  responde depois da conferência), o passo falha com ``acao_falhou`` sem agir.
+  Vale o valor da conferência da digitação ou a mesma regra de comparação (uma
+  máscara que a página só põe quando o foco sai do campo vale); o campo digitado
+  de novo vale pela última vez, e o que saiu da página deixa de contar. Perda de
+  disponibilidade aceita: um campo digitado antes que a página muda depois de uma
+  gravação (limpa ou formata com letras), sem o robô digitar de novo, faz a
+  próxima gravação no mesmo documento falhar. Os valores do campo nunca vão para
+  eventos nem mensagens;
 - valores de entradas, variáveis e itens nunca mudam o alvo de um passo: não
   entram em seletores CSS/XPath, cada um vira um único trecho codificado do
   endereço (no caminho e na rota depois do ``#``, sem barras, sem ``%`` e nunca
@@ -148,6 +187,7 @@ from playwright.async_api import (
     ElementHandle,
     Frame,
     FrameLocator,
+    JSHandle,
     Page,
     Request,
     Route,
@@ -294,6 +334,87 @@ _claimed_contexts: weakref.WeakSet[BrowserContext] = weakref.WeakSet()
 # O texto de um campo que é um elemento editável (``contenteditable``), cujo valor é o
 # texto mostrado; ``null`` nos outros campos.
 _EDITABLE_TEXT_JS = "(element) => (element.isContentEditable === true ? element.innerText : null)"
+
+#: Fora dos dígitos ASCII (a máscara de um campo só muda o resto).
+_NOT_DIGIT = re.compile(r"[^0-9]")
+
+# O campo de um elemento como o Playwright o encontra para digitar ou ler o valor
+# (``retarget`` com ``follow-label``): um rótulo leva ao campo dele.
+_FIELD_OF_FN = r"""
+const fieldOf = (element) => {
+  let field = element;
+  if (!field.matches('input, textarea, select') && !field.isContentEditable) {
+    field = field.closest('button, [role=button], [role=checkbox], [role=radio]') || field;
+  }
+  if (!field.matches('a, input, textarea, button, select, option, optgroup, [role=link], '
+      + '[role=button], [role=checkbox], [role=radio]') && !field.isContentEditable) {
+    const label = field.closest('label');
+    if (label && label.control) field = label.control;
+  }
+  return field;
+};
+"""
+
+# [valor do campo, se ele é um elemento editável, o valor que o navegador dá ao texto]: o
+# texto posto numa cópia solta do campo (``cloneNode``), que o navegador guarda como guardaria
+# no campo (``\r\n`` vira ``\n``, um e-mail ou endereço perde os espaços das pontas). O
+# ``maxlength`` só limita o que se digita, não o que um script põe: a cópia fica com o
+# texto inteiro.
+_FIELD_STATE_FN = (
+    _FIELD_OF_FN
+    + r"""
+const fieldState = (element, text) => {
+  if (element.isContentEditable === true) return [element.innerText, true, null];
+  const field = fieldOf(element);
+  if (!(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement
+      || field instanceof HTMLSelectElement)) {
+    return [null, false, null];
+  }
+  let browser = null;
+  if (!(field instanceof HTMLSelectElement)) {
+    try {
+      const copy = field.cloneNode(false);
+      copy.value = text;
+      browser = copy.value;
+    } catch (error) {
+      browser = null;
+    }
+  }
+  return [field.value, false, browser];
+};
+"""
+)
+_TYPED_STATE_JS = "(element, text) => {" + _FIELD_STATE_FN + "return fieldState(element, text);}"
+# Os campos de texto já digitados (:meth:`Interpreter._typed_fields_hold`), cada um com o
+# estado de :data:`_TYPED_STATE_JS`: ``null`` se saiu da página, ``'mesmo'`` se é o campo em
+# que o passo vai digitar agora.
+_TYPED_FIELD_JS = (
+    "(element, [text, current]) => {"
+    + _FIELD_STATE_FN
+    + "if (element === current) return 'mesmo';"
+    + "return element.isConnected ? fieldState(element, text) : null;}"
+)
+_TYPED_FIELDS_JS = (
+    "(_, [fields, texts, current]) => {"
+    + _FIELD_STATE_FN
+    + "return fields.map((element, index) => (element === current ? 'mesmo'"
+    + " : element.isConnected ? fieldState(element, texts[index]) : null));}"
+)
+_SAME_ELEMENTS_JS = "(element, others) => others.map((other) => other === element)"
+_SAME_ELEMENT_JS = "(element, other) => element === other"
+# Se a lista já tem a opção pelo rótulo, como o Playwright a escolhe (o rótulo exato ou com
+# os brancos normalizados). Num elemento que não é uma lista, o próprio Playwright dá o erro.
+_HAS_OPTION_JS = (
+    "(element, label) => {"
+    + _FIELD_OF_FN
+    + r"""
+const select = fieldOf(element);
+if (!(select instanceof HTMLSelectElement)) return true;
+const normalize = (text) => text.replace(/[​­]/g, '').trim().replace(/\s+/g, ' ');
+return Array.from(select.options).some(
+  (option) => option.label === label || normalize(option.label) === normalize(label));
+}"""
+)
 
 # Lê as linhas de dados de uma tabela HTML (ou de uma grade ARIA), já com o
 # texto de cada célula aparado. Uma ida e volta ao navegador por tabela.
@@ -509,6 +630,110 @@ _OTHER_ROWS_SHOWING_KEY_JS = r"""
 }
 """
 
+# Na hora de agir: a contagem de :data:`_OTHER_ROWS_SHOWING_KEY_JS`, se o elemento conferido
+# ainda está dentro do contêiner escolhido; -1 se não está (a página pôs outro texto na linha
+# dele, ou o levou para outra linha).
+_PINNED_ROW_JS = (
+    "(rows, [key, chosen, element]) => {"
+    " for (let at = element; at; at = at.parentNode ?? at.host) {"
+    "  if (at === chosen) return (" + _OTHER_ROWS_SHOWING_KEY_JS.strip() + ")(rows, [key, chosen]);"
+    " }"
+    " return -1;"
+    "}"
+)
+
+# O vigia de um passo que grava, posto na janela do elemento conferido logo antes de agir:
+# um ouvinte na fase de captura que decide no primeiro evento da ação (o do mouse, de
+# qualquer elemento; o do teclado ou da digitação, também sintético quando é no alvo; o
+# ``change`` só no alvo, porque o de outro campo que perde o foco não é da ação). O evento
+# vale se cai no alvo (o elemento, ou o botão ou link em volta dele num clique, como o
+# Playwright confere), com o mesmo endereço da conferência e, numa linha escolhida pelo
+# texto, com o elemento ainda dentro dela e a chave ainda no texto do HTML dela. Então o vigia
+# sai. Senão, ele cancela esse evento e todos os seguintes da ação (``preventDefault`` e
+# ``stopImmediatePropagation``) e marca a recusa, que o executor lê depois de agir.
+_DISPATCH_GUARD_JS = (
+    "(element, [kind, row, key]) => {"
+    + _FIELD_OF_FN
+    + r"""
+const view = element.ownerDocument.defaultView;
+const topHref = () => {
+  try {
+    return view.top.location.href;
+  } catch (error) {
+    return null;
+  }
+};
+const href = view.location.href;
+const top = topHref();
+let target = element;
+if (kind === 'clique') {
+  if (!target.matches('input, textarea, select') && !target.isContentEditable) {
+    target = target.closest('button, [role=button], a, [role=link]') || target;
+  }
+} else if (kind !== 'tecla') {
+  target = fieldOf(element);
+  while (kind === 'texto' && target.isContentEditable && target.parentElement
+      && target.parentElement.isContentEditable) {
+    target = target.parentElement;
+  }
+}
+const normalize = (text) => text.replace(/[​­]/g, '').replace(/\s+/g, ' ').trim();
+const skipped = new Set(['SCRIPT', 'NOSCRIPT', 'STYLE']);
+const buttons = new Set(['submit', 'button', 'reset']);
+const htmlText = (node) => {
+  if (node.nodeType === 1 && skipped.has(node.nodeName)) return '';
+  if (node instanceof HTMLInputElement && buttons.has(node.type)) return node.value;
+  let text = '';
+  for (let child = node.firstChild; child; child = child.nextSibling) {
+    if (child.nodeType === 3) text += child.nodeValue ?? '';
+    else if (child.nodeType === 1) text += htmlText(child);
+  }
+  if (node.shadowRoot) text += htmlText(node.shadowRoot);
+  return text;
+};
+const moved = () => {
+  if (view.location.href !== href) return true;
+  if (top === null) return false;
+  const now = topHref();
+  return now === null || now !== top;
+};
+const inRow = () => {
+  if (!row) return true;
+  let at = element;
+  while (at && at !== row) at = at.parentNode ?? at.host;
+  return at === row && normalize(htmlText(row)).includes(key);
+};
+const types = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'keydown',
+  'keypress', 'keyup', 'beforeinput', 'input', 'change'];
+let state = 'armado';
+const off = () => {
+  for (const type of types) view.removeEventListener(type, listener, true);
+};
+const listener = (event) => {
+  if (state === 'passou') return;
+  if (state === 'armado') {
+    const onTarget = event.composedPath().includes(target);
+    if (!onTarget && (event.type === 'change' || !event.isTrusted)) return;
+    if (onTarget && !moved() && inRow()) {
+      state = 'passou';
+      off();
+      return;
+    }
+    state = 'recusou';
+  }
+  event.preventDefault();
+  event.stopImmediatePropagation();
+};
+for (const type of types) view.addEventListener(type, listener, true);
+return {
+  stop: () => {
+    off();
+    return state === 'recusou';
+  },
+};
+}"""
+)
+
 
 class _StopBeforeWrite(Exception):
     def __init__(self, step: Step) -> None:
@@ -653,8 +878,44 @@ class _ListLoop:
             self.traces[index] = None
 
 
+class _Typed(NamedTuple):
+    """Um campo em que o robô digitou um texto, para conferir antes de gravar.
+
+    ``accepted`` é o valor que o campo tinha quando a digitação foi aceita; ``intent`` e
+    ``title`` vêm do robô (nunca valores), para a mensagem.
+    """
+
+    handle: ElementHandle
+    text: str
+    accepted: str
+    intent: str
+    title: str
+
+
+def _typed_value_matches(text: str, value: str, *, editable: bool, browser: str | None) -> bool:
+    """Se o campo tem o texto que o robô digitou, como o navegador ou a página o guardam.
+
+    Vale o próprio texto; num ``input`` ou ``textarea``, o valor que o navegador dá a ele
+    (``browser``, de :data:`_TYPED_STATE_JS`: ``\\r\\n`` vira ``\\n``, um e-mail ou
+    endereço perde os espaços das pontas); num elemento editável, o texto com os brancos
+    (e o espaço rígido) normalizados; e, num texto sem letras, a máscara da página: os
+    mesmos dígitos, na mesma ordem (CPF, CNPJ, CEP, telefone, moeda, datas). Qualquer outra
+    diferença não vale: o ``maxlength`` que cortou o texto, uma página que troca letras.
+    """
+    if value == text or (browser is not None and value == browser):
+        return True
+    if editable and value.split() == text.split():
+        return True
+    digits = _NOT_DIGIT.sub("", text)
+    return (
+        bool(digits)
+        and not any(char.isalpha() for char in text)
+        and _NOT_DIGIT.sub("", value) == digits
+    )
+
+
 class _StepCtx:
-    __slots__ = ("checked_at", "deadline", "element", "locator", "step")
+    __slots__ = ("checked_at", "deadline", "element", "guard", "locator", "step")
 
     def __init__(self, step: Step, deadline: float) -> None:
         self.step = step
@@ -666,6 +927,8 @@ class _StepCtx:
         #: O elemento conferido, num passo que grava: a ação vai para ele, e não para o
         #: que o localizador encontrar na hora (ver :meth:`Interpreter._confirm_target`).
         self.element: ElementHandle | None = None
+        #: O vigia posto na página logo antes de agir (:meth:`Interpreter._arm_guard`).
+        self.guard: JSHandle | None = None
 
     def remaining_ms(self) -> float:
         """Tempo que resta ao passo, em ms (nunca 0, que no Playwright é 'sem limite')."""
@@ -1197,6 +1460,10 @@ class Interpreter:
         #: Quantas vezes a página principal mudou de documento ou de endereço (ver
         #: :meth:`_confirm_target`).
         self._main_frame_changes = 0
+        #: Os campos de texto digitados desde a última navegação da página principal
+        #: (:meth:`_typed_fields_hold`), e os de antes dela, ainda por descartar.
+        self._typed: list[_Typed] = []
+        self._typed_gone: list[ElementHandle] = []
         #: A página (:func:`_page_key`) que o passo ``navigate`` em andamento abre, e os
         #: pedidos dele: o primeiro para essa página e os redirecionamentos desse.
         self._robot_navigation: str | None = None
@@ -1380,10 +1647,15 @@ class Interpreter:
         """A página principal mudou de endereço (inclusive sem pedido, por ``pushState``).
 
         Onde o passo ``navigate`` do robô para não conta nas voltas que já acabaram
-        (:meth:`_on_request`); qualquer outro endereço conta.
+        (:meth:`_on_request`); qualquer outro endereço conta. Os campos digitados até aqui
+        deixam de ser conferidos antes de gravar (:meth:`_typed_fields_hold`).
         """
         if frame.parent_frame is None:
             self._main_frame_changes += 1
+            if self._typed:
+                # Uma lista nova: quem está lendo a antiga (num ``await``) segue com ela.
+                self._typed_gone.extend(entry.handle for entry in self._typed)
+                self._typed = []
             robot = self._robot_navigation is not None and _page_key(frame.url) in {
                 self._robot_navigation,
                 *(_page_key(request.url) for request in self._robot_requests),
@@ -2245,6 +2517,8 @@ class Interpreter:
                                 # Onde ela parou (só nas voltas dela: não é uma navegação).
                                 self._visit(self.page.url)
                     finally:
+                        # O vigia que sobrou de um passo que falhou antes de agir sai da página.
+                        await self._guard_refused(ctx)
                         if ctx.element is not None:
                             await self._dispose(ctx.element)
                 self._check_page_domain(step)
@@ -2486,9 +2760,9 @@ class Interpreter:
                 async with navigation_owner.expect_navigation(
                     timeout=ctx.remaining_ms(), wait_until="load"
                 ):
-                    await self._on(ctx, locator).click(timeout=ctx.remaining_ms())
+                    await self._act_on(step, ctx, locator, lambda on, kw: on.click(**kw))
             else:
-                await self._on(ctx, locator).click(timeout=ctx.remaining_ms())
+                await self._act_on(step, ctx, locator, lambda on, kw: on.click(**kw))
             return {}
 
         return act
@@ -2501,17 +2775,26 @@ class Interpreter:
             writes = self._effect(step) is not Effect.READ
 
             async def act_text() -> dict[str, Any]:
-                await self._type(step, ctx, locator, text)
-                first = await self._field_value(ctx, locator)
-                if first != text:
+                if ctx.element is None:
+                    await self._type(step, ctx, locator, text)
+                else:
+                    await self._dispatched(step, ctx, self._type(step, ctx, locator, text))
+                value = await self._field_value(ctx, locator)
+                if value != text:
                     # A página mudou o campo (o CEP que preenche o logradouro quando o
                     # foco sai dele, e o texto digitado ficaria no fim do que ela pôs, ou
-                    # uma máscara). Num passo que grava, nada que gravou é repetido.
+                    # uma máscara). Num passo que grava, nada que gravou é repetido: vale
+                    # o texto como o navegador ou a máscara da página o guardam.
                     if writes:
-                        raise self._field_changed(step)
-                    await self._type(step, ctx, locator, text)
-                    if await self._field_value(ctx, locator) not in (text, first):
-                        raise self._field_changed(step)
+                        if not await self._typed_matches(ctx, locator, text, value):
+                            raise self._field_changed(step)
+                    else:
+                        first = value
+                        await self._type(step, ctx, locator, text)
+                        value = await self._field_value(ctx, locator)
+                        if value not in (text, first):
+                            raise self._field_changed(step)
+                await self._remember_typed(step, ctx, locator, text, value)
                 return {"origem": "texto", "tamanho": len(text)}
 
             return act_text
@@ -2565,7 +2848,11 @@ class Interpreter:
         return act_secret
 
     async def _type(self, step: FillStep, ctx: _StepCtx, locator: PwLocator, text: str) -> None:
-        """Digita ``text`` no campo, no lugar do que houver nele."""
+        """Digita ``text`` no campo, no lugar do que houver nele.
+
+        No elemento conferido (num passo que grava), sem esperar de novo pelo campo: a
+        espera já foi feita antes da conferência da hora de agir (:meth:`_confirm_target`).
+        """
         element = ctx.element
         if element is None:
             if step.sequential:
@@ -2574,10 +2861,10 @@ class Interpreter:
             else:
                 await locator.fill(text, timeout=ctx.remaining_ms())
         elif step.sequential:
-            await element.fill("", timeout=ctx.remaining_ms())
+            await element.fill("", force=True, timeout=ctx.remaining_ms())
             await element.type(text, timeout=ctx.remaining_ms())
         else:
-            await element.fill(text, timeout=ctx.remaining_ms())
+            await element.fill(text, force=True, timeout=ctx.remaining_ms())
 
     async def _field_value(self, ctx: _StepCtx, locator: PwLocator) -> str:
         """O valor que o campo tem agora (o texto, num elemento ``contenteditable``)."""
@@ -2589,6 +2876,166 @@ class Interpreter:
         if isinstance(shown, str):
             return shown
         return await on.input_value(timeout=ctx.remaining_ms())
+
+    async def _typed_matches(
+        self, ctx: _StepCtx, locator: PwLocator, text: str, value: str
+    ) -> bool:
+        """Se ``value``, o valor do campo, é ``text`` como o navegador ou a máscara da página
+        o guardam (:func:`_typed_value_matches`). Nunca anota os valores."""
+        on = self._on(ctx, locator)
+        if isinstance(on, ElementHandle):
+            state = await on.evaluate(_TYPED_STATE_JS, text)
+        else:
+            state = await on.evaluate(_TYPED_STATE_JS, text, timeout=ctx.remaining_ms())
+        _, editable, browser = state
+        return _typed_value_matches(
+            text,
+            value,
+            editable=editable is True,
+            browser=browser if isinstance(browser, str) else None,
+        )
+
+    async def _remember_typed(
+        self, step: FillStep, ctx: _StepCtx, locator: PwLocator, text: str, value: str
+    ) -> None:
+        """Anota o campo em que o texto foi digitado, para conferir antes de gravar.
+
+        Um campo digitado de novo fica só com a última anotação. Se o campo não puder ser
+        preso agora (a página o tirou logo depois), ele não é anotado.
+        """
+        try:
+            if ctx.element is not None:
+                copy = await ctx.element.evaluate_handle("(element) => element")
+                handle = copy.as_element()
+                if handle is None:
+                    await self._dispose(copy)
+                    return
+            else:
+                handle = await locator.element_handle(timeout=ctx.remaining_ms())
+        except PlaywrightError:
+            return
+        await self._dispose_gone()
+        entries = self._typed
+        same = await self._same_elements(handle, [entry.handle for entry in entries])
+        typed = _Typed(handle, text, value, step.target.intent, step.title)
+        if self._typed is not entries:
+            # A página principal navegou no meio: a lista antiga já vai ser descartada.
+            self._typed.append(typed)
+            return
+        kept: list[_Typed] = []
+        for entry, is_same in zip(entries, same, strict=True):
+            if is_same:
+                await self._dispose(entry.handle)
+            else:
+                kept.append(entry)
+        if self._typed is entries:
+            self._typed = [*kept, typed]
+        else:
+            self._typed.append(typed)
+
+    async def _same_elements(
+        self, handle: ElementHandle, others: list[ElementHandle]
+    ) -> list[bool]:
+        """Quais de ``others`` são o mesmo elemento que ``handle``."""
+        if not others:
+            return []
+        try:
+            same = await handle.evaluate(_SAME_ELEMENTS_JS, others)
+            if isinstance(same, list) and len(same) == len(others):
+                return [item is True for item in same]
+        except PlaywrightError:
+            pass  # algum é de outro documento: um por um
+        result: list[bool] = []
+        for other in others:
+            try:
+                result.append(await handle.evaluate(_SAME_ELEMENT_JS, other) is True)
+            except PlaywrightError:
+                result.append(False)
+        return result
+
+    async def _dispose_gone(self) -> None:
+        gone, self._typed_gone = self._typed_gone, []
+        for handle in gone:
+            await self._dispose(handle)
+
+    async def _typed_fields_hold(self, step: Step, current: ElementHandle | None) -> None:
+        """Antes de um passo que grava: os campos de texto digitados desde a última navegação
+        da página principal ainda têm o que o robô digitou.
+
+        A página pode mudar um campo depois da conferência da digitação, sozinha (o CEP
+        que preenche o logradouro depois de uma consulta), e o passo que grava enviaria um
+        valor que ninguém digitou. Cada campo vale como na conferência da digitação: o
+        valor que ele tinha quando ela foi aceita, ou o texto como o navegador ou a máscara
+        da página o guardam (:func:`_typed_value_matches`; a máscara que a página só põe
+        quando o foco sai do campo também vale). Um campo que saiu da página deixa de ser
+        conferido, e o campo em que o passo vai digitar agora (``current``) também. Se
+        algum mudou, o passo falha com ``acao_falhou`` sem agir; os valores nunca vão
+        para a mensagem.
+        """
+        await self._dispose_gone()
+        entries = self._typed
+        if not entries:
+            return
+        states = await self._typed_states(entries, current)
+        kept: list[_Typed] = []
+        gone: list[ElementHandle] = []
+        changed: _Typed | None = None
+        for entry, state in zip(entries, states, strict=True):
+            if state is None:
+                gone.append(entry.handle)
+                continue
+            kept.append(entry)
+            if state == "mesmo" or changed is not None:
+                continue
+            value, editable, browser = state
+            holds = isinstance(value, str) and (
+                value == entry.accepted
+                or _typed_value_matches(
+                    entry.text,
+                    value,
+                    editable=editable is True,
+                    browser=browser if isinstance(browser, str) else None,
+                )
+            )
+            if not holds:
+                changed = entry
+        if self._typed is entries:  # senão, a página principal navegou no meio
+            self._typed = kept
+            for handle in gone:
+                await self._dispose(handle)
+        if changed is not None:
+            raise StepError(
+                ErrorCode.ACAO_FALHOU,
+                f"O campo '{changed.intent}' (passo '{changed.title}') não tem mais o que o "
+                f"robô digitou: a página o mudou depois. O passo '{step.title}' enviaria um "
+                "valor que não foi digitado, então nada foi feito.",
+                details={"alvo": changed.intent},
+            )
+
+    async def _typed_states(
+        self, entries: list[_Typed], current: ElementHandle | None
+    ) -> list[Any]:
+        """O estado de cada campo digitado (:data:`_TYPED_FIELD_JS`); ``None`` quando o
+        documento dele não existe mais."""
+        handles = [entry.handle for entry in entries]
+        texts = [entry.text for entry in entries]
+        try:
+            states = await handles[0].evaluate(_TYPED_FIELDS_JS, [handles, texts, current])
+            if isinstance(states, list) and len(states) == len(handles):
+                return states
+        except PlaywrightError:
+            pass  # campos de outros documentos: um por um
+        result: list[Any] = []
+        for handle, text in zip(handles, texts, strict=True):
+            state = None
+            for other in (current, None):
+                try:
+                    state = await handle.evaluate(_TYPED_FIELD_JS, [text, other])
+                    break
+                except PlaywrightError:
+                    continue
+            result.append(state)
+        return result
 
     @staticmethod
     def _field_changed(step: FillStep) -> StepError:
@@ -2606,7 +3053,9 @@ class Interpreter:
         locator = await self._resolve(step.target, step, ctx)
 
         async def act() -> dict[str, Any]:
-            await self._on(ctx, locator).select_option(label=option, timeout=ctx.remaining_ms())
+            await self._act_on(
+                step, ctx, locator, lambda on, kw: on.select_option(label=option, **kw)
+            )
             return {}
 
         return act
@@ -2615,7 +3064,9 @@ class Interpreter:
         locator = await self._resolve(step.target, step, ctx)
 
         async def act() -> dict[str, Any]:
-            await self._on(ctx, locator).set_checked(step.checked, timeout=ctx.remaining_ms())
+            await self._act_on(
+                step, ctx, locator, lambda on, kw: on.set_checked(step.checked, **kw)
+            )
             return {"marcado": step.checked}
 
         return act
@@ -2631,7 +3082,9 @@ class Interpreter:
         locator = await self._resolve(step.target, step, ctx)
 
         async def act() -> dict[str, Any]:
-            await self._on(ctx, locator).press(step.key, timeout=ctx.remaining_ms())
+            await self._act_on(
+                step, ctx, locator, lambda on, kw: on.press(step.key, **kw), force=False
+            )
             return {"tecla": step.key}
 
         return act
@@ -2717,7 +3170,7 @@ class Interpreter:
 
         async def act() -> dict[str, Any]:
             async with self.page.expect_download(timeout=ctx.remaining_ms()) as info:
-                await self._on(ctx, locator).click(timeout=ctx.remaining_ms())
+                await self._act_on(step, ctx, locator, lambda on, kw: on.click(**kw))
             download = await info.value
             try:
                 failure = await download.failure()
@@ -2771,7 +3224,9 @@ class Interpreter:
         locator = await self._resolve(step.target, step, ctx)
 
         async def act() -> dict[str, Any]:
-            await self._on(ctx, locator).set_input_files(path, timeout=ctx.remaining_ms())
+            await self._act_on(
+                step, ctx, locator, lambda on, kw: on.set_input_files(path, **kw), force=False
+            )
             size = await asyncio.to_thread(os.path.getsize, path)
             return {"tamanho": size}
 
@@ -3011,24 +3466,211 @@ class Interpreter:
         (``ctx.element``): a ação vai para ele, e não para o que o localizador encontrar
         na hora (o do Playwright procura de novo, no documento que estiver carregado,
         enquanto espera o elemento ficar habilitado, e cairia na mesma linha de outra
-        página). Se a página navegar ou trocar o elemento depois disso, ele deixa de
-        existir e a ação falha sem agir; se a página principal mudou de endereço ou de
-        documento desde a última conferência, o passo falha com ``elemento_ambiguo`` e
-        nada é feito. Um segredo já vai para o elemento conferido (:meth:`_prepare_fill`).
+        página).
+
+        A espera pelo elemento (visível, habilitado, parado; editável para digitar; a
+        opção na lista) vem antes da conferência da hora de agir, sem mandar nenhuma
+        entrada à página (:meth:`_wait_ready`): enquanto o botão espera ficar habilitado,
+        a página pode mudar de endereço no mesmo documento (``pushState``, ``#``) ou trocar
+        o texto da linha sem trocar os nós. Se o elemento sai da página nessa espera sem
+        nenhuma navegação (a página montou o botão de novo), tudo é conferido de novo, uma
+        vez; na segunda, o passo falha. Depois da espera, os campos digitados são
+        conferidos (:meth:`_typed_fields_hold`) e, com o vigia já na página
+        (:meth:`_arm_guard`), o contador de navegações da página principal, a página e a
+        linha; a ação vai em seguida, sem nova espera (``force``), e o vigia confere o
+        primeiro evento dela (:meth:`_dispatched`). Se a página principal mudou de endereço
+        ou de documento desde a última conferência, o passo falha com
+        ``elemento_ambiguo`` e nada é feito. Um segredo já vai para o elemento em que a
+        origem foi conferida (:meth:`_prepare_fill`).
         """
         target = getattr(step, "target", None)
         if not isinstance(target, Target) or ctx.locator is None:
-            return act  # ``press`` sem alvo: a tecla vai para a página
+            # ``press`` sem alvo: a tecla vai para a página (e pode enviar o formulário).
+            await self._typed_fields_hold(step, None)
+            return act
         if again:
             await self._resolve(target, step, ctx)
             if _page_key(self.page.url) != page:
                 raise self._page_changed(step, target)
             act = self._row_not_acted_on(step)
-        if not (isinstance(step, FillStep) and isinstance(step.value, SecretValue)):
+        if isinstance(step, FillStep) and isinstance(step.value, SecretValue):
+            self._raise_if_page_changed(step, target, ctx, page)
+            await self._typed_fields_hold(step, None)
+            return act
+        retried = False
+        while True:
             ctx.element = await self._element_handle(ctx.locator, ctx)
+            self._raise_if_page_changed(step, target, ctx, page)
+            try:
+                await self._wait_ready(step, ctx, ctx.element)
+                break
+            except PlaywrightError:
+                if (
+                    retried
+                    or self._main_frame_changes != ctx.checked_at
+                    or await self._attached(ctx.element)
+                ):
+                    raise
+            # O elemento saiu da página antes de qualquer entrada, sem navegação (a página
+            # montou o botão de novo): tudo de novo, uma vez.
+            retried = True
+            await self._dispose(ctx.element)
+            ctx.element = None
+            checked_at = ctx.checked_at
+            await self._resolve(target, step, ctx)
+            if ctx.checked_at != checked_at or _page_key(self.page.url) != page:
+                raise self._page_changed(step, target)
+            act = self._row_not_acted_on(step)
+        await self._typed_fields_hold(step, ctx.element if isinstance(step, FillStep) else None)
+        await self._arm_guard(step, ctx, target, page)
+        return act
+
+    def _raise_if_page_changed(self, step: Step, target: Target, ctx: _StepCtx, page: str) -> None:
+        """A página principal mudou de endereço ou de documento desde a conferência do alvo."""
         if self._main_frame_changes != ctx.checked_at or _page_key(self.page.url) != page:
             raise self._page_changed(step, target)
-        return act
+
+    @staticmethod
+    async def _attached(handle: ElementHandle) -> bool:
+        try:
+            return await handle.evaluate("(element) => element.isConnected") is True
+        except PlaywrightError:
+            return False
+
+    async def _wait_ready(self, step: Step, ctx: _StepCtx, element: ElementHandle) -> None:
+        """Espera o que o Playwright esperaria antes de agir, sem mandar nenhuma entrada.
+
+        Clicar, marcar e baixar: visível, habilitado e parado; digitar: visível e
+        editável; escolher: visível, habilitado e com a opção na lista; teclar e enviar um
+        arquivo não esperam nada. Não usa o clique de teste (``trial``) do Playwright, que
+        manda os eventos do mouse à página e só os barra num ouvinte dele.
+        """
+        states: tuple[Literal["visible", "enabled", "editable", "stable"], ...]
+        if isinstance(step, (ClickStep, DownloadStep)):
+            states = ("visible", "enabled", "stable")
+        elif isinstance(step, CheckStep):
+            if await element.is_checked() == step.checked:
+                return  # já está como deve ficar: o Playwright não clica
+            states = ("visible", "enabled", "stable")
+        elif isinstance(step, FillStep):
+            states = ("visible", "editable")
+        elif isinstance(step, SelectStep):
+            states = ("visible", "enabled")
+        else:
+            return
+        for state in states:
+            await element.wait_for_element_state(state, timeout=ctx.remaining_ms())
+        if isinstance(step, SelectStep):
+            option = self._render(step.option)
+            loop = asyncio.get_running_loop()
+            while not await element.evaluate(_HAS_OPTION_JS, option):
+                if loop.time() + self._poll_s >= ctx.deadline:
+                    return  # a própria ação espera o resto do prazo e falha
+                await asyncio.sleep(self._poll_s)
+
+    async def _arm_guard(self, step: Step, ctx: _StepCtx, target: Target, page: str) -> None:
+        """Põe o vigia (:data:`_DISPATCH_GUARD_JS`) e faz a conferência da hora de agir.
+
+        Com o vigia já na página, o contador de navegações da página principal e a página
+        são os da conferência do alvo e, numa linha escolhida pelo texto, ela ainda é a
+        única com ele (:meth:`_row_issue`) e o elemento conferido ainda está nela. Senão, o
+        passo falha com ``elemento_ambiguo`` sem agir.
+        """
+        element = ctx.element
+        if element is None:  # pragma: no cover - preso em _confirm_target
+            raise AssertionError("o elemento conferido não foi preso")
+        choice = self._row_choice(target)
+        row: ElementHandle | None = None
+        try:
+            if choice is not None:
+                rows = await choice.chosen.element_handles()
+                if len(rows) != 1:
+                    for handle in rows:
+                        await self._dispose(handle)
+                    raise self._page_changed(step, target)
+                row = rows[0]
+            if isinstance(step, (ClickStep, CheckStep, DownloadStep)):
+                kind = "clique"
+            elif isinstance(step, FillStep):
+                kind = "texto"
+            elif isinstance(step, PressStep):
+                kind = "tecla"
+            else:
+                kind = "campo"
+            ctx.guard = await element.evaluate_handle(
+                _DISPATCH_GUARD_JS, [kind, row, choice.key if choice is not None else None]
+            )
+            self._raise_if_page_changed(step, target, ctx, page)
+            if choice is not None and row is not None:
+                try:
+                    others = await choice.rows.evaluate_all(
+                        _PINNED_ROW_JS, [choice.key, row, element]
+                    )
+                except PlaywrightError:
+                    others = None
+                if others != 0:
+                    raise self._page_changed(step, target)
+        finally:
+            if row is not None:
+                await self._dispose(row)
+
+    async def _act_on(
+        self,
+        step: Step,
+        ctx: _StepCtx,
+        locator: PwLocator,
+        action: Callable[[PwLocator | ElementHandle, dict[str, Any]], Awaitable[object]],
+        *,
+        force: bool = True,
+    ) -> None:
+        """Faz ``action`` no localizador (num passo de leitura) ou no elemento conferido.
+
+        No elemento conferido, a espera já foi feita antes da conferência da hora de agir
+        (:meth:`_confirm_target`): a ação vai sem esperar de novo (``force``, quando ela
+        tem essa espera), e o vigia confere o primeiro evento dela (:meth:`_dispatched`).
+        O prazo continua o do passo: o Playwright ainda espera, depois de agir, a
+        navegação que a ação começou.
+        """
+        if ctx.element is None:
+            await action(locator, {"timeout": ctx.remaining_ms()})
+            return
+        options: dict[str, Any] = {"timeout": ctx.remaining_ms()}
+        if force:
+            options["force"] = True
+        await self._dispatched(step, ctx, action(ctx.element, options))
+
+    async def _dispatched(self, step: Step, ctx: _StepCtx, action: Awaitable[object]) -> None:
+        """Age e lê o vigia: se ele recusou o primeiro evento da ação (outro endereço, outro
+        elemento, a linha mudou), o evento foi cancelado e o passo falha com
+        ``elemento_ambiguo``."""
+        failure: Exception | None = None
+        try:
+            await action
+        except Exception as exc:
+            failure = exc
+        if await self._guard_refused(ctx):
+            target = getattr(step, "target", None)
+            if isinstance(target, Target):
+                raise self._page_changed(step, target) from None
+        if failure is not None:
+            raise failure
+
+    async def _guard_refused(self, ctx: _StepCtx) -> bool:
+        """Tira o vigia da página e diz se ele recusou um evento.
+
+        Se o documento já foi trocado (a própria ação navegou), não há o que ler, e vale o
+        resultado da ação: um evento recusado é cancelado e não leva a página a outro
+        documento.
+        """
+        guard, ctx.guard = ctx.guard, None
+        if guard is None:
+            return False
+        try:
+            return await guard.evaluate("(guard) => guard.stop()") is True
+        except PlaywrightError:
+            return False
+        finally:
+            await self._dispose(guard)
 
     @staticmethod
     def _page_changed(step: Step, target: Target) -> StepError:
@@ -3165,7 +3807,7 @@ class Interpreter:
             await self._dispose(handle)
 
     @staticmethod
-    async def _dispose(handle: ElementHandle) -> None:
+    async def _dispose(handle: JSHandle) -> None:
         try:
             await handle.dispose()
         except PlaywrightError:
