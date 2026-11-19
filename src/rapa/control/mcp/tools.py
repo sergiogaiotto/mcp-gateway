@@ -209,7 +209,10 @@ def robot_tool(robot: RobotSummary) -> types.Tool:
         annotations=types.ToolAnnotations(
             title=robot.title,
             read_only_hint=robot.effect is Effect.READ,
-            destructive_hint=robot.effect is Effect.IRREVERSIBLE,
+            # Pela especificação do MCP, destructiveHint=false promete só acréscimos; um
+            # robô que grava pode sobrescrever dados, então todo robô que não só lê é
+            # destrutivo. O caso irreversível fica na descrição e no aviso confirmado.
+            destructive_hint=robot.effect is not Effect.READ,
             idempotent_hint=False,
             open_world_hint=True,
         ),

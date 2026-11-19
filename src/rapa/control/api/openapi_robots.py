@@ -3,6 +3,10 @@
 Cada robô vira uma operação ``POST /v1/catalogo/{slug}/execucoes`` com o
 esquema das entradas dele. Serve para clientes REST gerarem código e para
 ferramentas que importam OpenAPI.
+
+O ``operationId`` de cada robô é ``executar_<slug>``: o prefixo garante que
+nenhum robô repita o de uma operação fixa (como ``consultar_execucao``), mesmo
+um robô antigo publicado antes de esses nomes ficarem reservados.
 """
 
 import copy
@@ -16,6 +20,9 @@ from rapa.core.robot import Effect
 __all__ = ["build_robots_openapi"]
 
 _REF = "#/components/schemas/{model}"
+#: Prefixo dos ``operationId`` dos robôs; nenhuma operação fixa começa assim.
+_ROBOT_OPERATION_PREFIX = "executar_"
+_RUN_OPERATION_ID = "consultar_execucao"
 _EFFECT_TEXT = {
     Effect.READ: "Só lê dados no sistema de destino.",
     Effect.WRITE: "Grava dados no sistema de destino.",
@@ -53,7 +60,7 @@ def _operation(robot: RobotSummary) -> dict[str, Any]:
         "additionalProperties": False,
     }
     return {
-        "operationId": robot.slug,
+        "operationId": f"{_ROBOT_OPERATION_PREFIX}{robot.slug}",
         "summary": robot.title,
         "description": f"{robot.description}\n\n{_EFFECT_TEXT[robot.effect]}",
         "tags": ["robôs"],
@@ -104,7 +111,7 @@ def build_robots_openapi(
         paths[f"/v1/catalogo/{robot.slug}/execucoes"] = {"post": _operation(robot)}
     paths["/v1/execucoes/{run_id}"] = {
         "get": {
-            "operationId": "consultar_execucao",
+            "operationId": _RUN_OPERATION_ID,
             "summary": "Consultar uma execução",
             "tags": ["execuções"],
             "parameters": [

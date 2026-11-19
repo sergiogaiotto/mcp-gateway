@@ -13,6 +13,12 @@ uso único com gVisor. Para cada tentativa, o lançador:
 4. no fim (ou no prazo, com SIGTERM e depois SIGKILL), lê RESULT.json e o
    devolve ao despachante.
 
+Os arquivos de entrada também são separados por empresa: o worker só recebe a
+pasta ``<files_dir>/<uuid da empresa>``, com a empresa tirada da tarefa (que vem
+do token, nunca das entradas). Assim o identificador de arquivo escolhido por
+quem chama nunca alcança os arquivos de outra empresa. A pasta da empresa não é
+criada aqui: se não existir, o passo de envio falha com "arquivo não encontrado".
+
 Os segredos vêm de uma :class:`SecretSource`. Em produção ela consulta o OpenBao;
 aqui há uma versão estática, para desenvolvimento e testes.
 """
@@ -84,25 +90,57 @@ class NoSecrets:
         return {}
 
 
+class _SecretsFormatError(ValueError):
+    """Segredos em formato errado. A mensagem só cita nomes e tipos, nunca valores."""
+
+
+def _check_credentials(company_id: UUID, credentials: object) -> dict[str, dict[str, str]]:
+    """Confere as credenciais de uma empresa sem nunca pôr um valor na mensagem de erro."""
+    if not isinstance(credentials, Mapping):
+        raise _SecretsFormatError(f"as credenciais da empresa {company_id} precisam ser um objeto")
+    checked: dict[str, dict[str, str]] = {}
+    for name, fields in credentials.items():
+        if not isinstance(name, str):
+            raise _SecretsFormatError(
+                f"as credenciais da empresa {company_id} precisam ter nomes de texto"
+            )
+        if not isinstance(fields, Mapping):
+            # Uma senha escrita no lugar do objeto não pode aparecer na mensagem.
+            raise _SecretsFormatError(
+                f"a credencial '{name}' precisa ser um objeto com os campos do segredo"
+            )
+        if not all(isinstance(key, str) for key in fields):
+            raise _SecretsFormatError(f"a credencial '{name}' precisa ter nomes de campo de texto")
+        unknown = sorted(key for key in fields if key not in SECRET_FIELDS)
+        if unknown:
+            raise _SecretsFormatError(
+                f"campos desconhecidos na credencial '{name}': {', '.join(unknown)}"
+            )
+        for key, value in fields.items():
+            if not isinstance(value, str):
+                raise _SecretsFormatError(
+                    f"o campo '{key}' da credencial '{name}' precisa ser texto"
+                )
+        checked[name] = dict(fields)
+    return checked
+
+
 class StaticSecretSource:
     """Segredos fixos por empresa, para desenvolvimento e testes.
 
     Formato: ``{company_id: {nome_da_credencial: {campo: valor}}}``. Cada empresa
-    só enxerga as próprias credenciais.
+    só enxerga as próprias credenciais. As mensagens de erro citam só a empresa,
+    o nome da credencial e o do campo, nunca o valor de um segredo.
     """
 
     def __init__(self, secrets: Mapping[UUID, Mapping[str, Mapping[str, str]]]) -> None:
+        if not isinstance(secrets, Mapping):
+            raise _SecretsFormatError("os segredos precisam ser um objeto por empresa")
         checked: dict[UUID, dict[str, dict[str, str]]] = {}
         for company_id, credentials in secrets.items():
-            per_company: dict[str, dict[str, str]] = {}
-            for name, fields in credentials.items():
-                unknown = sorted(set(fields) - SECRET_FIELDS)
-                if unknown:
-                    raise ValueError(
-                        f"campos desconhecidos na credencial '{name}': {', '.join(unknown)}"
-                    )
-                per_company[name] = dict(fields)
-            checked[company_id] = per_company
+            if not isinstance(company_id, UUID):
+                raise _SecretsFormatError("cada empresa dos segredos precisa ser um UUID")
+            checked[company_id] = _check_credentials(company_id, credentials)
         self._secrets = checked
 
     @classmethod
@@ -114,10 +152,21 @@ class StaticSecretSource:
             raise ValueError("o arquivo de segredos não é um JSON válido") from None
         if not isinstance(data, dict):
             raise ValueError("o arquivo de segredos precisa ser um objeto JSON")
+        companies: dict[UUID, Any] = {}
+        for key, value in data.items():
+            try:
+                companies[UUID(key)] = value
+            except ValueError:
+                raise ValueError(
+                    "arquivo de segredos inválido: cada chave precisa ser o UUID de uma empresa"
+                ) from None
         try:
-            return cls({UUID(key): value for key, value in data.items()})
-        except (TypeError, AttributeError, ValueError) as exc:
+            return cls(companies)
+        except _SecretsFormatError as exc:
             raise ValueError(f"arquivo de segredos inválido: {exc}") from None
+        except Exception:
+            # Texto de um erro inesperado pode trazer um valor do arquivo: mensagem fixa.
+            raise ValueError("arquivo de segredos inválido") from None
 
     async def secrets_for(self, job: RunnerJob) -> Mapping[str, Mapping[str, str]]:
         available = self._secrets.get(job.company_id, {})
@@ -135,6 +184,8 @@ class LocalLauncherSettings:
     artifacts_dir: Path
     chromium: str | None = None
     browser_args: tuple[str, ...] = ()
+    #: Pasta dos arquivos de entrada, com uma subpasta por empresa
+    #: (``<files_dir>/<uuid da empresa>/<arquivo>``); arquivos soltos na raiz não valem.
     files_dir: Path | None = None
     python: str = field(default_factory=lambda: sys.executable)
     #: Intervalo de leitura dos eventos do worker.
@@ -230,7 +281,9 @@ class LocalProcessLauncher:
         )
         return work, artifacts
 
-    def _command(self, work: Path, artifacts: Path, *, with_secrets: bool) -> list[str]:
+    def _command(
+        self, job: RunnerJob, work: Path, artifacts: Path, *, with_secrets: bool
+    ) -> list[str]:
         settings = self.settings
         command = [
             settings.python,
@@ -253,7 +306,9 @@ class LocalProcessLauncher:
         if settings.chromium:
             command += ["--chromium", settings.chromium]
         if settings.files_dir is not None:
-            command += ["--files-dir", str(settings.files_dir)]
+            # Só a pasta da empresa da tarefa: a execução de uma empresa nunca vê os
+            # arquivos de outra, seja qual for o identificador pedido nas entradas.
+            command += ["--files-dir", str(settings.files_dir / str(job.company_id))]
         command += [f"--browser-arg={arg}" for arg in settings.browser_args]
         return command
 
@@ -272,7 +327,7 @@ class LocalProcessLauncher:
                     payload = json.dumps({name: dict(fields) for name, fields in secrets.items()})
                     await asyncio.to_thread(_write_private, work / "secrets.json", payload)
                 process = await asyncio.create_subprocess_exec(
-                    *self._command(work, artifacts, with_secrets=bool(secrets)),
+                    *self._command(job, work, artifacts, with_secrets=bool(secrets)),
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,

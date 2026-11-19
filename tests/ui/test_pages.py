@@ -1,10 +1,11 @@
 """Telas da interface com o ``User`` simulado do NiceGUI e a plataforma em memória."""
 
 import json
+from uuid import UUID
 
 import pytest
 
-from rapa.core.contracts import RunState, RunTrigger, VersionStatus
+from rapa.core.contracts import Principal, RunState, RunTrigger, VersionStatus
 from rapa.core.robot import Manifest
 from rapa.fixtures.robots import emitir_protocolo
 from tests.ui.conftest import BASE, HOST, World, login, logout
@@ -258,3 +259,50 @@ async def test_not_found_page_and_security_headers(world: World) -> None:
         assert login_page.status_code == 200
         assert login_page.headers["x-frame-options"] == "DENY"
         assert login_page.headers["x-content-type-options"] == "nosniff"
+
+
+class _Accounts:
+    """Contas como o banco as guarda; o teste desativa e derruba o banco."""
+
+    def __init__(self, world: World) -> None:
+        self.by_subject = {p.subject: p for p in world.principals.values()}
+        self.down = False
+
+    async def resolve(self, subject: str, company_id: UUID) -> Principal | None:
+        if self.down:
+            raise ConnectionError("banco fora do ar")
+        principal = self.by_subject.get(subject)
+        return principal if principal is not None and principal.company_id == company_id else None
+
+
+async def test_deactivated_account_loses_the_open_session(world: World) -> None:
+    accounts = _Accounts(world)
+    world.resolver = accounts
+    robot_id = world.robot_ids["emitir_protocolo"]
+    async with world.user() as user:
+        await login(user, "aprovador", f"/robos/{robot_id}")
+        await user.should_see(marker="passos")
+        # O administrador desativa a conta com a página aberta.
+        del accounts.by_subject["aprovador@a"]
+        await user.open(f"/robos/{robot_id}")
+        await user.should_see(marker="pagina-login")
+        await user.should_not_see(marker="usuario-logado")
+    assert len(world.store) == 0
+
+
+async def test_unavailable_database_never_opens_page_with_old_roles(world: World) -> None:
+    accounts = _Accounts(world)
+    world.resolver = accounts
+    async with world.user() as user:
+        await login(user, "operador", "/catalogo")
+        accounts.down = True
+        await user.open("/catalogo")
+        await user.should_see(marker="erro")
+        await user.should_see("Não foi possível conferir sua sessão agora")
+        await user.should_not_see(marker="usuario-logado")
+        await user.should_not_see(marker="robo-emitir_protocolo")
+        # A sessão continua: com o banco de volta, a página abre normalmente.
+        accounts.down = False
+        await user.open("/catalogo")
+        await user.should_see(marker="usuario-logado")
+    assert len(world.store) == 1

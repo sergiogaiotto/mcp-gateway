@@ -453,3 +453,145 @@ async def test_failed_refresh_ends_session() -> None:
     assert len(store) == 0
     with pytest.raises(LoginError):
         await auth.create_dev_ticket("vinculo", "ana", "/")
+
+
+# ---------------------------------------------------------------------------
+# O principal da sessão acompanha o banco e o provedor
+# ---------------------------------------------------------------------------
+
+
+class Principals:
+    """Resolvedor de principais com papéis que o teste muda (como o banco)."""
+
+    def __init__(self, principal: Principal | None) -> None:
+        self.current: Principal | None = principal
+        self.calls: list[tuple[str, Any]] = []
+        self.error: Exception | None = None
+
+    async def resolve(self, subject: str, company_id: Any) -> Principal | None:
+        self.calls.append((subject, company_id))
+        if self.error is not None:
+            raise self.error
+        return self.current
+
+
+async def test_session_principal_is_rechecked_and_follows_role_changes() -> None:
+    clock, store = Clock(), MemorySessionStore()
+    principals = Principals(PRINCIPAL)
+    auth = UiAuth(
+        dev=_dev(),
+        store=store,
+        clock=clock,
+        principals=principals,
+        principal_ttl=timedelta(seconds=30),
+    )
+    # O perfil de desenvolvimento é configurado na subida: o primeiro uso já confere.
+    _, session = await auth.start_session(PRINCIPAL, "Ana", "dev")
+    found = await auth.session_by_key(session.key)
+    assert found is not None and principals.calls == [("ana@empresa", COMPANY)]
+
+    # Dentro do prazo curto, sem nova consulta (a tela consulta a cada 2 s).
+    clock.now += timedelta(seconds=10)
+    assert await auth.session_by_key(session.key) is not None
+    assert len(principals.calls) == 1
+
+    # Papéis mudaram no banco: a sessão passa a usar os novos, sem pedir login de novo.
+    approver = PRINCIPAL.model_copy(update={"company_roles": frozenset({Role.APPROVER})})
+    principals.current = approver
+    clock.now += timedelta(seconds=25)
+    found = await auth.session_by_key(session.key)
+    assert found is not None and found.principal == approver
+    assert len(principals.calls) == 2
+    stored = await store.load(session.key)
+    assert stored is not None and stored.principal == approver
+
+    # Conta desativada (ou sem vínculo com a empresa): a sessão acaba no próximo uso.
+    principals.current = None
+    clock.now += timedelta(seconds=31)
+    assert await auth.session_by_key(session.key) is None
+    assert len(store) == 0
+
+
+async def test_session_ends_when_the_rechecked_principal_is_someone_else() -> None:
+    clock, store = Clock(), MemorySessionStore()
+    principals = Principals(PRINCIPAL.model_copy(update={"subject": "outra@empresa"}))
+    auth = UiAuth(dev=_dev(), store=store, clock=clock, principals=principals)
+    _, session = await auth.start_session(PRINCIPAL, "Ana", "dev")
+    assert await auth.session_by_key(session.key) is None
+    assert len(store) == 0
+
+    principals.current = PRINCIPAL.model_copy(update={"company_id": new_id()})
+    _, session = await auth.start_session(PRINCIPAL, "Ana", "dev")
+    assert await auth.session_by_key(session.key) is None
+
+
+async def test_recheck_failure_never_falls_back_to_the_old_principal() -> None:
+    clock, store = Clock(), MemorySessionStore()
+    principals = Principals(PRINCIPAL)
+    auth = UiAuth(dev=_dev(), store=store, clock=clock, principals=principals)
+    _, session = await auth.start_session(PRINCIPAL, "Ana", "dev")
+    principals.error = ConnectionError("banco fora do ar")
+    with pytest.raises(ConnectionError):
+        await auth.session_by_key(session.key)
+    # A sessão não foi dada como conferida: a próxima tentativa consulta de novo.
+    principals.error = None
+    principals.current = None
+    assert await auth.session_by_key(session.key) is None
+
+
+async def test_client_id_from_login_is_kept_after_recheck() -> None:
+    clock = Clock()
+    with_client = PRINCIPAL.model_copy(update={"client_id": "rapa-ui"})
+    auth = UiAuth(dev=_dev(), clock=clock, principals=Principals(PRINCIPAL))
+    _, session = await auth.start_session(with_client, "Ana", "oidc")
+    found = await auth.session_by_key(session.key)
+    assert found is not None and found.principal == with_client
+
+
+async def test_token_refresh_rechecks_access_with_the_new_token() -> None:
+    keycloak, store = FakeKeycloak(), MemorySessionStore()
+    resolver = Resolver(PRINCIPAL)
+    auth = UiAuth(oidc=_oidc(keycloak, resolver), store=store)
+    async with _client(auth) as client:
+        await _oidc_login(client, keycloak)
+    (session,) = store._sessions.values()
+    assert session.tokens is not None
+
+    # Renovou e a conta ainda tem acesso: papéis atualizados com o token novo.
+    approver = PRINCIPAL.model_copy(update={"company_roles": frozenset({Role.APPROVER})})
+    resolver.principal = approver
+    session.tokens.expires_at = time.time() + 5
+    fresh = await auth.fresh_session(session.key)
+    assert fresh is not None and fresh.access_token == "acesso-renovado-1"
+    assert fresh.principal == approver
+    assert resolver.calls[-1] == ({}, "acesso-renovado-1")
+
+    # Tirada da organização no Keycloak: o token renovado não dá mais acesso.
+    resolver.principal = None
+    assert fresh.tokens is not None
+    fresh.tokens.expires_at = time.time() + 5
+    assert await auth.fresh_session(session.key) is None
+    assert resolver.calls[-1] == ({}, "acesso-renovado-2")
+    assert len(store) == 0
+
+
+@pytest.mark.parametrize("problem", ["outra pessoa", "erro"])
+async def test_token_refresh_ends_session_on_identity_change_or_error(problem: str) -> None:
+    keycloak, store = FakeKeycloak(), MemorySessionStore()
+    resolver = Resolver(PRINCIPAL)
+    auth = UiAuth(oidc=_oidc(keycloak, resolver), store=store)
+    async with _client(auth) as client:
+        await _oidc_login(client, keycloak)
+    (session,) = store._sessions.values()
+    assert session.tokens is not None
+    if problem == "erro":
+
+        async def broken(claims: Mapping[str, Any], access_token: str) -> Principal | None:
+            raise ConnectionError("banco fora do ar")
+
+        resolver.resolve = broken  # type: ignore[method-assign]
+    else:
+        resolver.principal = PRINCIPAL.model_copy(update={"subject": "outra@empresa"})
+    session.tokens.expires_at = time.time() + 5
+    assert await auth.fresh_session(session.key) is None
+    assert len(store) == 0

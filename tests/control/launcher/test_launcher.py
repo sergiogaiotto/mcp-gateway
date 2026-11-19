@@ -22,6 +22,8 @@ from rapa.core.ids import new_id
 from rapa.fixtures.portal import DEFAULT_PASSWORD, DEFAULT_TOTP_SECRET, DEFAULT_USER
 from rapa.fixtures.robots import emitir_protocolo
 from rapa.fixtures.server import HOST_RESOLVER_ARG, RunningPortal
+from rapa.runner.ports import FileUnavailable, LocalFileProvider
+from tests.runner.test_worker import _upload_manifest
 
 INPUTS = {"nome": "Maria da Silva", "cpf": "529.982.247-25", "uf": "SP"}
 SECRETS = {
@@ -163,6 +165,98 @@ async def test_missing_worker_result_becomes_a_failure(
     assert result["error_code"] == "executor_sem_resultado"
 
 
+def _upload_job(portal: RunningPortal, company_id: UUID, file_id: str) -> RunnerJob:
+    return RunnerJob(
+        run_id=new_id(),
+        company_id=company_id,
+        attempt=1,
+        manifest=_upload_manifest(portal),
+        inputs={"documento": file_id},
+        deadline=datetime.now(UTC) + timedelta(minutes=2),
+    )
+
+
+def _company_files(files_dir: Path, company_id: UUID, name: str, content: bytes) -> Path:
+    folder = files_dir / str(company_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / name).write_bytes(content)
+    return folder / name
+
+
+async def test_files_dir_given_to_the_worker_is_the_company_folder(
+    portal_v1: RunningPortal, tmp_path: Path
+) -> None:
+    files_dir = tmp_path / "arquivos"
+    company_a, company_b = new_id(), new_id()
+    file_b = _company_files(files_dir, company_b, "notas_empresa_b.csv", b"dados da empresa B")
+    (files_dir / "solto_na_raiz.csv").write_bytes(b"sem empresa")
+    (files_dir / str(company_a)).mkdir()
+    (files_dir / str(company_a) / "atalho.csv").symlink_to(file_b)
+    launcher = LocalProcessLauncher(
+        RecordingIngestor(),
+        LocalLauncherSettings(
+            work_dir=tmp_path / "trabalho",
+            artifacts_dir=tmp_path / "artefatos",
+            files_dir=files_dir,
+        ),
+    )
+
+    def files_dir_of(job: RunnerJob) -> Path:
+        work, artifacts = launcher._paths(job)
+        command = launcher._command(job, work, artifacts, with_secrets=False)
+        return Path(command[command.index("--files-dir") + 1])
+
+    job_a, job_b = _upload_job(portal_v1, company_a, "x"), _upload_job(portal_v1, company_b, "x")
+    assert files_dir_of(job_a) == files_dir / str(company_a)
+    assert files_dir_of(job_b) == files_dir / str(company_b)
+
+    # A execução da empresa A não alcança o arquivo da B: nem pelo nome, nem por atalho,
+    # nem os arquivos soltos na raiz (que não são de empresa nenhuma).
+    provider_a = LocalFileProvider(files_dir_of(job_a))
+    for file_id in ("notas_empresa_b.csv", "atalho.csv", "solto_na_raiz.csv"):
+        with pytest.raises(FileUnavailable, match="não foi encontrado"):
+            await provider_a.path_for(file_id)
+    assert await LocalFileProvider(files_dir_of(job_b)).path_for("notas_empresa_b.csv") == (
+        file_b.resolve()
+    )
+    # Empresa sem pasta: o arquivo simplesmente não existe (a pasta não é criada).
+    other = _upload_job(portal_v1, new_id(), "notas_empresa_b.csv")
+    with pytest.raises(FileUnavailable, match="não foi encontrado"):
+        await LocalFileProvider(files_dir_of(other)).path_for("notas_empresa_b.csv")
+    assert not files_dir_of(other).exists()
+
+
+@pytest.mark.browser
+async def test_run_of_one_company_cannot_upload_another_company_file(
+    portal_v1: RunningPortal, chromium_path: str, tmp_path: Path
+) -> None:
+    files_dir = tmp_path / "arquivos"
+    company_a, company_b = new_id(), new_id()
+    own = b"planilha da empresa A\n"
+    _company_files(files_dir, company_a, "planilha_a.csv", own)
+    secret_b = b"dados sigilosos da empresa B"
+    _company_files(files_dir, company_b, "notas_empresa_b.csv", secret_b)
+    # No leiaute antigo (uma pasta só para todas as empresas), o arquivo da B ficava
+    # na raiz, onde a execução de qualquer empresa o alcançava pelo nome.
+    (files_dir / "notas_empresa_b.csv").write_bytes(secret_b)
+    launcher = LocalProcessLauncher(
+        RecordingIngestor(),
+        _settings(tmp_path, chromium_path, files_dir=files_dir),
+        StaticSecretSource({company_a: SECRETS, company_b: SECRETS}),
+    )
+
+    stolen = await launcher(_upload_job(portal_v1, company_a, "notas_empresa_b.csv"))
+
+    assert stolen["state"] == RunState.FAILED
+    assert stolen["error_code"] == "arquivo_indisponivel"
+    assert portal_v1.state.uploads == []
+
+    allowed = await launcher(_upload_job(portal_v1, company_a, "planilha_a.csv"))
+
+    assert allowed["state"] == RunState.SUCCEEDED, allowed["error_message"]
+    assert portal_v1.state.uploads == [{"nome": "planilha_a.csv", "tamanho": len(own)}]
+
+
 def test_worker_environment_leaves_control_plane_variables_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -194,3 +288,51 @@ async def test_static_secrets_are_scoped_by_company_and_credential(
         StaticSecretSource.from_file(path)
     with pytest.raises(ValueError, match="desconhecidos"):
         StaticSecretSource({company_a: {"portal": {"pin": "1"}}})
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        # Senha escrita direto no lugar do objeto da credencial (erro comum).
+        ({"portal": "Tr0ub4dor&3"}, "a credencial 'portal' precisa ser um objeto"),
+        ({"portal": ["Tr0ub4dor&3"]}, "a credencial 'portal' precisa ser um objeto"),
+        ({"portal": {"password": 12345678}}, "o campo 'password' da credencial 'portal'"),
+        ({"portal": {"password": None}}, "o campo 'password' da credencial 'portal'"),
+        ("Tr0ub4dor&3", "precisam ser um objeto"),
+        (["Tr0ub4dor&3"], "precisam ser um objeto"),
+    ],
+)
+def test_static_secrets_errors_never_show_secret_values(
+    tmp_path: Path, content: Any, message: str
+) -> None:
+    company = new_id()
+    path = tmp_path / "segredos.json"
+    path.write_text(json.dumps({str(company): content}))
+    with pytest.raises(ValueError, match=message) as from_file:
+        StaticSecretSource.from_file(path)
+    with pytest.raises(ValueError, match=message) as direct:
+        StaticSecretSource({company: content})
+    for error in (from_file.value, direct.value):
+        text = str(error)
+        assert "Tr0ub4dor" not in text and "12345678" not in text
+        # Nem os caracteres soltos da senha (o set() de uma string os espalhava).
+        assert "&" not in text and ", 0, 3" not in text
+    # O erro do arquivo não carrega a exceção original (que poderia ter o valor).
+    assert from_file.value.__cause__ is None and from_file.value.__suppress_context__
+
+
+def test_static_secrets_file_errors_do_not_echo_exception_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    company = new_id()
+    path = tmp_path / "segredos.json"
+    path.write_text(json.dumps({str(company): {"portal": {"password": "Tr0ub4dor&3"}}}))
+
+    def broken(self: StaticSecretSource, secrets: Any) -> None:
+        raise ValueError("falha inesperada com Tr0ub4dor&3")
+
+    monkeypatch.setattr(StaticSecretSource, "__init__", broken)
+    with pytest.raises(ValueError) as caught:
+        StaticSecretSource.from_file(path)
+    assert "Tr0ub4dor" not in str(caught.value)
+    assert str(caught.value).startswith("arquivo de segredos inválido")

@@ -22,6 +22,7 @@ from typing import Any
 from nicegui import ui
 
 from rapa.core.robot import FieldType, InputField
+from rapa.core.templates import TemplateError, format_value
 
 __all__ = [
     "FormField",
@@ -224,43 +225,86 @@ _THOUSANDS = re.compile(r"^-?[0-9]{1,3}(?:\.[0-9]{3})+$")
 _NUMBER_TEXT = re.compile(r"^-?[0-9]+(?:\.[0-9]+)?$")
 
 
+#: Inteiros aceitos: até 18 dígitos, como no texto digitado.
+_MAX_INTEGER = 10**18 - 1
+#: Maior inteiro que um ``float`` (o valor do campo numérico do navegador) guarda
+#: sem perder dígitos. Acima disso, o número já chegou trocado: melhor recusar.
+_MAX_EXACT_FLOAT_INT = 2**53
+_TOO_BIG = "Número grande demais."
+
+
 def _to_integer(value: Any) -> int:
+    """Inteiro para um campo ``integer`` do esquema: sempre ``int``, nunca ``float``.
+
+    O campo numérico do navegador entrega ``5.0``; ele vai como ``5``. Um ``float``
+    acima de 2**53 já perdeu dígitos no navegador e é recusado.
+    """
     if isinstance(value, bool):
         raise _FieldError("Informe um número inteiro.")
     if isinstance(value, int):
+        if abs(value) > _MAX_INTEGER:
+            raise _FieldError(_TOO_BIG)
         return value
     if isinstance(value, float):
-        if math.isfinite(value) and value.is_integer():
-            return int(value)
-        raise _FieldError("Informe um número inteiro.")
+        if not (math.isfinite(value) and value.is_integer()):
+            raise _FieldError("Informe um número inteiro.")
+        if abs(value) > _MAX_EXACT_FLOAT_INT:
+            raise _FieldError(_TOO_BIG)
+        return int(value)
     text = _as_text(value).replace(" ", "")
     if _THOUSANDS.fullmatch(text):
         text = text.replace(".", "")
     if re.fullmatch(r"-?[0-9]{1,18}", text):
         return int(text)
+    if re.fullmatch(r"-?[0-9]+", text):
+        raise _FieldError(_TOO_BIG)
     raise _FieldError("Informe um número inteiro.")
 
 
+def _typeable_number(number: int | float) -> int | float:
+    """Recusa o número que o executor não conseguiria digitar (grande ou pequeno demais)."""
+    try:
+        format_value(number)
+    except TemplateError:
+        raise _FieldError("Número grande ou pequeno demais.") from None
+    return number
+
+
 def _to_number(value: Any) -> int | float:
+    """Número para um campo ``number`` do esquema; os inteiros vão como ``int``.
+
+    ``5.0`` (o que o campo numérico do navegador entrega) vira ``5``, e um texto
+    só com dígitos vira ``int`` sem passar por ``float`` (que perderia dígitos).
+    """
     if isinstance(value, bool):
         raise _FieldError("Informe um número.")
-    if isinstance(value, (int, float)):
-        if isinstance(value, float) and not math.isfinite(value):
-            raise _FieldError("Informe um número.")
+    if isinstance(value, int):
+        if abs(value) > _MAX_INTEGER:
+            raise _FieldError(_TOO_BIG)
         return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise _FieldError("Informe um número.")
+        if value.is_integer() and abs(value) <= _MAX_EXACT_FLOAT_INT:
+            return int(value)
+        return _typeable_number(value)
     text = _as_text(value).replace(" ", "")
     # Em pt-BR a vírgula separa os decimais e o ponto, os milhares ("1.234,5" ou "1.000").
     if "," in text or _THOUSANDS.fullmatch(text):
         text = text.replace(".", "").replace(",", ".")
     if not _NUMBER_TEXT.fullmatch(text):
         raise _FieldError("Informe um número.")
+    if re.fullmatch(r"-?[0-9]+", text):
+        if len(text.lstrip("-")) > 18:
+            raise _FieldError(_TOO_BIG)
+        return int(text)
     try:
         number = float(text)
     except ValueError:
         raise _FieldError("Informe um número.") from None
     if not math.isfinite(number):
         raise _FieldError("Informe um número.")
-    return int(number) if re.fullmatch(r"-?[0-9]+", text) else number
+    return _typeable_number(number)
 
 
 _BR_DATE = re.compile(r"^([0-9]{2})/([0-9]{2})/([0-9]{4})$")
@@ -318,7 +362,14 @@ def _to_money(value: Any) -> str:
             raise _FieldError("Valor inválido; use o formato 1.234,56.") from None
     if not amount.is_finite():
         raise _FieldError("Valor inválido; use o formato 1.234,56.")
-    quantized = amount.quantize(Decimal("0.01"))
+    # Mais de 20 dígitos inteiros nunca cabem (o limite abaixo é menor); recusar antes
+    # evita que o arredondamento passe da precisão do Decimal (InvalidOperation).
+    if amount and amount.adjusted() >= 20:
+        raise _FieldError("Valor grande demais.")
+    try:
+        quantized = amount.quantize(Decimal("0.01"))
+    except InvalidOperation:  # pragma: no cover - barrado pelo limite acima
+        raise _FieldError("Valor grande demais.") from None
     if quantized != amount:
         raise _FieldError("Use no máximo dois dígitos de centavos.")
     sign = "-" if quantized < 0 else ""

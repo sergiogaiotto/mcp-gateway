@@ -29,7 +29,9 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from rapa.control.auth import (
     Authenticator,
@@ -51,7 +53,14 @@ from rapa.control.launcher import (
 from rapa.control.services import Dispatcher, PgPlatform, PgPrincipalResolver, PgRunQueue
 from rapa.core.contracts import Principal
 
-__all__ = ["AuthenticatorLoginResolver", "ServerSettings", "create_server_app", "main"]
+__all__ = [
+    "AuthenticatorLoginResolver",
+    "DispatcherSupervisor",
+    "ServerSettings",
+    "create_server_app",
+    "dispatcher_pool_size",
+    "main",
+]
 
 logger = logging.getLogger("rapa.server")
 
@@ -110,6 +119,7 @@ class ServerSettings(BaseModel):
     )
     chromium: str | None = None
     browser_args: tuple[str, ...] = ()
+    #: Arquivos de entrada, numa subpasta por empresa (``<pasta>/<uuid da empresa>/``).
     files_dir: Path | None = None
 
     @model_validator(mode="after")
@@ -146,7 +156,10 @@ class ServerSettings(BaseModel):
           e ``RAPA_SEGREDOS_DEV`` (JSON ``{"uuid da empresa": {"credencial": {...}}}``);
         - ``RAPA_CONCORRENCIA``, ``RAPA_PASTA_TRABALHO``, ``RAPA_PASTA_ARTEFATOS``,
           ``RAPA_PASTA_ARQUIVOS``, ``RAPA_CHROMIUM_PATH`` e ``RAPA_ARGS_NAVEGADOR``
-          (argumentos separados por espaço, com aspas se preciso);
+          (argumentos separados por espaço, com aspas se preciso). A pasta de
+          arquivos de entrada tem uma subpasta por empresa:
+          ``<RAPA_PASTA_ARQUIVOS>/<uuid da empresa>/<arquivo>``; cada execução só
+          enxerga a subpasta da própria empresa, e arquivos soltos na raiz não valem;
         - ``RAPA_MCP_ORIGENS`` (separadas por vírgula), ``RAPA_LIMITE_POR_SEGUNDO``
           (0 desliga) e ``RAPA_COOKIE_SEGURO``.
         """
@@ -311,8 +324,126 @@ def _mount_ui(
     create_ui(
         app,
         backend_factory=ContractsBackendFactory.from_platform(platform),
-        auth=UiAuth(dev=dev_login, oidc=oidc, cookie_secure=settings.cookie_secure),
+        # A interface age direto nos serviços, então a sessão confere de novo no banco
+        # (conta ativa e papéis), como a API faz a cada pedido.
+        auth=UiAuth(
+            dev=dev_login,
+            oidc=oidc,
+            cookie_secure=settings.cookie_secure,
+            principals=authenticator.resolver,
+        ),
     )
+
+
+def dispatcher_pool_size(concurrency: int) -> int:
+    """Conexões do pool do banco do despachante para ``concurrency`` execuções juntas.
+
+    Cada execução em andamento pode usar duas conexões ao mesmo tempo (a renovação
+    da concessão e a gravação dos eventos ou do resultado), e o laço principal usa
+    mais duas (pegar a próxima execução e a manutenção da fila). Com menos, as
+    execuções disputam o pool e a renovação da concessão pode atrasar.
+    """
+    return 2 * concurrency + 2
+
+
+class DispatcherSupervisor:
+    """Mantém o despachante deste processo rodando e diz se ele está de pé.
+
+    O laço do despachante já sobrevive aos erros de cada volta. Se mesmo assim ele
+    parar sem ter sido pedido (um erro inesperado), o supervisor registra o tipo do
+    erro e o reinicia depois de ``restart_delay_s``, espera que dobra a cada parada
+    seguida, até ``max_restart_delay_s``. Reiniciar é seguro: as execuções em
+    andamento continuam no mesmo :class:`Dispatcher`, que só volta a pegar novas.
+    Enquanto o despachante não está rodando, :attr:`healthy` é falso e ``/saude``
+    responde 503.
+    """
+
+    def __init__(
+        self,
+        dispatcher: Dispatcher,
+        *,
+        restart_delay_s: float = 1.0,
+        max_restart_delay_s: float = 30.0,
+    ) -> None:
+        if restart_delay_s <= 0 or max_restart_delay_s < restart_delay_s:
+            raise ValueError("as esperas para reiniciar o despachante precisam ser positivas")
+        self.dispatcher = dispatcher
+        self.restart_delay_s = restart_delay_s
+        self.max_restart_delay_s = max_restart_delay_s
+        #: Quantas vezes o despachante parou sem pedido e foi reiniciado.
+        self.restarts = 0
+        self._task: asyncio.Task[None] | None = None
+        self._running = False
+
+    @property
+    def healthy(self) -> bool:
+        """O despachante está rodando (não parou, nem espera para reiniciar)."""
+        return self._running and self._task is not None and not self._task.done()
+
+    def start(self, stop: asyncio.Event) -> asyncio.Task[None]:
+        """Começa a supervisionar; a tarefa termina quando ``stop`` é acionado."""
+        if self._task is not None:
+            raise RuntimeError("o despachante já foi iniciado")
+        self._running = True
+        self._task = asyncio.create_task(self._supervise(stop), name="despachante")
+        self._task.add_done_callback(self._ended)
+        return self._task
+
+    async def _supervise(self, stop: asyncio.Event) -> None:
+        loop = asyncio.get_running_loop()
+        delay = self.restart_delay_s
+        while True:
+            self._running = True
+            started = loop.time()
+            error: str | None = None
+            try:
+                await self.dispatcher.run(stop)
+            except Exception as exc:
+                # Só o tipo: a mensagem de um erro inesperado pode trazer dados.
+                error = type(exc).__name__
+            finally:
+                self._running = False
+            if stop.is_set():
+                if error is not None:
+                    logger.error("o despachante falhou ao encerrar: %s", error)
+                return
+            reason = error or "parou sem pedido"
+            if loop.time() - started >= self.max_restart_delay_s:
+                delay = self.restart_delay_s  # rodou bem por um tempo: espera curta de novo
+            self.restarts += 1
+            logger.error("o despachante parou (%s); reiniciando em %.1f s", reason, delay)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=delay)
+            if stop.is_set():
+                return
+            delay = min(delay * 2, self.max_restart_delay_s)
+
+    def _ended(self, task: asyncio.Task[None]) -> None:
+        self._running = False
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error("a supervisão do despachante parou: %s", type(error).__name__)
+
+
+class _DispatcherHealth:
+    """Faz ``/saude`` responder 503 enquanto o despachante deste processo estiver parado."""
+
+    def __init__(self, app: ASGIApp, supervisor: DispatcherSupervisor) -> None:
+        self.app = app
+        self.supervisor = supervisor
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and scope["path"] == "/saude" and not self.supervisor.healthy:
+            response = JSONResponse(
+                {"estado": "despachante_parado"},
+                status_code=503,
+                headers={"Cache-Control": "no-store"},
+            )
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
 
 
 def build_dispatcher(settings: ServerSettings, db: Database) -> Dispatcher:
@@ -338,7 +469,10 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
     """Monta a aplicação: REST e MCP, interface (opcional) e despachante (opcional)."""
     db = Database.from_url(settings.database_url)
     dispatcher_db = (
-        Database.from_url(settings.dispatcher_database_url)
+        Database.from_url(
+            settings.dispatcher_database_url,
+            pool_size=dispatcher_pool_size(settings.concurrency),
+        )
         if settings.dispatcher_database_url
         else None
     )
@@ -368,13 +502,16 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
             return {"estado": "ok"}
 
     dispatcher = build_dispatcher(settings, dispatcher_db) if dispatcher_db else None
+    supervisor = DispatcherSupervisor(dispatcher) if dispatcher else None
+    if supervisor is not None:
+        app.add_middleware(_DispatcherHealth, supervisor=supervisor)
     inner = app.router.lifespan_context
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[Any]:
         async with inner(application) as state:
             stop = asyncio.Event()
-            task = asyncio.create_task(dispatcher.run(stop)) if dispatcher else None
+            task = supervisor.start(stop) if supervisor else None
             try:
                 yield state
             finally:
@@ -389,6 +526,7 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
 
     app.router.lifespan_context = lifespan
     app.state.dispatcher = dispatcher
+    app.state.dispatcher_supervisor = supervisor
     if settings.http and settings.ui:
         _mount_ui(app, settings, platform, Authenticator(verifier, resolver))  # type: ignore[arg-type]
     return app

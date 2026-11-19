@@ -17,6 +17,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 from rapa.control.auth import BearerVerifier, StaticTokenVerifier
 from rapa.control.http_app import HttpSettings, create_http_app
+from rapa.core import policy
 from rapa.core.contracts import Principal, RobotSummary, Role, RunStatus, RunTrigger
 from rapa.core.ids import new_id
 from rapa.core.robot import Manifest
@@ -117,15 +118,21 @@ async def _publish(
     approver: Principal,
     area: UUID,
     manifest: Manifest,
+    *,
+    legacy: bool = False,
 ) -> UUID:
     version = await platform.create_version(creator, area, manifest)
+    if legacy:
+        # Robô publicado antes de o nome virar reservado: hoje o portão de política
+        # barraria a validação, mas um robô assim ainda pode existir no catálogo.
+        platform.robots[version.robot_id].versions[-1].violations = []
     await platform.mark_validated(creator, version.robot_id, version.version_no)
     await platform.publish(approver, version.robot_id, version.version_no)
     return version.robot_id
 
 
 async def build_world() -> World:
-    """Empresa A com 4 robôs (um com nome reservado) e empresa B com 2."""
+    """Empresa A com 4 robôs (um antigo, com nome reservado) e empresa B com 2."""
     platform = MemoryPlatform()
     company_a, area_a, company_b, area_b = new_id(), new_id(), new_id(), new_id()
     creator_a = make_principal(company_a, Role.CREATOR, subject="criadora@a")
@@ -161,7 +168,14 @@ async def build_world() -> World:
         ),
     ]
     for manifest in robots_a:
-        robot_id = await _publish(platform, creator_a, operator_a, area_a, manifest)
+        robot_id = await _publish(
+            platform,
+            creator_a,
+            operator_a,
+            area_a,
+            manifest,
+            legacy=manifest.name in policy.RESERVED_NAMES,
+        )
         world.robot_ids["a", manifest.name] = robot_id
     robots_b = [
         emitir_protocolo(BASE, HOST).model_copy(update={"title": "Emitir protocolo (B)"}),

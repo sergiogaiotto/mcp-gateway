@@ -18,6 +18,7 @@ import tempfile
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -35,7 +36,7 @@ from rapa.core.ids import new_id
 from rapa.fixtures.memory import MemoryPlatform
 from rapa.fixtures.robots import baixar_notas, emitir_protocolo
 from rapa.ui.app import create_ui
-from rapa.ui.auth import DevLogin, DevProfile, MemorySessionStore, UiAuth
+from rapa.ui.auth import DevLogin, DevProfile, MemorySessionStore, PrincipalResolver, UiAuth
 from rapa.ui.backend import ContractsBackendFactory
 from rapa.ui.context import UiSettings
 
@@ -85,13 +86,21 @@ class World:
     principals: dict[str, Principal]
     store: MemorySessionStore = field(default_factory=MemorySessionStore)
     robot_ids: dict[str, UUID] = field(default_factory=dict)
+    #: Resolvedor que a sessão consulta para conferir conta e papéis (como o banco).
+    resolver: PrincipalResolver | None = None
 
     def auth(self) -> UiAuth:
         profiles = [
             DevProfile(key, f"Perfil {key}", principal, description=principal.subject)
             for key, principal in self.principals.items()
         ]
-        return UiAuth(dev=DevLogin(profiles), store=self.store, cookie_secure=False)
+        return UiAuth(
+            dev=DevLogin(profiles),
+            store=self.store,
+            cookie_secure=False,
+            principals=self.resolver,
+            principal_ttl=timedelta(0),
+        )
 
     def settings(self) -> UiSettings:
         return UiSettings(

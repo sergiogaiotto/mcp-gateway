@@ -1,5 +1,6 @@
 """API REST (/v1) com TestClient e a plataforma em memória."""
 
+import asyncio
 import json
 from typing import Any
 from uuid import UUID
@@ -7,9 +8,11 @@ from uuid import UUID
 import pytest
 from fastapi.testclient import TestClient
 
+from rapa.control.api.openapi_robots import build_robots_openapi
 from rapa.control.auth import StaticTokenVerifier
 from rapa.control.http_app import HttpSettings, create_http_app
 from rapa.control.validation import InputValidator
+from rapa.core import policy
 from rapa.core.contracts import Principal, QuotaExceeded, RunStatus, RunTrigger
 from rapa.core.ids import new_id
 from rapa.fixtures.memory import MemoryPlatform
@@ -364,6 +367,35 @@ def test_create_robot_errors(client: TestClient, world: World) -> None:
     assert rejected["detalhes"] == created.json()["violations"]
 
 
+@pytest.mark.parametrize("name", sorted(policy.RESERVED_NAMES))
+def test_reserved_robot_names_never_reach_the_catalog(
+    client: TestClient, world: World, name: str
+) -> None:
+    # "busca" colide com GET /v1/catalogo/busca; os outros, com as ferramentas fixas do
+    # MCP e com a operação consultar_execucao do OpenAPI dos robôs.
+    manifest = simple_robot(name, "read", title="Nome reservado", description="Colide.")
+    created = client.post(
+        "/v1/robos",
+        json={"area_id": str(world.area_a), "manifesto": manifest.model_dump(mode="json")},
+        headers=auth(TOKEN_A_CREATOR),
+    )
+    assert created.status_code == 201, created.text
+    violations = created.json()["violations"]
+    assert any(f"'{name}' é reservado" in v for v in violations), violations
+    base = f"/v1/robos/{created.json()['robot_id']}/versoes/{created.json()['version_no']}"
+    rejected = _error(
+        client.post(f"{base}/validar", headers=auth(TOKEN_A_CREATOR)), 422, "entrada_invalida"
+    )
+    assert rejected["detalhes"] == violations
+    _error(client.post(f"{base}/publicar", headers=auth(TOKEN_A)), 409, "conflito")
+    # A busca continua sendo a busca.
+    found = client.get("/v1/catalogo/busca", headers=auth(TOKEN_A))
+    assert found.status_code == 200 and isinstance(found.json(), list)
+    assert "busca" not in [
+        r["slug"] for r in client.get("/v1/catalogo", headers=auth(TOKEN_A)).json()
+    ]
+
+
 # -- OpenAPI dos robôs --------------------------------------------------------
 
 
@@ -389,7 +421,7 @@ def test_openapi_per_company(client: TestClient) -> None:
     ]
     assert "/v1/catalogo/baixar_notas/execucoes" not in doc_b["paths"]
     operation = doc_a["paths"]["/v1/catalogo/emitir_protocolo/execucoes"]["post"]
-    assert operation["operationId"] == "emitir_protocolo"
+    assert operation["operationId"] == "executar_emitir_protocolo"
     body_schema = operation["requestBody"]["content"]["application/json"]["schema"]
     entradas = body_schema["properties"]["entradas"]
     assert entradas["required"] == ["nome", "cpf", "uf"]
@@ -404,6 +436,32 @@ def test_openapi_per_company(client: TestClient) -> None:
     validator = InputValidator()
     assert validator.errors(entradas, INPUTS) == []
     assert validator.errors(body_schema, {"entradas": INPUTS}) == []
+
+
+def _operation_ids(document: dict[str, Any]) -> list[str]:
+    return [
+        operation["operationId"]
+        for item in document["paths"].values()
+        for operation in item.values()
+    ]
+
+
+def test_openapi_operation_ids_are_unique_even_with_reserved_slugs(world: World) -> None:
+    summary = asyncio.run(world.platform.get_published(world.operator_a, "emitir_protocolo"))
+    assert summary is not None
+    # Robôs antigos, publicados antes de os nomes ficarem reservados.
+    legacy = [
+        summary.model_copy(update={"slug": slug, "robot_id": new_id()})
+        for slug in ("consultar_execucao", "executar_robo", "busca")
+    ]
+    document = build_robots_openapi([summary, *legacy])
+    ids = _operation_ids(document)
+    assert len(ids) == len(set(ids)) == 5
+    assert "consultar_execucao" in ids
+    robot_ids = [i for i in ids if i != "consultar_execucao"]
+    assert all(i.startswith("executar_") for i in robot_ids)
+    operation = document["paths"]["/v1/catalogo/consultar_execucao/execucoes"]["post"]
+    assert operation["operationId"] == "executar_consultar_execucao"
 
 
 def test_openapi_requires_token(client: TestClient) -> None:

@@ -108,6 +108,8 @@ RAPA_DEV=1 RAPA_COOKIE_SEGURO=0 RAPA_TOKENS_DEV=tokens.json RAPA_SEGREDOS_DEV=se
 
 A interface fica em http://127.0.0.1:8000, a API REST em `/v1` e o gateway MCP em `/mcp`, com `Authorization: Bearer token-ana`. Um robô criado por uma pessoa precisa ser publicado por outra, com o papel de aprovador.
 
+Os arquivos de entrada (para robôs que enviam arquivos) ficam em `RAPA_PASTA_ARQUIVOS`, numa subpasta por empresa: `<RAPA_PASTA_ARQUIVOS>/<uuid da empresa>/<arquivo>`. Cada execução só enxerga a subpasta da própria empresa; arquivos soltos na raiz não valem. `/saude` responde 503 enquanto o despachante do processo estiver parado.
+
 ## Licença
 
 Apache-2.0. Veja [LICENSE](LICENSE).

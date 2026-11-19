@@ -1,5 +1,6 @@
 """Estado compartilhado pelas páginas: fábrica de backend, login, histórico e opções."""
 
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from urllib.parse import quote
@@ -10,11 +11,15 @@ from fastapi.responses import RedirectResponse
 
 from rapa.core.contracts import Principal
 from rapa.ui.auth import LOGIN_PATH, UiAuth, UiSession, safe_return_path
-from rapa.ui.backend import Backend, NotAuthenticated
+from rapa.ui.backend import Backend, BackendUnavailable, NotAuthenticated
 
 __all__ = ["BackendFactory", "UiContext", "UiSettings", "Viewer"]
 
+logger = logging.getLogger(__name__)
+
 type BackendFactory = Callable[[UiSession], Backend]
+
+_CHECK_FAILED = "não foi possível conferir sua sessão agora; tente de novo em instantes"
 
 
 @dataclass(frozen=True)
@@ -50,11 +55,25 @@ class Viewer:
         return f"Viewer(subject={self.principal.subject!r})"
 
     async def backend(self) -> Backend:
-        """Backend no nome do principal da sessão, que precisa continuar válida."""
-        session = await self.ctx.auth.fresh_session(self._session_key)
-        if session is None or session.principal != self.principal:
+        """Backend no nome do principal atual da sessão, que precisa continuar válida.
+
+        A sessão confere de novo a conta e os papéis (veja :meth:`UiAuth.session_by_key`):
+        conta sem acesso encerra a sessão; papéis mudados passam a valer nesta ação,
+        sem pedir login de novo. Se não der para conferir, a ação não segue.
+        """
+        try:
+            session = await self.ctx.auth.fresh_session(self._session_key)
+        except Exception as exc:
+            logger.warning("falha ao conferir a sessão da interface: %s", type(exc).__name__)
+            raise BackendUnavailable(_CHECK_FAILED) from None
+        if session is None or not _same_person(session.principal, self.principal):
             raise NotAuthenticated("sua sessão expirou; entre de novo")
+        self.principal = session.principal
         return self.ctx.backend_factory(session)
+
+
+def _same_person(a: Principal, b: Principal) -> bool:
+    return a.subject == b.subject and a.company_id == b.company_id
 
 
 class UiContext:
@@ -69,7 +88,16 @@ class UiContext:
         self.settings = settings
 
     async def viewer(self, request: Request) -> Viewer | None:
-        session = await self.auth.session_from_request(request)
+        """Quem está logado, ou None.
+
+        Levanta :class:`BackendUnavailable` quando não dá para conferir a conta agora
+        (banco fora do ar): a página nunca abre com o principal antigo da sessão.
+        """
+        try:
+            session = await self.auth.session_from_request(request)
+        except Exception as exc:
+            logger.warning("falha ao conferir a sessão da interface: %s", type(exc).__name__)
+            raise BackendUnavailable(_CHECK_FAILED) from None
         return Viewer(self, session) if session is not None else None
 
     @staticmethod

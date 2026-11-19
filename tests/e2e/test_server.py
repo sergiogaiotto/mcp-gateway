@@ -1,22 +1,37 @@
 """Configuração do serviço e o processo ``python -m rapa.server`` de verdade."""
 
+import asyncio
 import json
 import os
 import socket
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import httpx2
 import pytest
+from sqlalchemy import text
 
+from rapa.control.services import PgPlatform
+from rapa.core.contracts import Forbidden, Role, VersionStatus
 from rapa.core.ids import new_id
-from rapa.server import ServerSettings, load_dev_tokens
-from tests.control.db.support import PgDatabase, make_tenant
+from rapa.server import (
+    DispatcherSupervisor,
+    ServerSettings,
+    create_server_app,
+    dispatcher_pool_size,
+    load_dev_tokens,
+)
+from rapa.ui.auth import UiAuth
+from rapa.ui.backend import NotAuthenticated
+from rapa.ui.context import UiContext, UiSettings, Viewer
+from tests.control.api.support import asgi_client, running
+from tests.control.db.support import PgDatabase, make_tenant, protocolo
 
 DB = "postgresql://rapa_app:senha@banco:5432/rapa"
 
@@ -100,6 +115,210 @@ def test_dev_tokens_file_format(tmp_path: Path) -> None:
         path.write_text(json.dumps(bad))
         with pytest.raises(ValueError):
             load_dev_tokens(path)
+
+
+DISPATCHER_DB = "postgresql://rapa_dispatcher:senha@banco:5432/rapa"
+
+
+@pytest.mark.parametrize("concurrency", [1, 4, 40])
+def test_dispatcher_pool_is_sized_from_concurrency(concurrency: int) -> None:
+    # Cada execução usa até duas conexões juntas (concessão e eventos ou resultado) e
+    # o laço principal mais duas; o padrão do SQLAlchemy (5) não dava para 4 execuções.
+    settings = ServerSettings(
+        database_url=DB,
+        dispatcher_database_url=DISPATCHER_DB,
+        http=False,
+        concurrency=concurrency,
+    )
+    app = create_server_app(settings)
+    assert dispatcher_pool_size(concurrency) == 2 * concurrency + 2
+    assert app.state.dispatcher.queue.db.engine.pool.size() == 2 * concurrency + 2
+
+
+class FakeDispatcher:
+    """Despachante que para com erro nas primeiras ``crashes`` voltas."""
+
+    def __init__(self, crashes: int) -> None:
+        self.crashes = crashes
+        self.runs = 0
+        self.running = asyncio.Event()
+
+    async def run(self, stop: asyncio.Event) -> None:
+        self.runs += 1
+        if self.runs <= self.crashes:
+            raise RuntimeError("falha inesperada com dados sigilosos")
+        self.running.set()
+        await stop.wait()
+
+
+async def _until(condition: Callable[[], bool]) -> None:
+    """Espera ``condition`` ficar verdadeira (até 5 s)."""
+    for _ in range(500):
+        if condition():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("a condição não ficou verdadeira em 5 s")
+
+
+async def test_dispatcher_supervisor_restarts_a_dead_dispatcher(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake = FakeDispatcher(crashes=2)
+    supervisor = DispatcherSupervisor(
+        fake,  # type: ignore[arg-type]
+        restart_delay_s=0.2,
+        max_restart_delay_s=1.0,
+    )
+    stop = asyncio.Event()
+    task = supervisor.start(stop)
+    await _until(lambda: not supervisor.healthy)
+    async with asyncio.timeout(5):
+        await fake.running.wait()
+    assert supervisor.healthy and supervisor.restarts == 2 and fake.runs == 3
+    stopped = [r.getMessage() for r in caplog.records if "despachante parou" in r.getMessage()]
+    assert stopped == [
+        "o despachante parou (RuntimeError); reiniciando em 0.2 s",
+        "o despachante parou (RuntimeError); reiniciando em 0.4 s",
+    ]
+    # Só o tipo do erro vai para o registro, nunca a mensagem.
+    assert "sigilosos" not in caplog.text
+    stop.set()
+    await task
+    assert not supervisor.healthy and supervisor.restarts == 2
+
+
+async def test_dispatcher_supervisor_waits_longer_after_each_crash() -> None:
+    fake = FakeDispatcher(crashes=1000)
+    supervisor = DispatcherSupervisor(
+        fake,  # type: ignore[arg-type]
+        restart_delay_s=0.01,
+        max_restart_delay_s=0.04,
+    )
+    stop = asyncio.Event()
+    task = supervisor.start(stop)
+    await _until(lambda: supervisor.restarts >= 6)
+    # A espera dobra a cada parada e para no máximo: nada de laço apertado.
+    assert fake.runs <= 7
+    stop.set()
+    async with asyncio.timeout(1):
+        await task
+    assert not supervisor.healthy
+
+
+async def test_health_reports_a_stopped_dispatcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    fakes: list[FakeDispatcher] = []
+
+    def build(settings: ServerSettings, db: Any) -> FakeDispatcher:
+        fakes.append(FakeDispatcher(crashes=1000 if len(fakes) == 0 else 0))
+        return fakes[-1]
+
+    monkeypatch.setattr("rapa.server.build_dispatcher", build)
+    settings = ServerSettings(database_url=DB, dispatcher_database_url=DISPATCHER_DB, http=False)
+    for crashing in (True, False):
+        app = create_server_app(settings)
+        supervisor: DispatcherSupervisor = app.state.dispatcher_supervisor
+        async with running(app), asgi_client(app) as client:
+            if crashing:
+                # O despachante morre logo e fica esperando para reiniciar: a saúde acusa.
+                await _until(lambda s=supervisor: not s.healthy)
+                response = await client.get("/saude")
+                assert response.status_code == 503
+                assert response.json() == {"estado": "despachante_parado"}
+            else:
+                await fakes[-1].running.wait()
+                response = await client.get("/saude")
+                assert response.status_code == 200
+                assert response.json() == {"estado": "ok"}
+
+
+async def _a_minute_later(auth: UiAuth, key: str) -> None:
+    """Simula o prazo da última conferência do principal ter passado."""
+    session = await auth.store.load(key)
+    assert session is not None and session.principal_checked_at is not None
+    session.principal_checked_at -= timedelta(minutes=1)
+    await auth.store.save(session)
+
+
+@pytest.mark.database
+async def test_ui_session_follows_the_database_like_the_api(
+    app_db: Any,
+    pg_database: PgDatabase,
+    superuser_engine: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant = await make_tenant(app_db, "Revoga")
+    platform = PgPlatform(app_db)
+    version = await platform.create_version(tenant.creator, tenant.area_id, protocolo())
+    await platform.mark_validated(tenant.creator, version.robot_id, version.version_no)
+    tokens = {
+        f"token-{label}": {"sujeito": p.subject, "empresa": str(tenant.company_id)}
+        for label, p in (("aprovador", tenant.approver), ("operador", tenant.operator))
+    }
+    mounted: dict[str, Any] = {}
+
+    def capture_ui(app: Any, **kwargs: Any) -> None:
+        mounted.update(kwargs)
+
+    # A interface de verdade (NiceGUI) é global ao processo; aqui basta a montagem.
+    monkeypatch.setattr("rapa.ui.app.create_ui", capture_ui)
+    settings = ServerSettings(
+        database_url=pg_database.app_url,
+        dev=True,
+        dev_tokens_file=_tokens(tmp_path, tokens),
+        rate_limit_per_s=None,
+    )
+    app = create_server_app(settings)
+    auth: UiAuth = mounted["auth"]
+    assert auth.principals is not None and auth.dev is not None
+    ctx = UiContext(mounted["backend_factory"], auth, UiSettings())
+    profiles = {p.principal.subject: p for p in auth.dev.profiles.values()}
+
+    async def login(subject: str) -> tuple[str, Viewer]:
+        profile = profiles[subject]
+        _, session = await auth.start_session(profile.principal, profile.label, "dev")
+        return session.key, Viewer(ctx, session)
+
+    async with running(app):
+        approver_key, approver = await login(tenant.approver.subject)
+        operator_key, operator = await login(tenant.operator.subject)
+        await approver.backend()
+        await (await operator.backend()).list_runs()
+
+        async with superuser_engine.begin() as conn:
+            # O aprovador continua ativo, mas perde o papel de aprovador.
+            await conn.execute(
+                text(
+                    "DELETE FROM memberships WHERE role = 'approver' AND user_id = "
+                    "(SELECT id FROM users WHERE subject = :s)"
+                ),
+                {"s": tenant.approver.subject},
+            )
+            # O operador é desativado e perde todos os vínculos.
+            await conn.execute(
+                text("UPDATE users SET active = false WHERE subject = :s"),
+                {"s": tenant.operator.subject},
+            )
+            await conn.execute(
+                text(
+                    "DELETE FROM memberships WHERE user_id = "
+                    "(SELECT id FROM users WHERE subject = :s)"
+                ),
+                {"s": tenant.operator.subject},
+            )
+        await _a_minute_later(auth, approver_key)
+        await _a_minute_later(auth, operator_key)
+
+        with pytest.raises(Forbidden):
+            await (await approver.backend()).publish_version(version.robot_id, 1)
+        assert not approver.principal.has_role(Role.APPROVER, tenant.area_id)
+        with pytest.raises(NotAuthenticated):
+            await operator.backend()
+        assert await auth.store.load(operator_key) is None
+
+    current = await platform.get_version(tenant.creator, version.robot_id, 1)
+    assert current is not None and current.status is VersionStatus.VALIDATED
+    assert await platform.list_recent(tenant.creator, 10) == []
 
 
 def _free_port() -> int:
