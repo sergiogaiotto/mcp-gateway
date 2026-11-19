@@ -14,13 +14,14 @@ principais:
   deixa a execução "indeterminada", nunca "falhou";
 - valores de entradas, variáveis e itens nunca mudam o alvo de um passo: não
   entram em seletores CSS/XPath, cada um vira um único trecho codificado do
-  endereço (no caminho, sem barras e nunca vazio), e o texto que escolhe uma
-  linha precisa ser o texto inteiro de um elemento dela (uma célula, por
-  exemplo), sem contar maiúsculas;
+  endereço (no caminho e na rota depois do ``#``, sem barras, sem ``%`` e nunca
+  vazio), e o texto que escolhe uma linha precisa ser o texto inteiro de um
+  elemento dela (uma célula, por exemplo), com as mesmas maiúsculas e sem
+  nenhum valor vazio;
 - o que faria a execução falhar no meio por causa das entradas (campo de item
   ausente, número que não pode ser digitado, lista maior que a repetição, valor
-  que não pode ir no caminho do endereço, texto vazio para escolher a linha)
-  falha antes do primeiro passo;
+  que não pode ir no caminho ou na rota do endereço, valor vazio no texto que
+  escolhe a linha) falha antes do primeiro passo;
 - eventos, mensagens, saídas e nomes de artefatos nunca contêm valores de
   credenciais; as chaves dos eventos e os valores que são constantes do
   executor (efeito, estado, código de erro, id de passo) nunca são mascarados.
@@ -30,6 +31,7 @@ import asyncio
 import math
 import os
 import re
+import unicodedata
 import weakref
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from datetime import UTC, datetime
@@ -143,8 +145,14 @@ _BETWEEN_WORDS = r"[\u200b\u00ad]*\s[\s\u200b\u00ad]*"
 
 type _Root = Page | FrameLocator | PwLocator
 type _Action = Callable[[], Awaitable[dict[str, Any]]]
-#: Onde uma referência cai no endereço de um ``navigate``.
-type _UrlSlot = Literal["autoridade", "caminho", "consulta", "fragmento"]
+#: Onde uma referência cai no endereço de um ``navigate``. ``rota`` é o fragmento
+#: até um ``?`` dentro dele: em aplicações de página única (``#!/notas/1``) é o caminho.
+type _UrlSlot = Literal["autoridade", "caminho", "consulta", "rota", "fragmento"]
+#: Trechos onde valem as regras do caminho, e como cada um aparece nas mensagens.
+_PATH_SLOTS: dict[_UrlSlot, str] = {
+    "caminho": "no caminho do endereço",
+    "rota": "na rota do endereço (depois do '#')",
+}
 #: Itens de uma repetição sobre uma entrada de lista: o nome da lista e as linhas.
 type _Rows = tuple[str, list[Mapping[str, object]]]
 
@@ -355,7 +363,10 @@ def _url_slots(parts: list[templates.Part]) -> dict[int, _UrlSlot]:
 
     Os valores são codificados e nunca trazem ``/``, ``?`` nem ``#``: só os trechos
     literais antes de cada referência decidem onde ela cai. Sem ``//`` no começo,
-    vale a regra mais estrita (caminho).
+    vale a regra mais estrita (caminho). No fragmento, até um ``?`` dentro dele,
+    vale a mesma regra do caminho (rota): aplicações de página única escolhem a
+    tela por ele e muitas decodificam ``%2F`` antes (o AngularJS em modo
+    ``#!``, por exemplo).
     """
     slots: dict[int, _UrlSlot] = {}
     before = ""
@@ -363,8 +374,8 @@ def _url_slots(parts: list[templates.Part]) -> dict[int, _UrlSlot]:
         if isinstance(part, str):
             before += part
             continue
-        if "#" in before:
-            slots[index] = "fragmento"
+        if (hash_at := before.find("#")) != -1:
+            slots[index] = "fragmento" if "?" in before[hash_at:] else "rota"
         elif "?" in before:
             slots[index] = "consulta"
         elif (start := before.find("//")) != -1 and not any(
@@ -381,26 +392,35 @@ def _path_value_problem(text: str) -> str | None:
     """Por que um valor não pode ser um trecho do caminho do endereço (``None`` se pode).
 
     Codificar não basta: muitos servidores (ASGI, WSGI, Laravel...) decodificam o
-    caminho antes de escolher a rota, e ``%2F`` volta a ser uma barra. Um valor
-    vazio some e junta os trechos vizinhos (``/notas//cancelar``), e ``.`` e
-    ``..`` mudam de pasta mesmo codificados.
+    caminho antes de escolher a rota, e ``%2F`` volta a ser uma barra; os que
+    decodificam duas vezes fazem o mesmo com ``%252F``, por isso ``%`` também é
+    recusado. Um valor vazio some e junta os trechos vizinhos
+    (``/notas//cancelar``), e ``.`` e ``..`` mudam de pasta mesmo codificados. A
+    conferência vale também para a forma NFKC do valor, que alguns servidores
+    aplicam: a barra larga ``／`` vira ``/`` e ``‥`` vira ``..``.
     """
     if not text:
         return "está vazio"
-    if text in (".", ".."):
-        return f"é '{text}', que mudaria de pasta"
-    if "/" in text or "\\" in text:
-        return "contém '/' ou '\\', que mudariam o caminho"
+    for form in (text, unicodedata.normalize("NFKC", text)):
+        if form in (".", ".."):
+            return f"é '{form}' (ou equivale a isso), que mudaria de pasta"
+        if "/" in form or "\\" in form:
+            return "contém '/' ou '\\' (ou um equivalente), que mudariam o caminho"
+        if "%" in form:
+            return "contém '%' (ou um equivalente), que um servidor poderia decodificar de novo"
     return None
 
 
 def _encode_url_value(text: str, slot: _UrlSlot) -> str:
     """Codifica um valor como um único trecho do endereço.
 
-    No caminho, recusa os valores que mudariam a rota mesmo codificados.
+    No caminho e na rota do fragmento, recusa os valores que mudariam a rota
+    mesmo codificados.
     """
-    if slot == "caminho" and (problem := _path_value_problem(text)) is not None:
-        raise templates.TemplateError(f"não pode ir no caminho do endereço: {problem}")
+    if (where := _PATH_SLOTS.get(slot)) is not None and (
+        problem := _path_value_problem(text)
+    ) is not None:
+        raise templates.TemplateError(f"não pode ir {where}: {problem}")
     return quote(text, safe="")
 
 
@@ -412,6 +432,20 @@ def _normalize_text(text: str) -> str:
     escolheria qualquer elemento sem texto (uma célula vazia, um botão só com ícone).
     """
     return _JS_SPACES.sub(" ", _IGNORED_IN_TEXT.sub("", text)).strip(" ")
+
+
+def _row_key_value(_index: int, text: str) -> str:
+    """Confere um valor do texto que escolhe o contêiner (``encode`` de ``render``).
+
+    Um valor que fica vazio depois de normalizado nunca pode entrar: com
+    ``Nota {{ item.numero }}`` e o número vazio (ou só um BOM), sobraria
+    ``Nota``, que pode ser o texto inteiro de um rótulo dentro de outra linha.
+    """
+    if not _normalize_text(text):
+        raise templates.TemplateError(
+            "ficaria vazio no texto que escolhe o contêiner, e sem ele não há como saber qual usar"
+        )
+    return text
 
 
 def _js_escape(char: str) -> str:
@@ -428,12 +462,13 @@ def _whole_text(key: str) -> re.Pattern[str]:
     ``key`` já vem normalizada. O Playwright testa expressões no texto cru
     (``textContent``), então a expressão aceita o que ele ignora ao comparar
     textos: brancos nas pontas e repetidos, U+200B e U+00AD. Os caracteres
-    precisam ser os mesmos, mas maiúsculas e minúsculas não contam: a chave
-    gravada vem de ``innerText``, que já aplicou o ``text-transform`` do CSS.
+    precisam ser os mesmos, com as mesmas maiúsculas e minúsculas: ``ab3x`` nunca
+    escolhe a linha de ``AB3X``. O ``text-transform`` do CSS não conta, porque o
+    texto é o do HTML (o gravador também grava a chave a partir dele).
     """
     words = (_INSIDE_WORD.join(_js_escape(char) for char in word) for word in key.split(" "))
     body = _BETWEEN_WORDS.join(words)
-    return re.compile(f"^{_TEXT_EDGE}{body}{_TEXT_EDGE}$", re.IGNORECASE)
+    return re.compile(f"^{_TEXT_EDGE}{body}{_TEXT_EDGE}$")
 
 
 def _step_targets(step: Step) -> list[Target]:
@@ -735,9 +770,9 @@ class Interpreter:
 
         O que faria a execução falhar no meio por causa das entradas (campo de
         item ausente, número que não pode ser digitado, lista maior que a
-        repetição aceita, valor que não pode ir no caminho de um endereço, texto
-        vazio para escolher um contêiner) falha aqui, antes de qualquer passo
-        gravar. As entradas recebidas não são alteradas.
+        repetição aceita, valor que não pode ir no caminho ou na rota de um
+        endereço, valor vazio no texto que escolhe um contêiner) falha aqui, antes
+        de qualquer passo gravar. As entradas recebidas não são alteradas.
         """
         values = dict(self._raw_inputs)
         problems: list[str] = []
@@ -804,11 +839,12 @@ class Interpreter:
     def _check_input_uses(self, values: Mapping[str, Any], problems: list[str]) -> None:
         """Confere os usos que só dependem das entradas e dos itens de listas de entrada.
 
-        São os valores que vão no caminho de um endereço e o texto que escolhe um
-        contêiner. Se um deles não serve, a execução pararia nesse passo, talvez
-        depois de outros já terem gravado. Variáveis só existem durante a
-        execução: essas são conferidas quando o passo roda. Vale para todos os
-        passos, inclusive os de ramos de ``if`` que podem nem rodar.
+        São os valores que vão no caminho ou na rota (depois do ``#``) de um
+        endereço e os que vão no texto que escolhe um contêiner. Se um deles não
+        serve, a execução pararia nesse passo, talvez depois de outros já terem
+        gravado. Variáveis só existem durante a execução: essas são conferidas
+        quando o passo roda. Vale para todos os passos, inclusive os de ramos de
+        ``if`` que podem nem rodar.
         """
         found: list[str] = []
 
@@ -870,7 +906,8 @@ class Interpreter:
         found: list[str] = []
         for index, slot in _url_slots(parts).items():
             ref = parts[index]
-            if slot != "caminho" or not isinstance(ref, templates.Ref):
+            place = _PATH_SLOTS.get(slot)
+            if place is None or not isinstance(ref, templates.Ref):
                 continue
             for where, value in self._ref_values(ref, values, rows):
                 try:
@@ -879,51 +916,50 @@ class Interpreter:
                     continue  # já recusado como valor que não pode ser digitado
                 problem = _path_value_problem(text)
                 if problem is not None:
-                    found.append(
-                        f"{where} não pode ir no caminho do endereço do passo "
-                        f"'{step.id}': {problem}"
-                    )
+                    found.append(f"{where} não pode ir {place} do passo '{step.id}': {problem}")
         return found
 
     @staticmethod
     def _row_key_problems(
         step: Step | None, target: Target, values: Mapping[str, Any], rows: _Rows | None
     ) -> list[str]:
+        """Valores de entradas e de itens que ficariam vazios no texto que escolhe o contêiner.
+
+        Cada valor é conferido sozinho, como :func:`_row_key_value` faz quando o
+        passo roda: ``Nota {{ item.numero }}`` com o número vazio não fica vazio,
+        mas escolheria a linha por outro texto. Variáveis (e itens de uma tabela
+        lida da página) só existem durante a execução e são conferidas lá.
+        """
         template = target.within_has_text
         if template is None:
             return []
         try:
-            scopes = {ref.scope for ref in templates.references(template)}
+            refs = list(dict.fromkeys(templates.references(template)))
         except templates.TemplateError:
             return []  # recusado ao montar o passo
-        if not scopes or templates.Scope.VARS in scopes:
-            return []  # texto fixo, ou que só existe durante a execução
-        contexts: list[tuple[str, dict[templates.Scope, Mapping[str, object]]]]
-        if templates.Scope.ITEM in scopes:
-            if rows is None:
-                return []  # itens de uma tabela lida da página
-            name, items = rows
-            contexts = [
-                (
-                    f" para '{name}[{index}]'",
-                    {templates.Scope.INPUTS: values, templates.Scope.ITEM: row},
-                )
-                for index, row in enumerate(items)
-            ]
-        else:
-            contexts = [("", {templates.Scope.INPUTS: values})]
         where = f"no passo '{step.id}'" if step is not None else "nas pós-condições"
         found: list[str] = []
-        for suffix, context in contexts:
-            try:
-                key = templates.render(template, context)
-            except templates.TemplateError:
-                continue
-            if not _normalize_text(key):
-                found.append(
-                    f"o texto que escolhe o contêiner de '{target.intent}' {where} "
-                    f"ficaria vazio{suffix}"
-                )
+        for ref in refs:
+            checks: list[tuple[str, Mapping[str, object]]]
+            if ref.scope is templates.Scope.INPUTS:
+                checks = [("", values)]
+            elif ref.scope is templates.Scope.ITEM and rows is not None:
+                name, items = rows
+                checks = [(f" para '{name}[{index}]'", row) for index, row in enumerate(items)]
+            else:
+                continue  # variáveis e itens de uma tabela lida da página
+            for suffix, scope_values in checks:
+                if ref.name not in scope_values:
+                    continue  # recusado ao montar o passo
+                try:
+                    text = templates.format_value(scope_values[ref.name])
+                except templates.TemplateError:
+                    continue  # já recusado como valor que não pode ser digitado
+                if not _normalize_text(text):
+                    found.append(
+                        f"{ref} ficaria vazio no texto que escolhe o contêiner de "
+                        f"'{target.intent}' {where}{suffix}"
+                    )
         return found
 
     def _check_list_limits(self, values: Mapping[str, Any]) -> None:
@@ -1425,10 +1461,11 @@ class Interpreter:
         """Monta o endereço codificando cada valor como um único trecho.
 
         ``?``, ``#`` ou ``&`` num valor nunca mudam o caminho nem a consulta; no
-        caminho, valores vazios, com ``/`` ou ``\\`` ou iguais a ``.`` e ``..``
-        são recusados. Domínio, porta e usuário vêm só do trecho literal do começo.
-        Valores de entradas e itens já foram conferidos antes do primeiro passo;
-        aqui a conferência pega os de variáveis.
+        caminho e na rota do fragmento (do ``#`` até um ``?`` dentro dele), valores
+        vazios, com ``/``, ``\\`` ou ``%`` ou iguais a ``.`` e ``..`` (também na
+        forma NFKC) são recusados. Domínio, porta e usuário vêm só do trecho
+        literal do começo. Valores de entradas e itens já foram conferidos antes
+        do primeiro passo; aqui a conferência pega os de variáveis.
         """
         try:
             slots = _url_slots(templates.parse(step.url))
@@ -1765,7 +1802,10 @@ class Interpreter:
             if target.within_has_text is not None:
                 # Normalizada como o Playwright normaliza: um texto só de U+200B,
                 # U+00AD ou U+FEFF (a célula vazia de um CSV do Excel) fica vazio.
-                key = _normalize_text(self._render(target.within_has_text))
+                # Cada valor é conferido sozinho (entradas e itens já foram antes do
+                # primeiro passo; aqui entram as variáveis): um valor vazio numa
+                # chave com trecho fixo deixaria só o trecho fixo.
+                key = _normalize_text(self._render(target.within_has_text, encode=_row_key_value))
                 if not key:
                     # Sem texto, qualquer elemento vazio (uma célula, um botão só com
                     # ícone) serviria, e qualquer contêiner seria escolhido.
@@ -1775,10 +1815,10 @@ class Interpreter:
                         "sem ele não há como saber qual usar.",
                     )
                 # O texto precisa ser o texto inteiro de um elemento do contêiner (uma
-                # célula, por exemplo), com os mesmos caracteres: "12" não escolhe a
-                # linha da nota "120" nem a do valor "12,00". Maiúsculas não contam,
-                # porque a chave gravada já passou pelo text-transform do CSS. Mais de
-                # um contêiner com o texto continua ambíguo.
+                # célula, por exemplo), com os mesmos caracteres e as mesmas
+                # maiúsculas: "12" não escolhe a linha da nota "120" nem a do valor
+                # "12,00", e "ab3x" não escolhe a de "AB3X". Mais de um contêiner com
+                # o texto continua ambíguo.
                 within = within.filter(has=self.page.get_by_text(_whole_text(key)))
             container = within
         return [self._build(container, locator) for locator in target.locators]

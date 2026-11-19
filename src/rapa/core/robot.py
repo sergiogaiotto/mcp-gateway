@@ -190,8 +190,11 @@ class Target(_Model):
         default=None,
         max_length=500,
         description=(
-            "Escolhe o contêiner que tem um elemento (por exemplo, uma célula) com "
-            "exatamente este texto, sem contar espaços nas pontas (template)"
+            "Escolhe o contêiner que tem um elemento (por exemplo, uma célula) cujo "
+            "texto inteiro é exatamente este, com as mesmas maiúsculas e minúsculas; "
+            "só os brancos nas pontas e repetidos não contam. Use o texto do HTML, não "
+            "o mostrado depois do text-transform do CSS. Nenhum valor do template pode "
+            "ficar vazio (template)"
         ),
     )
     snapshot: str | None = Field(

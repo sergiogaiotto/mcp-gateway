@@ -158,8 +158,9 @@ def _cancelar_notas(path: str = "/notas") -> Manifest:
     "numero",
     [
         "12",  # começo de outro número (120)
+        "abc",  # mesmo texto, outra caixa
         "3,0",  # pedaço de outra célula (o valor 3,00)
-        "AB",  # pedaço de outra célula, em outra caixa
+        "AB",  # pedaço de outra célula
         "1.00",  # o ponto não vale como "qualquer caractere" (o valor 1,00)
         "12 0",  # o espaço do meio conta
     ],
@@ -184,9 +185,7 @@ async def test_row_key_matches_the_exact_cell(run_robot: RobotRunner) -> None:
     page = _Page()
     outcome = await run_robot(
         _cancelar_notas(),
-        # A caixa não conta: a chave gravada vem de innerText, que aplica o
-        # text-transform do CSS (ver test_row_key_ignores_case_and_spacing...).
-        {"notas": [{"numero": "7"}, {"numero": "abc"}]},
+        {"notas": [{"numero": "7"}, {"numero": "ABC"}]},
         prepare_context=_serve({"/notas": _NOTAS}),
         after_run=page,
     )
@@ -240,15 +239,15 @@ _CAIXAS = """<!doctype html><meta charset="utf-8"><title>Notas</title>
 @pytest.mark.parametrize(
     ("numero", "title"),
     [
-        ("NF 7", "cancelou 7"),  # o que innerText devolve com text-transform: uppercase
-        ("nf 8", "cancelou 8"),  # outra caixa e quebras de linha na célula
+        ("nf 7", "cancelou 7"),  # o texto do HTML; o text-transform do CSS não conta
+        ("NF 8", "cancelou 8"),  # quebras de linha na célula
         ("  NF \t 8 ", "cancelou 8"),
-        ("nota \"a\" >> 'b'", "cancelou A"),  # aspas e ">>" não confundem o seletor
+        ("Nota \"A\" >> 'B'", "cancelou A"),  # aspas e ">>" não confundem o seletor
         ("001.003/2026", "cancelou 1"),  # o ponto é só um ponto
-        ("PROTOCOLO", "cancelou protocolo"),  # U+00AD e U+200B da página não contam
+        ("Protocolo", "cancelou protocolo"),  # U+00AD e U+200B da página não contam
     ],
 )
-async def test_row_key_ignores_case_and_spacing_but_not_characters(
+async def test_row_key_ignores_spacing_but_not_case_or_characters(
     run_robot: RobotRunner, numero: str, title: str
 ) -> None:
     page = _Page()
@@ -262,11 +261,55 @@ async def test_row_key_ignores_case_and_spacing_but_not_characters(
     assert page.title == title
 
 
+_SO_OUTRA_CAIXA = """<!doctype html><meta charset="utf-8"><title>Notas</title>
+<table aria-label="Notas"><tbody>
+  <tr><td>AB3X</td>
+    <td><button onclick="document.title='cancelou AB3X'">Cancelar</button></td></tr>
+  <tr><td style="text-transform: uppercase">nf 7</td>
+    <td><button onclick="document.title='cancelou 7'">Cancelar</button></td></tr>
+  <tr><td>Nota "A" &gt;&gt; 'B'</td>
+    <td><button onclick="document.title='cancelou A'">Cancelar</button></td></tr>
+</tbody></table>"""
+
+
+@pytest.mark.parametrize("numero", ["ab3x", "Ab3X", "NF 7", "nota \"a\" >> 'b'"])
+async def test_row_key_with_another_case_never_picks_a_row(
+    run_robot: RobotRunner, numero: str
+) -> None:
+    # A nota pedida não está na página; uma que só muda na caixa está. "NF 7" é o
+    # que innerText devolveria para a célula "nf 7" com text-transform: uppercase.
+    page = _Page()
+    outcome = await run_robot(
+        _cancelar_notas("/caixa"),
+        {"notas": [{"numero": numero}]},
+        prepare_context=_serve({"/caixa": _SO_OUTRA_CAIXA}),
+        after_run=page,
+    )
+    result = outcome.result
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_NAO_ENCONTRADO
+    assert not result.irreversible_started
+    assert page.title == "Notas"
+
+
+async def test_rows_that_differ_only_in_case_are_not_ambiguous(run_robot: RobotRunner) -> None:
+    page = _Page()
+    outcome = await run_robot(
+        _cancelar_notas("/caixas"),
+        {"notas": [{"numero": "nf 8"}]},
+        # Duas linhas: "nf 8" (mostrada em maiúsculas pelo CSS) e "NF 8".
+        prepare_context=_serve({"/caixas": _CAIXAS.replace("nf 7", "nf 8")}),
+        after_run=page,
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert page.title == "cancelou 7"
+
+
 @pytest.mark.parametrize(
     ("de", "para", "numero"),
     [
         ("001x003/2026", "001.003/2026", "001.003/2026"),  # o mesmo texto em duas linhas
-        ("nf 7", "NF 8", "nf 8"),  # o mesmo texto, em outra caixa
+        ("nf 7", "NF 8", "NF 8"),  # o mesmo texto, com outros brancos
     ],
 )
 async def test_row_key_in_two_rows_is_ambiguous(
@@ -356,6 +399,161 @@ async def test_blank_row_key_from_the_page_is_refused_when_the_step_runs(
     result = outcome.result
     assert result.state is RunState.FAILED, result.error_message
     assert result.error_code == ErrorCode.TEMPLATE_INVALIDO
+    assert result.failed_step_id == "cancelar"
+    assert not result.irreversible_started
+    assert page.title == "Notas"
+
+
+# Uma chave com trecho fixo ("Nota 120"): com o número vazio, sobraria "Nota", que é o
+# texto inteiro do rótulo dentro da linha da nota 120.
+_ROTULO = """<!doctype html><meta charset="utf-8"><title>Notas</title>
+<p id="chave">&#xFEFF;</p><p id="rotulo">Nota</p>
+<table aria-label="Notas"><tbody>
+  <tr><td><span>Nota</span> 120</td>
+    <td><button onclick="document.title='cancelou 120'">Cancelar</button></td></tr>
+</tbody></table>"""
+
+
+def _cancelar_com_rotulo(
+    key: str, *inputs: dict[str, Any], numero_required: bool = True
+) -> Manifest:
+    """Lê a chave e o rótulo da página e cancela a nota de cada item da lista."""
+    numero = {"name": "numero", "title": "Número", "type": "string", "required": numero_required}
+    return _manifest(
+        [
+            _open("/rotulo"),
+            *(
+                {
+                    "kind": "extract_text",
+                    "id": f"ler_{name}",
+                    "title": f"Ler {name}",
+                    "target": _target(name, {"by": "css", "value": f"#{name}"}),
+                    "into": name,
+                }
+                for name in ("chave", "rotulo")
+            ),
+            {
+                "kind": "for_each",
+                "id": "cada_nota",
+                "title": "Para cada nota",
+                "items": "inputs.notas",
+                "steps": [
+                    {
+                        "kind": "click",
+                        "id": "cancelar",
+                        "title": "Cancelar a nota",
+                        "effect": "irreversible",
+                        "timeout_ms": 1_000,
+                        "target": _target(
+                            "botão Cancelar da nota",
+                            {"by": "role", "value": "button", "name": "Cancelar"},
+                            within={"by": "role", "value": "row"},
+                            within_has_text=key,
+                        ),
+                    }
+                ],
+            },
+        ],
+        inputs=[_list_input("notas", numero), *inputs],
+    )
+
+
+_COMPLEMENTO = {"name": "complemento", "title": "Complemento", "type": "string", "required": False}
+
+
+@pytest.mark.parametrize(
+    ("key", "inputs"),
+    [
+        ("Nota {{ item.numero }}", {}),
+        ("{{ inputs.complemento }} {{ item.numero }}", {"complemento": "Nota"}),
+        ("{{ vars.rotulo }} {{ item.numero }}", {}),
+    ],
+)
+async def test_row_key_with_a_fixed_part_matches_the_whole_cell(
+    run_robot: RobotRunner, key: str, inputs: dict[str, Any]
+) -> None:
+    page = _Page()
+    outcome = await run_robot(
+        _cancelar_com_rotulo(key, _COMPLEMENTO),
+        {"notas": [{"numero": "120"}], **inputs},
+        prepare_context=_serve({"/rotulo": _ROTULO}),
+        after_run=page,
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert page.title == "cancelou 120"
+
+
+@pytest.mark.parametrize("numero", ["", "\u200b", "\ufeff", " ", None])
+@pytest.mark.parametrize(
+    "key",
+    [
+        "Nota {{ item.numero }}",
+        "{{ vars.rotulo }} {{ item.numero }}",  # a variável não adia a conferência do item
+    ],
+)
+async def test_blank_value_inside_a_row_key_fails_before_any_step(
+    run_robot: RobotRunner, key: str, numero: str | None
+) -> None:
+    # A chave inteira não fica vazia ("Nota"), mas a parte que escolhe a linha sim.
+    # A primeira nota é válida: nada pode ser cancelado antes de chegar à segunda.
+    manifest = _cancelar_com_rotulo(key, numero_required=False)  # sem valor, vira ""
+    assert policy.check(manifest) == []
+    requests: list[str] = []
+    item: dict[str, Any] = {} if numero is None else {"numero": numero}
+    outcome = await run_robot(
+        manifest,
+        {"notas": [{"numero": "120"}, item]},
+        prepare_context=_serve({"/rotulo": _ROTULO}, requests=requests),
+    )
+    result = outcome.result
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ENTRADA_INVALIDA
+    assert "item.numero" in (result.error_message or "")
+    assert "'notas[1]'" in (result.error_message or "")
+    assert not result.irreversible_started
+    assert outcome.kinds() == [RunEventKind.RUN_STARTED, RunEventKind.RUN_FAILED]
+    assert requests == []  # nem a página foi aberta
+
+
+@pytest.mark.parametrize("complemento", ["", "\ufeff", None])
+async def test_blank_input_inside_a_row_key_fails_before_any_step(
+    run_robot: RobotRunner, complemento: str | None
+) -> None:
+    # Com a variável junto, a entrada continua conferida antes do primeiro passo.
+    manifest = _cancelar_com_rotulo("{{ vars.rotulo }} {{ inputs.complemento }}", _COMPLEMENTO)
+    assert policy.check(manifest) == []
+    requests: list[str] = []
+    inputs: dict[str, Any] = {"notas": [{"numero": "120"}]}
+    if complemento is not None:
+        inputs["complemento"] = complemento
+    outcome = await run_robot(
+        manifest, inputs, prepare_context=_serve({"/rotulo": _ROTULO}, requests=requests)
+    )
+    result = outcome.result
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ENTRADA_INVALIDA
+    assert "inputs.complemento" in (result.error_message or "")
+    assert outcome.kinds() == [RunEventKind.RUN_STARTED, RunEventKind.RUN_FAILED]
+    assert requests == []
+
+
+async def test_blank_var_inside_a_row_key_is_refused_when_the_step_runs(
+    run_robot: RobotRunner,
+) -> None:
+    # vars.chave é só um BOM: a chave "Nota" escolheria a linha pelo rótulo.
+    manifest = _cancelar_com_rotulo("Nota {{ vars.chave }}")
+    assert policy.check(manifest) == []
+    page = _Page()
+    outcome = await run_robot(
+        manifest,
+        {"notas": [{"numero": "120"}]},
+        prepare_context=_serve({"/rotulo": _ROTULO}),
+        after_run=page,
+    )
+    result = outcome.result
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.TEMPLATE_INVALIDO
+    assert "vars.chave" in (result.error_message or "")
     assert result.failed_step_id == "cancelar"
     assert not result.irreversible_started
     assert page.title == "Notas"
@@ -454,6 +652,13 @@ async def test_navigate_encodes_each_value(run_robot: RobotRunner) -> None:
         "",  # o trecho sumiria: /notas//ver
         "..",
         ".",
+        "123%2Fcancelar",  # um servidor que decodifica duas vezes chegaria na barra
+        "%2e%2e",
+        "50%",
+        "123／cancelar",  # barra larga: NFKC, aplicado por alguns servidores, dá "/"
+        "．．",  # pontos largos: NFKC dá ".."
+        "‥",  # U+2025: NFKC dá ".."
+        "１００％",
     ],
 )
 async def test_navigate_refuses_path_values_before_any_step(
@@ -578,6 +783,143 @@ async def test_navigate_refuses_a_dynamic_port(run_robot: RobotRunner) -> None:
     assert outcome.result.state is RunState.FAILED
     assert outcome.result.error_code == ErrorCode.DOMINIO_NAO_PERMITIDO
     assert requests == []
+
+
+# Rotas no fragmento, como no AngularJS 1.x em modo hashbang: decodePath(path, false)
+# decodifica cada trecho (%2F inclusive) e não volta a codificar a barra; a rota é
+# escolhida no caminho decodificado. A consulta do fragmento fica separada da rota.
+_SPA = """<!doctype html><meta charset="utf-8"><title>Portal</title>
+<script>
+function decodePath(path, html5Mode) {
+  var segments = path.split('/'), i = segments.length;
+  while (i--) {
+    segments[i] = decodeURIComponent(segments[i]);
+    if (html5Mode) segments[i] = segments[i].replace(/\\//g, '%2F');
+  }
+  return segments.join('/');
+}
+function route() {
+  var hash = location.hash.replace(/^#!?/, ''), cut = hash.indexOf('?');
+  var path = decodePath(cut === -1 ? hash : hash.slice(0, cut), false);
+  var m;
+  if ((m = path.match(/^\\/notas\\/([^\\/]+)\\/cancelar$/))) {
+    fetch('/api/notas/' + m[1] + '/cancelar', {method: 'POST'});
+    document.title = 'CANCELOU ' + m[1];
+  } else if ((m = path.match(/^\\/notas\\/([^\\/]+)$/))) {
+    document.title = 'Nota ' + m[1];
+  } else if (path === '/notas') {
+    document.title = 'Busca ' + decodeURIComponent(hash.slice(cut + 1).split('=')[1]);
+  }
+}
+window.addEventListener('hashchange', route);
+route();
+</script>"""
+
+
+def _ver_nota_spa(tail: str, scope: str = "inputs") -> Manifest:
+    return _manifest(
+        [
+            _open("/inicio"),
+            {
+                "kind": "extract_text",
+                "id": "ler_numero",
+                "title": "Ler o número",
+                "target": _target("número", {"by": "css", "value": "#numero"}),
+                "into": "numero",
+            },
+            {
+                "kind": "navigate",
+                "id": "abrir_nota",
+                "title": "Abrir a nota",
+                "url": f"{BASE}/{tail.replace('VALOR', f'{{{{ {scope}.numero }}}}')}",
+            },
+        ],
+        inputs=[{"name": "numero", "title": "Número", "type": "string", "required": False}],
+    )
+
+
+def _spa_pages(numero_na_pagina: str = "1") -> dict[str, str]:
+    inicio = f'<!doctype html><title>Início</title><p id="numero">{numero_na_pagina}</p>'
+    return {"/inicio": inicio, "/": _SPA}
+
+
+@pytest.mark.parametrize(
+    ("tail", "numero"),
+    [
+        # Sem a recusa, uma leitura em validação segura cancelaria a nota 123.
+        ("#!/notas/VALOR", "123/cancelar"),
+        ("#!/notas/VALOR", "123\\cancelar"),
+        ("#!/notas/VALOR", ".."),
+        ("#!/notas/VALOR", ""),
+        ("#!/notas/VALOR", "123%2Fcancelar"),
+        ("#/notas/VALOR", "123/cancelar"),
+        ("#VALOR", "123/cancelar"),
+        ("?a=1#!/notas/VALOR", "123/cancelar"),  # o "#" depois do "?" abre o fragmento
+    ],
+)
+async def test_fragment_route_refuses_path_values_before_any_step(
+    run_robot: RobotRunner, tail: str, numero: str
+) -> None:
+    manifest = _ver_nota_spa(tail)
+    assert policy.check(manifest) == []
+    requests: list[str] = []
+    outcome = await run_robot(
+        manifest,
+        {"numero": numero},
+        mode=RunMode.UNTIL_FIRST_WRITE,
+        prepare_context=_serve(_spa_pages(), requests=requests),
+    )
+    result = outcome.result
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ENTRADA_INVALIDA
+    assert "a entrada 'numero' não pode ir na rota" in (result.error_message or "")
+    assert outcome.kinds() == [RunEventKind.RUN_STARTED, RunEventKind.RUN_FAILED]
+    assert requests == []  # nem a leitura em validação segura abriu a página
+
+
+async def test_fragment_route_refuses_a_path_value_from_the_page_when_the_step_runs(
+    run_robot: RobotRunner,
+) -> None:
+    manifest = _ver_nota_spa("#!/notas/VALOR", scope="vars")
+    assert policy.check(manifest) == []
+    requests: list[str] = []
+    outcome = await run_robot(
+        manifest,
+        mode=RunMode.UNTIL_FIRST_WRITE,
+        prepare_context=_serve(_spa_pages("123/cancelar"), requests=requests),
+    )
+    result = outcome.result
+    assert result.state is RunState.FAILED
+    assert result.error_code == ErrorCode.TEMPLATE_INVALIDO
+    assert result.failed_step_id == "abrir_nota"
+    assert requests == [f"{BASE}/inicio"]
+
+
+@pytest.mark.parametrize(
+    ("tail", "numero", "title"),
+    [
+        ("#!/notas/VALOR", "123", "Nota 123"),
+        ("#/notas/VALOR", "12 3", "Nota 12 3"),
+        # Na consulta do fragmento, o valor só é codificado: não escolhe a rota.
+        ("#!/notas?q=VALOR", "123/cancelar", "Busca 123/cancelar"),
+        ("#!/notas?q=VALOR", "", "Busca"),
+    ],
+)
+async def test_fragment_route_value_is_one_encoded_segment(
+    run_robot: RobotRunner, tail: str, numero: str, title: str
+) -> None:
+    requests: list[str] = []
+    page = _Page()
+    outcome = await run_robot(
+        _ver_nota_spa(tail),
+        {"numero": numero},
+        mode=RunMode.UNTIL_FIRST_WRITE,
+        prepare_context=_serve(_spa_pages(), requests=requests),
+        after_run=page,
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert page.title == title
+    assert not [url for url in requests if "/api/" in url]
 
 
 # -- a máscara nunca muda o que o plano de controle lê nos eventos -------------------------
