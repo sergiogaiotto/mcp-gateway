@@ -2,10 +2,11 @@
 // uma binding do Playwright, um descritor de cada ação da pessoa.
 //
 // Regras: só eventos confiáveis (isTrusted); nunca envia o valor de campos de
-// senha (inclusive campo de texto mascarado por CSS ou com rótulo de senha),
-// código de uso único, usuário de login (com ou sem <form>) ou do campo logo
-// antes de uma senha de transação; o valor final de cada campo sai no
-// change/blur (ou antes da próxima ação), com há quanto tempo a edição começou.
+// senha (inclusive campo de texto mascarado por CSS, com rótulo de senha ou cujo
+// nome acessível fala em senha), código de uso único, usuário de login (com ou
+// sem <form>) ou do campo logo antes de uma senha de transação; o valor final de
+// cada campo sai no change/blur (ou antes da próxima ação), com há quanto tempo a
+// edição começou.
 (() => {
   'use strict';
   const CONFIG = __RAPA_CONFIG__;
@@ -263,6 +264,17 @@
   };
 
   const isPassword = (el) => el.tagName === 'INPUT' && (inputType(el) === 'password' || isPasswordLikeText(el));
+
+  // Campo que só o nome acessível (aria-labelledby, aria-label) diz ser senha: o
+  // valor não sai, mas o campo não vira senha (rapa/recorder/sensitivity.py,
+  // password_by_name) e o usuário marcado pelo grupo continua usuário.
+  const isPasswordByName = (el) => {
+    if (el.tagName !== 'INPUT' || isPassword(el) || isOneTimeCode(el)) return false;
+    if (!PASSWORD_LABEL_TYPES.has(inputType(el))) return false;
+    const ac = norm(el.getAttribute('autocomplete')).toLowerCase().split(' ');
+    if (ac.indexOf('username') >= 0 || ac.indexOf('email') >= 0) return false;
+    return mentionsPassword(accessibleName(el, roleOf(el)));
+  };
 
   // Senha de transação (PIN, assinatura eletrônica, senha de pagamento) e verbos
   // irreversíveis: as mesmas regras de rapa/recorder/sensitivity.py.
@@ -577,6 +589,7 @@
     const password = isPassword(el);
     const otp = isOneTimeCode(el);
     const login = !password && !otp ? loginRole(el) : null;
+    const byName = !password && !otp && login === null && isPasswordByName(el);
     const isControl = tag === 'input' || tag === 'select' || tag === 'textarea';
     let text = '';
     if (!isControl) text = clip(el.innerText || el.textContent, MAX_TEXT);
@@ -602,7 +615,7 @@
       is_password: password,
       is_one_time_code: otp,
       is_username: login === 'username',
-      sensitive: password || otp || login !== null,
+      sensitive: password || otp || login !== null || byName,
       row: rowInfo(el, role, name, textForCount),
       form: formInfo(el),
       counts: {

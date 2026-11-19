@@ -7,6 +7,7 @@ import pytest
 
 from rapa.recorder import (
     REDACTED,
+    ClickEvent,
     ElementDescriptor,
     Heading,
     InputEvent,
@@ -18,7 +19,7 @@ from rapa.recorder import (
     Recording,
 )
 from rapa.recorder.recorder import redact_url
-from rapa.recorder.sensitivity import is_password_like_text
+from rapa.recorder.sensitivity import is_password_like_text, password_by_name
 
 
 def test_redact_url_masks_sensitive_params_and_drops_fragment() -> None:
@@ -84,6 +85,25 @@ def _send_input(recorder: Recorder, frame: _FakeFrame, value: str, **element: ob
     )
 
 
+def _send_click(recorder: Recorder, frame: _FakeFrame, name: str, **element: object) -> None:
+    """Uma mensagem do script para o clique num botão."""
+    recorder._on_binding(
+        {"page": frame.page, "frame": frame},
+        {
+            "nonce": recorder._nonce,
+            "kind": "click",
+            "element": {
+                "tag": "button",
+                "role": "button",
+                "name": name,
+                "frame_path": [],
+                **element,
+            },
+            "detail": 1,
+        },
+    )
+
+
 def test_text_field_that_looks_like_a_password_is_hidden_by_the_recorder_too() -> None:
     recorder = Recorder(probe_locators=False, capture_text=False)
     frame = _FakeFrame(_FakePage(), "https://banco.exemplo.com.br/login")
@@ -118,6 +138,8 @@ def test_username_typed_right_before_the_password_leaves_the_recording() -> None
         is_password=True,
         sensitive=True,
     )
+    # O envio do login: só com ele (botão de login) o campo vira o usuário.
+    _send_click(recorder, frame, "Entrar", css="#entrar")
     after = "https://portal.exemplo.com.br/inicio?usuario=ana+souza%40exemplo.com.br&q=ana%20souza%40exemplo.com.br&pagina=2"
     recorder._append(NavigationEvent, page_id=0, url=after, cause=NavigationCause.CLICK)
     recorder._append(PageTextEvent, page_id=0, url=after, text=f"Início\nOlá, {user}")
@@ -130,10 +152,11 @@ def test_username_typed_right_before_the_password_leaves_the_recording() -> None
     usuario = events[1]
     assert isinstance(usuario, InputEvent) and usuario.value is None and usuario.typed is None
     assert usuario.element.is_username and usuario.element.sensitive
-    navigation = events[3]
+    assert isinstance(events[3], ClickEvent)
+    navigation = events[4]
     assert isinstance(navigation, NavigationEvent)
     assert f"usuario={REDACTED}" in navigation.url and "pagina=2" in navigation.url
-    page_text = events[4]
+    page_text = events[5]
     assert isinstance(page_text, PageTextEvent) and page_text.text == f"Início\nOlá, {REDACTED}"
 
 
@@ -209,3 +232,75 @@ def test_password_rule_ignores_the_accessible_name_like_the_page_script() -> Non
     assert not is_password_like_text(field(label="CPF", name="Entre com seu CPF e senha"))
     assert is_password_like_text(field(label="Senha", name="CPF"))
     assert is_password_like_text(field(placeholder="Sua senha", name="Acesso"))
+
+
+def test_username_before_a_password_without_a_login_button_stays_in_the_recording() -> None:
+    recorder = Recorder(probe_locators=False, capture_text=False)
+    page = _FakePage()
+    frame = _FakeFrame(page, "https://banco.exemplo.com.br/pix")
+    recorder._register_page(page)
+    recorder._append(NavigationEvent, page_id=0, url=frame.url, cause=NavigationCause.TYPED)
+    _send_input(recorder, frame, "1250,00", label="Valor", name="Valor", css="#v", id="v")
+    _send_input(
+        recorder, frame, "s3nh4", input_type="password", css="#s", is_password=True, sensitive=True
+    )
+    # "Confirmar" com usuário e senha não é login: o campo fica como estava.
+    _send_click(recorder, frame, "Confirmar", css="#ok")
+    recorder._hide_usernames()
+    valor = recorder._events[1]
+    assert isinstance(valor, InputEvent)
+    assert valor.value == "1250,00" and not valor.element.sensitive
+    assert "1250,00" not in recorder._secret_values
+
+
+def test_scrub_ignores_letter_case_only_in_the_free_text_of_the_page() -> None:
+    recorder = Recorder(probe_locators=False, capture_text=False)
+    page = _FakePage()
+    frame = _FakeFrame(page, "https://erp.exemplo.com.br/inicio")
+    recorder._register_page(page)
+    recorder._remember_secret("financeiro")
+    url = "https://erp.exemplo.com.br/inicio"
+    recorder._append(
+        PageTextEvent,
+        page_id=0,
+        url=url,
+        title="Painel de FINANCEIRO",
+        headings=[Heading(level=1, text="Olá, Financeiro")],
+        text="Usuário: financeiro\nMenu Financeiro",
+        frame_texts=["FINANCEIRO"],
+    )
+    _send_input(recorder, frame, "Financeiro Corporativo", label="Departamento", css="#d")
+    _send_input(recorder, frame, "equipe financeiro", label="Equipe", css="#e")
+    _send_click(recorder, frame, "Financeiro", css="#menu", text="Financeiro")
+    text, departamento, equipe, menu = (recorder._scrub(e) for e in recorder._events)
+    assert isinstance(text, PageTextEvent)
+    assert text.title == f"Painel de {REDACTED}"
+    assert text.headings[0].text == f"Olá, {REDACTED}"
+    assert text.text == f"Usuário: {REDACTED}\nMenu {REDACTED}"
+    assert text.frame_texts == [REDACTED]
+    # Valores digitados e nomes de elementos: só o valor exato.
+    assert isinstance(departamento, InputEvent) and departamento.value == "Financeiro Corporativo"
+    assert isinstance(equipe, InputEvent) and equipe.value == f"equipe {REDACTED}"
+    assert isinstance(menu, ClickEvent) and menu.element.name == "Financeiro"
+
+
+def test_field_named_like_a_password_is_hidden_without_becoming_a_password() -> None:
+    recorder = Recorder(probe_locators=False, capture_text=False)
+    frame = _FakeFrame(_FakePage(), "https://banco.exemplo.com.br/entrar")
+    # aria-labelledby: "Digite a senha de 6 dígitos"; <label>: "Código pessoal".
+    _send_input(
+        recorder,
+        frame,
+        "918273",
+        label="Código pessoal",
+        name="Digite a senha de 6 dígitos",
+        css="#k",
+        name_attr="cod",
+    )
+    (event,) = recorder._events
+    assert isinstance(event, InputEvent)
+    assert event.value is None and event.typed is None
+    assert event.element.sensitive and not event.element.is_password
+    assert "918273" in recorder._secret_values
+    assert "cod" in recorder._pages[frame.page].sensitive_names
+    assert password_by_name(event.element)

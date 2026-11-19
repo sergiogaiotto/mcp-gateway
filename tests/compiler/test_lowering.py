@@ -760,6 +760,8 @@ def test_secret_input_of_a_field_that_became_the_username_is_dropped() -> None:
     rec.navigate("/login")
     rec.fill(textbox("Token de acesso", id="token"), "abc-123")
     rec.fill(password(), None)
+    # O campo só vira o usuário do cofre quando o envio é de login.
+    rec.click(button("Entrar", id="entrar"))
     result = compile_(rec.build())
     token = steps(result)[1]
     assert isinstance(token, FillStep)
@@ -775,11 +777,16 @@ def _username_scenarios() -> dict[str, Recording]:
     usuario = textbox("Usuário", id="usuario", name_attr="usuario")
     scenarios: dict[str, Recording] = {}
 
+    def sent(rec: RecordingBuilder) -> Recording:
+        """A pessoa termina clicando em "Entrar": o envio que a regra do login confere."""
+        rec.click(button("Entrar", id="entrar"))
+        return rec.build()
+
     rec = RecordingBuilder()
     rec.navigate("/login")
     rec.fill(usuario, "ana.souza")
     rec.fill(password(), None)
-    scenarios["direto"] = rec.build()
+    scenarios["direto"] = sent(rec)
 
     rec = RecordingBuilder()
     rec.navigate("/login")
@@ -788,7 +795,7 @@ def _username_scenarios() -> dict[str, Recording]:
     rec.key("Tab", usuario)
     rec.click(password())  # clique que só foca a senha
     rec.fill(password(), None)
-    scenarios["editado_com_tab"] = rec.build()
+    scenarios["editado_com_tab"] = sent(rec)
 
     # Login em duas etapas na mesma página (SPA): a senha só aparece depois do
     # "Continuar" ou do Enter no campo do usuário.
@@ -797,7 +804,7 @@ def _username_scenarios() -> dict[str, Recording]:
     rec.fill(usuario, "ana.souza")
     rec.click(button("Continuar"))
     rec.fill(password(), None)
-    scenarios["clique_entre"] = rec.build()
+    scenarios["clique_entre"] = sent(rec)
 
     rec = RecordingBuilder()
     rec.navigate("/login")
@@ -806,7 +813,7 @@ def _username_scenarios() -> dict[str, Recording]:
     rec.fill(usuario, "ana.souza")
     rec.key("Enter", usuario)
     rec.fill(password(), None)
-    scenarios["enter_entre"] = rec.build()
+    scenarios["enter_entre"] = sent(rec)
 
     # Na segunda etapa, só vale o primeiro campo preenchido na página.
     rec = RecordingBuilder()
@@ -815,14 +822,14 @@ def _username_scenarios() -> dict[str, Recording]:
     rec.fill(textbox("Descrição", id="descricao"), "aluguel")
     rec.click(button("Continuar"))
     rec.fill(password(), None)
-    scenarios["clique_depois_de_outro_campo"] = rec.build()
+    scenarios["clique_depois_de_outro_campo"] = sent(rec)
 
     rec = RecordingBuilder()
     rec.navigate("/login")
     rec.fill(usuario, "ana.souza")
     rec.click(button("Enviar código"))
     rec.fill(password(), None)
-    scenarios["verbo_entre"] = rec.build()
+    scenarios["verbo_entre"] = sent(rec)
 
     rec = RecordingBuilder()
     rec.navigate("/pix")
@@ -844,38 +851,38 @@ def _username_scenarios() -> dict[str, Recording]:
     rec.fill(textbox("Busca", id="q"), "notas fiscais")
     rec.navigate("/login")
     rec.fill(password(), None)
-    scenarios["outra_pagina"] = rec.build()
+    scenarios["outra_pagina"] = sent(rec)
 
     rec = RecordingBuilder()
     rec.navigate("/login")
     rec.fill(password(), None)
     rec.fill(usuario, "ana.souza")
-    scenarios["senha_antes"] = rec.build()
+    scenarios["senha_antes"] = sent(rec)
 
     rec = RecordingBuilder()
     rec.navigate("/login")
     rec.fill(element("textarea", role="textbox", name="Obs", label="Obs", id="obs"), "obs")
     rec.fill(password(), None)
-    scenarios["textarea"] = rec.build()
+    scenarios["textarea"] = sent(rec)
 
     rec = RecordingBuilder()
     rec.navigate("/login")
     rec.fill(usuario, "ana.souza")
     rec.select(select_box("Perfil", id="perfil"), "Contador")
     rec.fill(password(), None)
-    scenarios["lista_entre"] = rec.build()
+    scenarios["lista_entre"] = sent(rec)
 
     rec = RecordingBuilder()
     rec.navigate("/login")
     rec.fill(usuario, "ana.souza")
     rec.fill(textbox("Senha", id="senha_texto"), "S3nh@Forte!")
-    scenarios["senha_em_campo_de_texto"] = rec.build()
+    scenarios["senha_em_campo_de_texto"] = sent(rec)
 
     rec = RecordingBuilder()
     rec.navigate("/login")
     rec.fill(otp(), None)
     rec.fill(password(), None)
-    scenarios["codigo_antes"] = rec.build()
+    scenarios["codigo_antes"] = sent(rec)
     return scenarios
 
 
@@ -895,10 +902,10 @@ def test_recorder_username_rule_matches_the_compiler(name: str) -> None:
                 compiled.add(field_key(event.page_id, event.element))
     found = username_inputs(recording.events)
     assert {field_key(e.page_id, e.element) for e in found} == compiled
+    # Área de texto nunca é o usuário (o script também não a trata como usuário).
     expected = {
         "direto",
         "editado_com_tab",
-        "textarea",
         "senha_em_campo_de_texto",
         "clique_entre",
         "enter_entre",
@@ -1108,7 +1115,7 @@ def _login(
     return compile_(rec.build())
 
 
-@pytest.mark.parametrize("label", ["Entrar", "Acessar", "Login", "Continuar", "OK"])
+@pytest.mark.parametrize("label", ["Entrar", "Acessar", "Login", "Continuar"])
 def test_login_with_username_password_and_a_login_button_is_read(label: str) -> None:
     result = _login(label)
     click = steps(result)[-1]
@@ -1119,6 +1126,8 @@ def test_login_needs_username_password_and_a_login_button() -> None:
     # Sem usuário, com um botão que não é de login ou depois de gravar: não é login.
     assert step(_login(username=False), "clicar_entrar").effect is Effect.WRITE
     assert step(_login("Salvar"), "clicar_salvar").effect is Effect.WRITE
+    # "OK" não está no vocabulário curto de login: o POST grava.
+    assert step(_login("OK"), "clicar_ok").effect is Effect.WRITE
     assert step(_login(wrote_before=True), "clicar_entrar").effect is Effect.WRITE
 
 
