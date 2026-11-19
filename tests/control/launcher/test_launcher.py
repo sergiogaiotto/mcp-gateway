@@ -1,6 +1,9 @@
 """Lançador local: worker de verdade, Chromium de verdade, banco simulado."""
 
+import asyncio
 import json
+import os
+import sys
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -336,3 +339,72 @@ def test_static_secrets_file_errors_do_not_echo_exception_text(
         StaticSecretSource.from_file(path)
     assert "Tr0ub4dor" not in str(caught.value)
     assert str(caught.value).startswith("arquivo de segredos inválido")
+
+
+_STUBBORN_WORKER = """#!{python}
+import json, os, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+args = sys.argv[1:]
+events = args[args.index("--events") + 1]
+job = json.load(open(args[args.index("--job") + 1]))
+open({pid_file!r}, "w").write(str(os.getpid()))
+with open(events, "a") as out:
+    out.write(json.dumps({{
+        "run_id": job["run_id"], "attempt": job["attempt"], "seq": job.get("first_seq", 0),
+        "at": "2026-11-19T00:00:00Z", "kind": "run_started", "step_id": None, "data": {{}},
+    }}) + "\\n")
+time.sleep(300)
+"""
+
+
+def _stubborn_worker(tmp_path: Path) -> tuple[Path, Path]:
+    """Um "worker" que ignora o SIGTERM e não sai sozinho (o pior caso)."""
+    pid_file = tmp_path / "worker.pid"
+    script = tmp_path / "teimoso.py"
+    script.write_text(_STUBBORN_WORKER.format(python=sys.executable, pid_file=str(pid_file)))
+    script.chmod(0o755)
+    return script, pid_file
+
+
+def _gone(pid_file: Path) -> bool:
+    try:
+        os.kill(int(pid_file.read_text()), 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+@pytest.mark.parametrize("how", ["cancelada", "tentativa_antiga"])
+async def test_cancelled_or_stale_launch_kills_the_worker_promptly(
+    portal_v1: RunningPortal, tmp_path: Path, how: str
+) -> None:
+    script, pid_file = _stubborn_worker(tmp_path)
+    launcher = LocalProcessLauncher(
+        RecordingIngestor(stale=how == "tentativa_antiga"),
+        LocalLauncherSettings(
+            work_dir=tmp_path / "trabalho",
+            artifacts_dir=tmp_path / "artefatos",
+            python=str(script),
+            kill_grace_s=1,
+        ),
+    )
+    loop = asyncio.get_running_loop()
+    task = asyncio.create_task(launcher(_job(portal_v1)))
+    for _ in range(200):  # até 10 s para o worker subir
+        if pid_file.exists():
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("o worker não subiu")
+    started = loop.time()
+    if how == "cancelada":
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        with pytest.raises(StaleAttempt):
+            await task
+    # O worker morre no prazo de tolerância (SIGTERM ignorado, então SIGKILL), sem
+    # esperar a saída de erro dele fechar: nada de worker antigo gravando em paralelo.
+    assert loop.time() - started < 5
+    assert _gone(pid_file)

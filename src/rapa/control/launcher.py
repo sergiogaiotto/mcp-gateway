@@ -380,9 +380,19 @@ class LocalProcessLauncher:
                     await self._stop(process)
                     await self._forward(job, tail, work, pending, final=True)
                     break
+        except BaseException:
+            # Cancelamento (tentativa antiga, encerramento) ou erro ao gravar eventos: o
+            # worker para antes de qualquer espera. A saída de erro só fecha quando ele
+            # sai; esperar por ela antes deixaria um worker antigo gravando em paralelo
+            # com a nova tentativa e seguraria o encerramento sem limite.
+            await asyncio.shield(self._stop(process))
+            raise
         finally:
-            with contextlib.suppress(asyncio.CancelledError):
-                await stderr
+            if process.returncode is not None:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await stderr
+            else:  # pragma: no cover - _stop sempre espera o processo sair
+                stderr.cancel()
 
     async def _forward(
         self,
