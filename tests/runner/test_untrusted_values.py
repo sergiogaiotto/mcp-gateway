@@ -1171,6 +1171,77 @@ async def test_cell_shown_in_two_lines_is_ambiguous_with_a_shadow_component(
     assert failure.data["outras_linhas_pelo_texto_mostrado"] == 1
 
 
+# Componentes cujo shadow root mostra "ab" e "3x" em duas linhas, com o text-transform do
+# próprio shadow root.
+_EM_DUAS_LINHAS_TRANSFORMADAS = "".join(
+    f"<script>customElements.define('{tag}', class extends HTMLElement {{ "
+    "connectedCallback() { this.attachShadow({mode: 'open'}).innerHTML = "
+    f"'<style>:host {{ text-transform: {transform} }}</style>ab<br>3x'; }} }});</script>"
+    for tag, transform in (("x-maiusculas", "uppercase"), ("x-capitalize", "capitalize"))
+)
+# (célula da linha R1, célula da linha R2, chave). A chave escolhe uma linha pelo HTML; a
+# outra, lida com o <br> juntando as palavras, mostra a mesma chave (ou, na escolhida, a
+# outra mostra o que a escolhida mostra lida assim).
+_LINHAS_JUNTADAS = {
+    "maiusculas_na_celula": (
+        "<td style='text-transform: uppercase'>ab<br>3x<x-icone></x-icone></td>",
+        "<td>AB3X</td>",
+        "AB3X",
+    ),
+    "maiusculas_no_shadow_root": (
+        "<td><x-maiusculas></x-maiusculas></td>",
+        "<td>AB3X</td>",
+        "AB3X",
+    ),
+    "capitalize_na_celula": (
+        "<td style='text-transform: capitalize'>ab<br>3x<x-icone></x-icone></td>",
+        "<td>Ab3x</td>",
+        "Ab3x",
+    ),
+    "capitalize_no_shadow_root": (
+        "<td><x-capitalize></x-capitalize></td>",
+        "<td>Ab3x</td>",
+        "Ab3x",
+    ),
+    "minusculas_na_escolhida": (
+        "<td style='text-transform: lowercase'>AB<br>3X<x-icone></x-icone></td>",
+        "<td>ab3x</td>",
+        "AB3X",
+    ),
+}
+
+
+@pytest.mark.parametrize("cells", list(_LINHAS_JUNTADAS))
+async def test_cell_shown_in_two_lines_is_also_read_with_the_lines_joined(
+    run_robot: RobotRunner, cells: str
+) -> None:
+    # Uma das linhas tem a chave no HTML; a outra mostra, pelo CSS, "AB" e "3X" em duas
+    # linhas (ou "Ab" e "3x"). Lida com o <br> separando as palavras, ela mostra outra
+    # coisa; lida com o <br> juntando-as, mostra a chave. Na dúvida, qualquer leitura
+    # conta, e nenhuma das duas é cancelada.
+    first, second, key = _LINHAS_JUNTADAS[cells]
+    pagina = (
+        _com_registro(
+            f"<tr>{first}{_botao('R1')}</tr><tr>{second}{_botao('R2')}</tr>",
+            _cabecalho("numero", "acao"),
+        )
+        + _ICONE
+        + _EM_DUAS_LINHAS_TRANSFORMADAS
+    )
+    manifest = _manifest([_open("/notas"), _cancel_in_row("cancelar", key, "write")])
+    assert policy.check(manifest) == []
+    page = _Page()
+    outcome = await run_robot(manifest, prepare_context=_serve({"/notas": pagina}), after_run=page)
+    result = outcome.result
+    assert page.log == "", result.error_message  # nem R1 nem R2
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert "outra linha mostra" in (result.error_message or "")
+    [failure] = outcome.of(RunEventKind.STEP_FAILED, "cancelar")
+    assert failure.data["linhas_pelo_html"] == 1
+    assert failure.data["outras_linhas_pelo_texto_mostrado"] == 1
+
+
 async def test_row_key_in_another_row_without_the_target_is_ambiguous(
     run_robot: RobotRunner,
 ) -> None:
@@ -3212,3 +3283,210 @@ async def test_numbers_that_cannot_be_typed_fail_before_any_step(
     assert outcome.result.error_code == ErrorCode.ENTRADA_INVALIDA
     assert f"'{problem}'" in (outcome.result.error_message or "")
     assert outcome.kinds() == [RunEventKind.RUN_STARTED, RunEventKind.RUN_FAILED]
+
+
+# -- o campo fica com o texto digitado ------------------------------------------------------
+
+# O CEP preenche o logradouro quando o foco sai dele (no ``change``): o foco que a digitação
+# do logradouro põe nele dispara o preenchimento, e o texto digitado iria para o fim do
+# que a página pôs ("Rua do CEPPraça da Sé"). Cada valor que o logradouro recebe fica em
+# #digitado, e o que o "Salvar" envia, em #log.
+_ENDERECO_CAMPOS = (
+    '<label for="cep">CEP</label><input id="cep" name="cep">'
+    '<label for="logradouro">Logradouro</label><input id="logradouro" name="logradouro">'
+)
+_ENDERECO_SCRIPT = """
+const campo = (id) => %s.getElementById(id);
+campo('cep').addEventListener('change', () => { campo('logradouro').value = 'Rua do CEP'; });
+campo('logradouro').addEventListener('input', () => {
+  document.getElementById('digitado').textContent += campo('logradouro').value + '|';
+});"""
+_SALVAR = """<button onclick="document.getElementById('log').textContent +=
+  (document.querySelector('x-endereco')?.shadowRoot ?? document)
+    .getElementById('logradouro').value + '|'">Salvar</button>
+<p id="log"></p><p id="digitado"></p>"""
+_ENDERECO = {
+    "documento": f"""<!doctype html><meta charset="utf-8"><title>Endereço</title>
+{_ENDERECO_CAMPOS}{_SALVAR}
+<script>{_ENDERECO_SCRIPT % "document"}</script>""",
+    "shadow_root": f"""<!doctype html><meta charset="utf-8"><title>Endereço</title>
+<x-endereco></x-endereco>{_SALVAR}
+<script>
+customElements.define('x-endereco', class extends HTMLElement {{ connectedCallback() {{
+  this.attachShadow({{mode: 'open'}}).innerHTML = '{_ENDERECO_CAMPOS}';
+}} }});
+{_ENDERECO_SCRIPT % "document.querySelector('x-endereco').shadowRoot"}
+</script>""",
+}
+
+
+def _digitar(
+    step_id: str, label: str, text: str, *, effect: str = "read", sequential: bool = False
+) -> dict[str, Any]:
+    return _fill(step_id, label, text, effect=effect) | {"sequential": sequential}
+
+
+def _clicar(step_id: str, name: str) -> dict[str, Any]:
+    return {
+        "kind": "click",
+        "id": step_id,
+        "title": f"Clicar em {name}",
+        "effect": "write",
+        "target": _target(f"botão {name}", {"by": "role", "value": "button", "name": name}),
+    }
+
+
+class _Digitado(_Page):
+    """Também lê os valores que o logradouro recebeu (#digitado)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.typed: str | None = None
+
+    async def __call__(self, context: BrowserContext) -> None:
+        await super().__call__(context)
+        if context.pages:
+            self.typed = await context.pages[0].locator("#digitado").inner_text()
+
+
+@pytest.mark.parametrize("sequential", [False, True], ids=["fill", "tecla_a_tecla"])
+@pytest.mark.parametrize("where", list(_ENDERECO))
+async def test_text_typed_after_the_page_fills_the_field_is_exactly_the_text(
+    run_robot: RobotRunner, where: str, sequential: bool
+) -> None:
+    # Digitar o logradouro tira o foco do CEP, e a página preenche o logradouro antes de o
+    # texto entrar. O campo é conferido depois de digitar e, como mudou, é digitado de novo:
+    # o "Salvar" envia exatamente "Praça da Sé".
+    manifest = _manifest(
+        [
+            _open("/endereco"),
+            _digitar("digitar_cep", "CEP", "01001000", sequential=sequential),
+            _digitar("digitar_logradouro", "Logradouro", "Praça da Sé", sequential=sequential),
+            _clicar("salvar", "Salvar"),
+        ]
+    )
+    assert policy.check(manifest) == []
+    page = _Digitado()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/endereco": _ENDERECO[where]}), after_run=page
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert page.log == "Praça da Sé|"
+    assert page.typed is not None
+    assert page.typed.endswith("|Praça da Sé|")
+
+
+async def test_field_the_page_changes_in_a_step_that_writes_is_never_typed_again(
+    run_robot: RobotRunner,
+) -> None:
+    # O mesmo logradouro, num passo que grava: nada que gravou é repetido sozinho. O campo
+    # ficou com outro valor, e o passo falha sem digitar de novo e sem salvar.
+    manifest = _manifest(
+        [
+            _open("/endereco"),
+            _digitar("digitar_cep", "CEP", "01001000"),
+            _digitar("digitar_logradouro", "Logradouro", "Praça da Sé", effect="write"),
+            _clicar("salvar", "Salvar"),
+        ]
+    )
+    page = _Digitado()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/endereco": _ENDERECO["documento"]}), after_run=page
+    )
+    result = outcome.result
+    assert result.state is RunState.FAILED
+    assert result.error_code == ErrorCode.ACAO_FALHOU
+    assert result.failed_step_id == "digitar_logradouro"
+    assert page.log == ""  # nada foi salvo
+    assert page.typed == "Rua do CEPPraça da Sé|"  # digitado uma vez só
+    dump = outcome.dump()
+    assert "Praça" not in dump
+    assert "Rua do CEP" not in dump
+
+
+# Máscaras: a página formata o que recebe, sempre do mesmo jeito.
+_MASCARAS = """<!doctype html><meta charset="utf-8"><title>Cadastro</title>
+<label>CPF <input name="cpf"></label>
+<label>Valor <input name="valor"></label>
+<button onclick="document.getElementById('log').textContent +=
+  document.querySelector('[name=cpf]').value + ';' + document.querySelector('[name=valor]').value">
+Gravar</button>
+<p id="log"></p>
+<script>
+const cpf = document.querySelector('[name=cpf]');
+cpf.addEventListener('input', () => {
+  const d = cpf.value.replace(/\\D/g, '').slice(0, 11);
+  let out = d.slice(0, 3);
+  if (d.length > 3) out += '.' + d.slice(3, 6);
+  if (d.length > 6) out += '.' + d.slice(6, 9);
+  if (d.length > 9) out += '-' + d.slice(9, 11);
+  cpf.value = out;
+});
+const valor = document.querySelector('[name=valor]');
+valor.addEventListener('input', () => {
+  const d = valor.value.replace(/\\D/g, '').replace(/^0+/, '').padStart(3, '0');
+  const inteiro = d.slice(0, -2).replace(/\\B(?=(\\d{3})+(?!\\d))/g, '.');
+  valor.value = 'R$ ' + inteiro + ',' + d.slice(-2);
+});
+</script>"""
+
+
+@pytest.mark.parametrize("sequential", [False, True], ids=["fill", "tecla_a_tecla"])
+async def test_field_with_a_mask_keeps_the_page_formatting(
+    run_robot: RobotRunner, sequential: bool
+) -> None:
+    # A página formata o CPF e o valor: digitado de novo, o campo fica igual ao da primeira
+    # vez, e o formato da página vale.
+    manifest = _manifest(
+        [
+            _open("/cadastro"),
+            _digitar("digitar_cpf", "CPF", "52998224725", sequential=sequential),
+            _digitar("digitar_valor", "Valor", "123456", sequential=sequential),
+            _clicar("gravar", "Gravar"),
+        ]
+    )
+    page = _Page()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/cadastro": _MASCARAS}), after_run=page
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert page.log == "529.982.247-25;R$ 1.234,56"
+
+
+_REESCRITO = """<!doctype html><meta charset="utf-8"><title>Código</title>
+<label>Código <input name="codigo"></label>
+<button onclick="document.getElementById('log').textContent +=
+  document.querySelector('[name=codigo]').value">Gravar</button>
+<p id="log"></p>
+<script>
+let vezes = 0;
+const codigo = document.querySelector('[name=codigo]');
+codigo.addEventListener('input', () => {
+  vezes += 1;
+  codigo.value = codigo.value.replace(/-\\d+$/, '') + '-' + vezes;
+});
+</script>"""
+
+
+async def test_field_the_page_keeps_rewriting_fails_closed(run_robot: RobotRunner) -> None:
+    # Cada vez que recebe um texto, a página o troca por outro: digitado de novo, o campo
+    # não fica nem com o texto nem com o que ficou da primeira vez. O passo falha sem
+    # gravar, e a mensagem não mostra o valor do campo.
+    manifest = _manifest(
+        [
+            _open("/codigo"),
+            _digitar("digitar_codigo", "Código", "xyzzy42"),
+            _clicar("gravar", "Gravar"),
+        ]
+    )
+    page = _Page()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/codigo": _REESCRITO}), after_run=page
+    )
+    result = outcome.result
+    assert result.state is RunState.FAILED
+    assert result.error_code == ErrorCode.ACAO_FALHOU
+    assert result.failed_step_id == "digitar_codigo"
+    assert page.log == ""  # nada foi gravado
+    assert page.values == {"codigo": "xyzzy42-2"}  # digitado duas vezes, e só duas
+    assert "xyzzy42" not in outcome.dump()

@@ -36,6 +36,16 @@ As regras completas estão nas docstrings de `rapa.recorder.sensitivity`, `rapa.
 - **Um passo, um elemento.** Edições, marcações e escolhas só se juntam num passo quando são do mesmo campo (a mesma descrição, inclusive o `data-testid`) e do mesmo elemento (o número que o gravador dá a cada elemento): o alvo e o valor de um passo sempre vêm do mesmo elemento.
 - **Limpeza sem caixa.** Os valores sigilosos saem de todo texto que pode chegar ao robô ou ao modelo de linguagem, em maiúsculas ou minúsculas; só os valores digitados, a chave da linha e os endereços são trocados pelo valor exato.
 
+## Regras do executor
+
+As regras completas estão na docstring de `rapa.runner.interpreter`. Na dúvida, o passo grava e falha fechado antes de agir. Em resumo:
+
+- **Rede contra ações repetidas.** Uma ação que grava numa linha (a página e o texto que a escolhe) conta em cada endereço por onde a página principal passa depois dela, até o fim da volta e, depois, até o fim da repetição, menos os que o próprio `navigate` do robô abre. Perdas de disponibilidade conhecidas, que falham fechado: escolher a página por um clique (um link) numa volta seguinte, e uma página aberta por um `navigate` que vai sozinha a outro endereço depois (`replaceState`, `meta refresh`, redirecionamento por script).
+- **Confirmação.** A espera pela confirmação do anúncio de um passo que grava tem só o prazo da própria confirmação, nem o do passo nem o da execução: o lançador mata o processo do executor 15 s depois do prazo da execução, e o passo nunca age se esse prazo acabou durante a espera. Depois da confirmação do aviso de passo irreversível, o alvo, a linha única e a rede são conferidos de novo, na mesma página da primeira conferência; se a página for outra, o passo falha sem agir.
+- **Agir no elemento conferido.** Um passo que grava age no elemento que foi conferido, nunca no que o localizador encontrar depois em outro documento. Se a página navega ou monta o elemento de novo entre a conferência e a ação, o passo falha sem agir (perda de disponibilidade aceita: uma linha montada de novo nesse meio tempo).
+- **Texto conferido.** Depois de digitar um texto, o valor do campo é conferido. Se a página mudou o campo, o texto é digitado de novo, e vale se o campo ficar com ele ou exatamente com o que ficou da primeira vez (a máscara da própria página); senão, o passo falha. Num passo que grava, nada é digitado de novo: o campo com outro valor faz o passo falhar. Os valores do campo nunca vão para eventos nem mensagens. Uma mudança que a página faz depois, sozinha (num temporizador), não é vista.
+- **Resíduos conhecidos.** A conferência da linha única não vê shadow roots fechados nem uma chave que só o CSS mostra, sem nada no HTML (o `content` de um `::before`).
+
 ## Antes de abrir um PR
 
 ```bash

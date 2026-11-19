@@ -11,6 +11,7 @@ refresh`` de verdade, que o ``route.fulfill`` do Playwright não segue), num dom
 teste com porta. O registro do que gravou é o do servidor: cada pedido que cancelou.
 """
 
+import asyncio
 import threading
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,10 +24,10 @@ from playwright.async_api import Error as PlaywrightError
 
 from rapa.core import policy
 from rapa.core.contracts import RunState
-from rapa.core.events import RunEventKind
+from rapa.core.events import RunEvent, RunEventKind
 from rapa.core.robot import Manifest
 from rapa.runner.errors import ErrorCode
-from rapa.runner.ports import needs_ack
+from rapa.runner.ports import ListEventSink, needs_ack
 from tests.runner.support import Outcome, RobotRunner, assert_seq
 
 pytestmark = pytest.mark.browser
@@ -713,3 +714,129 @@ async def test_a_page_the_robot_navigates_to_in_the_next_iteration_is_another_pa
     )
     assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
     assert server.writes == ["a1", "b1"]
+
+
+# -- a página muda entre a conferência da linha e a ação ------------------------------------
+
+
+def _sides_app(server: _Server, *, enabled_after_ms: int = 0) -> _App:
+    """A nota 120 aparece no relatório duas vezes, uma em cada lado ("a" e "c", páginas
+    diferentes). O "Cancelar" da linha abre um popup que cancela a nota; o popup do lado
+    "a", 2 s depois, leva a página que o abriu de volta a /notas/a. Em /notas/c, o botão
+    pode ficar desabilitado por ``enabled_after_ms`` (o clique espera por ele)."""
+    relatorio = _page(
+        "<table aria-label='Notas'><thead><tr><th>numero</th><th>lado</th></tr></thead><tbody>"
+        "<tr><td>120</td><td>a</td></tr><tr><td>120</td><td>c</td></tr></tbody></table>"
+    )
+
+    def notas(lado: str, disabled_ms: int) -> str:
+        script = (
+            "<script>setTimeout(() => { document.getElementById('cancelar').disabled = false; "
+            f"}}, {disabled_ms});</script>"
+            if disabled_ms
+            else ""
+        )
+        rows = (
+            f"<tr><td>120</td><td><button id='cancelar' type='button'"
+            f"{' disabled' if disabled_ms else ''} "
+            f"onclick=\"window.open('/popup/cancelar?nota=120&lado={lado}')\">Cancelar</button>"
+            "</td></tr><tr><td>7</td><td><button type='button'>Cancelar</button></td></tr>"
+        )
+        return _page(f"<h1>Lado {lado}</h1>" + _table(rows) + script)
+
+    def app(method: str, path: str, form: dict[str, list[str]]) -> tuple[int, dict[str, str], str]:
+        parts = urlsplit(path)
+        if parts.path == "/relatorio":
+            return 200, {}, relatorio
+        if parts.path == "/popup/cancelar":
+            lado = parse_qs(parts.query).get("lado", ["?"])[0]
+            server.writes.append(f"C120@{lado}")
+            back = (
+                "<script>setTimeout(() => { window.opener.location.href = '/notas/a'; }, 2000);"
+                "</script>"
+                if lado == "a"
+                else ""
+            )
+            return 200, {}, _page("<p>Cancelada</p>" + back)
+        if parts.path in ("/notas/a", "/notas/c"):
+            lado = parts.path.rsplit("/", 1)[1]
+            return 200, {}, notas(lado, enabled_after_ms if lado == "c" else 0)
+        return 404, {}, "nada"
+
+    return app
+
+
+def _sides_manifest(base: str, effect: str, timeout_ms: int) -> Manifest:
+    read = _read_notes() | {"columns": ["numero", "lado"]}
+    cancel = _click("cancelar", "Cancelar", row=True, effect=effect) | {"timeout_ms": timeout_ms}
+    return _manifest(
+        [
+            _navigate(base, "/relatorio", "abrir_relatorio"),
+            read,
+            _for_each(
+                "vars.notas",
+                [_navigate(base, "/notas/{{ item.lado }}", "abrir_lado"), cancel],
+                "cada_nota",
+            ),
+        ]
+    )
+
+
+class _SlowSecondWarning(ListEventSink):
+    """Guarda os eventos; só a confirmação do segundo aviso de passo irreversível demora."""
+
+    def __init__(self, delay_s: float) -> None:
+        super().__init__()
+        self.delay_s = delay_s
+        self.warnings = 0
+
+    async def emit(self, event: RunEvent) -> None:
+        await super().emit(event)
+        if needs_ack(event):
+            self.warnings += 1
+            if self.warnings == 2:
+                await asyncio.sleep(self.delay_s)
+
+
+@pytest.mark.parametrize("timeout_ms", [1_000, 15_000])
+async def test_a_page_that_moves_during_the_irreversible_warning_is_checked_again(
+    run_robot: RobotRunner, server: _Server, timeout_ms: int
+) -> None:
+    # A volta 1 abre /notas/c com um ``navigate`` (outra página, por desenho) e confere a
+    # linha lá. A confirmação do aviso demora 4 s e, nesse meio tempo, o popup da volta 0
+    # leva a página de volta a /notas/a, onde a nota 120 já foi cancelada. Depois da
+    # confirmação, a página e a linha são conferidas de novo antes de agir.
+    server.app = _sides_app(server)
+    events = _SlowSecondWarning(delay_s=4.0)
+    outcome = await _run(
+        run_robot, _sides_manifest(server.base, "irreversible", timeout_ms), events=events
+    )
+    result = outcome.result
+    assert server.writes == ["C120@a"], result.error_message  # nunca duas vezes
+    assert result.state is RunState.INDETERMINATE  # a volta 0 já tinha agido
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO, result.error_message
+    assert result.failed_step_id == "cancelar"
+    assert "A página mudou" in (result.error_message or "")
+    assert events.warnings == 2  # o segundo aviso foi dado, mas nada foi feito depois dele
+    assert len(outcome.of(RunEventKind.STEP_SUCCEEDED, "cancelar")) == 1
+    assert_seq(outcome.events)
+
+
+@pytest.mark.parametrize("effect", ["write", "irreversible"])
+async def test_a_click_waiting_for_the_button_never_lands_on_another_page(
+    run_robot: RobotRunner, server: _Server, effect: str
+) -> None:
+    # Sem confirmação lenta: em /notas/c, o botão fica desabilitado por 6 s e o clique
+    # espera por ele; nesse meio tempo, o popup da volta 0 leva a página de volta a
+    # /notas/a. O clique vai para o botão conferido em /notas/c, que deixou de existir, e
+    # nunca para o da mesma linha em /notas/a.
+    server.app = _sides_app(server, enabled_after_ms=6_000)
+    outcome = await _run(run_robot, _sides_manifest(server.base, effect, 10_000))
+    result = outcome.result
+    assert server.writes == ["C120@a"], result.error_message  # nunca duas vezes
+    expected = RunState.INDETERMINATE if effect == "irreversible" else RunState.FAILED
+    assert result.state is expected, result.error_message
+    assert result.failed_step_id == "cancelar"
+    assert result.error_code in (ErrorCode.ACAO_FALHOU, ErrorCode.ELEMENTO_AMBIGUO)
+    assert len(outcome.of(RunEventKind.STEP_SUCCEEDED, "cancelar")) == 1
+    assert_seq(outcome.events)
