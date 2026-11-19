@@ -829,11 +829,12 @@ async def test_row_shown_with_the_key_of_another_row_is_ambiguous_for_reads(
     assert result.failed_step_id == "ler_qtd"
 
 
-async def test_row_shown_with_the_key_of_another_row_is_not_found_by_conditions(
+async def test_row_shown_with_the_key_of_another_row_is_ambiguous_in_conditions(
     run_robot: RobotRunner,
 ) -> None:
-    # Numa condição, a linha que não é única conta como elemento não encontrado, como
-    # dois elementos já contavam: "visível" é falso, e o ramo não roda.
+    # Numa condição, a linha que não é única nunca conta como não encontrada (uma
+    # condição negada levaria a um ramo que grava): a condição falha fechado, e nenhum
+    # ramo roda.
     pagina = _DUAS_CAIXAS.replace(
         "<table", f"<table><tr>{_botao('todas', 'Marcar')}</tr></table><table"
     )
@@ -868,10 +869,248 @@ async def test_row_shown_with_the_key_of_another_row_is_not_found_by_conditions(
     )
     page = _Page()
     outcome = await run_robot(manifest, prepare_context=_serve({"/notas": pagina}), after_run=page)
-    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
-    [decided] = outcome.of(RunEventKind.STEP_SUCCEEDED, "se_pendente_visivel")
-    assert decided.data["ramo"] == "senao"
+    result = outcome.result
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert result.failed_step_id == "se_pendente_visivel"
+    assert "outra linha mostra" in (result.error_message or "")
+    assert not outcome.of(RunEventKind.STEP_STARTED, "marcar")
     assert page.log == ""
+
+
+# Uma linha de notas e o botão que cria uma nota (fora da tabela).
+def _com_botao_criar(rows: str) -> str:
+    return _com_registro(rows).replace(
+        "<table", f"<table><tr>{_botao('CRIOU', 'Criar nota')}</tr></table><table"
+    )
+
+
+_AMBIGUAS = {
+    # A nota AB3X mostrada em minúsculas, ao lado da nota ab3x.
+    "minusculas_ao_lado": (
+        f"<tr><td style='text-transform: lowercase'>AB3X</td>{_botao('AB3X')}</tr>"
+        f"<tr><td>ab3x</td>{_botao('ab3x')}</tr>",
+        "AB3X",
+    ),
+    # A nota "nf 8" mostrada em maiúsculas, ao lado da nota NF 8 (chave "nf 8").
+    "maiusculas_ao_lado": (
+        f"<tr><td style='text-transform: uppercase'>nf 8</td>{_botao('nf8')}</tr>"
+        f"<tr><td>NF 8</td>{_botao('NF8')}</tr>",
+        "nf 8",
+    ),
+    # A nota ab3x mostrada como AB3X, ao lado da nota AB3X (chave "AB3X").
+    "mostra_a_chave": (
+        f"<tr><td style='text-transform: uppercase'>ab3x</td>{_botao('ab3x')}</tr>"
+        f"<tr><td>AB3X</td>{_botao('AB3X')}</tr>",
+        "AB3X",
+    ),
+    # Duas linhas com a chave no HTML.
+    "duas_no_html": (
+        f"<tr><td>AB3X</td>{_botao('AB3X-1')}</tr><tr><td>AB3X</td>{_botao('AB3X-2')}</tr>",
+        "AB3X",
+    ),
+}
+
+
+def _se_a_nota_nao_existe(key: str, condition: dict[str, Any]) -> Manifest:
+    """Cria a nota se a condição sobre a linha dela (negada) vale."""
+    target = _target(
+        "botão Cancelar da nota",
+        {"by": "role", "value": "button", "name": "Cancelar", "exact": True},
+        within={"by": "role", "value": "row"},
+        within_has_text=key,
+    )
+    return _manifest(
+        [
+            _open("/notas"),
+            _if(
+                "se_nao_existe",
+                {**condition, "negate": True, "target": target},
+                [
+                    {
+                        "kind": "click",
+                        "id": "criar",
+                        "title": "Criar a nota",
+                        "effect": "write",
+                        "timeout_ms": 1_000,
+                        "target": _target(
+                            "botão Criar nota",
+                            {"by": "role", "value": "button", "name": "Criar nota"},
+                        ),
+                    }
+                ],
+            ),
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "condition", [{"op": "visible"}, {"op": "text_contains", "text": "Cancelar"}]
+)
+@pytest.mark.parametrize("variant", list(_AMBIGUAS))
+async def test_negated_condition_on_an_ambiguous_row_never_runs_its_branch(
+    run_robot: RobotRunner, variant: str, condition: dict[str, Any]
+) -> None:
+    # "Se a linha da nota não está visível, crie a nota": a linha da nota não se
+    # distingue de outra, e contar isso como "não está" criaria a nota de novo.
+    rows, key = _AMBIGUAS[variant]
+    manifest = _se_a_nota_nao_existe(key, condition)
+    assert policy.check(manifest) == []
+    page = _Page()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/notas": _com_botao_criar(rows)}), after_run=page
+    )
+    result = outcome.result
+    assert page.log == ""  # nada foi criado nem cancelado
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert result.failed_step_id == "se_nao_existe"
+    assert not outcome.of(RunEventKind.STEP_STARTED, "criar")
+    [failure] = outcome.of(RunEventKind.STEP_FAILED, "se_nao_existe")
+    assert failure.data["alvo"] == "botão Cancelar da nota"
+    assert_seq(outcome.events)
+
+
+@pytest.mark.parametrize(
+    ("rows", "created"),
+    [
+        # A linha é a única com a chave: a nota existe, e nada é criado.
+        (f"<tr><td>AB3X</td>{_botao('AB3X')}</tr><tr><td>ab3y</td>{_botao('ab3y')}</tr>", ""),
+        # Nenhuma linha tem a chave: a nota não existe e é criada.
+        (f"<tr><td>ab3y</td>{_botao('ab3y')}</tr>", "CRIOU;"),
+    ],
+)
+async def test_negated_condition_on_a_unique_or_missing_row_decides(
+    run_robot: RobotRunner, rows: str, created: str
+) -> None:
+    manifest = _se_a_nota_nao_existe("AB3X", {"op": "visible"})
+    page = _Page()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/notas": _com_botao_criar(rows)}), after_run=page
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert page.log == created
+
+
+async def test_assert_on_an_ambiguous_row_fails_closed(run_robot: RobotRunner) -> None:
+    # A verificação espera a linha deixar de ser ambígua; no fim do prazo, falha com
+    # elemento_ambiguo, e não com "a verificação falhou" pela linha não encontrada.
+    rows, key = _AMBIGUAS["minusculas_ao_lado"]
+    manifest = _manifest(
+        [
+            _open("/notas"),
+            {
+                "kind": "assert",
+                "id": "conferir",
+                "title": "Conferir que a nota não está na lista",
+                "timeout_ms": 1_000,
+                "message": "A nota ainda está na lista.",
+                "condition": {
+                    "op": "visible",
+                    "negate": True,
+                    "target": _target(
+                        "botão Cancelar da nota",
+                        {"by": "role", "value": "button", "name": "Cancelar", "exact": True},
+                        within={"by": "role", "value": "row"},
+                        within_has_text=key,
+                    ),
+                },
+            },
+        ]
+    )
+    outcome = await run_robot(manifest, prepare_context=_serve({"/notas": _com_registro(rows)}))
+    result = outcome.result
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert result.failed_step_id == "conferir"
+
+
+_AB3X_MINUSCULO = "<span style='text-transform: lowercase'>AB3X</span>"
+
+
+def _com_sombra(tag: str, html: str, cell: str, chosen: str = _AB3X_MINUSCULO) -> str:
+    """A nota AB3X (``chosen``) e outra nota cuja célula (``cell``) usa o elemento ``tag``,
+    que mostra ``html`` de dentro de um shadow root aberto, que o innerText não vê."""
+    rows = f"<tr><td>{chosen}</td>{_botao('AB3X')}</tr><tr><td>{cell}</td>{_botao('outra')}</tr>"
+    script = (
+        f"<script>customElements.define('{tag}', class extends HTMLElement {{ "
+        f"connectedCallback() {{ this.attachShadow({{mode: 'open'}}).innerHTML = {html!r}; }} "
+        "});</script>"
+    )
+    return _com_registro(rows) + script
+
+
+_DE_SOMBRA = {
+    # O texto solto no shadow root.
+    "texto_solto": ("AB3X", _com_sombra("x-texto", "ab3x", "<x-texto></x-texto>")),
+    # O texto solto, transformado pelo CSS do próprio shadow root.
+    "texto_transformado": (
+        "AB3X",
+        _com_sombra(
+            "x-caixa",
+            "<style>:host { text-transform: uppercase }</style>ab3x",
+            "<x-caixa></x-caixa>",
+            "AB3X",
+        ),
+    ),
+    # Um slot mostra o texto do próprio elemento.
+    "slot": ("AB3X", _com_sombra("x-slot", "<b><slot></slot></b>", "<x-slot>ab3x</x-slot>")),
+    # Parte do texto fora e parte dentro do shadow root.
+    "em_partes": ("AB3X", _com_sombra("x-parte", "3x", "ab<x-parte></x-parte>")),
+    # Capitalize: o texto é comparado sem olhar maiúsculas.
+    "capitalize": (
+        "Ab3x",
+        _com_sombra(
+            "x-maiuscula",
+            "<style>:host { text-transform: capitalize }</style>ab3x",
+            "<x-maiuscula></x-maiuscula>",
+            "Ab3x",
+        ),
+    ),
+}
+
+
+@pytest.mark.parametrize("variant", list(_DE_SOMBRA))
+async def test_text_shown_from_a_shadow_root_makes_the_row_ambiguous(
+    run_robot: RobotRunner, variant: str
+) -> None:
+    # A outra linha mostra "ab3x" (ou o que a linha escolhida mostra) de dentro de um
+    # shadow root: a chave pode ter vindo de qualquer uma, e nada é feito.
+    key, page_html = _DE_SOMBRA[variant]
+    page = _Page()
+    outcome = await run_robot(
+        _cancelar_notas(),
+        {"notas": [{"numero": key}]},
+        prepare_context=_serve({"/notas": page_html}),
+        after_run=page,
+    )
+    result = outcome.result
+    assert page.log == "", variant  # nenhuma das duas notas foi cancelada
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert "outra linha mostra" in (result.error_message or "")
+    [failure] = outcome.of(RunEventKind.STEP_FAILED, "cancelar")
+    assert failure.data["outras_linhas_pelo_texto_mostrado"] == 1
+
+
+@pytest.mark.parametrize(
+    "html", ["zz9", "<style>:host { visibility: hidden }</style>ab3x"], ids=["outro", "escondido"]
+)
+async def test_text_in_a_shadow_root_that_shows_something_else_is_not_ambiguous(
+    run_robot: RobotRunner, html: str
+) -> None:
+    # O shadow root da outra linha mostra outro número, ou nada: só a linha AB3X
+    # mostra "ab3x", e ela é cancelada.
+    pagina = _com_sombra("x-outra", html, "<x-outra></x-outra>")
+    page = _Page()
+    outcome = await run_robot(
+        _cancelar_notas(),
+        {"notas": [{"numero": "AB3X"}]},
+        prepare_context=_serve({"/notas": pagina}),
+        after_run=page,
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert page.log == "AB3X;"
 
 
 async def test_row_key_in_another_row_without_the_target_is_ambiguous(

@@ -442,7 +442,8 @@ class AckingEventSink:
                         "o passo não foi executado."
                     )
                 error = StepError(ErrorCode.SEM_CONFIRMACAO, message)
-                # O passo que não começou (o executor o troca pelo contêiner, se houver).
+                # O passo que não começou: o executor registra a falha nele (evento
+                # step_failed), mesmo dentro de um contêiner.
                 error.step_id = event.step_id
                 raise error
             await asyncio.sleep(self.poll_s)
