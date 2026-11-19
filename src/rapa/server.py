@@ -381,7 +381,11 @@ class DispatcherSupervisor:
         return self._running and self._task is not None and not self._task.done()
 
     def start(self, stop: asyncio.Event) -> asyncio.Task[None]:
-        """Começa a supervisionar; a tarefa termina quando ``stop`` é acionado."""
+        """Começa a supervisionar; a tarefa termina quando ``stop`` é acionado.
+
+        Só uma vez por supervisor: uma segunda chamada levanta ``RuntimeError``
+        antes de criar qualquer tarefa.
+        """
         if self._task is not None:
             raise RuntimeError("o despachante já foi iniciado")
         self._running = True
@@ -427,6 +431,16 @@ class DispatcherSupervisor:
             logger.error("a supervisão do despachante parou: %s", type(error).__name__)
 
 
+async def _stop_dispatcher(stop: asyncio.Event, task: asyncio.Task[None]) -> None:
+    """Pede a parada e espera o despachante terminar o que está em andamento.
+
+    Se a própria supervisão já tinha parado com erro (registrado em
+    :meth:`DispatcherSupervisor._ended`), o encerramento segue mesmo assim.
+    """
+    stop.set()
+    await asyncio.gather(task, return_exceptions=True)
+
+
 class _DispatcherHealth:
     """Faz ``/saude`` responder 503 enquanto o despachante deste processo estiver parado."""
 
@@ -466,7 +480,12 @@ def build_dispatcher(settings: ServerSettings, db: Database) -> Dispatcher:
 
 
 def create_server_app(settings: ServerSettings) -> FastAPI:
-    """Monta a aplicação: REST e MCP, interface (opcional) e despachante (opcional)."""
+    """Monta a aplicação: REST e MCP, interface (opcional) e despachante (opcional).
+
+    O ``lifespan`` da aplicação roda uma vez só: para subir de novo, monte outra.
+    Os bancos e o verificador de tokens são fechados ao sair, mesmo se a subida
+    falhar no meio.
+    """
     db = Database.from_url(settings.database_url)
     dispatcher_db = (
         Database.from_url(
@@ -506,23 +525,32 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
     if supervisor is not None:
         app.add_middleware(_DispatcherHealth, supervisor=supervisor)
     inner = app.router.lifespan_context
+    started = False
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[Any]:
-        async with inner(application) as state:
-            stop = asyncio.Event()
-            task = supervisor.start(stop) if supervisor else None
-            try:
-                yield state
-            finally:
-                stop.set()
-                if task is not None:
-                    await task
-                if isinstance(verifier, TokenVerifier):
-                    await verifier.aclose()
-                await db.dispose()
-                if dispatcher_db is not None:
-                    await dispatcher_db.dispose()
+        # O gateway MCP e o despachante só sobem uma vez por aplicação. Uma segunda
+        # entrada (outro TestClient na mesma aplicação, por exemplo) é recusada aqui,
+        # antes de abrir qualquer coisa ou de mexer no que já está rodando.
+        nonlocal started
+        if started:
+            raise RuntimeError(
+                "o serviço desta aplicação já foi iniciado uma vez; "
+                "monte outra com create_server_app"
+            )
+        started = True
+        async with contextlib.AsyncExitStack() as stack:
+            # Fechados por último e sempre, mesmo se a subida falhar no meio.
+            stack.push_async_callback(db.dispose)
+            if dispatcher_db is not None:
+                stack.push_async_callback(dispatcher_db.dispose)
+            if isinstance(verifier, TokenVerifier):
+                stack.push_async_callback(verifier.aclose)
+            state = await stack.enter_async_context(inner(application))
+            if supervisor is not None:
+                stop = asyncio.Event()
+                stack.push_async_callback(_stop_dispatcher, stop, supervisor.start(stop))
+            yield state
 
     app.router.lifespan_context = lifespan
     app.state.dispatcher = dispatcher

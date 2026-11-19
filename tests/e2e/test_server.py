@@ -7,7 +7,8 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -15,8 +16,12 @@ from uuid import UUID
 
 import httpx2
 import pytest
+from fastapi import FastAPI
 from sqlalchemy import text
 
+from rapa.control.auth import TokenVerifier
+from rapa.control.db import Database
+from rapa.control.mcp import McpGateway
 from rapa.control.services import PgPlatform
 from rapa.core.contracts import Forbidden, Role, VersionStatus
 from rapa.core.ids import new_id
@@ -229,6 +234,138 @@ async def test_health_reports_a_stopped_dispatcher(monkeypatch: pytest.MonkeyPat
                 response = await client.get("/saude")
                 assert response.status_code == 200
                 assert response.json() == {"estado": "ok"}
+
+
+JWT = {
+    "jwt_issuer": "https://sso.exemplo/realms/rapa",
+    "jwt_audience": "https://rapa.exemplo",
+    "jwks_url": "https://sso.exemplo/realms/rapa/protocol/openid-connect/certs",
+}
+
+
+def _full_service() -> FastAPI:
+    """REST, MCP e despachante juntos (sem a interface, que é global ao processo)."""
+    return create_server_app(
+        ServerSettings(database_url=DB, dispatcher_database_url=DISPATCHER_DB, ui=False, **JWT)
+    )
+
+
+def _record_closing(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Anota cada banco e cada verificador de tokens que a aplicação fecha."""
+    closed: list[str] = []
+    dispose, aclose = Database.dispose, TokenVerifier.aclose
+
+    async def record_dispose(self: Database) -> None:
+        closed.append("banco")
+        await dispose(self)
+
+    async def record_aclose(self: TokenVerifier) -> None:
+        closed.append("verificador")
+        await aclose(self)
+
+    monkeypatch.setattr(Database, "dispose", record_dispose)
+    monkeypatch.setattr(TokenVerifier, "aclose", record_aclose)
+    return closed
+
+
+async def test_service_starts_only_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeDispatcher(crashes=0)
+    monkeypatch.setattr("rapa.server.build_dispatcher", lambda settings, db: fake)
+    closed = _record_closing(monkeypatch)
+    app = _full_service()
+    async with running(app), asgi_client(app) as client:
+        await fake.running.wait()
+        # Entrar de novo com o serviço de pé: recusado, e o que está rodando segue.
+        with pytest.raises(RuntimeError, match="já foi iniciado uma vez"):
+            async with running(app):
+                pass
+        assert (await client.get("/saude")).status_code == 200
+        assert closed == [] and fake.runs == 1
+    assert sorted(closed) == ["banco", "banco", "verificador"]
+    # Depois de encerrado (outro TestClient na mesma aplicação, por exemplo): recusado
+    # antes de abrir qualquer coisa, sem despachante novo nem nada para fechar.
+    with pytest.raises(RuntimeError, match="já foi iniciado uma vez"):
+        async with running(app):
+            pass
+    assert sorted(closed) == ["banco", "banco", "verificador"] and fake.runs == 1
+    assert not app.state.dispatcher_supervisor.healthy
+
+
+@asynccontextmanager
+async def _failing_mcp(self: McpGateway) -> AsyncIterator[None]:
+    raise RuntimeError("falha ao subir")
+    yield  # pragma: no cover
+
+
+def _failing_start(self: DispatcherSupervisor, stop: asyncio.Event) -> asyncio.Task[None]:
+    raise RuntimeError("falha ao subir")
+
+
+@pytest.mark.parametrize("where", ["mcp", "despachante"])
+async def test_failed_startup_still_closes_databases_and_verifier(
+    monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    closed = _record_closing(monkeypatch)
+    if where == "mcp":
+        monkeypatch.setattr(McpGateway, "run", _failing_mcp)
+    else:
+        monkeypatch.setattr(DispatcherSupervisor, "start", _failing_start)
+    app = _full_service()
+    # Dentro do grupo de tarefas do SDK do MCP, o erro chega dentro de um grupo de exceções.
+    failure = pytest.RaisesExc(RuntimeError, match="falha ao subir")
+    with pytest.RaisesGroup(failure, allow_unwrapped=True):
+        async with running(app):
+            pass  # pragma: no cover
+    assert sorted(closed) == ["banco", "banco", "verificador"]
+
+
+class Fatal(BaseException):
+    """Erro que nem a supervisão pega: a própria supervisão para."""
+
+
+class ScriptedDispatcher:
+    """Para com erro na primeira volta, roda na segunda e morre de vez com ``die``."""
+
+    def __init__(self) -> None:
+        self.runs = 0
+        self.running = asyncio.Event()
+        self.die = asyncio.Event()
+
+    async def run(self, stop: asyncio.Event) -> None:
+        self.runs += 1
+        if self.runs == 1:
+            raise RuntimeError("falha inesperada")
+        self.running.set()
+        await self.die.wait()
+        raise Fatal
+
+
+async def test_full_service_health_follows_the_dispatcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = ScriptedDispatcher()
+    monkeypatch.setattr("rapa.server.build_dispatcher", lambda settings, db: fake)
+    closed = _record_closing(monkeypatch)
+    app = _full_service()
+    supervisor: DispatcherSupervisor = app.state.dispatcher_supervisor
+    async with running(app), asgi_client(app) as client:
+        # Parou com erro: enquanto espera para reiniciar, a saúde acusa.
+        await _until(lambda: fake.runs == 1 and not supervisor.healthy)
+        response = await client.get("/saude")
+        assert response.status_code == 503
+        assert response.json() == {"estado": "despachante_parado"}
+        assert response.headers["cache-control"] == "no-store"
+        async with asyncio.timeout(5):
+            await fake.running.wait()
+        assert (await client.get("/saude")).status_code == 200
+        # A supervisão em si morreu: a saúde acusa e continua acusando.
+        fake.die.set()
+        await _until(lambda: not supervisor.healthy)
+        await asyncio.sleep(0.05)
+        assert (await client.get("/saude")).status_code == 503
+        assert fake.runs == 2
+    # O encerramento segue até o fim mesmo assim.
+    assert sorted(closed) == ["banco", "banco", "verificador"]
 
 
 async def _a_minute_later(auth: UiAuth, key: str) -> None:
