@@ -26,8 +26,10 @@ principais:
   linha escolhida precisa ser a **única** com a chave nas duas bases: nenhuma
   outra linha pode ter, no HTML, um elemento com esse texto inteiro, e nenhuma
   outra pode mostrar um elemento com esse texto (o ``innerText`` normalizado
-  como acima). Se o HTML e o texto mostrado apontam para linhas diferentes, ou
-  para mais de uma, o passo falha fechado com ``elemento_ambiguo`` antes de
+  como acima) nem com o texto que a linha escolhida mostra no lugar dele (a
+  célula ``AB3X`` mostrada como ``ab3x`` pelo CSS, ao lado da nota ``ab3x``). Se
+  o HTML e o texto mostrado apontam para linhas diferentes, ou para mais de uma,
+  o passo falha fechado com ``elemento_ambiguo`` antes de
   agir, e nada é feito; vale também para passos de leitura, cujo valor pode ir
   para um passo que grava, e numa condição (``visible``, ``text_contains``) a
   linha que não é única conta como elemento não encontrado, como dois elementos
@@ -35,14 +37,20 @@ principais:
   com ``elemento_nao_encontrado`` (uma chave lida em ``NF 7`` de uma célula
   ``nf 7`` mostrada em maiúsculas não escolhe nada). A comparação nunca ignora
   maiúsculas, para uma chave nunca escolher a linha de outro código;
-- numa execução, a mesma ação que grava (``write`` ou ``irreversible``) nunca
-  se repete na mesma linha: a ação é o tipo do passo e o alvo (localizador
-  principal, contêiner e quadros, com os valores já montados), e a linha é a
-  página (esquema, domínio e caminho do endereço) e o texto que a escolhe. Na
-  segunda vez, o passo falha com ``elemento_ambiguo`` antes de agir (e antes do
-  aviso de passo irreversível). Dois passos com o mesmo alvo, nos dois ramos de
-  um ``if``, fazem a mesma ação; alvos diferentes na mesma linha (digitar a
-  quantidade e clicar em Salvar) não, e passos de leitura podem voltar a ela. A
+- numa execução, duas ações que gravam (``write`` ou ``irreversible``) nunca
+  caem na mesma linha em voltas diferentes de uma repetição: a linha é a página
+  (domínio e caminho do endereço, em minúsculas e sem a barra do fim) e o texto
+  que a escolhe, e a página de uma ação é cada endereço por onde a página passou
+  por causa dela (antes de agir, as navegações durante e depois dela, até o
+  próximo passo que pode mudar a página): a resposta de um formulário que mostra
+  a mesma tabela em outro endereço ainda é a mesma linha. Na segunda vez, o passo
+  falha com ``elemento_ambiguo`` antes de agir (e antes do aviso de passo
+  irreversível), qualquer que seja o alvo: os dois ramos de um ``if``, por
+  localizadores diferentes, e chaves cruzadas entre dois passos também são
+  recusados. Na mesma volta (ou fora de repetições), passos diferentes podem
+  agir na mesma linha (dois cliques no "+", digitar a quantidade e clicar em
+  Salvar), e duas repetições que não estão uma dentro da outra (marcar todas,
+  depois cancelar todas) não se cruzam; passos de leitura podem voltar a ela. A
   mesma chave em outra página (a nota 1 de cada filial) é outra linha. É a rede
   de segurança para itens repetidos de uma tabela lida da página;
 - o que faria a execução falhar no meio por causa das entradas (campo de item
@@ -52,7 +60,9 @@ principais:
   mesma linha) falha antes do primeiro passo. Itens repetidos são os que
   escolhem a mesma linha, pelo mesmo texto normalizado, para a mesma ação que
   grava, e fazem no resto da repetição os mesmos passos com os mesmos valores
-  onde isso pode mudar a página (endereços, alvos, opções). Valores usados só em
+  onde isso pode mudar a página (endereços, alvos, opções); numa repetição com
+  outras dentro, cada item de fora repete as ações das de dentro (dois meses na
+  mesma página cancelariam as mesmas notas). Valores usados só em
   passos que não rodam não contam: um ramo de ``if`` cuja condição é um
   ``equals`` só de entradas e itens de listas de entrada é decidido antes, como
   seria na execução, e uma repetição sobre uma lista de entrada vazia não roda.
@@ -73,7 +83,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Literal, NamedTuple, Self, assert_never, cast
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 from uuid import UUID
 
 from playwright.async_api import (
@@ -82,6 +92,7 @@ from playwright.async_api import (
     Frame,
     FrameLocator,
     Page,
+    Request,
     Route,
 )
 from playwright.async_api import Error as PlaywrightError
@@ -193,8 +204,8 @@ _PATH_SLOTS: dict[_UrlSlot, str] = {
 type _Rows = tuple[str, list[tuple[int, Mapping[str, object]]]]
 #: Ramos de ``if`` em volta de um bloco que só durante a execução se sabe se rodam.
 type _Undecided = tuple[str, ...]
-#: Uma ação que grava numa linha: o tipo do passo e o alvo (:func:`_target_signature`)
-#: e o texto normalizado que escolhe a linha. Na execução, a página vem antes.
+#: Uma ação que grava numa linha, na conferência antes do primeiro passo: o tipo do passo
+#: e o alvo (:func:`_target_signature`) e o texto normalizado que escolhe a linha.
 type _RowAction = tuple[object, ...]
 #: Passos que só leem a página: não mudam a página nem a linha onde os seguintes agem.
 _PAGE_READS = (ExtractTextStep, ExtractTableStep, AssertStep, WaitForStep)
@@ -241,15 +252,55 @@ _READ_TABLE_JS = """
 }
 """
 
-# Quantos contêineres, fora o escolhido pelo texto do HTML, mostram a chave: têm um
-# elemento (ou são um) cujo texto mostrado (innerText), normalizado como o Playwright
-# normaliza, é a chave inteira. -1 se o escolhido não está entre os contêineres. Cada
-# elemento é visto uma vez, e quem mostra a chave marca os elementos que o contêm.
+# Quantos contêineres, fora o escolhido pelo texto do HTML, mostram a chave ou o que o
+# escolhido mostra no lugar dela: têm um elemento (ou são um) cujo texto mostrado
+# (innerText), normalizado como o Playwright normaliza, é a chave inteira ou o texto
+# mostrado por um elemento do escolhido cujo texto do HTML é a chave (a célula "AB3X"
+# mostrada como "ab3x" pelo CSS). -1 se o escolhido não está entre os contêineres. O
+# texto do HTML é o que o Playwright compara: o dos filhos e o de shadow roots abertos,
+# sem scripts e estilos, e o valor de botões <input>. Cada elemento é visto uma vez, e
+# quem mostra um desses textos marca os elementos que o contêm.
 _OTHER_ROWS_SHOWING_KEY_JS = r"""
 (rows, [key, chosen]) => {
   if (!rows.includes(chosen)) return -1;
   const normalize = (text) => text.replace(/[\u200b\u00ad]/g, '').replace(/\s+/g, ' ').trim();
   const skipped = new Set(['SCRIPT', 'NOSCRIPT', 'STYLE']);
+  const buttons = new Set(['submit', 'button', 'reset']);
+  const shown = (node) =>
+    normalize((typeof node.innerText === 'string' ? node.innerText : node.textContent) ?? '');
+  const htmlTexts = new Map();
+  const htmlText = (node) => {
+    let text = htmlTexts.get(node);
+    if (text !== undefined) return text;
+    text = '';
+    if (node.nodeType === 1 && skipped.has(node.nodeName)) {
+      text = '';
+    } else if (node instanceof HTMLInputElement && buttons.has(node.type)) {
+      text = node.value;
+    } else {
+      for (let child = node.firstChild; child; child = child.nextSibling) {
+        if (child.nodeType === 3) text += child.nodeValue ?? '';
+        else if (child.nodeType === 1) text += htmlText(child);
+      }
+      if (node.shadowRoot) text += htmlText(node.shadowRoot);
+    }
+    htmlTexts.set(node, text);
+    return text;
+  };
+  const wanted = new Set([key]);
+  const inChosen = [chosen];
+  while (inChosen.length) {
+    const node = inChosen.pop();
+    if (node.nodeType === 1) {
+      if (skipped.has(node.nodeName)) continue;
+      if (normalize(htmlText(node)) === key) {
+        const text = shown(node);
+        if (text) wanted.add(text);  // uma chave escondida não mostra nada
+      }
+      if (node.shadowRoot) inChosen.push(node.shadowRoot);
+    }
+    for (const child of node.children) inChosen.push(child);
+  }
   const seen = new Set();
   const marked = new Set();
   const mark = (node) => {
@@ -263,8 +314,7 @@ _OTHER_ROWS_SHOWING_KEY_JS = r"""
       seen.add(node);
       if (node.nodeType === 1) {
         if (skipped.has(node.nodeName)) continue;
-        const text = typeof node.innerText === 'string' ? node.innerText : node.textContent;
-        if (normalize(text ?? '') === key) mark(node);
+        if (wanted.has(shown(node))) mark(node);
         if (node.shadowRoot) pending.push(node.shadowRoot);
       }
       for (const child of node.children) pending.push(child);
@@ -346,6 +396,37 @@ class _RowIssue(NamedTuple):
     shown_elsewhere: int | None
 
 
+#: Onde um passo roda: as repetições em volta dele, da mais externa à mais interna, cada
+#: uma com o id do passo ``for_each`` e a posição do item.
+type _IterationPath = tuple[tuple[str, int], ...]
+
+
+class _Act(NamedTuple):
+    """Uma ação que gravou numa linha escolhida pelo texto, para a rede contra repetições."""
+
+    step_id: str
+    key: str
+    path: _IterationPath
+
+
+def _other_iteration(earlier: _IterationPath, current: _IterationPath) -> tuple[str, int] | None:
+    """A repetição em volta das duas ações em que elas estão em voltas diferentes.
+
+    Devolve o id da repetição e a posição da ação anterior nela, ou ``None`` quando as
+    duas estão na mesma volta de todas as repetições em volta de ambas (ou fora delas):
+    dois passos seguidos no mesmo item, ou duas repetições que não estão uma dentro da
+    outra. Uma repetição só está num lugar do robô, então as que as duas têm em comum
+    são o começo das duas listas. (Ids repetidos, que o portão de política recusa, só
+    fariam duas repetições diferentes parecerem a mesma: na dúvida, recusa.)
+    """
+    for (loop, earlier_index), (other_loop, index) in zip(earlier, current, strict=False):
+        if loop != other_loop:
+            return None
+        if earlier_index != index:
+            return loop, earlier_index
+    return None
+
+
 class _ListLoop:
     """O que cada item de uma repetição sobre uma entrada de lista faz no corpo dela.
 
@@ -405,17 +486,25 @@ def _host(url: str) -> str:
 
 
 def _page_key(url: str) -> str:
-    """A página de um endereço: esquema, domínio (e porta, se não for a padrão) e caminho.
+    """A página de um endereço: domínio (e porta, se não for a padrão) e caminho normalizado.
 
-    A consulta e o fragmento não contam: ``/notas?pagina=2`` é a mesma página de
-    ``/notas`` para a rede contra ações repetidas (na dúvida, a mesma linha).
+    Na dúvida, a mesma página: a consulta, o fragmento e o esquema não contam
+    (``/notas?pagina=2`` é ``/notas``, e ``http`` é ``https``), e o caminho vale
+    decodificado, em minúsculas, sem parâmetros de trecho (``;jsessionid=...``), sem
+    barras repetidas e sem a barra do fim (``/Notas/`` é ``/notas``).
     """
     try:
         parts = urlsplit(url)
     except ValueError:
         return url
-    origin = _normalize_origin(url) or f"{parts.scheme}:"
-    return f"{origin}{parts.path or '/'}"
+    origin = _normalize_origin(url)
+    if origin:
+        origin = origin.split("://", 1)[1]
+    else:
+        origin = f"{parts.scheme}:"
+    segments = (segment.split(";", 1)[0] for segment in unquote(parts.path).split("/"))
+    path = "/".join(segment for segment in segments if segment).casefold()
+    return f"{origin}/{path}"
 
 
 def _number_source(kind: FieldType, text: str) -> str:
@@ -612,12 +701,13 @@ def _step_targets(step: Step) -> list[Target]:
 
 
 def _target_signature(kind: str, target: Target, render: Callable[[str], str]) -> _RowAction:
-    """A ação de um passo num alvo: o tipo do passo e onde ele age.
+    """A ação de um passo num alvo, na conferência antes do primeiro passo.
 
-    Onde ele age é o localizador principal (o único que passos que gravam usam), o
-    contêiner e os quadros, com os valores já montados. O id do passo e a descrição
-    do alvo não entram: dois passos que agem no mesmo elemento, nos dois ramos de um
-    ``if``, fazem a mesma ação.
+    É o tipo do passo e onde ele age: o localizador principal (o único que passos
+    que gravam usam), o contêiner e os quadros, com os valores já montados. O id do
+    passo e a descrição do alvo não entram: dois passos que agem no mesmo elemento,
+    nos dois ramos de um ``if``, fazem a mesma ação. (Na execução, a rede contra
+    ações repetidas não olha o alvo: :meth:`Interpreter._row_not_acted_on`.)
     """
 
     def locator(spec: Locator) -> tuple[object, ...]:
@@ -713,7 +803,9 @@ def _repeated_rows(loop: _ListLoop) -> list[str]:
     São os que chegam à mesma ação que grava, com o mesmo texto normalizado para
     escolher a linha, e que fazem no resto da repetição os mesmos passos com os
     mesmos valores onde isso pode mudar a página: na execução, a segunda vez
-    pararia no meio, depois de outros itens já terem gravado.
+    pararia no meio, depois de outros itens já terem gravado. Numa repetição com
+    outras dentro, as ações de dentro contam para cada item de fora: dois meses que
+    abrem a mesma página (só a consulta muda) cancelariam de novo as mesmas notas.
     """
     found: list[str] = []
     for uses in loop.actions.values():
@@ -738,7 +830,8 @@ def _repeated_rows(loop: _ListLoop) -> list[str]:
             found.append(
                 f"os itens {items} escolheriam, pelo mesmo texto, a mesma linha para {steps} "
                 f"em '{intent}', e a mesma ação se repetiria nela (a lista tem itens "
-                f"repetidos?){_undecided_reason(undecided, 'a lista é recusada')}"
+                "repetidos, ou itens que levam à mesma página?)"
+                f"{_undecided_reason(undecided, 'a lista é recusada')}"
             )
     return found
 
@@ -870,12 +963,19 @@ class Interpreter:
         self._started_at = 0.0
         self._inputs: dict[str, Any] = {}
         self._vars: dict[str, Any] = {}
-        self._items: list[tuple[Mapping[str, object], int]] = []
+        #: Itens das repetições em andamento: o item, a posição dele e o id da repetição.
+        self._items: list[tuple[Mapping[str, object], int, str]] = []
         self._steps_done = 0
         self._irreversible_step: Step | None = None
-        #: Ações que gravam já feitas numa linha: (página, ação, texto da linha) -> id
-        #: do passo que agiu e repetição em que agiu (``None`` fora de repetições).
-        self._acted_rows: dict[_RowAction, tuple[str, int | None]] = {}
+        #: Ações que gravaram numa linha, por (página, texto normalizado da linha). Uma
+        #: ação conta em todas as páginas por onde a página passou por causa dela.
+        self._acted_rows: dict[tuple[str, str], list[_Act]] = {}
+        #: Ações cujas consequências ainda podem levar a página a outro endereço: as
+        #: desde o último passo que pode mudar a página (ver :meth:`_run_leaf`).
+        self._open_acts: list[_Act] = []
+        #: Navegações da página principal começadas por essas ações (e o que vier de
+        #: um redirecionamento delas conta para as mesmas ações).
+        self._navigation_acts: dict[Request, tuple[_Act, ...]] = {}
         self._artifacts: list[ArtifactRef] = []
         self._secret_locators: list[PwLocator] = []
         self._blocked_navigation: str | None = None
@@ -986,13 +1086,49 @@ class Interpreter:
         try:
             if self._block_other_domains:
                 await context.route("**/*", self._guard_request)
-            return await context.new_page()
+            page = await context.new_page()
         except PlaywrightError as exc:
             raise StepError(
                 ErrorCode.NAVEGADOR_INDISPONIVEL,
                 "Não consegui abrir uma página no navegador.",
                 details={"detalhe": self._detail(exc)},
             ) from None
+        # Síncronos: quando page.url muda, a página já foi anotada nas ações em aberto.
+        page.on("request", self._on_request)
+        page.on("framenavigated", self._on_frame_navigated)
+        return page
+
+    def _on_request(self, request: Request) -> None:
+        """Uma navegação da página principal conta para as ações que a podem ter causado.
+
+        São as ações em aberto (:attr:`_open_acts`) e, num redirecionamento, as da
+        navegação de onde ele veio, mesmo que a página já esteja em outro passo: o
+        endereço pedido e cada um dos redirecionamentos viram páginas dessas ações.
+        """
+        try:
+            if not request.is_navigation_request() or request.frame.parent_frame is not None:
+                return
+        except PlaywrightError:  # pedidos de service worker não têm quadro
+            return
+        acts = dict.fromkeys(self._open_acts)
+        if request.redirected_from is not None:
+            acts.update(dict.fromkeys(self._navigation_acts.get(request.redirected_from, ())))
+        if acts:
+            self._navigation_acts[request] = tuple(acts)
+            self._mark_acted(acts, request.url)
+
+    def _on_frame_navigated(self, frame: Frame) -> None:
+        """A página principal mudou de endereço (inclusive sem pedido, por ``pushState``)."""
+        if frame.parent_frame is None and self._open_acts:
+            self._mark_acted(self._open_acts, frame.url)
+
+    def _mark_acted(self, acts: Iterable[_Act], url: str) -> None:
+        """Anota que essas ações gravaram também na página de ``url`` (ver :func:`_page_key`)."""
+        page = _page_key(url)
+        for act in acts:
+            known = self._acted_rows.setdefault((page, act.key), [])
+            if act not in known:
+                known.append(act)
 
     def _claim(self, context: BrowserContext) -> None:
         if self._used:
@@ -1271,6 +1407,12 @@ class Interpreter:
                 trace.append(entry)
             if acts_on_row and entry[1]:  # (ação, texto da linha, ...); vazio já é recusado
                 loop.actions.setdefault(entry[:2], []).append((index, step, undecided))
+                # Cada item de uma repetição de fora repete a de dentro inteira: dois
+                # itens de fora que caem na mesma página agiriam de novo nas mesmas
+                # linhas.
+                for each, each_reach in outer:
+                    uses = each.actions.setdefault(entry[:2], [])
+                    uses.extend((outer_index, step, undecided) for outer_index in each_reach)
 
     @staticmethod
     def _branches(
@@ -1695,6 +1837,15 @@ class Interpreter:
             await self._run_leaf(step)
 
     async def _run_leaf(self, step: Step) -> None:
+        """Roda um passo simples: prepara, confere a rede contra repetições e age.
+
+        Uma ação que grava numa linha escolhida pelo texto conta na página onde
+        estava antes de agir, onde parou depois, e em cada endereço por onde a página
+        principal passou (pedido de navegação, redirecionamento ou ``pushState``) até
+        o próximo passo que pode mudar a página começar a agir: um clique sem
+        ``expect_navigation`` volta antes de a resposta do formulário chegar. Passos
+        que só leem (:data:`_PAGE_READS`) não encerram esse intervalo.
+        """
         loop = asyncio.get_running_loop()
         started = loop.time()
         ctx = _StepCtx(step, min(started + step.timeout_ms / 1000, self._deadline))
@@ -1709,7 +1860,7 @@ class Interpreter:
                     action = await self._prepare(step, ctx)
                     # Com o alvo já encontrado, a página é a dele; e ainda antes do aviso
                     # de passo irreversível.
-                    row = self._row_not_acted_on(step)
+                    act = self._row_not_acted_on(step)
                     if irreversible:
                         # O aviso vai antes: com confirmação, ele pode esperar o plano de
                         # controle gravá-lo. Se falhar, nada foi enviado ao portal.
@@ -1717,11 +1868,22 @@ class Interpreter:
                         announced = True
                         # Daqui em diante, qualquer falha deixa a execução indeterminada.
                         self._irreversible_step = step
-                    if row is not None:
-                        # Registrada antes de agir: uma ação que falhou no meio também conta.
-                        iteration = self._items[-1][1] if self._items else None
-                        self._acted_rows[row] = (step.id, iteration)
-                    data = await action()
+                    if not isinstance(step, _PAGE_READS):
+                        # O que a página fizer daqui em diante é consequência deste passo,
+                        # não das ações anteriores (que já tiveram até aqui para levá-la a
+                        # outro endereço).
+                        self._open_acts = []
+                    if act is not None:
+                        # Anotada antes de agir (uma ação que falhou no meio também conta)
+                        # na página de agora, e em aberto: cada endereço por onde a
+                        # página passar até o próximo passo que pode mudá-la também conta.
+                        self._open_acts.append(act)
+                        self._mark_acted([act], self.page.url)
+                    try:
+                        data = await action()
+                    finally:
+                        if act is not None:
+                            self._mark_acted([act], self.page.url)  # onde ela parou
                 self._check_page_domain(step)
             except StepError:
                 raise
@@ -1783,7 +1945,7 @@ class Interpreter:
             if isinstance(step, ForEachStep):
                 items = self._loop_items(step)
                 for index, item in enumerate(items):
-                    self._items.append((item, index))
+                    self._items.append((item, index, step.id))
                     try:
                         await self._run_block(step.steps)
                     finally:
@@ -2269,11 +2431,14 @@ class Interpreter:
 
         Pelo texto do HTML (como o Playwright compara), só um contêiner pode ter um
         elemento com o texto inteiro; pelo texto mostrado (``innerText``,
-        normalizado igual), nenhum outro contêiner pode ter. Uma célula com
-        ``text-transform`` ou com uma chave de ordenação escondida mostra um texto
-        que não está no HTML, e a linha certa pode ser outra. ``None`` quando a
-        linha é única (ou o alvo não escolhe linha pelo texto); se a página mudar
-        no meio da conferência, a linha não conta como única.
+        normalizado igual), nenhum outro contêiner pode mostrar esse texto, nem o
+        que a linha escolhida mostra no lugar dele (a célula ``AB3X`` mostrada como
+        ``ab3x`` pelo CSS, ao lado da nota ``ab3x``: a chave pode ter sido lida de
+        qualquer uma). Uma célula com ``text-transform`` ou com uma chave de
+        ordenação escondida mostra um texto que não está no HTML, e a linha certa
+        pode ser outra. ``None`` quando a linha é única (ou o alvo não escolhe linha
+        pelo texto); se a página mudar no meio da conferência, a linha não conta
+        como única.
         """
         if choice is None:
             return None
@@ -2306,9 +2471,9 @@ class Interpreter:
             details = {**details, "linhas_pelo_html": issue.by_html}
         else:
             reason = (
-                "outra linha mostra esse mesmo texto na página (por exemplo, pelo "
-                "text-transform do CSS ou por um texto escondido na célula), e não dá para "
-                "saber qual delas o texto quer dizer"
+                "outra linha mostra na página esse mesmo texto, ou o que esta linha mostra "
+                "no lugar dele (por exemplo, pelo text-transform do CSS ou por um texto "
+                "escondido na célula), e não dá para saber qual delas o texto quer dizer"
             )
             details = {
                 **details,
@@ -2342,17 +2507,24 @@ class Interpreter:
             )
         return key
 
-    def _row_not_acted_on(self, step: Step) -> _RowAction | None:
-        """A ação que um passo que grava vai fazer numa linha, se ela ainda não foi feita.
+    def _row_not_acted_on(self, step: Step) -> _Act | None:
+        """A ação que um passo que grava vai fazer numa linha, se ela não repete outra.
 
-        Rede de segurança contra ações repetidas: numa execução, a mesma ação que
-        grava (o tipo do passo e o alvo, :func:`_target_signature`) nunca é feita
-        duas vezes na mesma linha, que é a página (:func:`_page_key`) e o texto
-        normalizado que a escolhe. Isso acontece com itens repetidos numa tabela lida
-        da página, inclusive quando cada um vai para um ramo de um ``if`` com o mesmo
-        alvo. A segunda vez falha antes de agir, e antes do aviso de passo
-        irreversível. Passos de leitura, alvos diferentes na mesma linha e a mesma
-        chave em outra página (a nota 1 de cada filial) não contam.
+        Rede de segurança contra ações repetidas: numa execução, duas ações que gravam
+        (``write`` ou ``irreversible``) nunca caem na mesma linha em voltas diferentes
+        de uma repetição (:func:`_other_iteration`). A linha é a página
+        (:func:`_page_key`) e o texto normalizado que a escolhe, e as páginas de uma
+        ação são todos os endereços por onde a página passou por causa dela
+        (:meth:`_run_leaf`): a resposta de um formulário que mostra a mesma tabela em
+        outro endereço ainda é a mesma linha. Isso pega itens repetidos numa tabela
+        lida da página, inclusive quando cada um vai para um ramo de um ``if``, por
+        qualquer localizador, e chaves cruzadas (o segundo passo do item 0 e o
+        primeiro do item 1 na mesma linha). A segunda vez falha antes de agir, e antes
+        do aviso de passo irreversível. Passos de leitura, passos na mesma volta (dois
+        cliques no "+" da mesma linha, digitar a quantidade e clicar em Salvar),
+        repetições que não estão uma dentro da outra (marcar todas as linhas, depois
+        cancelar todas) e a mesma chave em outra página (a nota 1 de cada filial) não
+        contam.
         """
         if step.effect is Effect.READ:
             return None
@@ -2362,27 +2534,28 @@ class Interpreter:
         key = self._row_key(target)
         if key is None:
             return None
-        action = (
-            _page_key(self.page.url),
-            _target_signature(step.kind, target, self._render),
-            key,
-        )
-        previous = self._acted_rows.get(action)
-        if previous is not None:
-            step_id, iteration = previous
-            details: dict[str, object] = {"alvo": target.intent, "passo_anterior": step_id}
-            if iteration is not None:
-                details["iteracao_anterior"] = iteration
-            who = "ele" if step_id == step.id else f"o passo '{step_id}', com o mesmo alvo,"
+        path = tuple((loop, index) for _, index, loop in self._items)
+        for previous in self._acted_rows.get((_page_key(self.page.url), key), ()):
+            other = _other_iteration(previous.path, path)
+            if other is None:
+                continue
+            loop, index = other
+            who = "ele" if previous.step_id == step.id else f"o passo '{previous.step_id}'"
             raise StepError(
                 ErrorCode.ELEMENTO_AMBIGUO,
                 f"O passo '{step.title}' agiria em '{target.intent}' na linha escolhida por "
-                f"este mesmo texto, nesta mesma página, onde {who} já agiu nesta execução; "
-                "agir de novo repetiria a ação na mesma linha, então nada foi feito agora. "
-                "Confira se a lista tem itens repetidos.",
-                details=details,
+                f"este mesmo texto, nesta mesma página, onde {who} já agiu nesta execução, "
+                f"na volta nº {index + 1} da repetição '{loop}'; agir de novo gravaria outra "
+                "vez na mesma linha, então nada foi feito agora. Confira se a lista tem "
+                "itens repetidos.",
+                details={
+                    "alvo": target.intent,
+                    "passo_anterior": previous.step_id,
+                    "repeticao": loop,
+                    "iteracao_anterior": index,
+                },
             )
-        return action
+        return _Act(step.id, key, path)
 
     @staticmethod
     def _refuse_dynamic_selectors(target: Target) -> None:
