@@ -137,8 +137,8 @@ _STEP_ACTIVITY = frozenset(
 _WROTE_AND_STOPPED = "executor_parou_depois_de_gravar"
 #: Começo da mensagem de uma execução que falhou depois de começar a gravar.
 _WROTE_BEFORE_STOPPING = (
-    "Um passo que grava no sistema de destino já tinha começado: confira o sistema de "
-    "destino antes de executar de novo."
+    "A execução chegou ao início de um passo que grava e pode ter gravado no sistema de "
+    "destino: confira o sistema de destino antes de executar de novo."
 )
 
 

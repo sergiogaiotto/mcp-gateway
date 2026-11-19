@@ -338,7 +338,7 @@ async def test_finish_after_a_write_is_final(
     assert row["write_started_at"] == marked
     if expected is not RunState.SUCCEEDED:
         # Quem lê a falha fica sabendo que algo pode ter sido gravado.
-        assert row["error_message"].startswith("Um passo que grava no sistema de destino")
+        assert row["error_message"].startswith("A execução chegou ao início de um passo que grava")
         assert "confira o sistema de destino" in row["error_message"]
     # Concluída, nada a recolher e nada de volta na fila.
     report = await queue.reap_expired(now=now + timedelta(minutes=5))

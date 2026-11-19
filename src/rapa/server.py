@@ -474,7 +474,9 @@ async def _stop_dispatcher(
     Essa espera vai até ``drain_timeout_s``. O que ainda estiver em andamento é
     registrado (só a contagem) e interrompido: o lançador para o executor e nada é
     gravado; quando a concessão vencer, o recolhimento devolve a execução à fila
-    ou, se um passo irreversível já tinha começado, a marca como indeterminada.
+    se nenhum passo que grava tinha começado, a marca como falha se um passo que
+    grava já tinha começado, ou como indeterminada se um passo irreversível já
+    tinha começado.
     """
     stop.set()
     await asyncio.gather(task, return_exceptions=True)

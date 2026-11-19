@@ -6,7 +6,7 @@
 - **Sem LLM nas execuções.** O executor só interpreta a lista de passos. O modelo de linguagem entra apenas para criar e consertar robôs, e sempre como proponente: o código decide.
 - **A empresa é fronteira obrigatória.** Toda tabela com dados de empresa tem `company_id` e isolamento por linha; nada que venha de um usuário escolhe a empresa, que sempre vem do token.
 - **Segredos nunca aparecem** em eventos, logs, prompts, telas ou resultados. O executor digita o valor do cofre na hora; o resto do sistema só vê a referência.
-- **Nada que gravou é repetido automaticamente.** Depois de um passo irreversível, uma falha vira estado "indeterminado" e uma pessoa decide.
+- **Nada que gravou é repetido automaticamente.** O executor só começa um passo que grava depois que o plano de controle registra o aviso; a partir daí a execução nunca volta para a fila: se parar, falha (e uma pessoa confere o sistema de destino). Depois de um passo irreversível, uma falha vira estado "indeterminado" e uma pessoa decide.
 
 ## Organização do código
 
