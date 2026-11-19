@@ -1,9 +1,10 @@
 """Despachante com um lançador falso: concorrência limitada, resultados e cerca."""
 
 import asyncio
+import logging
 import threading
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -434,6 +435,178 @@ async def test_dispatch_loop_and_heartbeats_survive_unexpected_errors() -> None:
     # As renovações falharam o tempo todo, e mesmo assim o resultado foi gravado.
     assert queue.calls["heartbeat"] >= 2
     assert [r["state"] for r in queue.finished] == ["succeeded"]
+
+
+class _BrokenStepQueue:
+    """Fila falsa em que uma etapa do laço (partições, recolhimento ou despacho) sempre falha."""
+
+    def __init__(self, broken: str, job: RunnerJob | None = None) -> None:
+        self.broken = {broken}
+        self.job = job
+        self.calls: Counter[str] = Counter()
+        self.finished: list[Mapping[str, Any]] = []
+
+    def _check(self, step: str) -> None:
+        self.calls[step] += 1
+        if step in self.broken:
+            if step == "partitions":
+                raise PermissionError("sem permissão para criar a partição de dados sigilosos")
+            raise sqlalchemy.exc.ProgrammingError(
+                "SELECT", {}, Exception(f"erro persistente em {step} com dados sigilosos")
+            )
+
+    async def ensure_event_partitions(self, months_ahead: int = 2) -> int:
+        self._check("partitions")
+        return 0
+
+    async def reap_expired(self, *, now: datetime | None = None, skip: Any = ()) -> ReapReport:
+        self._check("reap")
+        return ReapReport()
+
+    async def claim_next(self, *, now: datetime | None = None) -> RunnerJob | None:
+        self._check("claim")
+        job, self.job = self.job, None
+        return job
+
+    async def heartbeat(self, run_id: UUID, attempt: int, *, now: datetime | None = None) -> bool:
+        return True
+
+    async def finish(
+        self, run_id: UUID, attempt: int, result: Mapping[str, Any], *, now: datetime | None = None
+    ) -> bool:
+        self.finished.append(result)
+        return True
+
+
+async def _succeed(job: RunnerJob) -> Mapping[str, Any]:
+    return result(job.run_id, job.attempt, outputs={"notas": []})
+
+
+@pytest.mark.parametrize("broken", ["partitions", "reap"])
+async def test_persistent_maintenance_error_does_not_block_dispatch(broken: str) -> None:
+    # Sem permissão para criar partições, ou um recolhedor que sempre falha: as
+    # execuções da fila continuam sendo despachadas, e a outra etapa continua rodando.
+    queue = _BrokenStepQueue(broken, _job())
+    dispatcher = Dispatcher(
+        queue,  # type: ignore[arg-type]
+        _succeed,
+        poll_interval=0.01,
+        heartbeat_interval=0.01,
+        reap_interval=0,
+        partitions_interval=0,
+    )
+    stop = asyncio.Event()
+    loop = asyncio.create_task(dispatcher.run(stop))
+    try:
+        async with asyncio.timeout(10):
+            while not queue.finished:
+                assert not loop.done(), "o laço de despacho parou sozinho"
+                await asyncio.sleep(0.01)
+        await asyncio.sleep(0.5)
+    finally:
+        stop.set()
+        async with asyncio.timeout(10):
+            await loop
+    assert [r["state"] for r in queue.finished] == ["succeeded"]
+    assert queue.calls["claim"] >= 10  # o laço seguiu pegando execuções
+    other = "reap" if broken == "partitions" else "partitions"
+    assert queue.calls[other] >= 10
+    # A etapa que falha é repetida com espera crescente, não a cada volta do laço.
+    assert 2 <= queue.calls[broken] <= 12
+    assert set(dispatcher.failing) == {broken}
+
+
+async def test_failing_maintenance_step_backs_off_and_shows_in_health(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="rapa.control.dispatcher")
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    now = [start]
+    queue = _BrokenStepQueue("partitions")
+    dispatcher = Dispatcher(
+        queue,  # type: ignore[arg-type]
+        _succeed,
+        poll_interval=1.0,
+        reap_interval=30.0,
+        partitions_interval=3600.0,
+        unhealthy_after_s=120.0,
+        clock=lambda: now[0],
+    )
+
+    async def at(seconds: float) -> None:
+        now[0] = start + timedelta(seconds=seconds)
+        await dispatcher.maintenance()
+
+    await at(0)
+    assert queue.calls == Counter({"partitions": 1, "reap": 1})  # o recolhedor rodou
+    assert dispatcher.failing == {"partitions": start}
+    assert dispatcher.healthy  # uma falha só ainda não muda a saúde
+    # Nova tentativa depois de um intervalo do laço, dobrando a cada falha, até 60 s.
+    elapsed, tries = 0.0, 1
+    for wait in (1, 2, 4, 8, 16, 32, 60, 60, 60):
+        await at(elapsed + wait - 0.5)
+        assert queue.calls["partitions"] == tries
+        elapsed += wait
+        await at(elapsed)
+        tries += 1
+        assert queue.calls["partitions"] == tries
+    assert queue.calls["reap"] >= 5  # o recolhedor seguiu no próprio intervalo
+    # Falhando há mais de ``unhealthy_after_s``: a saúde do despachante acusa.
+    assert not dispatcher.healthy
+    assert dispatcher.failing == {"partitions": start}
+
+    # Uma sequência longa de falhas não estoura a conta da espera, que fica em 60 s.
+    for _ in range(2000):
+        elapsed += 60
+        await at(elapsed)
+    tries += 2000
+    assert queue.calls["partitions"] == tries
+    # Só o tipo do erro vai para o registro, nunca a mensagem.
+    assert "PermissionError" in caplog.text and "sigilosos" not in caplog.text
+
+    # A etapa volta a funcionar: a saúde volta e a próxima vez segue o intervalo normal.
+    queue.broken.clear()
+    elapsed += 60
+    await at(elapsed)
+    assert queue.calls["partitions"] == tries + 1
+    assert dispatcher.failing == {} and dispatcher.healthy
+    await at(elapsed + 3599)
+    assert queue.calls["partitions"] == tries + 1
+    await at(elapsed + 3600)
+    assert queue.calls["partitions"] == tries + 2
+
+
+async def test_persistent_claim_error_shows_in_health() -> None:
+    queue = _BrokenStepQueue("claim")
+    dispatcher = Dispatcher(
+        queue,  # type: ignore[arg-type]
+        _succeed,
+        poll_interval=0.01,
+        reap_interval=0,
+        unhealthy_after_s=0.1,
+    )
+    stop = asyncio.Event()
+    loop = asyncio.create_task(dispatcher.run(stop))
+
+    async def until(condition: Callable[[], bool]) -> None:
+        for _ in range(1000):
+            if condition():
+                return
+            assert not loop.done(), "o laço de despacho parou sozinho"
+            await asyncio.sleep(0.01)
+        raise AssertionError("a condição não ficou verdadeira em 10 s")
+
+    try:
+        await until(lambda: not dispatcher.healthy)
+        assert set(dispatcher.failing) == {"claim"}
+        assert queue.calls["reap"] >= 2  # a manutenção segue rodando
+        queue.broken.clear()
+        await until(lambda: dispatcher.healthy)
+        assert dispatcher.failing == {}
+    finally:
+        stop.set()
+        async with asyncio.timeout(10):
+            await loop
 
 
 async def test_worker_that_never_started_is_a_plain_failure(

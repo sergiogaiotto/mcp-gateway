@@ -960,3 +960,196 @@ async def test_irreversible_step_that_failed_before_its_warning_is_a_plain_failu
     status = await platform.get(tenant.operator, rid)
     assert status is not None and status.state is RunState.FAILED
     assert status.error_code == "elemento_nao_encontrado"
+
+
+async def test_steps_done_counts_only_the_current_attempt(
+    app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine
+) -> None:
+    await reset_queue(superuser_engine, total_slots=5)
+    platform = PgPlatform(app_db)
+    queue = PgRunQueue(dispatcher_db, lease=timedelta(seconds=10))
+    tenant = await _tenant_with_robots(platform, app_db, "Passos por tentativa")
+    run = await platform.start(tenant.operator, "baixar_notas", {}, RunTrigger.REST)
+    rid = run.run_id
+    now = datetime.now(UTC)
+    job = await queue.claim_next(now=now)
+    assert job is not None and job.attempt == 1
+    await queue.ingest_events(
+        rid,
+        1,
+        [event(rid, 1, 0, RunEventKind.RUN_STARTED)]
+        + [event(rid, 1, 1 + i, RunEventKind.STEP_SUCCEEDED, s) for i, s in enumerate("abc")],
+    )
+    status = await platform.get(tenant.operator, rid)
+    assert status is not None and status.steps_done == 3
+
+    # O executor some e a execução volta para a fila: a tentativa 2 recomeça do início.
+    assert (await queue.reap_expired(now=now + timedelta(seconds=11))).requeued == [rid]
+    job = await queue.claim_next(now=now + timedelta(seconds=12))
+    assert job is not None and job.attempt == 2
+    status = await platform.get(tenant.operator, rid)
+    assert status is not None and status.steps_done == 0
+
+    first = job.first_seq
+    await queue.ingest_events(
+        rid,
+        2,
+        [event(rid, 2, first, RunEventKind.RUN_STARTED)]
+        + [
+            event(rid, 2, first + 1 + i, RunEventKind.STEP_SUCCEEDED, s)
+            for i, s in enumerate("abcd")
+        ],
+    )
+    status = await platform.get(tenant.operator, rid)
+    assert status is not None and status.steps_done == 4
+    assert await queue.finish(rid, 2, result(rid, 2, steps_done=4))
+    status = await platform.get(tenant.operator, rid)
+    assert status is not None and status.state is RunState.SUCCEEDED
+    # Os passos da tentativa perdida não se somam aos da que terminou.
+    assert status.steps_done == 4
+    assert status.steps_done <= sum(1 for _ in notas().iter_steps())
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        1e23,
+        1.2345678901234567e20,
+        5e300,
+        1e16,
+        0.1,
+        1e-7,
+        5e-324,
+        -0.0,
+        2**70,
+        [1e23, {"b": 5e300, "a": [0.5, 1e22]}],
+    ],
+    ids=repr,
+)
+async def test_identical_resend_with_numbers_is_ignored(
+    app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine, value: object
+) -> None:
+    """Reenvio idêntico (confirmação do COMMIT perdida) com números que o JSONB reescreve.
+
+    O JSONB guarda o número pelo valor: ``1e23`` volta do banco como
+    ``100000000000000000000000``. O reenvio do mesmo evento não é um conflito.
+    """
+    await reset_queue(superuser_engine, total_slots=5)
+    platform = PgPlatform(app_db)
+    queue = PgRunQueue(dispatcher_db)
+    tenant = await _tenant_with_robots(platform, app_db, f"Número {value!r}")
+    run = await platform.start(tenant.operator, "baixar_notas", {}, RunTrigger.REST)
+    assert await queue.claim_next() is not None
+    rid = run.run_id
+    batch = [
+        event(rid, 1, 0, RunEventKind.RUN_STARTED),
+        event(rid, 1, 1, RunEventKind.STEP_SUCCEEDED, "ler_valor", valor=value),
+    ]
+    assert await queue.ingest_events(rid, 1, batch) == 2
+    assert await queue.ingest_events(rid, 1, batch) == 0
+    assert await queue.ingest_events(rid, 1, [e.model_dump(mode="json") for e in batch]) == 0
+    # O mesmo evento repetido dentro de um lote também é o mesmo.
+    third = event(rid, 1, 2, RunEventKind.STEP_SUCCEEDED, "outro", valor=value)
+    assert await queue.ingest_events(rid, 1, [third, third.model_copy()]) == 1
+    assert [seq for _, seq, _ in await _stored(dispatcher_db, rid)] == [0, 1, 2]
+
+
+@pytest.mark.parametrize(
+    ("stored", "resent"),
+    [
+        (1e23, 1.0000000000000001e23),
+        (5e300, 5.000000000000001e300),
+        (0.1, 0.10000000000000002),
+        (True, 1),
+        (False, 0),
+        (1, "1"),
+        (None, 0),
+        ([1, 2], [2, 1]),
+        ({"a": 1}, {"a": 1, "b": None}),
+    ],
+    ids=repr,
+)
+async def test_resend_with_other_numbers_or_types_is_a_conflict(
+    app_db: Database,
+    dispatcher_db: Database,
+    superuser_engine: AsyncEngine,
+    stored: object,
+    resent: object,
+) -> None:
+    """A comparação pelo valor do JSON não confunde números diferentes nem tipos diferentes."""
+    await reset_queue(superuser_engine, total_slots=5)
+    platform = PgPlatform(app_db)
+    queue = PgRunQueue(dispatcher_db)
+    tenant = await _tenant_with_robots(platform, app_db, f"Conflito {stored!r}")
+    run = await platform.start(tenant.operator, "baixar_notas", {}, RunTrigger.REST)
+    assert await queue.claim_next() is not None
+    rid = run.run_id
+    original = event(rid, 1, 0, RunEventKind.STEP_SUCCEEDED, "ler_valor", valor=stored)
+    changed = original.model_copy(update={"data": {"valor": resent}})
+    assert await queue.ingest_events(rid, 1, [original]) == 1
+    # Contra o que está gravado...
+    with pytest.raises(EventConflict):
+        await queue.ingest_events(rid, 1, [changed])
+    # ...e dentro do mesmo lote.
+    with pytest.raises(EventConflict):
+        await queue.ingest_events(
+            rid, 1, [original.model_copy(update={"seq": 1}), changed.model_copy(update={"seq": 1})]
+        )
+    assert [seq for _, seq, _ in await _stored(dispatcher_db, rid)] == [0]
+
+
+class _CommitThenFail:
+    """Grava os eventos e, na primeira vez, falha como se a confirmação do COMMIT se perdesse."""
+
+    def __init__(self, queue: PgRunQueue) -> None:
+        self.queue = queue
+        self.calls = 0
+
+    async def ingest_events(
+        self, run_id: UUID, attempt: int, events: list[dict[str, object]]
+    ) -> int:
+        self.calls += 1
+        count = await self.queue.ingest_events(run_id, attempt, events)
+        if self.calls == 1:
+            raise DBAPIError("COMMIT", {}, ConnectionError("conexão caiu depois do COMMIT"))
+        return count
+
+
+async def test_resend_after_a_lost_commit_acknowledgement_is_acknowledged(
+    app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    await reset_queue(superuser_engine, total_slots=5)
+    platform = PgPlatform(app_db)
+    queue = PgRunQueue(dispatcher_db)
+    tenant = await _tenant_with_robots(platform, app_db, "COMMIT sem confirmação")
+    run = await platform.start(
+        tenant.operator, "emitir_protocolo", PROTOCOLO_INPUTS, RunTrigger.REST
+    )
+    rid = run.run_id
+    job = await queue.claim_next()
+    assert job is not None
+    launcher = LocalProcessLauncher(
+        _CommitThenFail(queue),  # type: ignore[arg-type]
+        LocalLauncherSettings(work_dir=tmp_path / "trabalho", artifacts_dir=tmp_path / "artefatos"),
+    )
+    work = tmp_path / f"{rid}-1"
+    (work / "ack").mkdir(parents=True)
+    lines = [
+        event(rid, 1, 0, RunEventKind.RUN_STARTED),
+        event(rid, 1, 1, RunEventKind.STEP_SUCCEEDED, "ler_valor", valor=1e23),
+        _warning(rid, 1, 2),
+    ]
+    (work / "events.jsonl").write_text(
+        "".join(e.model_dump_json() + "\n" for e in lines), encoding="utf-8"
+    )
+    tail = _EventTail(work / "events.jsonl")
+    pending: list[dict[str, object]] = []
+    # A gravação deu certo, mas a resposta se perdeu: nada é confirmado ainda.
+    await launcher._forward(job, tail, work, pending)
+    assert len(pending) == 3 and not (work / "ack" / "2.ack").exists()
+    # O reenvio idêntico é aceito e o aviso, já gravado, é confirmado.
+    await launcher._forward(job, tail, work, pending)
+    assert pending == [] and (work / "ack" / "2.ack").exists()
+    state, irreversible_at, _ = await _run_row(dispatcher_db, rid)
+    assert state == "running" and irreversible_at is not None
+    assert [seq for _, seq, _ in await _stored(dispatcher_db, rid)] == [0, 1, 2]

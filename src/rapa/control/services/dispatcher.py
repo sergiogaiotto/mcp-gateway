@@ -16,11 +16,18 @@ continua sendo renovada e a gravação é repetida, com espera crescente, até d
 certo ou até o prazo da execução (mais uma folga). Enquanto isso, o recolhedor
 deste despachante não devolve a execução à fila. Erros inesperados (pool de
 conexões esgotado, por exemplo) não derrubam o laço nem a renovação.
+
+Cada etapa do laço (criar partições de eventos, recolher concessões vencidas e
+pegar execuções) tem a sua própria proteção: um erro persistente numa delas não
+impede as outras. A etapa de manutenção que falha é repetida com espera
+crescente, e :attr:`Dispatcher.healthy` fica falso quando alguma etapa falha sem
+parar há ``unhealthy_after_s`` ou mais.
 """
 
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -40,6 +47,15 @@ type Launcher = Callable[[RunnerJob], Awaitable[Mapping[str, Any]]]
 
 #: Espera máxima entre duas tentativas de gravar o resultado.
 _FINISH_RETRY_MAX_S = 5.0
+#: Espera máxima antes de repetir uma etapa da manutenção que falhou.
+_MAINTENANCE_RETRY_MAX_S = 60.0
+
+#: Etapas do laço acompanhadas pela saúde do despachante, com a descrição para o log.
+_STEPS = {
+    "partitions": "criação das partições de eventos",
+    "reap": "recolhimento das concessões vencidas",
+    "claim": "despacho de execuções",
+}
 
 
 class WorkerNotStarted(Exception):
@@ -85,6 +101,16 @@ def _error_name(exc: BaseException) -> str:
     return type(exc).__name__
 
 
+@dataclass(slots=True)
+class _StepState:
+    """Situação de uma etapa do laço: última vez que deu certo e falhas seguidas."""
+
+    last_ok: datetime | None = None
+    failures: int = 0
+    failing_since: datetime | None = None
+    retry_at: datetime | None = None
+
+
 class Dispatcher:
     """Laço de despacho com concorrência limitada."""
 
@@ -100,15 +126,23 @@ class Dispatcher:
         partitions_interval: float = 6 * 3600.0,
         finish_retry_s: float = 0.2,
         finish_grace_s: float = 300.0,
+        unhealthy_after_s: float = 60.0,
         clock: Callable[[], datetime] = now_utc,
     ) -> None:
         """``finish_retry_s`` é a primeira espera entre tentativas de gravar o
         resultado (dobra a cada falha, até 5 s); ``finish_grace_s`` é quanto
-        tempo além do prazo da execução o despachante insiste em gravá-lo."""
+        tempo além do prazo da execução o despachante insiste em gravá-lo.
+
+        Uma etapa da manutenção que falha é repetida depois de ``poll_interval``,
+        espera que dobra a cada falha seguida, até 60 s. ``unhealthy_after_s`` é
+        quanto tempo uma etapa do laço pode falhar sem parar antes de
+        :attr:`healthy` ficar falso."""
         if concurrency < 1:
             raise ValueError("a concorrência precisa ser pelo menos 1")
         if finish_retry_s <= 0 or finish_grace_s < 0:
             raise ValueError("as esperas para gravar o resultado precisam ser positivas")
+        if unhealthy_after_s < 0:
+            raise ValueError("o prazo para acusar falha na saúde não pode ser negativo")
         self.queue = queue
         self.launch = launch
         self.concurrency = concurrency
@@ -118,15 +152,40 @@ class Dispatcher:
         self.partitions_interval = partitions_interval
         self.finish_retry_s = finish_retry_s
         self.finish_grace_s = finish_grace_s
+        self.unhealthy_after_s = unhealthy_after_s
         self.clock = clock
         self._tasks: dict[asyncio.Task[None], RunnerJob] = {}
-        self._last_reap: datetime | None = None
-        self._last_partitions: datetime | None = None
+        self._steps = {name: _StepState() for name in _STEPS}
         self._wakeup = asyncio.Event()
 
     @property
     def in_flight(self) -> int:
         return len(self._tasks)
+
+    @property
+    def failing(self) -> dict[str, datetime]:
+        """Etapas do laço que falharam na última vez, com o início das falhas seguidas.
+
+        As etapas são ``"partitions"`` (partições de eventos), ``"reap"``
+        (recolhimento das concessões vencidas) e ``"claim"`` (pegar execuções).
+        """
+        return {
+            name: state.failing_since
+            for name, state in self._steps.items()
+            if state.failing_since is not None
+        }
+
+    @property
+    def healthy(self) -> bool:
+        """Nenhuma etapa do laço falha sem parar há ``unhealthy_after_s`` ou mais.
+
+        Uma falha passageira não muda a saúde; uma etapa que segue falhando (sem
+        permissão para criar partições, recolhedor quebrado, banco fora do ar)
+        deixa o despachante sem saúde até voltar a dar certo.
+        """
+        limit = timedelta(seconds=self.unhealthy_after_s)
+        now = self.clock()
+        return all(now - since < limit for since in self.failing.values())
 
     def wake(self) -> None:
         """Acorda o laço antes do próximo intervalo (por exemplo, depois de enfileirar)."""
@@ -137,28 +196,79 @@ class Dispatcher:
         grace = timedelta(seconds=self.finish_grace_s)
         return [job.run_id for job in self._tasks.values() if now < job.deadline + grace]
 
+    def _due(self, name: str, now: datetime, interval: float) -> bool:
+        """Se é hora da etapa: pelo intervalo normal ou, depois de uma falha, pela espera."""
+        state = self._steps[name]
+        if state.retry_at is not None:
+            return now >= state.retry_at
+        return state.last_ok is None or now - state.last_ok >= timedelta(seconds=interval)
+
+    def _succeeded(self, name: str, now: datetime) -> None:
+        state = self._steps[name]
+        if state.failures:
+            logger.warning(
+                "a etapa de %s voltou a funcionar depois de %d falhas",
+                _STEPS[name],
+                state.failures,
+            )
+        state.last_ok = now
+        state.failures = 0
+        state.failing_since = None
+        state.retry_at = None
+
+    def _failed(self, name: str, now: datetime, exc: Exception, *, backoff: bool) -> None:
+        """Registra a falha da etapa (só o tipo do erro); com ``backoff``, adia a próxima."""
+        state = self._steps[name]
+        state.failures += 1
+        if state.failing_since is None:
+            state.failing_since = now
+        if not backoff:
+            logger.error("falha na etapa de %s: %s", _STEPS[name], _error_name(exc))
+            return
+        # O expoente é limitado para a conta não estourar numa sequência longa de falhas.
+        delay = min(
+            self.poll_interval * 2 ** min(state.failures - 1, 32),
+            max(_MAINTENANCE_RETRY_MAX_S, self.poll_interval),
+        )
+        state.retry_at = now + timedelta(seconds=delay)
+        logger.error(
+            "falha na etapa de %s (%d seguidas): %s; nova tentativa em %.1f s",
+            _STEPS[name],
+            state.failures,
+            _error_name(exc),
+            delay,
+        )
+
     async def maintenance(self) -> None:
-        """Recolhe concessões vencidas e cria partições de eventos, quando for a hora."""
+        """Cria partições de eventos e recolhe concessões vencidas, quando for a hora.
+
+        Cada etapa tem a sua proteção: o erro de uma é registrado e não impede a
+        outra nem o despacho. A etapa que falhou é repetida com espera crescente.
+        """
         now = self.clock()
-        if self._last_partitions is None or now - self._last_partitions >= timedelta(
-            seconds=self.partitions_interval
-        ):
-            await self.queue.ensure_event_partitions()
-            self._last_partitions = now
-        if self._last_reap is None or now - self._last_reap >= timedelta(
-            seconds=self.reap_interval
-        ):
-            # As execuções em andamento aqui não são recolhidas: se a concessão
-            # venceu, foi porque o banco caiu, não porque o executor sumiu.
-            report = await self.queue.reap_expired(now=now, skip=self._held(now))
-            self._last_reap = now
-            if report.requeued or report.indeterminate or report.failed:
-                logger.warning(
-                    "concessões vencidas: %d de volta à fila, %d indeterminadas, %d falharam",
-                    len(report.requeued),
-                    len(report.indeterminate),
-                    len(report.failed),
-                )
+        if self._due("partitions", now, self.partitions_interval):
+            try:
+                await self.queue.ensure_event_partitions()
+            except Exception as exc:  # sem permissão, nome em uso, banco fora: tenta depois
+                self._failed("partitions", now, exc, backoff=True)
+            else:
+                self._succeeded("partitions", now)
+        if self._due("reap", now, self.reap_interval):
+            try:
+                # As execuções em andamento aqui não são recolhidas: se a concessão
+                # venceu, foi porque o banco caiu, não porque o executor sumiu.
+                report = await self.queue.reap_expired(now=now, skip=self._held(now))
+            except Exception as exc:
+                self._failed("reap", now, exc, backoff=True)
+            else:
+                self._succeeded("reap", now)
+                if report.requeued or report.indeterminate or report.failed:
+                    logger.warning(
+                        "concessões vencidas: %d de volta à fila, %d indeterminadas, %d falharam",
+                        len(report.requeued),
+                        len(report.indeterminate),
+                        len(report.failed),
+                    )
 
     async def run_once(self) -> int:
         """Pega execuções até encher a concorrência; devolve quantas lançou."""
@@ -192,16 +302,22 @@ class Dispatcher:
         """Roda até ``stop`` ser acionado; depois espera o que está em andamento.
 
         Nenhum erro de uma volta encerra o laço: ele registra o tipo do erro e
-        tenta de novo depois do intervalo. Só o cancelamento o interrompe.
+        tenta de novo depois do intervalo. Só o cancelamento o interrompe. A
+        manutenção e o despacho são protegidos em separado: uma manutenção que
+        falha sempre não impede de pegar as execuções da fila.
         """
         while not stop.is_set():
             try:
                 await self.maintenance()
+            except Exception as exc:  # cada etapa já se protege; isto é só uma rede
+                logger.error("falha na manutenção da fila: %s", _error_name(exc))
+            now = self.clock()
+            try:
                 await self.run_once()
-            except DBAPIError as exc:
-                logger.error("erro de banco no despacho: %s", _error_name(exc))
-            except Exception as exc:  # pool esgotado, erro inesperado: o laço continua
-                logger.error("falha no despacho: %s", _error_name(exc))
+            except Exception as exc:  # banco fora, pool esgotado, erro inesperado: segue
+                self._failed("claim", now, exc, backoff=False)
+            else:
+                self._succeeded("claim", now)
             self._wakeup.clear()
             waiters = [
                 asyncio.ensure_future(stop.wait()),

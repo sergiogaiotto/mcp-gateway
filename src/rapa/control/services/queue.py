@@ -26,6 +26,7 @@ quando está gravado para esta tentativa, com o mesmo conteúdo.
 :class:`PgRunQueue` embrulha cada função na sua própria transação.
 """
 
+import json
 from collections import defaultdict
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -35,7 +36,20 @@ from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from sqlalchemy import RowMapping, and_, case, func, insert, literal, or_, select, text, update
+from sqlalchemy import (
+    RowMapping,
+    Text,
+    and_,
+    case,
+    cast,
+    func,
+    insert,
+    literal,
+    or_,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rapa.control.db.schema import (
@@ -316,6 +330,9 @@ async def claim_next(
                 started_at=now,
                 lease_expires_at=now + lease,
                 deadline_at=deadline,
+                # A tentativa nova recomeça do primeiro passo: os passos contados
+                # são só os dela, não se somam aos de uma tentativa perdida.
+                steps_done=0,
             )
             .returning(runs.c.attempt)
         )
@@ -435,7 +452,47 @@ def _event_data(event: RunEvent) -> Any:
 
 
 def _same_event(a: RunEvent, b: RunEvent) -> bool:
-    return (a.kind, a.step_id, _event_data(a)) == (b.kind, b.step_id, _event_data(b))
+    return (a.kind, a.step_id, _event_json(a)) == (b.kind, b.step_id, _event_json(b))
+
+
+def _canonical_number(value: Decimal) -> str:
+    """O número pelo valor exato: dígitos sem zeros nas pontas e o expoente."""
+    sign, digits, exponent = value.as_tuple()
+    if not isinstance(exponent, int):  # NaN ou infinito: o JSONB não os aceita
+        return str(value)
+    significant = "".join(map(str, digits)).lstrip("0")
+    if not significant:
+        return "0"  # o JSONB não guarda o sinal do zero
+    stripped = significant.rstrip("0")
+    exponent += len(significant) - len(stripped)
+    return f"{'-' if sign else ''}{stripped}e{exponent}"
+
+
+def _canonical(value: Any) -> str:
+    """Texto canônico de um valor JSON lido com os números em ``Decimal``.
+
+    Chaves em ordem e cada número escrito pelo valor exato. Dois valores têm o
+    mesmo texto quando o JSONB os guardaria iguais: ``1e23`` e
+    ``100000000000000000000000`` são o mesmo número; ``true`` e ``1`` não.
+    """
+    if isinstance(value, dict):
+        items = sorted(value.items())
+        return "{" + ",".join(f"{json.dumps(k)}:{_canonical(v)}" for k, v in items) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(_canonical(item) for item in value) + "]"
+    if isinstance(value, Decimal):
+        return _canonical_number(value)
+    return json.dumps(value)  # texto, booleano ou nulo
+
+
+def _canonical_json(raw: str) -> str:
+    """Texto canônico do documento JSON ``raw`` (ver :func:`_canonical`)."""
+    return _canonical(json.loads(raw, parse_float=Decimal, parse_int=Decimal))
+
+
+def _event_json(event: RunEvent) -> str:
+    """Texto canônico dos dados do evento, como o JSONB os guardaria."""
+    return _canonical_json(json.dumps(_event_data(event)))
 
 
 def _parse_events(
@@ -463,8 +520,9 @@ async def ingest_events(
 
     Ao voltar sem erro, todos os eventos recebidos estão gravados para esta
     tentativa: é isso que permite ao lançador confirmar o aviso de passo
-    irreversível. Reenviar um evento já gravado (mesmo ``seq``, mesmo conteúdo)
-    não faz nada. Um ``seq`` que repete com outro conteúdo, ou que fica dentro
+    irreversível. Reenviar um evento já gravado (mesmo ``seq``, mesmo conteúdo,
+    comparado pelo valor do JSON como o JSONB o guarda) não faz nada. Um
+    ``seq`` que repete com outro conteúdo, ou que fica dentro
     da numeração das tentativas anteriores, levanta :class:`EventConflict`, e
     eventos de uma execução que já terminou (por exemplo, encerrada pelo
     recolhedor) levantam :class:`StaleAttempt`; nos dois casos nada é gravado.
@@ -486,7 +544,7 @@ async def ingest_events(
     by_seq: dict[int, RunEvent] = {}
     for event in parsed:
         first = by_seq.setdefault(event.seq, event)
-        if not _same_event(first, event):
+        if first is not event and not _same_event(first, event):
             raise EventConflict(
                 f"o lote repete o evento número {event.seq} com outro conteúdo; nada foi gravado"
             )
@@ -504,6 +562,9 @@ async def ingest_events(
             f"o evento número {lowest} da tentativa {attempt} está dentro da numeração das "
             f"tentativas anteriores (até {earlier_max}); nada foi gravado"
         )
+    # Os dados gravados vêm como o texto do JSONB, que reescreve os números pelo
+    # valor (``1e23`` volta como ``100000000000000000000000``): os dois lados são
+    # comparados na forma canônica, nunca como objetos Python.
     stored = (
         await session.execute(
             select(
@@ -511,17 +572,17 @@ async def ingest_events(
                 run_events.c.attempt,
                 run_events.c.kind,
                 run_events.c.step_id,
-                run_events.c.data,
+                cast(run_events.c.data, Text),
             ).where(run_events.c.run_id == run_id, run_events.c.seq.in_(list(by_seq)))
         )
     ).all()
     for seq, stored_attempt, kind, step_id, data in stored:
         incoming = by_seq[seq]
-        if (stored_attempt, kind, step_id, data) != (
+        if (stored_attempt, kind, step_id, _canonical_json(data)) != (
             attempt,
             incoming.kind.value,
             incoming.step_id,
-            _event_data(incoming),
+            _event_json(incoming),
         ):
             raise EventConflict(
                 f"o evento número {seq} já foi gravado com outro conteúdo; nada foi gravado"
