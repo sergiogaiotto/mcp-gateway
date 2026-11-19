@@ -12,12 +12,19 @@ principais:
 - todo passo simples que grava se anuncia antes de agir (evento
   ``step_started`` com ``grava: true``), e antes de um passo irreversível agir o
   executor avisa (``irreversivel: true``); com confirmação, o executor só segue
-  quando o plano de controle confirma que gravou o anúncio, e o prazo do passo
-  só começa depois dela. Qualquer falha depois do aviso de passo irreversível
-  deixa a execução "indeterminada", nunca "falhou". Um contêiner (``for_each``,
-  ``if``) não age e nunca se anuncia como gravação (o efeito dele vai em
-  ``efeito_do_bloco``): o efeito dele vale para cada passo de dentro, que só
-  sobe, e é cada um destes que se anuncia;
+  quando o plano de controle confirma que gravou o anúncio, e a espera por ela
+  nunca conta no prazo do passo (que só corre depois dela, ou fica parado
+  enquanto o aviso de passo irreversível espera). Qualquer falha depois do aviso
+  de passo irreversível deixa a execução "indeterminada", nunca "falhou". Um
+  contêiner (``for_each``, ``if``) não age e nunca se anuncia como gravação (o
+  efeito dele vai em ``efeito_do_bloco``): o efeito dele vale para cada passo de
+  dentro que age na página (clicar, digitar, escolher, marcar, teclar, enviar ou
+  baixar um arquivo, abrir um endereço), que só sobe, e é cada um destes que se
+  anuncia. Um passo de dentro que só lê (``extract_text``, ``extract_table``,
+  ``wait_for``, ``assert``) fica com o efeito dele e nunca se anuncia como
+  gravação. O efeito de cada passo é o mesmo em tudo: no anúncio, na rede contra
+  ações repetidas, nos localizadores alternativos e na conferência antes do
+  primeiro passo;
 - valores de entradas, variáveis e itens nunca mudam o alvo de um passo: não
   entram em seletores CSS/XPath, cada um vira um único trecho codificado do
   endereço (no caminho e na rota depois do ``#``, sem barras, sem ``%`` e nunca
@@ -40,8 +47,10 @@ principais:
   para um passo que grava, e para condições (``visible``, ``text_contains``):
   uma linha que não é única nunca conta como não encontrada (uma condição
   negada levaria ao ramo que cria a nota), e a condição falha fechado com
-  ``elemento_ambiguo``. O texto mostrado inclui o de shadow roots abertos, que o
-  ``innerText`` não vê. Se nenhuma linha tem a chave no HTML, o passo falha
+  ``elemento_ambiguo``. Na dúvida, uma outra linha mostra a chave se o
+  ``innerText``, o ``textContent`` ou o texto montado dos shadow roots abertos
+  (que o ``innerText`` não vê) de um elemento dela a mostra; o texto montado
+  nunca substitui o ``innerText``. Se nenhuma linha tem a chave no HTML, o passo falha
   com ``elemento_nao_encontrado`` (uma chave lida em ``NF 7`` de uma célula
   ``nf 7`` mostrada em maiúsculas não escolhe nada). A comparação nunca ignora
   maiúsculas, para uma chave nunca escolher a linha de outro código;
@@ -50,13 +59,18 @@ principais:
   (domínio e caminho do endereço, em minúsculas e sem a barra do fim) e o texto
   que a escolhe, e as páginas de uma ação são a de antes de agir e cada endereço
   por onde a página principal passou depois, até o fim da volta da repetição em
-  que ela agiu (e, se a volta acabou, até o próximo passo que pode mudar a
-  página começar a agir): a resposta de um formulário que mostra a mesma tabela
-  em outro endereço ainda é a mesma linha, quer o formulário seja enviado pela
-  ação, quer por um passo seguinte da volta (a confirmação de um modal, "Cancelar
-  selecionadas"), e a página que a volta abre depois de agir (um link, um
-  ``navigate``) também. Uma página que o robô abre numa volta seguinte, antes de
-  agir nela, é outra página. Na segunda vez, o passo
+  que ela agiu e, depois dela, até o fim da execução, menos os endereços que o
+  próprio passo ``navigate`` do robô abre: a resposta de um formulário que
+  mostra a mesma tabela em outro endereço ainda é a mesma linha, quer o
+  formulário seja enviado pela ação, quer por um passo seguinte da volta (a
+  confirmação de um modal, "Cancelar selecionadas"), e a página que a volta abre
+  depois de agir (um link, um ``navigate``) também, assim como o endereço a que
+  um temporizador ou um popup da ação leva a página numa volta seguinte. Uma
+  página que o robô abre com um ``navigate`` numa volta seguinte, antes de agir
+  nela, é outra página; uma página aberta numa volta seguinte por um clique (um
+  link) conta como da ação anterior, porque não dá para saber se quem levou a
+  página até ela foi o clique ou um temporizador ou popup da ação: na dúvida,
+  o passo é recusado. Na segunda vez, o passo
   falha com ``elemento_ambiguo`` antes de agir (e antes do aviso de passo
   irreversível), qualquer que seja o alvo: os dois ramos de um ``if``, por
   localizadores diferentes, e chaves cruzadas entre dois passos também são
@@ -225,6 +239,23 @@ type _RowAction = tuple[object, ...]
 #: Passos que só leem a página: não mudam a página nem a linha onde os seguintes agem.
 _PAGE_READS = (ExtractTextStep, ExtractTableStep, AssertStep, WaitForStep)
 
+
+def _effective_effect(step: Step, inherited: Iterable[Effect]) -> Effect:
+    """O efeito com que um passo é tratado, dentro dos contêineres de efeito ``inherited``.
+
+    Um passo que age na página (clicar, digitar, escolher, marcar, teclar, enviar ou
+    baixar um arquivo, abrir um endereço) e um contêiner ficam com o maior entre o
+    efeito deles e o dos contêineres em volta: o efeito só sobe, e na dúvida um passo
+    dentro de um bloco que grava também grava. Um passo que só lê a página
+    (:data:`_PAGE_READS`) nunca age nela e fica com o seu. É esse efeito que vale em
+    tudo: no anúncio (e na confirmação), na rede contra ações repetidas, na regra dos
+    localizadores alternativos e na conferência antes do primeiro passo.
+    """
+    if isinstance(step, _PAGE_READS):
+        return step.effect
+    return max_effect(step.effect, *inherited)
+
+
 #: Contextos já usados por alguma execução: nunca se reaproveita um contexto.
 _claimed_contexts: weakref.WeakSet[BrowserContext] = weakref.WeakSet()
 
@@ -278,11 +309,13 @@ _READ_TABLE_JS = """
 #
 # O texto mostrado é o innerText, que não entra em shadow roots (o de um elemento que só
 # tem um shadow root é vazio). Nos elementos com um shadow root aberto dentro (ou que
-# são um), ele é montado à parte, como a página mostra: o conteúdo do shadow root no
-# lugar dos filhos (os filhos só pelos slots), o innerText dos elementos de dentro, e o
-# texto solto com o text-transform de quem o mostra. Com outro text-transform
-# (capitalize, por exemplo), esse texto é comparado sem olhar maiúsculas: na dúvida,
-# mostra a mesma chave. Só esses elementos pagam a montagem; o resto usa o innerText.
+# são um), ele também é montado à parte, como a página mostra: o conteúdo do shadow root
+# no lugar dos filhos (os filhos só pelos slots), o innerText dos elementos de dentro,
+# uma quebra de linha por <br>, e o texto solto com o text-transform de quem o mostra.
+# Com outro text-transform (capitalize, por exemplo), esse texto é comparado sem olhar
+# maiúsculas: na dúvida, mostra a mesma chave. Só esses elementos pagam a montagem, que
+# nunca substitui o innerText: um elemento mostra a chave se o innerText, o textContent
+# ou o texto montado dele a mostram.
 _OTHER_ROWS_SHOWING_KEY_JS = r"""
 (rows, [key, chosen]) => {
   if (!rows.includes(chosen)) return -1;
@@ -319,12 +352,11 @@ _OTHER_ROWS_SHOWING_KEY_JS = r"""
     }
   };
   const composedTexts = new Map();
+  const innerText = (element) =>
+    typeof element.innerText === 'string' ? element.innerText : element.textContent ?? '';
   // [texto mostrado, se as maiúsculas dele são incertas]
   const shownParts = (element) => {
-    if (!withShadow.has(element)) {
-      const text = typeof element.innerText === 'string' ? element.innerText : element.textContent;
-      return [text ?? '', false];
-    }
+    if (!withShadow.has(element)) return [innerText(element), false];
     let parts = composedTexts.get(element);
     if (parts !== undefined) return parts;
     let text = '';
@@ -338,6 +370,8 @@ _OTHER_ROWS_SHOWING_KEY_JS = r"""
         const [piece, uncertain] = transformed(child.nodeValue ?? '', element);
         text += piece;
         loose ||= uncertain;
+      } else if (child.nodeName === 'BR') {
+        text += '\n';  // o innerText de um <br> é vazio, mas ele separa as palavras
       } else if (child.nodeType === 1 && !skipped.has(child.nodeName)) {
         const display = getComputedStyle(child).display;
         if (display === 'none') continue;
@@ -349,6 +383,15 @@ _OTHER_ROWS_SHOWING_KEY_JS = r"""
     parts = [text, loose];
     composedTexts.set(element, parts);
     return parts;
+  };
+  // Os textos que um elemento pode estar mostrando, cada um com a incerteza das
+  // maiúsculas: o innerText, o texto montado (com um shadow root aberto dentro) e, nas
+  // outras linhas, também o textContent. Na dúvida, qualquer um deles.
+  const shownTexts = (element, withContent) => {
+    const texts = [[innerText(element), false]];
+    if (withShadow.has(element)) texts.push(shownParts(element));
+    if (withContent) texts.push([element.textContent ?? '', false]);
+    return texts;
   };
   const htmlTexts = new Map();
   const htmlText = (node) => {
@@ -377,11 +420,12 @@ _OTHER_ROWS_SHOWING_KEY_JS = r"""
     if (node.nodeType === 1) {
       if (skipped.has(node.nodeName)) continue;
       if (normalize(htmlText(node)) === key) {
-        const [raw, loose] = shownParts(node);
-        const text = normalize(raw);
-        if (text) {  // uma chave escondida não mostra nada
-          wanted.add(text);
-          looseWanted ||= loose;
+        for (const [raw, loose] of shownTexts(node, false)) {
+          const text = normalize(raw);
+          if (text) {  // uma chave escondida não mostra nada
+            wanted.add(text);
+            looseWanted ||= loose;
+          }
         }
       }
       if (node.shadowRoot) inChosen.push(node.shadowRoot);
@@ -389,11 +433,11 @@ _OTHER_ROWS_SHOWING_KEY_JS = r"""
     for (const child of node.children) inChosen.push(child);
   }
   const folded = new Set(Array.from(wanted, (text) => text.toLowerCase()));
-  const shows = (node) => {
-    const [raw, loose] = shownParts(node);
-    const text = normalize(raw);
-    return wanted.has(text) || ((loose || looseWanted) && folded.has(text.toLowerCase()));
-  };
+  const shows = (node) =>
+    shownTexts(node, true).some(([raw, loose]) => {
+      const text = normalize(raw);
+      return wanted.has(text) || ((loose || looseWanted) && folded.has(text.toLowerCase()));
+    });
   const seen = new Set();
   const marked = new Set();
   const mark = (node) => {
@@ -1089,12 +1133,17 @@ class Interpreter:
         #: linha (a volta é o caminho de :data:`_IterationPath` até ela): a página e o
         #: ``order`` da última ação de antes da última visita.
         self._visits: dict[_IterationPath, dict[str, int]] = {}
-        #: Voltas que já acabaram, mas cujas navegações ainda podem chegar: contam até o
-        #: próximo passo que pode mudar a página começar a agir.
+        #: Voltas que já acabaram, mas cujas navegações ainda podem chegar (a resposta de
+        #: um formulário, um temporizador, um popup): contam até o fim da execução, menos
+        #: as navegações do próprio passo ``navigate`` do robô.
         self._lingering: dict[_IterationPath, None] = {}
         #: Voltas de cada navegação da página principal (um redirecionamento dela conta
         #: para as mesmas voltas, mesmo que a volta já tenha acabado).
         self._navigation_iterations: dict[Request, tuple[_IterationPath, ...]] = {}
+        #: A página (:func:`_page_key`) que o passo ``navigate`` em andamento abre, e os
+        #: pedidos dele: o primeiro para essa página e os redirecionamentos desse.
+        self._robot_navigation: str | None = None
+        self._robot_requests: list[Request] = []
         self._artifacts: list[ArtifactRef] = []
         self._secret_locators: list[PwLocator] = []
         self._blocked_navigation: str | None = None
@@ -1221,16 +1270,17 @@ class Interpreter:
         """As repetições em volta do passo atual, cada uma com a posição do item."""
         return tuple((loop, index) for _, index, loop in self._items)
 
-    def _open_iterations(self) -> list[_IterationPath]:
+    def _open_iterations(self, *, lingering: bool = True) -> list[_IterationPath]:
         """As voltas em que uma navegação agora conta (ver :meth:`_row_not_acted_on`).
 
         São as voltas em andamento que já agiram numa linha, de fora para dentro, e
-        as que acabaram sem que outro passo tenha começado a mudar a página.
+        (com ``lingering``) as que já acabaram.
         """
         path = self._iteration_path()
         prefixes = (path[:depth] for depth in range(1, len(path) + 1))
         found = dict.fromkeys(prefix for prefix in prefixes if prefix in self._visits)
-        found.update(self._lingering)
+        if lingering:
+            found.update(self._lingering)
         return list(found)
 
     def _visit(self, url: str, iterations: Iterable[_IterationPath] | None = None) -> None:
@@ -1246,39 +1296,60 @@ class Interpreter:
 
         Num redirecionamento, conta também nas voltas da navegação de onde ele veio,
         mesmo que elas já tenham acabado: o endereço pedido e cada um dos
-        redirecionamentos viram páginas das ações dessas voltas.
+        redirecionamentos viram páginas das ações dessas voltas. A navegação do
+        próprio passo ``navigate`` do robô (o primeiro pedido para a página dele e os
+        redirecionamentos desse) não conta nas voltas que já acabaram: a página que o
+        robô abre antes de agir é outra página. Qualquer outra, mesmo durante o
+        ``navigate`` (um popup que leva a página a outro endereço), conta.
         """
         try:
             if not request.is_navigation_request() or request.frame.parent_frame is not None:
                 return
         except PlaywrightError:  # pedidos de service worker não têm quadro
             return
-        iterations = dict.fromkeys(self._open_iterations())
-        if request.redirected_from is not None:
-            iterations.update(
-                dict.fromkeys(self._navigation_iterations.get(request.redirected_from, ()))
-            )
+        origin = request.redirected_from
+        if self._robot_navigation is not None and (
+            origin in self._robot_requests
+            if origin is not None
+            else not self._robot_requests and _page_key(request.url) == self._robot_navigation
+        ):
+            self._robot_requests.append(request)
+            iterations = dict.fromkeys(self._open_iterations(lingering=False))
+        else:
+            iterations = dict.fromkeys(self._open_iterations())
+        if origin is not None:
+            iterations.update(dict.fromkeys(self._navigation_iterations.get(origin, ())))
         if iterations:
             self._navigation_iterations[request] = tuple(iterations)
             self._visit(request.url, iterations)
 
     def _on_frame_navigated(self, frame: Frame) -> None:
-        """A página principal mudou de endereço (inclusive sem pedido, por ``pushState``)."""
+        """A página principal mudou de endereço (inclusive sem pedido, por ``pushState``).
+
+        Onde o passo ``navigate`` do robô para não conta nas voltas que já acabaram
+        (:meth:`_on_request`); qualquer outro endereço conta.
+        """
         if frame.parent_frame is None:
-            self._visit(frame.url)
+            robot = self._robot_navigation is not None and _page_key(frame.url) in {
+                self._robot_navigation,
+                *(_page_key(request.url) for request in self._robot_requests),
+            }
+            self._visit(frame.url, self._open_iterations(lingering=not robot))
 
     def _record_act(self, act: _Act) -> _Act:
         """Anota uma ação numa linha, antes de agir, na página de agora.
 
-        Daqui até o fim de cada volta em volta dela, as páginas visitadas também são
-        páginas dela, para as voltas seguintes daquela repetição.
+        Daqui em diante, as páginas visitadas também são páginas dela, para as voltas
+        seguintes de cada repetição em volta dela (depois do fim da volta, menos as
+        que o passo ``navigate`` do robô abre: :meth:`_on_request`).
         """
         self._order += 1
         act = act._replace(order=self._order)
         self._acts.setdefault(act.key, []).append(act)
         for depth in range(1, len(act.path) + 1):
             self._visits.setdefault(act.path[:depth], {})
-        self._visit(self.page.url)
+        # Só nas voltas dela: a página onde ela age não é uma navegação.
+        self._visit(self.page.url, self._open_iterations(lingering=False))
         return act
 
     def _claim(self, context: BrowserContext) -> None:
@@ -1449,14 +1520,17 @@ class Interpreter:
             rows: _Rows | None,
             undecided: _Undecided,
             loops: tuple[tuple[_ListLoop, tuple[int, ...]], ...],
+            inherited: Effect,
         ) -> None:
+            # ``inherited``: o efeito dos contêineres em volta (:func:`_effective_effect`).
             for step in steps:
+                effect = _effective_effect(step, (inherited,))
                 if isinstance(step, NavigateStep):
                     found.extend(self._url_value_problems(step, values, rows, undecided))
                 for target in _step_targets(step):
                     found.extend(self._row_key_problems(step, target, values, rows, undecided))
                 if loops and rows is not None:
-                    self._trace_step(step, values, rows, undecided, loops)
+                    self._trace_step(step, values, rows, undecided, loops, effect)
                 if isinstance(step, ForEachStep):
                     inner = self._loop_rows(step, values)
                     if inner is None:
@@ -1465,11 +1539,11 @@ class Interpreter:
                         if _changes_page(step.steps):
                             for each_loop, each_reach in loops:
                                 each_loop.forget(each_reach)
-                        walk(step.steps, None, undecided, ())
+                        walk(step.steps, None, undecided, (), effect)
                     elif inner[1]:  # sobre uma lista de entrada vazia, nada roda
                         indexes = tuple(index for index, _ in inner[1])
                         loop = _ListLoop(inner[0], indexes)
-                        walk(step.steps, inner, undecided, (*loops, (loop, indexes)))
+                        walk(step.steps, inner, undecided, (*loops, (loop, indexes)), effect)
                         found.extend(_repeated_rows(loop))
                 elif isinstance(step, IfStep):
                     for block, block_rows, block_undecided in self._branches(
@@ -1480,9 +1554,9 @@ class Interpreter:
                             # Só os itens que chegam ao ramo (a repetição de dentro é a deles).
                             reach = tuple(index for index, _ in block_rows[1])
                             block_loops = (*loops[:-1], (loops[-1][0], reach))
-                        walk(block, block_rows, block_undecided, block_loops)
+                        walk(block, block_rows, block_undecided, block_loops, effect)
 
-        walk(self._manifest.steps, None, (), ())
+        walk(self._manifest.steps, None, (), (), Effect.READ)
         for condition in self._manifest.postconditions:
             target = getattr(condition, "target", None)
             if isinstance(target, Target):
@@ -1509,19 +1583,21 @@ class Interpreter:
         rows: _Rows,
         undecided: _Undecided,
         loops: tuple[tuple[_ListLoop, tuple[int, ...]], ...],
+        effect: Effect,
     ) -> None:
         """Anota o que ``step`` faz para cada item das repetições sobre listas de entrada.
 
         ``loops`` são essas repetições em volta do passo, da mais externa à mais
         interna, cada uma com os itens que chegam ao passo; ``rows`` são os itens da
-        mais interna, de onde vem ``item``. Ver :class:`_ListLoop`.
+        mais interna, de onde vem ``item``; ``effect`` é o efeito com que o passo
+        roda (:func:`_effective_effect`). Ver :class:`_ListLoop`.
         """
         if isinstance(step, (ForEachStep, IfStep)):
             return  # nos contêineres, contam os passos de dentro
         reads_page = isinstance(step, _PAGE_READS)
         target = getattr(step, "target", None)
         acts_on_row = (
-            step.effect is not Effect.READ
+            effect is not Effect.READ
             and isinstance(target, Target)
             and target.within is not None
             and target.within_has_text is not None
@@ -1870,12 +1946,12 @@ class Interpreter:
         await self._emit(RunEventKind.STEP_STARTED, step.id, data)
 
     def _effect(self, step: Step) -> Effect:
-        """O efeito com que um passo é anunciado e tratado ao agir.
+        """O efeito com que um passo é anunciado e tratado ao agir (:func:`_effective_effect`).
 
-        É o dele ou, se for maior, o de um contêiner em volta: o efeito só sobe, e na
-        dúvida um passo dentro de um bloco que grava também grava.
+        Num passo que age, é o dele ou, se for maior, o de um contêiner em volta; um
+        passo que só lê fica com o seu.
         """
-        return max_effect(step.effect, *self._block_effects)
+        return _effective_effect(step, self._block_effects)
 
     async def _screenshot(self, step_id: str | None, reason: Literal["depois", "falha"]) -> None:
         """Guarda a tela atual (melhor esforço: uma falha aqui não derruba a execução)."""
@@ -2031,22 +2107,26 @@ class Interpreter:
     async def _run_leaf(self, step: Step) -> None:
         """Roda um passo simples: anuncia, prepara, confere a rede contra repetições e age.
 
-        Um passo que grava (``write``, também pelo efeito de um contêiner em volta)
-        se anuncia antes de preparar e, com confirmação, só segue quando o plano de
-        controle a dá; o prazo do passo começa depois dela. O passo irreversível só
-        avisa depois de encontrar o alvo, e a espera pela confirmação do aviso
-        também não conta no prazo. Se a confirmação não vem, o passo falha como
-        qualquer outro (evento ``step_failed`` dele), sem ter agido.
+        Um passo que grava (``write``, também pelo efeito de um contêiner em volta,
+        se ele age na página: :meth:`_effect`) se anuncia antes de preparar e, com
+        confirmação, só segue quando o plano de controle a dá; o prazo do passo
+        começa depois dela. O passo irreversível só avisa depois de encontrar o alvo;
+        a espera pela confirmação do aviso tem só o prazo da própria confirmação, e
+        o prazo do passo fica parado até ela chegar. Se a confirmação não vem, o
+        passo falha como qualquer outro (evento ``step_failed`` dele), sem ter agido.
 
         Uma ação que grava numa linha escolhida pelo texto é anotada antes de agir
         (:meth:`_record_act`); daí até o fim de cada volta em volta dela, cada
         endereço por onde a página principal passa (pedido de navegação,
         redirecionamento ou ``pushState``) também é página dela, inclusive pelos
         passos seguintes da volta (a confirmação de um modal, um link). Uma volta que
-        acabou ainda conta as navegações até o próximo passo que pode mudar a página
-        começar a agir: um clique sem ``expect_navigation`` volta antes de a resposta
-        do formulário chegar. Passos que só leem (:data:`_PAGE_READS`) não encerram
-        esse intervalo.
+        acabou continua contando as navegações da página principal até o fim da
+        execução, inclusive as que um clique de uma volta seguinte provoca (na
+        dúvida, a navegação pode ser um temporizador ou um popup da ação anterior),
+        menos as do próprio passo ``navigate`` do robô (:meth:`_on_request`): um
+        clique sem ``expect_navigation`` volta antes de a resposta do formulário
+        chegar, e um ``setTimeout`` da página ou um popup pode levá-la a outro
+        endereço muito depois.
         """
         loop = asyncio.get_running_loop()
         started = loop.time()
@@ -2069,23 +2149,27 @@ class Interpreter:
                     act = self._row_not_acted_on(step)
                     if irreversible:
                         # O aviso vai antes: com confirmação, ele pode esperar o plano de
-                        # controle gravá-lo. Se falhar, nada foi enviado ao portal.
+                        # controle gravá-lo. Se falhar, nada foi enviado ao portal. A
+                        # espera tem o prazo da própria confirmação, e o do passo fica
+                        # parado até ela chegar.
+                        timeout.reschedule(None)
                         waiting_since = loop.time()
                         try:
                             await self._emit_step_started(step, effect, irreversible=True)
                         finally:
                             announced = True
+                        if loop.time() >= self._deadline:
+                            # Nada foi enviado ao portal: o passo não age depois do prazo.
+                            raise StepError(
+                                ErrorCode.TEMPO_ESGOTADO,
+                                f"O prazo da execução acabou durante o passo '{step.title}'.",
+                            )
                         ctx.deadline = min(
                             ctx.deadline + loop.time() - waiting_since, self._deadline
                         )
                         timeout.reschedule(ctx.deadline + _TIMEOUT_GRACE_S)
                         # Daqui em diante, qualquer falha deixa a execução indeterminada.
                         self._irreversible_step = step
-                    if not isinstance(step, _PAGE_READS):
-                        # O que a página fizer daqui em diante é consequência deste passo,
-                        # não das voltas que já acabaram (que tiveram até aqui para
-                        # levá-la a outro endereço).
-                        self._lingering.clear()
                     if act is not None:
                         # Anotada antes de agir: uma ação que falhou no meio também conta.
                         act = self._record_act(act)
@@ -2093,7 +2177,8 @@ class Interpreter:
                         data = await action()
                     finally:
                         if act is not None:
-                            self._visit(self.page.url)  # onde ela parou
+                            # Onde ela parou (só nas voltas dela: não é uma navegação).
+                            self._visit(self.page.url, self._open_iterations(lingering=False))
                 self._check_page_domain(step)
             except StepError:
                 raise
@@ -2148,10 +2233,10 @@ class Interpreter:
 
         O contêiner não age: ele se anuncia sem esperar confirmação e sem marcar uma
         gravação (:meth:`_emit_block_started`), e o efeito dele vale para cada passo
-        de dentro (:meth:`_effect`), que se anuncia antes de agir. Se nada de dentro
-        começou, nada foi gravado. Ao fim de cada volta, as páginas dela continuam
-        contando para as ações dela até o próximo passo que pode mudar a página
-        (:meth:`_run_leaf`).
+        de dentro que age na página (:meth:`_effect`), que se anuncia antes de agir.
+        Se nada de dentro começou, nada foi gravado. Ao fim de cada volta, as
+        navegações da página principal continuam contando para as ações dela até o
+        fim da execução, menos as do passo ``navigate`` do robô (:meth:`_run_leaf`).
         """
         loop = asyncio.get_running_loop()
         started = loop.time()
@@ -2171,6 +2256,16 @@ class Interpreter:
                         self._items.pop()
                         if iteration in self._visits:
                             self._lingering[iteration] = None
+                # A repetição acabou e não roda de novo nesta volta das de fora: as voltas
+                # dela nunca mais são comparadas (:func:`_iteration_depth`), e não precisam
+                # anotar as páginas seguintes.
+                around = self._iteration_path()
+                for iteration in [
+                    each
+                    for each in self._lingering
+                    if each[:-1] == around and each[-1][0] == step.id
+                ]:
+                    del self._lingering[iteration]
                 data: dict[str, Any] = {"itens": len(items)}
             else:
                 holds = await self._holds(step.condition)
@@ -2269,6 +2364,8 @@ class Interpreter:
             )
 
         async def act() -> dict[str, Any]:
+            # A navegação que este passo faz não conta nas voltas que já acabaram.
+            self._robot_navigation = _page_key(url)
             try:
                 response = await self.page.goto(url, timeout=ctx.remaining_ms(), wait_until="load")
             except PlaywrightTimeoutError:
@@ -2281,6 +2378,9 @@ class Interpreter:
                     f"Não consegui abrir a página do passo '{step.title}'.",
                     details={"detalhe": self._detail(exc)},
                 ) from None
+            finally:
+                self._robot_navigation = None
+                self._robot_requests.clear()
             return {"dominio": host, "status": response.status if response is not None else None}
 
         return act
@@ -2739,22 +2839,26 @@ class Interpreter:
         (:func:`_page_key`) e o texto normalizado que a escolhe. As páginas de uma
         ação, para as voltas seguintes de uma repetição em volta dela, são a página
         onde ela agiu e todos os endereços por onde a página principal passou depois,
-        até o fim da volta dessa repetição em que ela agiu (:meth:`_run_leaf`): a
-        resposta de um formulário, enviado por ela ou por um passo seguinte da mesma
-        volta (a confirmação de um modal, "Cancelar selecionadas"), que mostra a mesma
-        tabela em outro endereço ainda é a mesma linha, e também a página que a
-        própria volta abre depois de agir (um link, um ``navigate``). Uma página que
-        o robô abre numa volta seguinte, antes de agir nela, é outra página (a nota 1
-        de cada filial). Isso pega itens repetidos numa tabela lida da página,
+        na volta dessa repetição em que ela agiu e, depois dela, até o fim da
+        execução, menos os que o passo ``navigate`` do robô abre (:meth:`_run_leaf`):
+        a resposta de um formulário, enviado por ela ou por um passo seguinte da
+        mesma volta (a confirmação de um modal, "Cancelar selecionadas"), que mostra
+        a mesma tabela em outro endereço ainda é a mesma linha, e também a página que
+        a própria volta abre depois de agir (um link, um ``navigate``) e a que um
+        temporizador ou um popup dela abre depois. Uma página que o robô abre com um
+        ``navigate`` numa volta seguinte, antes de agir nela, é outra página (a nota
+        1 de cada filial); uma aberta por um clique, não (na dúvida, a navegação veio
+        da ação anterior). Isso pega itens repetidos numa tabela lida da página,
         inclusive quando cada um vai para um ramo de um ``if``, por qualquer
         localizador, e chaves cruzadas (o segundo passo do item 0 e o primeiro do item
         1 na mesma linha). A segunda vez falha antes de agir, e antes do aviso de passo
         irreversível. Passos de leitura, passos na mesma volta (dois cliques no "+" da
         mesma linha, digitar a quantidade e clicar em Salvar) e repetições que não
         estão uma dentro da outra (marcar todas as linhas, depois cancelar todas) não
-        contam; por isso uma ação fora de repetições nunca é anotada.
+        contam; por isso uma ação fora de repetições nunca é anotada. O efeito é o
+        de :meth:`_effect`: um clique de leitura num bloco que grava também conta.
         """
-        if step.effect is Effect.READ:
+        if self._effect(step) is Effect.READ:
             return None
         target = getattr(step, "target", None)
         if not isinstance(target, Target):
@@ -2819,13 +2923,14 @@ class Interpreter:
 
         O localizador principal tem preferência. Em passos de leitura, os
         alternativos entram depois de ``heal_after_ms`` (ou no fim do prazo) e
-        geram o evento ``step_healed``; em passos que gravam, só o principal vale.
+        geram o evento ``step_healed``; em passos que gravam (pelo efeito de
+        :meth:`_effect`, também o de um bloco que grava), só o principal vale.
         Num contêiner escolhido pelo texto, a linha também precisa ser a única com
         ele, no HTML e no texto mostrado (:meth:`_row_issue`).
         """
         choice = self._row_choice(target)
         candidates = self._candidates(target, choice)
-        allow_fallback = step.effect is Effect.READ
+        allow_fallback = self._effect(step) is Effect.READ
         loop = asyncio.get_running_loop()
         start = loop.time()
         heal_at = start + min(self._heal_after_s, max(0.0, (ctx.deadline - start) / 4))

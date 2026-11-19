@@ -2,8 +2,11 @@
 
 Só os passos simples que agem se anunciam como gravação (``grava``, o aviso de passo
 irreversível) e esperam a confirmação; um contêiner nunca, e o efeito dele vale para
-os passos de dentro. A espera pela confirmação não consome o prazo do passo, e uma
-confirmação que não vem é a falha do próprio passo, mesmo dentro de um contêiner.
+os passos de dentro que agem na página. Um passo de dentro que só lê fica com o
+efeito dele. O efeito com que um passo roda é o mesmo no anúncio, na rede contra
+ações repetidas, nos localizadores alternativos e na conferência antes do primeiro
+passo. A espera pela confirmação não consome o prazo do passo, e uma confirmação que
+não vem é a falha do próprio passo, mesmo dentro de um contêiner.
 
 As páginas são servidas pelo próprio navegador (``route.fulfill``).
 """
@@ -11,6 +14,7 @@ As páginas são servidas pelo próprio navegador (``route.fulfill``).
 import asyncio
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 from playwright.async_api import BrowserContext, Route
@@ -36,10 +40,13 @@ _PAGINA = """<!doctype html><meta charset="utf-8"><title>Notas</title>
 document.getElementById('log').textContent = localStorage.log">Gravar</button>"""
 
 
-def _serve() -> ContextSetup:
+def _serve(pages: dict[str, str] | None = None) -> ContextSetup:
+    """Responde com a página do caminho em ``pages`` (sem ``pages``, sempre com _PAGINA)."""
+
     async def prepare(context: BrowserContext) -> None:
         async def handler(route: Route) -> None:
-            await route.fulfill(content_type="text/html; charset=utf-8", body=_PAGINA)
+            body = _PAGINA if pages is None else pages[urlsplit(route.request.url).path]
+            await route.fulfill(content_type="text/html; charset=utf-8", body=body)
 
         await context.route("**/*", handler)
 
@@ -154,13 +161,14 @@ def _started(events: list[RunEvent], step_id: str) -> list[RunEvent]:
 # -- a espera pela confirmação não consome o prazo do passo --------------------------------
 
 
+@pytest.mark.parametrize("delay_s", [1.5, 3.5])
 @pytest.mark.parametrize("effect", ["write", "irreversible"])
 async def test_waiting_for_the_ack_does_not_use_up_the_step_timeout(
-    run_robot: RobotRunner, effect: str
+    run_robot: RobotRunner, effect: str, delay_s: float
 ) -> None:
-    # A confirmação demora mais que o prazo do passo (1 s): o passo ainda tem o prazo
-    # inteiro depois dela, e grava uma vez.
-    sink = _SlowAcks(delay_s=1.5)
+    # A confirmação demora mais que o prazo do passo (1 s), e até mais que ele somado à
+    # folga de 2 s: o passo ainda tem o prazo inteiro depois dela, e grava uma vez.
+    sink = _SlowAcks(delay_s=delay_s)
     log = _Log()
     outcome = await run_robot(
         _manifest([_open(), _gravar(effect)]), events=sink, prepare_context=_serve(), after_run=log
@@ -224,9 +232,10 @@ async def test_containers_never_announce_a_write_and_pass_their_effect_down(
     run_robot: RobotRunner, container: str
 ) -> None:
     # O contêiner gravaria (efeito declarado "write"), mas quem age são os passos de
-    # dentro: a leitura de dentro se anuncia como gravação (o efeito só sobe), e o
-    # contêiner, não. Se o executor parasse antes do primeiro passo de dentro, nada
-    # teria sido gravado, e a execução poderia voltar para a fila.
+    # dentro: o clique de dentro (declarado como leitura) se anuncia como gravação (o
+    # efeito só sobe), e o contêiner, não. A leitura de dentro nunca age na página e
+    # fica com o efeito dela. Se o executor parasse antes do clique, nada teria sido
+    # gravado, e a execução poderia voltar para a fila.
     body = [_ler(), _gravar("read")]
     if container == "repeticao":
         manifest = _manifest([_open(), _for_each(body, "write")], inputs=[_NOTAS])
@@ -244,14 +253,17 @@ async def test_containers_never_announce_a_write_and_pass_their_effect_down(
     assert block.data["efeito_do_bloco"] == "write"
     assert "efeito" not in block.data and "grava" not in block.data
     assert not waits_for_ack(block) and not _marks_write(block)
-    for step_id in ("ler", "gravar"):
-        [started] = outcome.of(RunEventKind.STEP_STARTED, step_id)
-        assert started.data["efeito"] == "write"
-        assert started.data["grava"] is True
-        assert waits_for_ack(started) and _marks_write(started)
-    # A primeira marca de gravação é a do primeiro passo de dentro.
+    [read] = outcome.of(RunEventKind.STEP_STARTED, "ler")
+    assert read.data["efeito"] == "read"
+    assert "grava" not in read.data and "irreversivel" not in read.data
+    assert not waits_for_ack(read) and not _marks_write(read)
+    [started] = outcome.of(RunEventKind.STEP_STARTED, "gravar")
+    assert started.data["efeito"] == "write"
+    assert started.data["grava"] is True
+    assert waits_for_ack(started) and _marks_write(started)
+    # A primeira marca de gravação é a do primeiro passo de dentro que age.
     first = next(e for e in outcome.events if _marks_write(e))
-    assert first.step_id == "ler"
+    assert first.step_id == "gravar"
 
 
 async def test_inner_step_of_a_writing_block_waits_for_the_ack(
@@ -303,5 +315,164 @@ async def test_irreversible_block_warns_before_each_inner_step_not_before_the_bl
     assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
     assert log.log == "G;"
     warnings = [event for event in outcome.events if needs_ack(event)]
-    assert [event.step_id for event in warnings] == ["ler", "gravar"]
+    assert [event.step_id for event in warnings] == ["gravar"]  # a leitura nunca avisa
     assert outcome.result.irreversible_started
+
+
+async def test_read_inside_a_writing_block_never_waits_for_the_ack(
+    run_robot: RobotRunner, tmp_path: Path
+) -> None:
+    # Sem confirmação nenhuma: a leitura de dentro roda (ela não grava nada), e o
+    # clique de dentro, que herda a gravação do bloco, nunca age.
+    inner = ListEventSink()
+    sink = AckingEventSink(inner, tmp_path / "sem-confirmacao", timeout_s=0.3)
+    manifest = _manifest([_open(), _for_each([_ler(), _gravar("read")], "write")], inputs=[_NOTAS])
+    log = _Log()
+    outcome = await run_robot(
+        manifest,
+        {"notas": [{"numero": "1"}]},
+        events=sink,
+        prepare_context=_serve(),
+        after_run=log,
+    )
+    assert log.log == ""
+    assert outcome.result.error_code == ErrorCode.SEM_CONFIRMACAO
+    assert outcome.result.failed_step_id == "gravar"
+    succeeded = [e.step_id for e in inner.events if e.kind is RunEventKind.STEP_SUCCEEDED]
+    assert succeeded == ["abrir", "ler"]
+    assert [e.step_id for e in inner.events if waits_for_ack(e)] == ["gravar"]
+
+
+async def test_read_inside_an_irreversible_block_never_warns(run_robot: RobotRunner) -> None:
+    # A leitura de dentro roda sem aviso de passo irreversível; o clique seguinte não
+    # encontra o botão antes de avisar: nada começou, e a execução falha (não fica
+    # indeterminada).
+    manifest = _manifest(
+        [_open(), _for_each([_ler(), _gravar("read", name="Outro botão")], "irreversible")],
+        inputs=[_NOTAS],
+    )
+    outcome = await run_robot(manifest, {"notas": [{"numero": "1"}]}, prepare_context=_serve())
+    result = outcome.result
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_NAO_ENCONTRADO
+    assert result.failed_step_id == "gravar"
+    assert not result.irreversible_started
+    assert not [event for event in outcome.events if needs_ack(event)]
+    [read] = outcome.of(RunEventKind.STEP_STARTED, "ler")
+    assert read.data["efeito"] == "read"
+
+
+# -- o efeito herdado vale também na rede e nos localizadores alternativos -----------------
+
+# Duas notas, cada uma com o botão "Gravar" na linha; cada clique fica no registro.
+_LINHAS = """<!doctype html><meta charset="utf-8"><title>Notas</title>
+<p id="log"></p><script>document.getElementById('log').textContent = localStorage.log || ''</script>
+<table aria-label="Notas"><thead><tr><th>numero</th><th>acao</th></tr></thead><tbody>
+<tr><td>A</td><td><button onclick="localStorage.log = (localStorage.log || '') + 'GA;'">
+Gravar</button></td></tr>
+<tr><td>B</td><td><button onclick="localStorage.log = (localStorage.log || '') + 'GB;'">
+Gravar</button></td></tr>
+</tbody></table>"""
+# Relatório (outra página) com a nota A duas vezes.
+_RELATORIO = """<!doctype html><meta charset="utf-8"><title>Relatório</title>
+<table aria-label="Notas"><thead><tr><th>numero</th><th>acao</th></tr></thead><tbody>
+<tr><td>A</td><td>ok</td></tr><tr><td>A</td><td>ok</td></tr></tbody></table>"""
+
+
+def _gravar_na_linha(*names: str) -> dict[str, Any]:
+    """Clique, declarado como leitura, no botão da linha da nota do item."""
+    return {
+        "kind": "click",
+        "id": "gravar",
+        "title": "Gravar a nota",
+        "effect": "read",
+        "timeout_ms": 1_000,
+        "target": {
+            "intent": "botão Gravar da nota",
+            "locators": [
+                {"by": "role", "value": "button", "name": name, "exact": True} for name in names
+            ],
+            "within": {"by": "role", "value": "row"},
+            "within_has_text": "{{ item.numero }}",
+        },
+    }
+
+
+async def test_click_inside_a_writing_block_never_uses_a_fallback_locator(
+    run_robot: RobotRunner,
+) -> None:
+    # O clique foi declarado como leitura, mas o bloco grava: só o localizador principal
+    # ("Salvar", que não existe) vale, e o alternativo ("Gravar") nunca é usado.
+    manifest = _manifest(
+        [_open(), _for_each([_gravar_na_linha("Salvar", "Gravar")], "write")], inputs=[_NOTAS]
+    )
+    log = _Log()
+    outcome = await run_robot(
+        manifest,
+        {"notas": [{"numero": "A"}]},
+        prepare_context=_serve({"/notas": _LINHAS}),
+        after_run=log,
+    )
+    result = outcome.result
+    assert log.log == ""
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.LOCALIZADOR_ALTERNATIVO_EM_GRAVACAO
+    assert result.failed_step_id == "gravar"
+    assert not outcome.of(RunEventKind.STEP_HEALED)
+
+
+async def test_click_inside_a_writing_block_never_acts_twice_on_the_same_row(
+    run_robot: RobotRunner,
+) -> None:
+    # Uma lista de entrada com a nota A duas vezes: o clique (declarado como leitura)
+    # herda a gravação do bloco, e a lista é recusada antes do primeiro passo.
+    requests: list[str] = []
+
+    async def record(context: BrowserContext) -> None:
+        context.on("request", lambda request: requests.append(request.url))
+
+    manifest = _manifest(
+        [_open(), _for_each([_gravar_na_linha("Gravar")], "write")], inputs=[_NOTAS]
+    )
+    outcome = await run_robot(
+        manifest, {"notas": [{"numero": "A"}, {"numero": "A"}]}, prepare_context=record
+    )
+    result = outcome.result
+    assert result.error_code == ErrorCode.ENTRADA_INVALIDA, result.error_message
+    assert "os itens 'notas[0]' e 'notas[1]'" in (result.error_message or "")
+    assert requests == []
+
+    # A nota A duas vezes numa tabela lida da página: a segunda vez é recusada pela rede
+    # durante a execução, antes de agir.
+    manifest = _manifest(
+        [
+            {**_open(), "url": f"{BASE}/relatorio"},
+            {
+                "kind": "extract_table",
+                "id": "ler_relatorio",
+                "title": "Ler o relatório",
+                "target": {
+                    "intent": "notas",
+                    "locators": [{"by": "role", "value": "table", "name": "Notas"}],
+                },
+                "into": "notas",
+                "columns": ["numero", "acao"],
+            },
+            {**_open(), "id": "abrir_notas"},
+            {**_for_each([_gravar_na_linha("Gravar")], "write"), "items": "vars.notas"},
+        ]
+    )
+    log = _Log()
+    outcome = await run_robot(
+        manifest,
+        prepare_context=_serve({"/relatorio": _RELATORIO, "/notas": _LINHAS}),
+        after_run=log,
+    )
+    result = outcome.result
+    assert log.log == "GA;", result.error_message  # nunca duas vezes
+    assert result.state is RunState.FAILED
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert result.failed_step_id == "gravar"
+    assert "já agiu" in (result.error_message or "")
+    started = outcome.of(RunEventKind.STEP_STARTED, "gravar")
+    assert [event.data["efeito"] for event in started] == ["write", "write"]

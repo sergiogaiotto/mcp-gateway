@@ -1113,6 +1113,64 @@ async def test_text_in_a_shadow_root_that_shows_something_else_is_not_ambiguous(
     assert page.log == "AB3X;"
 
 
+# Um componente com shadow root aberto (um ícone) que não mostra texto.
+_ICONE = (
+    "<script>customElements.define('x-icone', class extends HTMLElement { "
+    "connectedCallback() { this.attachShadow({mode: 'open'}).innerHTML = '<span></span>'; } "
+    "});</script>"
+)
+_EM_DUAS_LINHAS = {
+    # A quebra de linha (<br>) e o ícone na mesma célula: o innerText é "AB\n3X".
+    "br_com_icone": "<td>AB<br>3X<x-icone></x-icone></td>",
+    "br_sem_icone": "<td>AB<br>3X</td>",
+    "div_com_icone": "<td><div>AB</div><div>3X</div><x-icone></x-icone></td>",
+    # O ícone na outra célula da mesma linha.
+    "br_icone_fora": "<td>AB<br>3X</td>",
+}
+
+
+@pytest.mark.parametrize("source", ["lida_da_tabela", "chave_fixa"])
+@pytest.mark.parametrize("cell", list(_EM_DUAS_LINHAS))
+async def test_cell_shown_in_two_lines_is_ambiguous_with_a_shadow_component(
+    run_robot: RobotRunner, cell: str, source: str
+) -> None:
+    # A primeira linha mostra "AB" e "3X" em duas linhas (lida da página, a chave é
+    # "AB 3X"), e a segunda tem "AB 3X" no HTML. O texto que a página mostra nunca é
+    # trocado pelo montado para o shadow root, e o <br> separa as palavras: nenhuma
+    # das duas é cancelada.
+    first = _EM_DUAS_LINHAS[cell]
+    button = _botao("R1")
+    if cell == "br_icone_fora":
+        button = button.replace("<td>", "<td><x-icone></x-icone>", 1)
+    pagina = (
+        _com_registro(
+            f"<tr>{first}{button}</tr><tr><td>AB 3X</td>{_botao('R2')}</tr>",
+            _cabecalho("numero", "acao"),
+        )
+        + _ICONE
+    )
+    cancel = _cancel_in_row(
+        "cancelar", "{{ item.numero }}" if source == "lida_da_tabela" else "AB 3X", "write"
+    )
+    if source == "lida_da_tabela":
+        ler = _ler_notas(["numero", "acao"]) | {"max_rows": 1}  # só a linha R1
+        manifest = _manifest([_open("/notas"), ler, _for_each("vars.notas", [cancel])])
+    else:
+        manifest = _manifest([_open("/notas"), cancel])
+    assert policy.check(manifest) == []
+    page = _Page()
+    outcome = await run_robot(manifest, prepare_context=_serve({"/notas": pagina}), after_run=page)
+    result = outcome.result
+    assert page.log == "", result.error_message  # nem R1 nem R2
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert result.failed_step_id == "cancelar"
+    assert "outra linha mostra" in (result.error_message or "")
+    [failure] = outcome.of(RunEventKind.STEP_FAILED, "cancelar")
+    assert failure.data["linhas_pelo_html"] == 1
+    assert failure.data["outras_linhas_pelo_texto_mostrado"] == 1
+
+
 async def test_row_key_in_another_row_without_the_target_is_ambiguous(
     run_robot: RobotRunner,
 ) -> None:
@@ -1335,9 +1393,14 @@ def _filial_com_menu(tag: str) -> str:
     return _filial(tag).replace("<table", f"<nav>{menu}</nav><table")
 
 
-async def test_a_page_the_robot_opens_by_a_click_is_another_page(run_robot: RobotRunner) -> None:
-    # A filial é escolhida por um link (um passo do robô, não a resposta da ação que
-    # gravou): a nota 1 da filial "b" é outra linha, e as duas são canceladas.
+async def test_a_page_opened_by_a_click_in_a_later_iteration_counts_for_the_earlier_action(
+    run_robot: RobotRunner,
+) -> None:
+    # A filial é escolhida por um link, um clique do robô. A navegação que vem depois do
+    # clique pode ser dele ou de um temporizador ou popup da ação da volta anterior, e
+    # não dá para saber qual: na dúvida, a página conta como da ação anterior, e a nota 1
+    # da filial "b" não é cancelada. (Aberta com um ``navigate``, ela é outra linha:
+    # test_the_same_row_key_on_other_pages_is_another_row.)
     escolher = {
         "kind": "click",
         "id": "escolher_filial",
@@ -1366,8 +1429,15 @@ async def test_a_page_the_robot_opens_by_a_click_is_another_page(run_robot: Robo
         ),
         after_run=page,
     )
-    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
-    assert page.log == "A1;B1;"
+    result = outcome.result
+    assert page.log == "A1;", result.error_message
+    assert result.state is RunState.INDETERMINATE  # o cancelamento da filial "a" já agiu
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert result.failed_step_id == "cancelar"
+    assert "já agiu" in (result.error_message or "")
+    [failure] = outcome.of(RunEventKind.STEP_FAILED, "cancelar")
+    assert failure.data["repeticao"] == "cada_filial"
+    assert failure.data["iteracao_anterior"] == 0
 
 
 # -- a ação que grava leva a outro endereço com a mesma tabela -----------------------------

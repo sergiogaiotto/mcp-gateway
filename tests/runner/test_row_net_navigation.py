@@ -531,3 +531,185 @@ async def test_meta_refresh_after_the_action_never_acts_twice(
     outcome = await _run(run_robot, manifest)
     _assert_refused_once(outcome, server, "cancelar", irreversible=True)
     assert len([event for event in outcome.events if needs_ack(event)]) == 1
+
+
+# -- uma navegação que a ação provoca tarde chega numa volta seguinte ----------------------
+
+
+def _wait_text(text: str) -> dict[str, Any]:
+    return {
+        "kind": "wait_for",
+        "id": "esperar",
+        "title": "Esperar o aviso",
+        "state": "visible",
+        "timeout_ms": 6_000,
+        "target": {
+            "intent": f"aviso {text}",
+            "locators": [{"by": "text", "value": text, "exact": True}],
+        },
+    }
+
+
+def _late_app(server: _Server, how: str) -> _App:
+    """O "Cancelar" da linha some com o aviso "Pronto" e leva a página, tarde, a outro
+    endereço que mostra a mesma tabela (e o aviso): por um ``setTimeout`` depois do
+    fetch que cancela, ou por um popup que cancela e depois leva a página que o abriu."""
+    if how == "temporizador":
+        go = (
+            "fetch('/api/cancelar', {method: 'POST', body: n})"
+            ".then(() => setTimeout(() => { location.href = '/notas/b'; }, 800));"
+        )
+    else:
+        go = "window.open('/popup/cancelar?nota=' + n);"
+    rows = "".join(
+        f"<tr><td>{n}</td><td><button type='button' onclick=\"cancelar('{n}')\">Cancelar"
+        "</button></td></tr>"
+        for n in _NUMEROS
+    )
+    notas = _page(
+        "<p id='pronto'>Pronto</p><button type='button'>Atualizar</button>"
+        + _table(rows)
+        + "<script>function cancelar(n) { document.getElementById('pronto').remove(); "
+        + go
+        + " }</script>"
+    )
+    popup = _page(
+        "<p>Cancelada</p><script>setTimeout(() => "
+        "{ window.opener.location.href = '/notas/lista'; }, 900);</script>"
+    )
+
+    def app(method: str, path: str, form: dict[str, list[str]]) -> tuple[int, dict[str, str], str]:
+        parts = urlsplit(path)
+        if parts.path == "/relatorio":
+            return 200, {}, _RELATORIO
+        if method == "POST" and parts.path == "/api/cancelar":
+            server.writes.append(f"C{form['_corpo'][0]}")
+            return 200, {}, "ok"
+        if parts.path == "/popup/cancelar":
+            server.writes.extend(f"C{n}" for n in parse_qs(parts.query).get("nota", []))
+            return 200, {}, popup
+        return 200, {}, notas
+
+    return app
+
+
+@pytest.mark.parametrize("how", ["temporizador", "popup"])
+@pytest.mark.parametrize("first", ["atualizar_que_grava", "atualizar_que_le"])
+async def test_late_navigation_of_the_action_in_the_next_iteration_never_acts_twice(
+    run_robot: RobotRunner, server: _Server, how: str, first: str
+) -> None:
+    # A volta seguinte clica em "Atualizar" (um passo que pode mudar a página) antes de a
+    # navegação provocada pela ação anterior começar; a página vai para outro endereço
+    # com a mesma tabela, e o item repetido não age de novo nela.
+    server.app = _late_app(server, how)
+    effect = "write" if first == "atualizar_que_grava" else "read"
+    steps = [
+        _click("atualizar", "Atualizar", effect=effect),
+        _wait_text("Pronto"),
+        _click("cancelar", "Cancelar", row=True),
+    ]
+    outcome = await _run(run_robot, _from_report(server.base, steps))
+    _assert_refused_once(outcome, server, "cancelar", irreversible=True)
+    assert len(outcome.of(RunEventKind.STEP_SUCCEEDED, "atualizar")) == 2
+
+
+async def test_late_navigation_in_an_inner_loop_never_acts_twice(
+    run_robot: RobotRunner, server: _Server
+) -> None:
+    # O mesmo, numa repetição de dentro de outra.
+    server.app = _late_app(server, "temporizador")
+    manifest = _manifest(
+        [
+            _for_each(
+                "inputs.pedidos",
+                [
+                    _navigate(server.base, "/relatorio", "abrir_relatorio"),
+                    _read_notes(),
+                    _navigate(server.base, "/notas", "abrir_notas"),
+                    _for_each(
+                        "vars.notas",
+                        [
+                            _click("atualizar", "Atualizar", effect="write"),
+                            _wait_text("Pronto"),
+                            _click("cancelar", "Cancelar", row=True),
+                        ],
+                        "cada_nota",
+                    ),
+                ],
+                "cada_pedido",
+            )
+        ],
+        inputs=[
+            {
+                "name": "pedidos",
+                "title": "Pedidos",
+                "type": "list",
+                "item_fields": [{"name": "pedido", "title": "Pedido", "type": "string"}],
+            }
+        ],
+    )
+    outcome = await _run(run_robot, manifest, inputs={"pedidos": [{"pedido": "1"}]})
+    _assert_refused_once(outcome, server, "cancelar", irreversible=True)
+
+
+async def test_a_page_the_robot_navigates_to_in_the_next_iteration_is_another_page(
+    run_robot: RobotRunner, server: _Server
+) -> None:
+    # A nota 1 de cada filial. A volta da filial "a" cancela e o POST redireciona (303)
+    # de volta para a filial; a volta da filial "b" abre a página dela com um
+    # ``navigate``, que redireciona (302) para a lista de notas dela. As navegações do
+    # próprio ``navigate`` não contam para a volta anterior, e as duas notas são
+    # canceladas, cada uma uma vez.
+    def filial(name: str) -> str:
+        rows = (
+            f"<tr><td>1</td><td><form method='post' action='/filial/{name}/cancelar'>"
+            f"<input type='hidden' name='nota' value='{name}1'><button>Cancelar</button>"
+            "</form></td></tr>"
+        )
+        return _page(f"<h1>Filial {name}</h1>" + _table(rows))
+
+    def app(method: str, path: str, form: dict[str, list[str]]) -> tuple[int, dict[str, str], str]:
+        where = urlsplit(path).path
+        if method == "POST":
+            server.writes.extend(form.get("nota", []))
+            return 303, {"location": where.removesuffix("/cancelar") + "/notas"}, ""
+        if where in ("/filial/a", "/filial/b"):
+            return 302, {"location": f"{where}/notas"}, ""
+        return 200, {}, filial(where.split("/")[2])
+
+    server.app = app
+    manifest = _manifest(
+        [
+            _for_each(
+                "inputs.filiais",
+                [
+                    _navigate(server.base, "/filial/{{ item.filial }}", "abrir_filial"),
+                    {
+                        **_click("cancelar", "Cancelar", navigation=True),
+                        "target": {
+                            "intent": "botão Cancelar da nota 1",
+                            "locators": [
+                                {"by": "role", "value": "button", "name": "Cancelar", "exact": True}
+                            ],
+                            "within": {"by": "role", "value": "row"},
+                            "within_has_text": "1",
+                        },
+                    },
+                ],
+                "cada_filial",
+            )
+        ],
+        inputs=[
+            {
+                "name": "filiais",
+                "title": "Filiais",
+                "type": "list",
+                "item_fields": [{"name": "filial", "title": "Filial", "type": "string"}],
+            }
+        ],
+    )
+    outcome = await _run(
+        run_robot, manifest, inputs={"filiais": [{"filial": "a"}, {"filial": "b"}]}
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert server.writes == ["a1", "b1"]
