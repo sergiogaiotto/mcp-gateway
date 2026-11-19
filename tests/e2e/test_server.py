@@ -7,9 +7,9 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -23,12 +23,14 @@ from rapa.control.auth import TokenVerifier
 from rapa.control.db import Database
 from rapa.control.mcp import McpGateway
 from rapa.control.services import Dispatcher, PgPlatform, ReapReport
-from rapa.core.contracts import Forbidden, Role, VersionStatus
+from rapa.core.contracts import Forbidden, Role, RunnerJob, VersionStatus
 from rapa.core.ids import new_id
+from rapa.fixtures.robots import baixar_notas
 from rapa.server import (
     DispatcherSupervisor,
     ServerSettings,
     _DispatcherHealth,
+    _stop_dispatcher,
     create_server_app,
     dispatcher_pool_size,
     load_dev_tokens,
@@ -148,10 +150,14 @@ class FakeDispatcher:
         self.crashes = crashes
         self.runs = 0
         self.running = asyncio.Event()
-        # O que o supervisor lê do despachante de verdade para a saúde.
+        # O que o supervisor lê do despachante de verdade para a saúde e o encerramento.
         self.healthy = True
         self.stalled = False
         self.failing: dict[str, datetime] = {}
+        self.in_flight = 0
+
+    async def drain(self) -> None:  # pragma: no cover - nada em andamento
+        raise AssertionError("nada em andamento para esperar")
 
     async def run(self, stop: asyncio.Event) -> None:
         self.runs += 1
@@ -403,10 +409,14 @@ class ScriptedDispatcher:
         self.runs = 0
         self.running = asyncio.Event()
         self.die = asyncio.Event()
-        # O que o supervisor lê do despachante de verdade para a saúde.
+        # O que o supervisor lê do despachante de verdade para a saúde e o encerramento.
         self.healthy = True
         self.stalled = False
         self.failing: dict[str, datetime] = {}
+        self.in_flight = 0
+
+    async def drain(self) -> None:  # pragma: no cover - nada em andamento
+        raise AssertionError("nada em andamento para esperar")
 
     async def run(self, stop: asyncio.Event) -> None:
         self.runs += 1
@@ -442,6 +452,231 @@ async def test_full_service_health_follows_the_dispatcher(
         assert (await client.get("/saude")).status_code == 503
         assert fake.runs == 2
     # O encerramento segue até o fim mesmo assim.
+    assert sorted(closed) == ["banco", "banco", "verificador"]
+
+
+UI = {"oidc_client_id": "rapa-ui", "oidc_redirect_uri": "https://rapa.exemplo/auth/oidc/retorno"}
+
+
+def _service_with_ui(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> FastAPI:
+    """O serviço com a interface ligada (a configuração de produção, ``RAPA_UI=1``).
+
+    No lugar do NiceGUI, que é global ao processo, uma montagem que faz com o ciclo
+    de vida da aplicação o mesmo que ``ui.run_with``: envolve o que encontrar, com a
+    subida da interface antes e o encerramento dela depois.
+    """
+
+    def mount(app: FastAPI, **kwargs: Any) -> None:
+        wrapped = app.router.lifespan_context
+
+        @asynccontextmanager
+        async def ui_lifespan(application: FastAPI) -> AsyncIterator[Any]:
+            events.append("interface: subida")
+            async with wrapped(application) as state:
+                yield state
+            events.append("interface: encerramento")
+
+        app.router.lifespan_context = ui_lifespan
+
+    monkeypatch.setattr("rapa.ui.app.create_ui", mount)
+    return create_server_app(
+        ServerSettings(database_url=DB, dispatcher_database_url=DISPATCHER_DB, **JWT, **UI)
+    )
+
+
+class _RecordingDispatcher(FakeDispatcher):
+    """Anota quando o laço termina de parar."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__(crashes=0)
+        self.events = events
+
+    async def run(self, stop: asyncio.Event) -> None:
+        await super().run(stop)
+        self.events.append("despachante: parou")
+
+
+async def test_service_with_ui_starts_only_once_and_closes_databases_last(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = _record_closing(monkeypatch)
+    fake = _RecordingDispatcher(events)
+    monkeypatch.setattr("rapa.server.build_dispatcher", lambda settings, db: fake)
+    app = _service_with_ui(monkeypatch, events)
+    async with running(app), asgi_client(app) as client:
+        await fake.running.wait()
+        assert events == ["interface: subida"]
+        # A recusa vem antes de tudo, inclusive da subida da interface.
+        with pytest.raises(RuntimeError, match="já foi iniciado uma vez"):
+            async with running(app):
+                pass  # pragma: no cover
+        assert events == ["interface: subida"] and fake.runs == 1
+        assert (await client.get("/saude")).status_code == 200
+    # O despachante para primeiro; a interface encerra depois dele e antes de o
+    # verificador e os bancos serem fechados.
+    closing = [
+        "interface: subida",
+        "despachante: parou",
+        "interface: encerramento",
+        "verificador",
+        "banco",
+        "banco",
+    ]
+    assert events == closing
+    with pytest.raises(RuntimeError, match="já foi iniciado uma vez"):
+        async with running(app):
+            pass  # pragma: no cover
+    assert events == closing and fake.runs == 1
+
+
+class _OneRunQueue:
+    """Fila com uma execução só, que grava o resultado em memória."""
+
+    def __init__(self, job: RunnerJob) -> None:
+        self.job: RunnerJob | None = job
+        self.finished: list[Mapping[str, Any]] = []
+
+    async def ensure_event_partitions(self, months_ahead: int = 2) -> int:
+        return 0
+
+    async def reap_expired(self, *, now: Any = None, skip: Any = ()) -> ReapReport:
+        return ReapReport()
+
+    async def claim_next(self, *, now: Any = None) -> RunnerJob | None:
+        job, self.job = self.job, None
+        return job
+
+    async def heartbeat(self, run_id: UUID, attempt: int, *, now: Any = None) -> bool:
+        return True
+
+    async def finish(
+        self, run_id: UUID, attempt: int, result: Mapping[str, Any], *, now: Any = None
+    ) -> bool:
+        self.finished.append(result)
+        return True
+
+
+class _SlowRun:
+    """Lançador cuja execução só termina com ``release``."""
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.cancelled = False
+        self.job = RunnerJob(
+            run_id=new_id(),
+            company_id=new_id(),
+            attempt=1,
+            manifest=baixar_notas("https://portal.test", "portal.test"),
+            inputs={},
+            deadline=datetime.now(UTC) + timedelta(minutes=5),
+        )
+
+    async def __call__(self, job: RunnerJob) -> dict[str, Any]:
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return {"run_id": str(job.run_id), "attempt": job.attempt, "state": "succeeded"}
+
+
+class _CrashingDispatcher(Dispatcher):
+    """Despachante de verdade que, na primeira volta, pega uma execução e para com
+    ``error`` (fora das proteções do laço): a execução segue em andamento nele."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.launch_stub = _SlowRun()
+        self.queue_stub = _OneRunQueue(self.launch_stub.job)
+        super().__init__(self.queue_stub, self.launch_stub, poll_interval=0.01)  # type: ignore[arg-type]
+        self.error = error
+        self.crashed = False
+
+    async def run(self, stop: asyncio.Event) -> None:
+        if not self.crashed:
+            self.crashed = True
+            await self.run_once()
+            raise self.error
+        await super().run(stop)  # pragma: no cover - o teste encerra antes de reiniciar
+
+
+def test_drain_timeout_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="encerramento"):
+        DispatcherSupervisor(FakeDispatcher(crashes=0), drain_timeout_s=0)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("falha inesperada"), Fatal()],
+    ids=["esperando_para_reiniciar", "supervisao_morta"],
+)
+async def test_shutdown_waits_for_runs_left_by_a_stopped_dispatcher_loop(
+    error: BaseException, caplog: pytest.LogCaptureFixture
+) -> None:
+    dispatcher = _CrashingDispatcher(error)
+    supervisor = DispatcherSupervisor(dispatcher, restart_delay_s=30.0, max_restart_delay_s=30.0)
+    stop = asyncio.Event()
+    task = supervisor.start(stop)
+    # O laço parou com a execução em andamento: ou espera para reiniciar, ou a
+    # própria supervisão morreu.
+    await _until(lambda: dispatcher.in_flight == 1 and not supervisor.healthy)
+    if isinstance(error, Fatal):
+        await _until(task.done)
+    stopping = asyncio.create_task(_stop_dispatcher(supervisor, stop, task))
+    await asyncio.sleep(0.1)
+    assert not stopping.done() and dispatcher.in_flight == 1
+    dispatcher.launch_stub.release.set()
+    async with asyncio.timeout(5):
+        await stopping
+    assert dispatcher.in_flight == 0 and not dispatcher.launch_stub.cancelled
+    assert [r["state"] for r in dispatcher.queue_stub.finished] == ["succeeded"]
+    assert "esperando 1 execução(ões) em andamento" in caplog.text
+
+
+async def test_shutdown_interrupts_runs_that_outlast_the_drain_timeout(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    dispatcher = _CrashingDispatcher(RuntimeError("falha inesperada"))
+    supervisor = DispatcherSupervisor(
+        dispatcher, restart_delay_s=30.0, max_restart_delay_s=30.0, drain_timeout_s=0.2
+    )
+    stop = asyncio.Event()
+    task = supervisor.start(stop)
+    await _until(lambda: dispatcher.in_flight == 1 and not supervisor.healthy)
+    async with asyncio.timeout(5):
+        await _stop_dispatcher(supervisor, stop, task)
+    # Interrompida (o lançador para o executor) antes de os bancos serem fechados, e
+    # nada é gravado: a concessão vence e o recolhimento decide (devolve à fila ou,
+    # com um passo irreversível começado, marca como indeterminada).
+    assert dispatcher.in_flight == 0 and dispatcher.launch_stub.cancelled
+    assert dispatcher.queue_stub.finished == []
+    assert "1 execução(ões) ainda em andamento depois de 0.2 s" in caplog.text
+
+
+async def test_full_service_shutdown_drains_runs_before_closing_databases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dispatcher = _CrashingDispatcher(Fatal())
+    monkeypatch.setattr("rapa.server.build_dispatcher", lambda settings, db: dispatcher)
+    closed = _record_closing(monkeypatch)
+    app = _full_service()
+    supervisor: DispatcherSupervisor = app.state.dispatcher_supervisor
+    leave = asyncio.Event()
+
+    async def serve() -> None:
+        # O SDK do MCP exige abrir e fechar o grupo de tarefas na mesma tarefa.
+        async with running(app):
+            await leave.wait()
+
+    serving = asyncio.create_task(serve())
+    await _until(lambda: dispatcher.in_flight == 1 and not supervisor.healthy)
+    leave.set()
+    await asyncio.sleep(0.1)
+    # A supervisão morreu, mas o encerramento espera a execução antes de fechar os bancos.
+    assert not serving.done() and closed == []
+    dispatcher.launch_stub.release.set()
+    async with asyncio.timeout(5):
+        await serving
+    assert [r["state"] for r in dispatcher.queue_stub.finished] == ["succeeded"]
     assert sorted(closed) == ["banco", "banco", "verificador"]
 
 
