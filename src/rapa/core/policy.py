@@ -24,6 +24,7 @@ from rapa.core.robot import (
     ForEachStep,
     IfStep,
     Locator,
+    LocatorBy,
     Manifest,
     NavigateStep,
     SecretValue,
@@ -39,11 +40,27 @@ from rapa.core.robot import (
     child_blocks,
 )
 
-__all__ = ["MAX_NESTING", "TEST_TLD", "Violation", "check", "first_write_step", "iter_targets"]
+__all__ = [
+    "MAX_NESTING",
+    "RAW_SELECTORS",
+    "RESERVED_NAMES",
+    "TEST_TLD",
+    "Violation",
+    "check",
+    "first_write_step",
+    "iter_targets",
+]
 
 MAX_NESTING = 3
 #: Domínio reservado para testes (RFC 2606); só ele aceita http sem TLS.
 TEST_TLD = ".test"
+#: Estratégias cujo valor vira seletor sem escape; não aceitam valores dinâmicos.
+RAW_SELECTORS = frozenset({LocatorBy.CSS, LocatorBy.XPATH})
+#: Nomes que nenhum robô pode usar: ``busca`` é a rota fixa ``GET /v1/catalogo/busca``
+#: e os outros são as ferramentas fixas do MCP (e a operação ``consultar_execucao`` do
+#: OpenAPI dos robôs). A regra vale na criação de versões, não na leitura do manifesto,
+#: para versões já guardadas continuarem abrindo.
+RESERVED_NAMES = frozenset({"busca", "buscar_robo", "executar_robo", "consultar_execucao"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +149,20 @@ class _Checker:
         self.check_template(locator.value, step_id, item_fields, where)
         if locator.name is not None:
             self.check_template(locator.name, step_id, item_fields, where)
+        if locator.by in RAW_SELECTORS:
+            try:
+                dynamic = templates.has_references(locator.value)
+            except templates.TemplateError:
+                return  # já registrado como template inválido
+            if dynamic:
+                # Um valor entra cru no seletor: aspas, colchetes ou vírgulas nele
+                # escolheriam outro elemento. Papel, rótulo, texto e test_id escapam.
+                self.add(
+                    "seletor_dinamico",
+                    f"{where}: localizadores {locator.by.value} não podem usar entradas, "
+                    "variáveis nem itens; use papel, rótulo, texto ou test_id",
+                    step_id,
+                )
 
     def check_target(self, target: Target, step_id: str, item_fields: set[str] | None) -> None:
         where = f"alvo '{target.intent}'"
@@ -171,7 +202,12 @@ class _Checker:
         split = urlsplit(probe)
         host = (split.hostname or "").lower()
         prefix_split = urlsplit(literal_prefix)
-        if not host or (prefix_split.hostname or "").lower() != host or "{{" in split.netloc:
+        # Domínio, porta e usuário vêm inteiros do trecho literal do começo.
+        if (
+            not host
+            or (prefix_split.hostname or "").lower() != host
+            or prefix_split.netloc.lower() != split.netloc.lower()
+        ):
             self.add(
                 "dominio_dinamico",
                 "o domínio do endereço precisa ser fixo; só o caminho pode usar valores",
@@ -319,6 +355,12 @@ class _Checker:
     # -- manifesto -----------------------------------------------------------
 
     def run(self) -> list[Violation]:
+        if self.manifest.name in RESERVED_NAMES:
+            self.add(
+                "nome_reservado",
+                f"o nome '{self.manifest.name}' é reservado pelo RaPA (rotas e ferramentas "
+                "fixas); escolha outro nome para o robô",
+            )
         for credential in self.manifest.credentials:
             host = urlsplit(credential.origin).hostname or ""
             if host not in self.manifest.allowed_domains:

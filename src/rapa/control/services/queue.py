@@ -17,11 +17,18 @@ Funções para o despachante, todas recebendo uma sessão sem empresa (papel
 Escritas de uma tentativa antiga (``attempt`` diferente do atual, ou execução
 já devolvida à fila) são recusadas com :class:`StaleAttempt`.
 
+A numeração dos eventos é da execução, não da tentativa: :func:`claim_next`
+entrega no trabalho o ``first_seq`` (o número seguinte ao último evento
+gravado), e o executor numera a partir dele. Assim ``(run_id, seq)`` continua
+único e crescente entre as tentativas, e um evento só é dado como gravado
+quando está gravado para esta tentativa, com o mesmo conteúdo.
+
 :class:`PgRunQueue` embrulha cada função na sua própria transação.
 """
 
+import json
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -29,7 +36,20 @@ from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from sqlalchemy import RowMapping, and_, case, func, insert, literal, or_, select, text, update
+from sqlalchemy import (
+    RowMapping,
+    Text,
+    and_,
+    case,
+    cast,
+    func,
+    insert,
+    literal,
+    or_,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rapa.control.db.schema import (
@@ -52,7 +72,7 @@ from rapa.core.contracts import (
     RunState,
 )
 from rapa.core.events import RunEvent, RunEventKind
-from rapa.core.robot import Effect, Manifest
+from rapa.core.robot import Manifest
 
 __all__ = [
     "DEFAULT_LEASE",
@@ -61,6 +81,7 @@ __all__ = [
     "DISPATCHER_ACTOR",
     "QUEUE_LOCK_KEY",
     "ArtifactInfo",
+    "EventConflict",
     "PgRunQueue",
     "ReapReport",
     "RunnerOutcome",
@@ -80,6 +101,10 @@ DEFAULT_LEASE = timedelta(seconds=60)
 DEFAULT_MAX_DURATION = timedelta(minutes=30)
 #: Quantas vezes uma execução pode perder a concessão antes de falhar de vez.
 DEFAULT_MAX_ATTEMPTS = 3
+#: Espera máxima por uma trava nas transações de manutenção.
+DEFAULT_MAINTENANCE_LOCK_TIMEOUT = timedelta(seconds=2)
+#: Duração máxima de um comando nas transações de manutenção.
+DEFAULT_MAINTENANCE_STATEMENT_TIMEOUT = timedelta(seconds=60)
 DISPATCHER_ACTOR = "despachante"
 
 _ACTIVE = (RunState.RUNNING.value, RunState.AWAITING_HUMAN.value)
@@ -95,6 +120,19 @@ class StaleAttempt(Conflict):
     """Escrita de uma tentativa que não é mais a atual (cerca)."""
 
     code = "tentativa_antiga"
+
+
+class EventConflict(StaleAttempt):
+    """Evento que não pode ser gravado para esta tentativa.
+
+    Acontece quando o número do evento repete ou fica abaixo da numeração das
+    tentativas anteriores, ou repete um evento desta tentativa com outro
+    conteúdo. Nada do lote é gravado. Como :class:`StaleAttempt`, quem repassa
+    os eventos deve parar o executor sem confirmar nenhum aviso: confirmar um
+    aviso que não está gravado deixaria o passo irreversível rodar sem registro.
+    """
+
+    code = "evento_conflitante"
 
 
 class ArtifactInfo(BaseModel):
@@ -166,7 +204,10 @@ async def _capacity(session: AsyncSession) -> Capacity | None:
     return Capacity(int(row[0]), Decimal(row[1]))
 
 
-async def _loads(session: AsyncSession) -> tuple[dict[UUID, CompanyLoad], int, bool]:
+async def _loads(
+    session: AsyncSession,
+) -> tuple[dict[UUID, CompanyLoad], int, frozenset[UUID]]:
+    """Uso não interativo por empresa, interativos rodando e empresas com interativo na fila."""
     interactive = (runs.c.priority == INTERACTIVE_PRIORITY).label("interactive")
     queued = (runs.c.state == RunState.QUEUED.value).label("queued")
     rows = (
@@ -179,11 +220,11 @@ async def _loads(session: AsyncSession) -> tuple[dict[UUID, CompanyLoad], int, b
     running: dict[UUID, int] = defaultdict(int)
     waiting: dict[UUID, int] = defaultdict(int)
     interactive_running = 0
-    interactive_waiting = False
+    interactive_waiting: set[UUID] = set()
     for company_id, is_interactive, is_queued, count in rows:
         if is_interactive:
             if is_queued:
-                interactive_waiting = True
+                interactive_waiting.add(company_id)
             else:
                 interactive_running += int(count)
         elif is_queued:
@@ -213,7 +254,7 @@ async def _loads(session: AsyncSession) -> tuple[dict[UUID, CompanyLoad], int, b
             guaranteed_slots=guaranteed,
             max_borrow_factor=factor,
         )
-    return loads, interactive_running, interactive_waiting
+    return loads, interactive_running, frozenset(interactive_waiting)
 
 
 async def claim_next(
@@ -234,10 +275,14 @@ async def claim_next(
     if capacity is None:
         return None
     loads, interactive_running, interactive_waiting = await _loads(session)
-    admission = plan(capacity, loads, interactive_running)
+    admission = plan(capacity, loads, interactive_running, interactive_waiting)
     conditions = []
+    interactive = runs.c.priority == INTERACTIVE_PRIORITY
     if admission.interactive and interactive_waiting:
-        conditions.append(runs.c.priority == INTERACTIVE_PRIORITY)
+        conditions.append(interactive)
+    elif admission.interactive_overflow:
+        # Reserva cheia: só o interativo das empresas que não tomam a garantia de outra.
+        conditions.append(and_(interactive, runs.c.company_id.in_(admission.interactive_overflow)))
     eligible = admission.within_guarantee | admission.borrowing
     if eligible:
         conditions.append(
@@ -289,8 +334,18 @@ async def claim_next(
                 started_at=now,
                 lease_expires_at=now + lease,
                 deadline_at=deadline,
+                # A tentativa nova recomeça do primeiro passo: os passos contados
+                # são só os dela, não se somam aos de uma tentativa perdida.
+                steps_done=0,
             )
             .returning(runs.c.attempt)
+        )
+        # A tentativa nova continua a numeração dos eventos da execução. O valor é
+        # definitivo: a cerca já recusa eventos das tentativas anteriores.
+        first_seq = await session.scalar(
+            select(func.coalesce(func.max(run_events.c.seq), -1) + 1).where(
+                run_events.c.run_id == candidate["id"]
+            )
         )
         return RunnerJob(
             run_id=candidate["id"],
@@ -300,6 +355,7 @@ async def claim_next(
             inputs=dict(candidate["inputs"]),
             mode=RunMode(candidate["mode"]),
             deadline=deadline,
+            first_seq=int(first_seq or 0),
         )
     return None
 
@@ -357,7 +413,6 @@ async def _lock_run(session: AsyncSession, run_id: UUID) -> RowMapping:
                 select(
                     runs.c.id,
                     runs.c.company_id,
-                    runs.c.version_id,
                     runs.c.attempt,
                     runs.c.state,
                     runs.c.irreversible_started_at,
@@ -381,40 +436,67 @@ def _fence(run: RowMapping, attempt: int) -> None:
         )
 
 
-_irreversible_cache: dict[UUID, frozenset[str]] = {}
-_IRREVERSIBLE_CACHE_SIZE = 1024
+def _marks_irreversible(event: RunEvent) -> bool:
+    """Se o evento mostra que um passo irreversível começou.
 
-
-async def _irreversible_steps(session: AsyncSession, version_id: UUID) -> frozenset[str]:
-    cached = _irreversible_cache.get(version_id)
-    if cached is not None:
-        return cached
-    manifest_json = await session.scalar(
-        select(robot_versions.c.manifest).where(robot_versions.c.id == version_id)
-    )
-    try:
-        manifest = Manifest.model_validate(manifest_json)
-    except ValidationError:
-        return frozenset()
-    steps = frozenset(
-        step.id for step, _ in manifest.iter_steps() if step.effect is Effect.IRREVERSIBLE
-    )
-    if len(_irreversible_cache) >= _IRREVERSIBLE_CACHE_SIZE:
-        _irreversible_cache.clear()
-    _irreversible_cache[version_id] = steps
-    return steps
-
-
-def _marks_irreversible(event: RunEvent, irreversible_steps: frozenset[str]) -> bool:
+    Vale só o aviso (``"irreversivel": true``), o mesmo que o executor espera
+    ver confirmado antes de agir. O interpretador também anuncia, sem o aviso, o
+    passo irreversível que falhou antes de agir (por exemplo, botão não
+    encontrado): nada foi enviado ao portal, então isso não marca a execução.
+    """
     if event.kind is RunEventKind.STEP_STARTED:
-        return (
-            event.data.get("irreversivel") is True
-            or event.data.get("efeito") == Effect.IRREVERSIBLE.value
-            or event.step_id in irreversible_steps
-        )
+        return event.data.get("irreversivel") is True
     if event.kind in (RunEventKind.RUN_SUCCEEDED, RunEventKind.RUN_FAILED):
         return event.data.get("irreversivel_iniciado") is True
     return False
+
+
+def _event_data(event: RunEvent) -> Any:
+    return event.model_dump(mode="json")["data"]
+
+
+def _same_event(a: RunEvent, b: RunEvent) -> bool:
+    return (a.kind, a.step_id, _event_json(a)) == (b.kind, b.step_id, _event_json(b))
+
+
+def _canonical_number(value: Decimal) -> str:
+    """O número pelo valor exato: dígitos sem zeros nas pontas e o expoente."""
+    sign, digits, exponent = value.as_tuple()
+    if not isinstance(exponent, int):  # NaN ou infinito: o JSONB não os aceita
+        return str(value)
+    significant = "".join(map(str, digits)).lstrip("0")
+    if not significant:
+        return "0"  # o JSONB não guarda o sinal do zero
+    stripped = significant.rstrip("0")
+    exponent += len(significant) - len(stripped)
+    return f"{'-' if sign else ''}{stripped}e{exponent}"
+
+
+def _canonical(value: Any) -> str:
+    """Texto canônico de um valor JSON lido com os números em ``Decimal``.
+
+    Chaves em ordem e cada número escrito pelo valor exato. Dois valores têm o
+    mesmo texto quando o JSONB os guardaria iguais: ``1e23`` e
+    ``100000000000000000000000`` são o mesmo número; ``true`` e ``1`` não.
+    """
+    if isinstance(value, dict):
+        items = sorted(value.items())
+        return "{" + ",".join(f"{json.dumps(k)}:{_canonical(v)}" for k, v in items) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(_canonical(item) for item in value) + "]"
+    if isinstance(value, Decimal):
+        return _canonical_number(value)
+    return json.dumps(value)  # texto, booleano ou nulo
+
+
+def _canonical_json(raw: str) -> str:
+    """Texto canônico do documento JSON ``raw`` (ver :func:`_canonical`)."""
+    return _canonical(json.loads(raw, parse_float=Decimal, parse_int=Decimal))
+
+
+def _event_json(event: RunEvent) -> str:
+    """Texto canônico dos dados do evento, como o JSONB os guardaria."""
+    return _canonical_json(json.dumps(_event_data(event)))
 
 
 def _parse_events(
@@ -440,30 +522,76 @@ async def ingest_events(
 ) -> int:
     """Grava os eventos novos da tentativa atual; devolve quantos foram incluídos.
 
-    Reenviar um evento (mesmo ``seq``) não faz nada: vale o primeiro recebido.
-    Um evento de passo irreversível iniciado marca ``irreversible_started_at``,
-    o que impede a execução de voltar para a fila.
+    Ao voltar sem erro, todos os eventos recebidos estão gravados para esta
+    tentativa: é isso que permite ao lançador confirmar o aviso de passo
+    irreversível. Reenviar um evento já gravado (mesmo ``seq``, mesmo conteúdo,
+    comparado pelo valor do JSON como o JSONB o guarda) não faz nada. Um
+    ``seq`` que repete com outro conteúdo, ou que fica dentro
+    da numeração das tentativas anteriores, levanta :class:`EventConflict`, e
+    eventos de uma execução que já terminou (por exemplo, encerrada pelo
+    recolhedor) levantam :class:`StaleAttempt`; nos dois casos nada é gravado.
+
+    O aviso de passo irreversível marca ``irreversible_started_at``, o que
+    impede a execução de voltar para a fila.
     """
     parsed = _parse_events(run_id, attempt, events)
     run = await _lock_run(session, run_id)
     _fence(run, attempt)
+    if run["state"] not in _ACTIVE:
+        # Concluída (pelo resultado ou pelo recolhedor) com o executor ainda vivo:
+        # nada mais é gravado nem confirmado, e o lançador para o executor.
+        raise StaleAttempt(
+            f"a execução já foi concluída; os eventos da tentativa {attempt} foram recusados"
+        )
     if not parsed:
         return 0
     by_seq: dict[int, RunEvent] = {}
     for event in parsed:
-        by_seq.setdefault(event.seq, event)
-    previous_max = await session.scalar(
-        select(func.max(run_events.c.seq)).where(run_events.c.run_id == run_id)
-    )
-    known = set(
-        (
-            await session.scalars(
-                select(run_events.c.seq).where(
-                    run_events.c.run_id == run_id, run_events.c.seq.in_(list(by_seq))
-                )
+        first = by_seq.setdefault(event.seq, event)
+        if first is not event and not _same_event(first, event):
+            raise EventConflict(
+                f"o lote repete o evento número {event.seq} com outro conteúdo; nada foi gravado"
             )
-        ).all()
-    )
+    earlier_max, previous_max = (
+        await session.execute(
+            select(
+                func.max(run_events.c.seq).filter(run_events.c.attempt < attempt),
+                func.max(run_events.c.seq),
+            ).where(run_events.c.run_id == run_id)
+        )
+    ).one()
+    lowest = min(by_seq)
+    if earlier_max is not None and lowest <= earlier_max:
+        raise EventConflict(
+            f"o evento número {lowest} da tentativa {attempt} está dentro da numeração das "
+            f"tentativas anteriores (até {earlier_max}); nada foi gravado"
+        )
+    # Os dados gravados vêm como o texto do JSONB, que reescreve os números pelo
+    # valor (``1e23`` volta como ``100000000000000000000000``): os dois lados são
+    # comparados na forma canônica, nunca como objetos Python.
+    stored = (
+        await session.execute(
+            select(
+                run_events.c.seq,
+                run_events.c.attempt,
+                run_events.c.kind,
+                run_events.c.step_id,
+                cast(run_events.c.data, Text),
+            ).where(run_events.c.run_id == run_id, run_events.c.seq.in_(list(by_seq)))
+        )
+    ).all()
+    for seq, stored_attempt, kind, step_id, data in stored:
+        incoming = by_seq[seq]
+        if (stored_attempt, kind, step_id, _canonical_json(data)) != (
+            attempt,
+            incoming.kind.value,
+            incoming.step_id,
+            _event_json(incoming),
+        ):
+            raise EventConflict(
+                f"o evento número {seq} já foi gravado com outro conteúdo; nada foi gravado"
+            )
+    known = {row[0] for row in stored}
     new = [event for seq, event in sorted(by_seq.items()) if seq not in known]
     if not new:
         return 0
@@ -478,7 +606,7 @@ async def ingest_events(
                 "at": _utc(event.at),
                 "kind": event.kind.value,
                 "step_id": event.step_id,
-                "data": event.model_dump(mode="json")["data"],
+                "data": _event_data(event),
             }
             for event in new
         ],
@@ -488,21 +616,20 @@ async def ingest_events(
     if succeeded:
         values["steps_done"] = runs.c.steps_done + succeeded
     if run["irreversible_started_at"] is None:
-        steps = await _irreversible_steps(session, run["version_id"])
-        marks = [_utc(e.at) for e in new if _marks_irreversible(e, steps)]
+        marks = [_utc(e.at) for e in new if _marks_irreversible(e)]
         if marks:
             values["irreversible_started_at"] = min(marks)
-    if run["state"] in _ACTIVE:
-        state = run["state"]
-        for event in new:
-            if previous_max is not None and event.seq <= previous_max:
-                continue
-            if event.kind is RunEventKind.HUMAN_NEEDED:
-                state = RunState.AWAITING_HUMAN.value
-            elif event.kind in _STEP_ACTIVITY:
-                state = RunState.RUNNING.value
-        if state != run["state"]:
-            values["state"] = state
+    state = run["state"]
+    for event in new:
+        # Evento que chega atrasado (abaixo do último gravado) não muda o estado.
+        if previous_max is not None and event.seq <= previous_max:
+            continue
+        if event.kind is RunEventKind.HUMAN_NEEDED:
+            state = RunState.AWAITING_HUMAN.value
+        elif event.kind in _STEP_ACTIVITY:
+            state = RunState.RUNNING.value
+    if state != run["state"]:
+        values["state"] = state
     if values:
         await session.execute(update(runs).where(runs.c.id == run_id).values(**values))
     return len(new)
@@ -586,20 +713,31 @@ async def finish(
 
 
 async def reap_expired(
-    session: AsyncSession, *, now: datetime, max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    session: AsyncSession,
+    *,
+    now: datetime,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    skip: Collection[UUID] = (),
 ) -> ReapReport:
     """Recolhe execuções cuja concessão venceu (executor sumiu).
 
     Sem passo irreversível iniciado, a execução volta para a fila (até
     ``max_attempts`` tentativas; depois disso, falha). Com passo irreversível
     iniciado, vira indeterminada: uma pessoa confere o sistema de destino.
+
+    As execuções em ``skip`` ficam de fora: são as que o próprio despachante
+    ainda acompanha (por exemplo, gravando o resultado depois de uma queda do
+    banco que deixou a concessão vencer).
     """
     now = _utc(now)
+    conditions = [runs.c.state.in_(_ACTIVE), runs.c.lease_expires_at < now]
+    if skip:
+        conditions.append(runs.c.id.not_in(list(skip)))
     expired = (
         (
             await session.execute(
                 select(runs.c.id, runs.c.company_id, runs.c.attempt, runs.c.irreversible_started_at)
-                .where(runs.c.state.in_(_ACTIVE), runs.c.lease_expires_at < now)
+                .where(*conditions)
                 .order_by(runs.c.lease_expires_at)
                 .with_for_update(skip_locked=True)
             )
@@ -679,13 +817,34 @@ class PgRunQueue:
         lease: timedelta = DEFAULT_LEASE,
         max_duration: timedelta = DEFAULT_MAX_DURATION,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        maintenance_lock_timeout: timedelta = DEFAULT_MAINTENANCE_LOCK_TIMEOUT,
+        maintenance_statement_timeout: timedelta = DEFAULT_MAINTENANCE_STATEMENT_TIMEOUT,
         clock: Callable[[], datetime] = now_utc,
     ) -> None:
+        """``maintenance_lock_timeout`` e ``maintenance_statement_timeout`` limitam as
+        transações de manutenção (partições e recolhimento): criar uma partição pede
+        trava exclusiva em ``run_events`` e, enquanto espera, enfileira atrás de si
+        as leituras e gravações de eventos. Com o limite, a espera vira erro, e o
+        despachante segue despachando e tenta a manutenção de novo mais tarde."""
+        if maintenance_lock_timeout <= timedelta(0) or maintenance_statement_timeout <= timedelta(
+            0
+        ):
+            raise ValueError("os limites de tempo da manutenção precisam ser positivos")
         self.db = db
         self.lease = lease
         self.max_duration = max_duration
         self.max_attempts = max_attempts
+        self.maintenance_lock_timeout = maintenance_lock_timeout
+        self.maintenance_statement_timeout = maintenance_statement_timeout
         self.clock = clock
+
+    async def _limit_maintenance(self, session: AsyncSession) -> None:
+        """Limita a espera por travas e a duração dos comandos desta transação."""
+        lock_ms = max(1, int(self.maintenance_lock_timeout.total_seconds() * 1000))
+        statement_ms = max(1, int(self.maintenance_statement_timeout.total_seconds() * 1000))
+        # SET não aceita parâmetros; os valores são inteiros calculados aqui.
+        await session.execute(text(f"SET LOCAL lock_timeout = {lock_ms}"))
+        await session.execute(text(f"SET LOCAL statement_timeout = {statement_ms}"))
 
     async def claim_next(self, *, now: datetime | None = None) -> RunnerJob | None:
         async with self.db.dispatcher_session() as session:
@@ -719,12 +878,16 @@ class PgRunQueue:
         async with self.db.dispatcher_session() as session:
             return await finish(session, run_id, attempt, result, now=now or self.clock())
 
-    async def reap_expired(self, *, now: datetime | None = None) -> ReapReport:
+    async def reap_expired(
+        self, *, now: datetime | None = None, skip: Collection[UUID] = ()
+    ) -> ReapReport:
         async with self.db.dispatcher_session() as session:
+            await self._limit_maintenance(session)
             return await reap_expired(
-                session, now=now or self.clock(), max_attempts=self.max_attempts
+                session, now=now or self.clock(), max_attempts=self.max_attempts, skip=skip
             )
 
     async def ensure_event_partitions(self, months_ahead: int = 2) -> int:
         async with self.db.dispatcher_session() as session:
+            await self._limit_maintenance(session)
             return await ensure_event_partitions(session, months_ahead)

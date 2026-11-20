@@ -7,12 +7,13 @@ import pytest
 
 from rapa.control.db.roles import RoleNames, grants_sql
 from rapa.control.db.session import psycopg_url
+from rapa.control.services._common import INTERACTIVE_PRIORITY, PRIORITY_BY_TRIGGER
 from rapa.control.services.admission import Capacity, CompanyLoad, plan
 from rapa.control.services.audit import payload_digest
 from rapa.control.services.dispatcher import failure_result
 from rapa.control.services.inputs import validate_inputs
 from rapa.control.services.robots import fold_text
-from rapa.core.contracts import RunMode, RunnerJob
+from rapa.core.contracts import RunMode, RunnerJob, RunTrigger
 from rapa.core.ids import new_id
 from rapa.core.robot import Manifest
 from rapa.fixtures.robots import baixar_notas, emitir_protocolo
@@ -74,6 +75,29 @@ def test_interactive_reserve_and_overflow() -> None:
     more = {A: CompanyLoad(running=8, queued=5, guaranteed_slots=20)}
     assert plan(CAPACITY, more, interactive_running=2).within_guarantee == frozenset()
     assert not plan(CAPACITY, more, interactive_running=2).anything
+
+
+def test_interactive_overflow_never_takes_another_company_guarantee() -> None:
+    # Reserva cheia: um interativo além dela só usa vaga que nenhuma outra empresa
+    # precise para a própria garantia.
+    loads = {B: CompanyLoad(running=0, queued=9, guaranteed_slots=9)}
+    admission = plan(CAPACITY, loads, interactive_running=1, interactive_waiting={A, B})
+    assert not admission.interactive
+    # Livres: 9, todas da garantia da B: só a própria B pode usá-las com um interativo.
+    assert admission.interactive_overflow == {B}
+    assert admission.within_guarantee == {B}
+    loads = {B: CompanyLoad(running=0, queued=3, guaranteed_slots=4)}
+    # Livres: 9; B ainda precisa de 3; sobram 6 para o interativo da A.
+    admission = plan(CAPACITY, loads, interactive_running=1, interactive_waiting={A})
+    assert admission.interactive_overflow == {A} and admission.anything
+    # Com vaga na reserva, qualquer interativo entra.
+    admission = plan(CAPACITY, loads, interactive_running=0, interactive_waiting={A})
+    assert admission.interactive
+    # Sem vaga nenhuma, nenhum interativo entra.
+    full = {B: CompanyLoad(running=9, queued=3, guaranteed_slots=9)}
+    admission = plan(CAPACITY, full, interactive_running=1, interactive_waiting={A, B})
+    assert not admission.interactive and admission.interactive_overflow == frozenset()
+    assert not admission.anything
 
 
 MANIFEST = emitir_protocolo("http://portal-v1.rapa.test:8080", "portal-v1.rapa.test")
@@ -167,3 +191,14 @@ def test_failure_result_is_conservative_for_irreversible_robots() -> None:
     assert failure_result(job(reading, RunMode.FULL), "x", "m")["state"] == "failed"
     assert failure_result(job(MANIFEST, RunMode.FULL), "x", "m")["state"] == "indeterminate"
     assert failure_result(job(MANIFEST, RunMode.UNTIL_FIRST_WRITE), "x", "m")["state"] == "failed"
+    # Executor que nem chegou a ser iniciado: nada pode ter rodado.
+    assert failure_result(job(MANIFEST, RunMode.FULL), "x", "m", started=False)["state"] == "failed"
+
+
+def test_priority_by_trigger() -> None:
+    # Só validação (e, no futuro, gravação e controle ao vivo) usa a reserva
+    # interativa; o botão "Executar" da interface roda em produção, como a API.
+    interactive = {t for t, p in PRIORITY_BY_TRIGGER.items() if p == INTERACTIVE_PRIORITY}
+    assert interactive == {RunTrigger.VALIDATION}
+    assert PRIORITY_BY_TRIGGER[RunTrigger.MANUAL] == PRIORITY_BY_TRIGGER[RunTrigger.REST]
+    assert set(PRIORITY_BY_TRIGGER) == set(RunTrigger)

@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 __all__ = [
     "ARIA_ROLES",
+    "MAX_LIST_ITEMS",
     "SCHEMA_VERSION",
     "AssertStep",
     "CheckStep",
@@ -58,6 +59,8 @@ __all__ = [
 ]
 
 SCHEMA_VERSION: Literal[1] = 1
+#: Maior número de itens de uma entrada de lista (e de uma repetição).
+MAX_LIST_ITEMS = 10_000
 
 STEP_ID_PATTERN = r"^[a-z][a-z0-9_]{0,39}$"
 NAME_PATTERN = r"^[a-z_][a-z0-9_]{0,63}$"
@@ -147,7 +150,8 @@ class Locator(_Model):
     Para ``role``, ``value`` é o papel ARIA e ``name`` o nome acessível
     (opcional em contêineres como linhas e tabelas). ``value`` e ``name`` podem
     conter templates (por exemplo, o número de uma nota vindo de
-    ``item.numero``).
+    ``item.numero``), menos em ``css`` e ``xpath``: ali o valor entraria cru no
+    seletor, e o portão de política recusa.
     """
 
     by: LocatorBy
@@ -185,7 +189,13 @@ class Target(_Model):
     within_has_text: str | None = Field(
         default=None,
         max_length=500,
-        description="Filtra o contêiner pelo texto (template)",
+        description=(
+            "Escolhe o contêiner que tem um elemento (por exemplo, uma célula) cujo "
+            "texto inteiro é exatamente este, com as mesmas maiúsculas e minúsculas; "
+            "só os brancos nas pontas e repetidos não contam. Use o texto do HTML, não "
+            "o mostrado depois do text-transform do CSS. Nenhum valor do template pode "
+            "ficar vazio (template)"
+        ),
     )
     snapshot: str | None = Field(
         default=None,
@@ -374,7 +384,7 @@ class ForEachStep(_StepBase):
     kind: Literal["for_each"] = "for_each"
     items: str = Field(pattern=ITEMS_REF_PATTERN, description="Lista a percorrer")
     steps: list[Step] = Field(min_length=1, max_length=200)
-    max_items: int = Field(default=1000, ge=1, le=10_000)
+    max_items: int = Field(default=1000, ge=1, le=MAX_LIST_ITEMS)
 
 
 class IfStep(_StepBase):
@@ -478,7 +488,7 @@ class InputField(_Model):
         if self.type is FieldType.LIST and self.item_fields is not None:
             schema: dict[str, Any] = {
                 "type": "array",
-                "maxItems": 10_000,
+                "maxItems": MAX_LIST_ITEMS,
                 "items": {
                     "type": "object",
                     "properties": {f.name: f.json_schema() for f in self.item_fields},
@@ -628,12 +638,34 @@ class Manifest(_Model):
         """Efeito mais forte entre todos os passos."""
         return max_effect(*(step.effect for step, _ in self.iter_steps()))
 
+    def input_list_limits(self) -> dict[str, int]:
+        """Maior número de itens que cada entrada de lista pode ter.
+
+        Uma lista percorrida por ``for_each`` não pode passar do ``max_items`` de
+        nenhuma repetição que a percorre: recusar na chamada é melhor do que
+        falhar no meio da execução, depois de passos que já gravaram.
+        """
+        limits: dict[str, int] = {}
+        for step, _ in self.iter_steps():
+            if isinstance(step, ForEachStep):
+                scope, name = step.items.split(".", 1)
+                if scope == "inputs":
+                    limits[name] = min(limits.get(name, MAX_LIST_ITEMS), step.max_items)
+        return limits
+
     def input_json_schema(self) -> dict[str, Any]:
         """JSON Schema 2020-12 das entradas: vira o inputSchema da tool MCP e o corpo do REST."""
+        limits = self.input_list_limits()
+        properties: dict[str, Any] = {}
+        for spec in self.inputs:
+            schema = spec.json_schema()
+            if spec.type is FieldType.LIST and spec.name in limits:
+                schema["maxItems"] = min(schema["maxItems"], limits[spec.name])
+            properties[spec.name] = schema
         return {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
-            "properties": {f.name: f.json_schema() for f in self.inputs},
+            "properties": properties,
             "required": [f.name for f in self.inputs if f.required],
             "additionalProperties": False,
         }

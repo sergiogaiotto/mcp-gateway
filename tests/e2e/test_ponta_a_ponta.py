@@ -6,133 +6,39 @@ executado de verdade pelo despachante: o lançador local roda o worker, que abre
 o Chromium, entra no portal com usuário, senha e TOTP e emite o protocolo.
 """
 
-import asyncio
 import json
-from collections.abc import AsyncIterator
-from pathlib import Path
 from typing import Any
 
-import httpx2
 import pytest
 from fastapi import FastAPI
 from sqlalchemy import text
 
 from rapa.control.db import Database
 from rapa.control.services import verify_chain
-from rapa.fixtures.portal import DEFAULT_PASSWORD, DEFAULT_TOTP_SECRET, DEFAULT_USER
+from rapa.fixtures.portal import DEFAULT_PASSWORD, DEFAULT_TOTP_SECRET
 from rapa.fixtures.robots import baixar_notas, emitir_protocolo
-from rapa.fixtures.server import HOST_RESOLVER_ARG, RunningPortal
-from rapa.server import ServerSettings, create_server_app
+from rapa.fixtures.server import RunningPortal
 from tests.control.api.support import asgi_client, auth, mcp_client, running
-from tests.control.db.conftest import app_db, pg_database, superuser_engine  # noqa: F401
-from tests.control.db.support import PgDatabase, Tenant, make_tenant, reset_queue
+from tests.control.db.support import Tenant
+from tests.e2e.support import INPUTS, TOKENS, publish, wait_finished
 
 pytestmark = [pytest.mark.database, pytest.mark.browser]
-
-INPUTS = {"nome": "Maria da Silva", "cpf": "529.982.247-25", "uf": "SP"}
-SECRETS = {
-    "portal": {"username": DEFAULT_USER, "password": DEFAULT_PASSWORD},
-    "portal_otp": {"totp_secret": DEFAULT_TOTP_SECRET},
-}
-TOKENS = {
-    "creator": "token-criadora",
-    "approver": "token-aprovador",
-    "operator": "token-operadora",
-    "outsider": "token-vizinho",
-    "other": "token-outra-empresa",
-}
-
-
-async def _wait_finished(client: httpx2.AsyncClient, run_id: str, token: str) -> dict[str, Any]:
-    for _ in range(600):
-        response = await client.get(f"/v1/execucoes/{run_id}", headers=auth(token))
-        assert response.status_code == 200, response.text
-        status: dict[str, Any] = response.json()
-        if status["finished_at"] is not None:
-            return status
-        await asyncio.sleep(0.1)
-    raise AssertionError(f"a execução {run_id} não terminou em 60 s")
-
-
-async def _publish(
-    client: httpx2.AsyncClient, tenant: Tenant, manifest: dict[str, Any]
-) -> dict[str, Any]:
-    body = {"area_id": str(tenant.area_id), "manifesto": manifest}
-    created = await client.post("/v1/robos", json=body, headers=auth(TOKENS["creator"]))
-    assert created.status_code == 201, created.text
-    base = created.headers["location"]
-    validated = await client.post(f"{base}/validar", headers=auth(TOKENS["creator"]))
-    assert validated.status_code == 200, validated.text
-    # Quem criou não publica; quem aprova, sim.
-    refused = await client.post(f"{base}/publicar", headers=auth(TOKENS["creator"]))
-    assert refused.status_code == 403
-    published = await client.post(f"{base}/publicar", headers=auth(TOKENS["approver"]))
-    assert published.status_code == 200, published.text
-    info: dict[str, Any] = published.json()
-    assert info["status"] == "published"
-    return info
-
-
-@pytest.fixture
-async def platform_app(
-    app_db: Database,  # noqa: F811
-    pg_database: PgDatabase,  # noqa: F811
-    superuser_engine: Any,  # noqa: F811
-    portal_v1: RunningPortal,
-    chromium_path: str,
-    tmp_path: Path,
-) -> AsyncIterator[tuple[FastAPI, Tenant, Tenant]]:
-    await reset_queue(superuser_engine, total_slots=4)
-    tenant = await make_tenant(app_db, "Ponta a ponta")
-    other = await make_tenant(app_db, "Outra empresa")
-    tokens = {
-        TOKENS["creator"]: tenant.creator,
-        TOKENS["approver"]: tenant.approver,
-        TOKENS["operator"]: tenant.operator,
-        TOKENS["outsider"]: tenant.outsider,
-        TOKENS["other"]: other.admin,
-    }
-    tokens_file = tmp_path / "tokens.json"
-    tokens_file.write_text(
-        json.dumps(
-            {t: {"sujeito": p.subject, "empresa": str(p.company_id)} for t, p in tokens.items()}
-        )
-    )
-    secrets_file = tmp_path / "segredos.json"
-    secrets_file.write_text(json.dumps({str(tenant.company_id): SECRETS}))
-    settings = ServerSettings(
-        database_url=pg_database.app_url,
-        dispatcher_database_url=pg_database.dispatcher_url,
-        ui=False,
-        dev=True,
-        dev_tokens_file=tokens_file,
-        dev_secrets_file=secrets_file,
-        rate_limit_per_s=None,
-        poll_interval_s=0.2,
-        work_dir=tmp_path / "trabalho",
-        artifacts_dir=tmp_path / "artefatos",
-        chromium=chromium_path,
-        browser_args=(HOST_RESOLVER_ARG,),
-    )
-    # O lifespan (gateway MCP e despachante) roda dentro do teste: o SDK do MCP
-    # exige abrir e fechar o grupo de tarefas na mesma tarefa.
-    yield create_server_app(settings), tenant, other
 
 
 async def test_publish_by_rest_call_by_mcp_and_rest_and_run_on_the_portal(
     platform_app: tuple[FastAPI, Tenant, Tenant],
     portal_v1: RunningPortal,
-    app_db: Database,  # noqa: F811
-    superuser_engine: Any,  # noqa: F811
+    app_db: Database,
+    superuser_engine: Any,
 ) -> None:
     app, tenant, _other = platform_app
     base, host = portal_v1.base_url, portal_v1.host
 
     async with running(app), asgi_client(app) as client:
-        protocolo = await _publish(
+        protocolo = await publish(
             client, tenant, emitir_protocolo(base, host).model_dump(mode="json")
         )
-        await _publish(client, tenant, baixar_notas(base, host).model_dump(mode="json"))
+        await publish(client, tenant, baixar_notas(base, host).model_dump(mode="json"))
 
         # -- MCP: cada robô publicado vira uma tool, só para a empresa dele ------
         async with mcp_client(app, TOKENS["operator"]) as mcp:
@@ -153,7 +59,7 @@ async def test_publish_by_rest_call_by_mcp_and_rest_and_run_on_the_portal(
             peek = await mcp.call_tool("consultar_execucao", {"execucao_id": mcp_run["run_id"]})
             assert peek.is_error
 
-        done = await _wait_finished(client, mcp_run["run_id"], TOKENS["operator"])
+        done = await wait_finished(client, mcp_run["run_id"], TOKENS["operator"])
         assert done["state"] == "succeeded", done
         assert len(portal_v1.state.protocolos) == 1
         issued = portal_v1.state.protocolos[0]
@@ -170,7 +76,7 @@ async def test_publish_by_rest_call_by_mcp_and_rest_and_run_on_the_portal(
         )
         assert first.status_code == 202, first.text
         assert again.json()["run_id"] == first.json()["run_id"]
-        notas = await _wait_finished(client, first.json()["run_id"], TOKENS["operator"])
+        notas = await wait_finished(client, first.json()["run_id"], TOKENS["operator"])
         assert notas["state"] == "succeeded", notas
         assert len(notas["outputs"]["notas"]) == 10
 

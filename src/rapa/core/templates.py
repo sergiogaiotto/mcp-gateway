@@ -6,8 +6,9 @@ um template escrito a partir de conteúdo não confiável nunca execute código.
 Para escrever ``{{`` literal, use ``{{{{``.
 """
 
+import math
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
@@ -17,6 +18,7 @@ __all__ = [
     "Scope",
     "TemplateError",
     "escape",
+    "format_value",
     "has_references",
     "parse",
     "references",
@@ -45,6 +47,9 @@ class Ref:
 
 _REF = re.compile(r"\s*(inputs|vars|item)\.([a-z_][a-z0-9_]{0,63})\s*")
 _MAX_TEMPLATE_LENGTH = 4000
+# Números digitáveis: de 1e-18 a 1e18 (exclusive) em valor absoluto, além do zero.
+_MIN_EXPONENT = -18
+_MAX_EXPONENT = 17
 
 type Part = str | Ref
 
@@ -98,29 +103,64 @@ def escape(text: str) -> str:
     return text.replace("{{", "{{{{")
 
 
-def _format(value: object, ref: Ref) -> str:
+def _format_decimal(value: Decimal) -> str:
+    # Sem expoente ("1e+16" ou "1E+2" seriam digitados como texto) e com limite de
+    # tamanho, para um número enorme não virar centenas de dígitos.
+    if not value.is_finite():
+        raise TemplateError("não é um número finito")
+    if value and not _MIN_EXPONENT <= value.adjusted() <= _MAX_EXPONENT:
+        raise TemplateError("é um número grande ou pequeno demais para ser digitado")
+    return format(value, "f")
+
+
+def format_value(value: object) -> str:
+    """Texto que o robô digita para um valor simples.
+
+    Números inteiros que chegam como ``float`` (``5.0``, comum em JSON e em
+    formulários) viram ``"5"``; os demais números nunca usam expoente.
+    """
     if isinstance(value, bool):
         return "true" if value else "false"
-    if isinstance(value, (str, int, Decimal)):
+    if isinstance(value, (str, int)):
         return str(value)
     if isinstance(value, float):
-        return repr(value)
-    raise TemplateError(f"{ref} não é um valor simples (tipo {type(value).__name__})")
+        if not math.isfinite(value):
+            raise TemplateError("não é um número finito")
+        if value.is_integer() and abs(value) < 10 ** (_MAX_EXPONENT + 1):
+            return str(int(value))
+        # repr() dá os dígitos mais curtos que voltam ao mesmo float.
+        return _format_decimal(Decimal(repr(value)))
+    if isinstance(value, Decimal):
+        return _format_decimal(value)
+    raise TemplateError(f"não é um valor simples (tipo {type(value).__name__})")
 
 
-def render(template: str, context: Mapping[Scope, Mapping[str, object]]) -> str:
+def render(
+    template: str,
+    context: Mapping[Scope, Mapping[str, object]],
+    *,
+    encode: Callable[[int, str], str] | None = None,
+) -> str:
     """Substitui as referências pelos valores do contexto.
 
     Falha se alguma referência não tiver valor: um robô nunca digita um campo
-    vazio por engano.
+    vazio por engano. ``encode``, quando dado, transforma o texto de cada valor
+    (nunca os trechos literais), por exemplo para codificá-lo num endereço. Ele
+    recebe a posição da referência na lista de :func:`parse` (o trecho do
+    endereço onde ela cai pode mudar a regra) e o texto, e pode recusar o valor
+    levantando :class:`TemplateError`.
     """
     out: list[str] = []
-    for part in parse(template):
+    for index, part in enumerate(parse(template)):
         if isinstance(part, str):
             out.append(part)
             continue
         scope_values = context.get(part.scope)
         if scope_values is None or part.name not in scope_values:
             raise TemplateError(f"sem valor para {part}")
-        out.append(_format(scope_values[part.name], part))
+        try:
+            text = format_value(scope_values[part.name])
+            out.append(encode(index, text) if encode is not None else text)
+        except TemplateError as exc:
+            raise TemplateError(f"{part}: {exc}") from None
     return "".join(out)

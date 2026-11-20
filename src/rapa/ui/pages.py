@@ -76,7 +76,13 @@ def _parse_int(value: str) -> int | None:
 
 async def _protected(ctx: UiContext, request: Request, active: str, body: _Body) -> Response | None:
     """Confere a sessão, desenha o cabeçalho e o corpo; mostra os erros em pt-BR."""
-    viewer = await ctx.viewer(request)
+    try:
+        viewer = await ctx.viewer(request)
+    except BackendUnavailable as exc:
+        # Sem conferir a conta no banco, a página não abre (nem com os papéis antigos).
+        with ui.column().classes("w-full max-w-xl mx-auto p-6 gap-4"):
+            error_box(exc)
+        return None
     if viewer is None:
         return ctx.login_redirect(request)
     main = page_frame(viewer, active)
@@ -106,7 +112,11 @@ def register_pages(ctx: UiContext) -> None:
 
     @ui.page("/", response_timeout=timeout)
     async def index(request: Request) -> Response:
-        if await ctx.viewer(request) is None:
+        try:
+            signed_in = await ctx.viewer(request) is not None
+        except BackendUnavailable:
+            signed_in = True  # a página inicial mostra o erro
+        if not signed_in:
             return ctx.login_redirect(request)
         return RedirectResponse(HOME_PATH, status_code=303)
 
@@ -154,7 +164,11 @@ async def _login(
     ctx: UiContext, request: Request, volta: str, erro: str, cookie_tried: bool, logged_out: bool
 ) -> Response | None:
     return_to = safe_return_path(volta)
-    if await ctx.viewer(request) is not None:
+    try:
+        signed_in = await ctx.viewer(request) is not None
+    except BackendUnavailable:
+        signed_in = False  # sem conferir a sessão, mostra o login
+    if signed_in:
         return RedirectResponse(return_to, status_code=303)
     binding = request.cookies.get(BINDING_COOKIE)
     if binding is None and ctx.auth.dev is not None and not cookie_tried:

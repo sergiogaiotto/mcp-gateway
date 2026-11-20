@@ -8,20 +8,30 @@ principal (e dos iframes), os downloads, as requisições de documento e XHR (pa
 detectar gravações) e o texto visível de cada página depois que ela assenta.
 
 O valor de campos de senha, de código de uso único e do usuário de login nunca
-sai da página: o script manda só a marcação de campo sensível.
+entra na gravação, nem o do campo logo antes de uma senha de transação. O script
+marca esses campos (inclusive senha em campo de texto mascarado por CSS, campo que
+o nome acessível diz ser senha e usuário de login sem ``<form>``) e manda o valor
+só para o gravador apagá-lo dos outros textos. O gravador repete as regras do
+lado do Python (``rapa.recorder.sensitivity``): marca de senha pelo rótulo e, ao
+fechar a gravação, o usuário dos logins com a forma da regra conservadora (o
+mesmo que o compilador trata como usuário). A limpeza ignora maiúsculas só no
+texto livre da página (títulos, texto, iframes); valores digitados, nomes de
+elementos, rótulos e endereços só perdem o valor exato.
 """
 
 import asyncio
 import json
+import re
 import secrets
 import time
+import unicodedata
 from collections.abc import Callable, Coroutine
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib import resources
 from typing import Any, cast
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, quote_plus, urlencode, urlsplit, urlunsplit
 
 from playwright.async_api import BrowserContext, Download, Frame, Page, Request
 from playwright.async_api import Error as PlaywrightError
@@ -47,12 +57,21 @@ from rapa.recorder.models import (
     RequestEvent,
     SelectEvent,
 )
+from rapa.recorder.sensitivity import is_password_like_text, login_inputs, password_by_name
 
 __all__ = ["Recorder", "RecorderError"]
 
 _PACKAGE = resources.files("rapa.recorder")
 _CAPTURE_JS = _PACKAGE.joinpath("capture.js").read_text(encoding="utf-8")
 _PAGE_TEXT_JS = _PACKAGE.joinpath("page_text.js").read_text(encoding="utf-8")
+#: Valores sigilosos mais curtos que isto não são procurados nos textos.
+MIN_REDACTED_CHARS = 4
+#: Cada valor sigiloso entra com as formas que ele tem num endereço (até quatro).
+_MAX_SECRET_VALUES = 256
+#: Edição mais longa que o script pode informar (um dia, em milissegundos).
+_MAX_EDITING_MS = 86_400_000
+#: Campos do texto livre da página, em que a limpeza ignora maiúsculas.
+_FREE_TEXT_FIELDS = frozenset({"title", "headings", "text", "frame_texts"})
 _STOP_JS = "() => { const stop = window[Symbol.for('rapa.recorder.stop')]; if (stop) stop(); }"
 _FRAME_INFO_JS = """(el) => ({
   tag: el.tagName.toLowerCase(),
@@ -197,6 +216,16 @@ class Recorder:
         self._stopping = False
         self._closed = False
         self._recording: Recording | None = None
+        #: Valores de campos sigilosos (usuário, senha, código), só em memória, para
+        #: apagar dos textos capturados ao fechar a gravação. Nunca entram nela.
+        self._secret_values: set[str] = set()
+        #: Campos sigilosos descobertos só ao fechar: os endereços já gravados são
+        #: mascarados de novo com os nomes desses campos.
+        self._redact_again = False
+        #: Buscas dos valores sigilosos (exata e sem caixa), montadas uma vez para o
+        #: conjunto atual.
+        self._patterns: dict[bool, re.Pattern[str] | None] = {}
+        self._pattern_for: set[str] = set()
 
     # -- ciclo de vida ---------------------------------------------------------
 
@@ -272,14 +301,153 @@ class Recorder:
         for disposable in reversed(self._disposables):
             with suppress(Exception):
                 await disposable.close()
+        self._hide_usernames()
+        events = [self._scrub(event) for event in self._events]
+        self._secret_values.clear()
+        self._patterns.clear()
+        self._pattern_for.clear()
         self._recording = Recording(
             started_at=self._started_at,
             finished_at=datetime.now(UTC),
-            events=list(self._events),
+            events=events,
             other_hosts=sorted(self._other_hosts),
             dropped_messages=self._dropped,
         )
         return self._recording
+
+    def _remember_secret(self, value: object) -> None:
+        if not isinstance(value, str):
+            return
+        value = value.strip()
+        if len(value) < MIN_REDACTED_CHARS:
+            return
+        # Também como o valor aparece num endereço: percent-encoding estrito, o do
+        # encodeURIComponent e o de formulário (espaço vira "+").
+        for variant in dict.fromkeys(
+            (
+                value,
+                quote(value, safe=""),
+                quote(value, safe="!~*'()"),
+                quote_plus(value, safe="*"),
+            )
+        ):
+            if len(self._secret_values) < _MAX_SECRET_VALUES:
+                self._secret_values.add(variant)
+
+    def _hide_usernames(self) -> None:
+        """Tira da gravação o usuário que o script não reconheceu (segunda camada).
+
+        O script só reconhece o usuário pelo grupo de campos da página, e só no
+        momento em que manda o valor: no login em duas etapas de uma SPA a senha
+        ainda está escondida. Aqui a regra conservadora do login (``login_inputs``,
+        a mesma do compilador) apaga, depois do fato, o valor do usuário dos logins
+        com a forma da regra, marca o campo como sensível e guarda o valor para
+        ``_scrub`` apagá-lo dos textos; fora dela o campo fica como está. O campo
+        antes de uma senha de transação também sai da gravação, mas sem a marca de
+        usuário (o compilador o transforma numa entrada). Os endereços já gravados
+        são mascarados de novo com o nome do campo.
+        """
+        found = login_inputs(self._events)
+        if not found.usernames and not found.hidden:
+            return
+        states = {state.page_id: state for state in self._pages.values()}
+        for event, is_username in [
+            *((e, True) for e in found.usernames),
+            *((e, False) for e in found.hidden),
+        ]:
+            self._remember_secret(event.value)
+            self._remember_secret(event.typed)
+            event.value = None
+            event.typed = None
+            event.script_modified = False
+            event.element.is_username = is_username
+            event.element.sensitive = True
+            state = states.get(event.page_id)
+            if state is not None and event.element.name_attr:
+                state.sensitive_names.add(event.element.name_attr.lower())
+        self._redact_again = True
+
+    def _secret_pattern(self, *, ignore_case: bool) -> re.Pattern[str] | None:
+        """Os valores sigilosos numa busca só, exata ou sem caixa.
+
+        As duas cobrem as normalizações Unicode do valor (é composto ou "e" +
+        acento). A busca sem caixa, só para o texto livre da página, também leva as
+        formas em maiúsculas e minúsculas, que cobrem o que muda de tamanho ao
+        trocar de caixa ("ß" → "SS"). Os mais longos vêm primeiro.
+        """
+        if self._pattern_for != self._secret_values:
+            self._patterns.clear()
+            self._pattern_for = set(self._secret_values)
+        if ignore_case in self._patterns:
+            return self._patterns[ignore_case]
+        variants: set[str] = set()
+        for secret in self._secret_values:
+            forms = (
+                (secret, secret.upper(), secret.lower(), secret.casefold())
+                if ignore_case
+                else (secret,)
+            )
+            for form in forms:
+                for normalized in ("NFC", "NFD"):
+                    variants.add(unicodedata.normalize(normalized, form))
+        ordered = sorted((v for v in variants if v), key=len, reverse=True)
+        flags = re.IGNORECASE if ignore_case else 0
+        pattern = re.compile("|".join(re.escape(v) for v in ordered), flags) if ordered else None
+        self._patterns[ignore_case] = pattern
+        return pattern
+
+    def _scrub(self, event: RecordingEvent) -> RecordingEvent:
+        """Troca por ``REMOVIDO`` os valores sigilosos que aparecerem em qualquer texto do evento.
+
+        O nome de usuário costuma aparecer na página depois do login ("Olá, ana.souza")
+        e chegaria às pós-condições e ao prompt do modelo de linguagem. No texto
+        livre da página (título, cabeçalhos, texto e iframes) a busca não olha
+        maiúsculas: o texto vem do ``innerText``, que já passou pelo
+        ``text-transform`` do CSS ("ANA.SOUZA"), e cobre as formas Unicode do valor
+        ("weiß" em maiúsculas é "WEISS"). Valores digitados, nomes e rótulos de
+        elementos e endereços só perdem o valor exato: o usuário "financeiro" não
+        apaga o menu "Financeiro" nem o departamento "Financeiro Corporativo". Quando
+        um campo sigiloso só foi descoberto ao fechar a gravação, os endereços do
+        evento são mascarados de novo com os nomes dos campos sigilosos da aba.
+        """
+        if not self._secret_values and not self._redact_again:
+            return event
+        exact = self._secret_pattern(ignore_case=False)
+        loose = self._secret_pattern(ignore_case=True)
+        names: set[str] = set()
+        for state in self._pages.values():
+            if state.page_id == event.page_id:
+                names = state.sensitive_names
+
+        def clean(value: Any, pattern: re.Pattern[str] | None) -> Any:
+            if isinstance(value, str):
+                return pattern.sub(REDACTED, value) if pattern is not None else value
+            if isinstance(value, list):
+                return [clean(item, pattern) for item in value]
+            if isinstance(value, dict):
+                return {key: clean(item, pattern) for key, item in value.items()}
+            return value
+
+        data = event.model_dump(mode="json")
+        redacted = dict(data)
+        if self._redact_again:
+            for key in ("url", "frame_url"):
+                url = redacted.get(key)
+                if isinstance(url, str) and url:
+                    redacted[key] = redact_url(url, names)
+        free_text = isinstance(event, PageTextEvent)
+        cleaned = {
+            key: clean(item, loose if free_text and key in _FREE_TEXT_FIELDS else exact)
+            for key, item in redacted.items()
+        }
+        if cleaned == data:
+            return event
+        try:
+            return type(event).model_validate(cleaned)
+        except ValidationError:
+            raise RecorderError(
+                "Não consegui apagar um valor sigiloso da gravação; grave de novo."
+            ) from None
 
     def expect_typed_navigation(self, page: Page) -> None:
         """Avisa que a próxima navegação da aba foi digitada pela pessoa (barra de endereço)."""
@@ -382,6 +550,16 @@ class Recorder:
         except ValidationError:
             self._dropped += 1
             return
+        if element is not None and not element.sensitive and is_password_like_text(element):
+            # Mesma regra do script (que também olha a máscara por CSS): senha em
+            # campo de texto, pelo autocomplete ou pelo rótulo. Um campo que o
+            # script já marcou (usuário, por exemplo) fica como ele marcou: o cofre
+            # nunca digita a senha num campo de texto que é o usuário.
+            element.is_password = True
+        elif element is not None and not element.sensitive and password_by_name(element):
+            # Só o nome acessível (aria-labelledby, aria-label) fala em senha: o valor
+            # sai da gravação, sem a marca de senha (o compilador decide pelo login).
+            element.sensitive = True
         if element is not None and (
             element.is_password or element.is_one_time_code or element.is_username
         ):
@@ -406,12 +584,17 @@ class Recorder:
             created = click
         elif kind == "input" and element is not None:
             sensitive = element.sensitive
+            if sensitive:
+                # O valor só chega aqui se o script não marcou o campo; não é gravado.
+                for part in ("secret", "value", "typed"):
+                    self._remember_secret(payload.get(part))
             created = self._append(
                 InputEvent,
                 element=element,
                 value=None if sensitive else payload.get("value"),
                 typed=None if sensitive else payload.get("typed"),
                 script_modified=False if sensitive else bool(payload.get("script_modified")),
+                editing_since_ms=self._editing_since(payload.get("editing_ms")),
                 **common,
             )
         elif kind == "select" and element is not None:
@@ -445,6 +628,14 @@ class Recorder:
             self._spawn(lambda: self._probe(element, frame, state))
         if element.frame_path is None and frame.parent_frame is not None:
             self._spawn(lambda: self._fill_frame_path(element, frame))
+
+    def _editing_since(self, editing_ms: object) -> float | None:
+        """Começo da edição do campo no relógio da gravação (o script manda a duração)."""
+        if isinstance(editing_ms, bool) or not isinstance(editing_ms, int | float):
+            return None
+        if not 0 <= editing_ms <= _MAX_EDITING_MS:  # também descarta NaN
+            return None
+        return max(0.0, self._now_ms() - float(editing_ms))
 
     def _on_frame_navigated(self, frame: Frame) -> None:
         if self._closed:

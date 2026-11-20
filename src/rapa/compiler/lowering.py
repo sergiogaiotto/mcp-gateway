@@ -9,10 +9,27 @@ Regras principais:
 - a primeira navegação vira ``navigate``; as seguintes causadas por clique viram
   ``click.expect_navigation``; as digitadas viram ``navigate``; as feitas pela
   própria página (redirecionamentos) são ignoradas;
-- entradas seguidas no mesmo campo viram um ``fill`` com o valor final;
+- entradas seguidas no mesmo campo viram um ``fill`` com o valor final; as
+  requisições feitas enquanto a pessoa editava o campo, depois de cada edição e
+  depois do Tab que deixa o campo contam no efeito do passo, como num
+  salvamento automático;
 - campo de senha → ``SecretValue(field="password")`` de uma credencial por
-  origem; o campo preenchido logo antes, na mesma página, vira o usuário;
-  código de uso único → ``SecretValue(field="totp")`` de outra credencial;
+  origem; código de uso único → ``SecretValue(field="totp")`` de outra
+  credencial;
+- usuário e envio do login pela regra conservadora de
+  ``rapa.recorder.sensitivity.analyze_logins``: o campo só vira o usuário do
+  cofre, e o envio só é leitura, quando o botão é de login, a página só tem
+  credenciais e nada gravou antes no robô (o envio é confirmado na
+  classificação). Sem a confirmação, um campo cujo valor já saiu da gravação
+  (antes de uma senha de transação, ou que tinha a forma de usuário) vira uma
+  entrada obrigatória com aviso; os outros ficam literais;
+- campo de texto com cara de senha (rótulo, nome, id ou placeholder de senha,
+  ``rapa.recorder.sensitivity``) é tratado como senha, e o valor gravado é
+  descartado; o que só o nome acessível diz ser senha perde o valor e vira a
+  senha do cofre num login confirmado, ou uma entrada; outro literal com cara de
+  segredo (cartão, token, chave), ou com um valor sensível apagado pela limpeza
+  da gravação (``REMOVIDO``), vira uma entrada obrigatória do robô, sem o valor
+  digitado;
 - lista → ``select``; caixa de seleção e opção → ``check``; arquivo →
   ``upload`` com uma entrada do tipo arquivo; clique seguido de download →
   ``download``; Enter → ``press``; campo com máscara → ``sequential``.
@@ -20,14 +37,16 @@ Regras principais:
 
 import re
 from bisect import bisect_right
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 from itertools import pairwise
 from typing import Any
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from rapa.compiler.effects import ActionContext, classify_action, writes_in
+from rapa.compiler.effects import AUTHENTICATION, ActionContext, classify_action, writes_in
 from rapa.compiler.generalize import ParameterCandidate, generalize_inputs
 from rapa.compiler.locators import (
     BuiltTarget,
@@ -65,13 +84,27 @@ from rapa.recorder.models import (
     RequestEvent,
     SelectEvent,
 )
+from rapa.recorder.sensitivity import (
+    LOGIN_WORDS,
+    action_label,
+    analyze_logins,
+    clickable,
+    declared_username,
+    field_key,
+    focus_only,
+    is_password_like_text,
+    looks_secret,
+    password_by_name,
+    plain_label,
+)
 
 __all__ = ["CompileError", "CompileResult", "lower"]
 
-_TEXT_INPUT_TYPES = frozenset({"text", "email", "tel", "url", "search", "number", ""})
 #: Sessão de servidores Java no caminho: não vale numa nova execução.
 _JSESSIONID = re.compile(r";jsessionid=[^?#/]*", re.IGNORECASE)
-_BUTTON_INPUT_TYPES = frozenset({"submit", "button", "reset", "image"})
+#: Folga no começo da edição de um campo: o aviso do script e a requisição chegam
+#: ao gravador por caminhos diferentes. Uma requisição a mais só sobe o efeito.
+_EDITING_SLACK_MS = 250.0
 
 
 class CompileError(ValueError):
@@ -104,8 +137,22 @@ class _Draft:
     #: Ação da pessoa usada para classificar o efeito (None: não classificar).
     action_index: int | None = None
     document_index: int | None = None
-    only_credentials: bool = False
-    password_fields: int = 0
+    #: Todas as ações que o passo absorveu (a primeira é ``action_index``): edições
+    #: seguidas do mesmo campo, o Tab que deixa o campo, o segundo clique de um
+    #: clique duplo. As requisições depois de cada uma contam no efeito.
+    absorbed: list[int] = field(default_factory=list)
+    #: Entrada criada para um literal com cara de segredo (``Lowering.secret_input``).
+    secret_input: str | None = None
+    #: Campo do login que espera a confirmação do envio: "username" (o usuário) ou
+    #: "password" (senha só pelo nome acessível). ``Lowering.finish_logins`` decide.
+    pending: str | None = None
+    #: Última entrada do campo (já sem o valor, se ele era sigiloso) e o endereço dela.
+    source: InputEvent | None = None
+    url: str = ""
+
+    def __post_init__(self) -> None:
+        if self.action_index is not None and self.action_index not in self.absorbed:
+            self.absorbed.insert(0, self.action_index)
 
 
 @dataclass
@@ -114,7 +161,6 @@ class _Document:
 
     index: int | None
     url: str
-    fills: list[InputEvent | SelectEvent | FileEvent] = field(default_factory=list)
 
 
 def _origin(url: str) -> str:
@@ -128,33 +174,42 @@ def _host(url: str) -> str | None:
 
 
 def _field_key(event: InputEvent | SelectEvent | CheckEvent | FileEvent) -> tuple[Any, ...]:
-    el = event.element
-    frames = tuple(f.css or f.id or f.name or "" for f in el.frame_path or [])
-    return (event.page_id, frames, el.css, el.id, el.name_attr)
+    return field_key(event.page_id, event.element)
 
 
-def _focus_only(element: ElementDescriptor) -> bool:
-    """Clique que só foca ou ativa um campo (o evento do campo basta)."""
-    if element.tag in ("textarea", "select", "option"):
-        return True
-    if element.tag == "input":
-        return element.input_type not in _BUTTON_INPUT_TYPES
-    return False
-
-
-def _clickable(element: ElementDescriptor | None) -> bool:
-    if element is None:
-        return False
+def _hidden_warning(label: str, name: str) -> str:
+    """Aviso do campo antes de uma senha de transação, que virou a entrada ``name``."""
     return (
-        element.role in ("button", "link")
-        or element.tag in ("a", "button")
-        or (element.tag == "input" and element.input_type in _BUTTON_INPUT_TYPES)
+        f"O campo {quoted(label)} vem antes de uma senha de transação ou de um botão "
+        "irreversível; não foi tratado como usuário do login, o valor digitado não "
+        f"entrou no robô e virou a entrada {name}."
     )
 
 
-def _is_text_field(element: ElementDescriptor) -> bool:
-    return (element.tag == "input" and (element.input_type or "") in _TEXT_INPUT_TYPES) or (
-        element.tag == "textarea"
+def _login_warning(label: str, name: str) -> str:
+    """Aviso do campo com cara de usuário de um login que não foi confirmado."""
+    return (
+        f"O campo {quoted(label)} parecia o usuário de um login, mas o envio não passou na "
+        "regra do login (botão de login, só credenciais na página e nada gravado antes); "
+        "não foi tratado como usuário do cofre, o valor digitado não entrou no robô e virou "
+        f"a entrada {name}."
+    )
+
+
+def _named_password_warning(label: str, name: str) -> str:
+    """Aviso do campo que só o nome acessível diz ser senha, fora de um login."""
+    return (
+        f"O nome do campo {quoted(label)} fala em senha; o valor digitado não entrou no "
+        f"robô e virou a entrada {name}."
+    )
+
+
+def _redacted_warning(label: str, name: str) -> str:
+    """Aviso do campo cujo valor tinha um dado sensível apagado na gravação."""
+    return (
+        f"O valor digitado no campo {quoted(label)} tinha um dado sensível (usuário, senha "
+        "ou código) que foi apagado da gravação; o valor não entrou no robô e virou a "
+        f"entrada {name}."
     )
 
 
@@ -172,14 +227,31 @@ class _Lowering:
         self.hosts: list[str] = []
         self.credentials: dict[tuple[str, CredentialKind], str] = {}
         self.credential_names: set[str] = set()
-        self.file_inputs: list[dict[str, Any]] = []
+        #: Entradas do robô: arquivos enviados e literais com cara de segredo.
+        self.inputs: list[dict[str, Any]] = []
+        #: Campo → entrada criada para o literal com cara de segredo digitado nele.
+        self.secret_inputs: dict[tuple[Any, ...], str] = {}
         self.outputs: list[dict[str, Any]] = []
         self.var_names: set[str] = set()
         self.postconditions: list[dict[str, Any]] = []
         self.document = _Document(index=None, url="")
         self.navigated = False
-        #: Campos que viraram usuário de uma credencial (regra "logo antes da senha").
-        self.username_fields: set[tuple[Any, ...]] = set()
+        #: Logins da gravação (regra conservadora) e os que o envio confirmou.
+        self.logins = analyze_logins(self.events)
+        self.confirmed: set[int] = set()
+        self.username_groups: dict[int, list[int]] = {}
+        self.password_groups: dict[int, list[int]] = {}
+        self.submit_groups: dict[int, list[int]] = {}
+        self.bridge_groups: dict[int, list[int]] = {}
+        for number, group in enumerate(self.logins.groups):
+            for entry in group.username:
+                self.username_groups.setdefault(entry.index, []).append(number)
+            for entry in group.password:
+                self.password_groups.setdefault(entry.index, []).append(number)
+            if group.submit is not None:
+                self.submit_groups.setdefault(group.submit.index, []).append(number)
+            for bridge in group.bridges:
+                self.bridge_groups.setdefault(bridge.index, []).append(number)
         user_actions = [e for e in self.events if e.type in USER_ACTION_TYPES]
         self.action_indices = [e.index for e in user_actions]
         self.next_action: dict[int, RecordingEvent | None] = {}
@@ -196,6 +268,12 @@ class _Lowering:
                 self.requests_by_action[event.index] = []
             elif isinstance(event, RequestEvent) and last_action is not None:
                 self.requests_by_action[last_action].append(event)
+        #: Requisições feitas enquanto a pessoa editava o campo, antes de o valor sair.
+        self.requests_while_editing: dict[int, list[RequestEvent]] = {
+            event.index: self.requests_during_edit(position, event)
+            for position, event in enumerate(self.events)
+            if isinstance(event, InputEvent) and event.editing_since_ms is not None
+        }
         self.downloads: dict[int, DownloadEvent] = {}
         self.navigation_by_trigger: dict[int, NavigationEvent] = {}
         self.popup_triggers: set[int] = set()
@@ -246,6 +324,36 @@ class _Lowering:
 
     def requests_after(self, action_index: int) -> list[RequestEvent]:
         return self.requests_by_action.get(action_index, [])
+
+    def requests_during_edit(self, position: int, event: InputEvent) -> list[RequestEvent]:
+        """Requisições entre o começo da edição do campo e o envio do valor.
+
+        O script só manda o valor quando a pessoa deixa o campo; um salvamento
+        automático com atraso acontece antes, com o campo ainda em foco. Vale o
+        que veio depois da ação anterior da pessoa e na mesma página (o que a
+        navegação até ela pediu fica de fora).
+        """
+        since = (event.editing_since_ms or 0.0) - _EDITING_SLACK_MS
+        found: list[RequestEvent] = []
+        for earlier in reversed(self.events[:position]):
+            if earlier.type in USER_ACTION_TYPES or earlier.t_ms < since:
+                break
+            if (
+                isinstance(earlier, NavigationEvent)
+                and earlier.main_frame
+                and not earlier.same_document
+                and earlier.page_id == event.page_id
+            ):
+                break
+            if isinstance(earlier, RequestEvent):
+                found.append(earlier)
+        found.reverse()
+        return found
+
+    def requests_of(self, action_index: int) -> list[RequestEvent]:
+        """Requisições que contam no efeito de uma ação: durante a edição e depois dela."""
+        during = self.requests_while_editing.get(action_index, [])
+        return during + self.requests_after(action_index)
 
     def credential(self, url: str, kind: CredentialKind) -> str:
         origin = _origin(url)
@@ -341,7 +449,7 @@ class _Lowering:
 
     def on_click(self, event: ClickEvent) -> None:
         element = event.element
-        if _focus_only(element):
+        if focus_only(element):
             return
         if event.index in self.popup_triggers:
             return
@@ -353,7 +461,9 @@ class _Lowering:
             and previous.step["kind"] in ("click", "download")
             and previous.element.css == element.css
         ):
-            return  # segundo clique de um clique duplo
+            # Segundo clique de um clique duplo: o que ele gravou conta no mesmo passo.
+            previous.absorbed.append(event.index)
+            return
         nxt = self.next_action.get(event.index)
         if (
             isinstance(nxt, FileEvent)
@@ -381,8 +491,6 @@ class _Lowering:
                     element=element,
                     action_index=event.index,
                     document_index=self.document.index,
-                    only_credentials=self.only_credentials(),
-                    password_fields=self.password_fields(),
                 )
             )
             self.outputs.append(
@@ -406,27 +514,7 @@ class _Lowering:
                 element=element,
                 action_index=event.index,
                 document_index=self.document.index,
-                only_credentials=self.only_credentials(),
-                password_fields=self.password_fields(),
             )
-        )
-
-    def only_credentials(self) -> bool:
-        """Na página atual a pessoa só preencheu usuário, senha ou código."""
-        fills = [f for f in self.document.fills if not isinstance(f, FileEvent)]
-        return bool(fills) and all(
-            isinstance(f, InputEvent)
-            and (f.element.sensitive or _field_key(f) in self.username_fields)
-            for f in fills
-        )
-
-    def password_fields(self) -> int:
-        return len(
-            {
-                _field_key(f)
-                for f in self.document.fills
-                if isinstance(f, InputEvent) and f.element.is_password
-            }
         )
 
     def var_name(self, filename: str) -> str:
@@ -445,44 +533,169 @@ class _Lowering:
             return last
         return None
 
-    def on_input(self, event: InputEvent) -> None:
+    def input_name(self, label: str, fallback: str) -> str:
+        """Nome livre para uma nova entrada do robô."""
+        taken = {f["name"] for f in self.inputs}
+        base = name_from(label, fallback)
+        name = base
+        n = 2
+        while name in taken:
+            name = f"{base}_{n}"
+            n += 1
+        return name
+
+    def hide_password_like(self, event: InputEvent) -> InputEvent:
+        """Senha num campo que não é do tipo senha (mascarado por CSS, rótulo "Senha").
+
+        O gravador já marca esses campos; aqui é a segunda camada, para gravações
+        que chegaram sem a marca: o valor gravado é descartado e o campo passa a
+        ser tratado como senha (credencial do cofre e regra do usuário).
+        """
         element = event.element
-        self.document.fills.append(event)
+        if element.sensitive or not is_password_like_text(element):
+            return event
+        self.warn(
+            f"O campo {quoted(element_label(element))} parece de senha, mas não é do tipo "
+            "senha; o valor gravado foi descartado e o robô digita a senha do cofre."
+        )
+        hidden = element.model_copy(update={"is_password": True, "sensitive": True})
+        return event.model_copy(
+            update={"element": hidden, "value": None, "typed": None, "script_modified": False}
+        )
+
+    def secret_input(
+        self, key: tuple[Any, ...], label: str, warning: Callable[[str], str] | None = None
+    ) -> str:
+        """Entrada obrigatória para um literal com cara de segredo (cartão, token, chave).
+
+        O valor digitado na demonstração não entra no robô: quem chama informa o
+        valor a cada execução.
+        """
+        name = self.secret_inputs.get(key)
+        if name is None:
+            name = self.input_name(label, "valor")
+            self.inputs.append(
+                {
+                    "name": name,
+                    "title": clip_label(label, 200),
+                    "description": clip_label(
+                        f"Valor digitado no campo {quoted(label)}; parece sigiloso e não foi "
+                        "guardado no robô.",
+                        1000,
+                    ),
+                    "type": "string",
+                    "required": True,
+                }
+            )
+            self.secret_inputs[key] = name
+            self.warn(
+                warning(quoted(name))
+                if warning is not None
+                else f"O campo {quoted(label)} parece guardar um dado sigiloso; o valor "
+                f"digitado não entrou no robô e virou a entrada {quoted(name)}."
+            )
+        return name
+
+    def hide_password_by_name(self, event: InputEvent) -> InputEvent:
+        """Campo que só o nome acessível diz ser senha (segunda camada do gravador).
+
+        O valor gravado é descartado; o campo continua sem a marca de senha e só
+        vira a senha do cofre num login confirmado (``finish_logins``).
+        """
+        element = event.element
+        if element.sensitive or not password_by_name(element):
+            return event
+        hidden = element.model_copy(update={"sensitive": True})
+        return event.model_copy(
+            update={"element": hidden, "value": None, "typed": None, "script_modified": False}
+        )
+
+    def literal(
+        self, event: InputEvent, key: tuple[Any, ...], label: str
+    ) -> tuple[dict[str, Any], str | None]:
+        """Valor de um campo comum: o literal, ou uma entrada se ele tem cara de segredo.
+
+        Um valor em que a limpeza da gravação apagou um dado sensível (``REMOVIDO``)
+        também vira entrada: o robô nunca digita a marca no sistema.
+        """
+        text = event.value or ""
+        if REDACTED in text:
+            name = self.secret_input(key, label, partial(_redacted_warning, label))
+        elif looks_secret(event.element):
+            name = self.secret_input(key, label)
+        else:
+            return {"source": "text", "template": templates.escape(text)}, None
+        return {"source": "text", "template": f"{{{{ inputs.{name} }}}}"}, name
+
+    def hidden_input(
+        self, key: tuple[Any, ...], label: str, warning: Callable[[str, str], str]
+    ) -> tuple[dict[str, Any], str]:
+        """Campo cujo valor saiu da gravação e não é credencial: vira entrada obrigatória."""
+        name = self.secret_input(key, label, partial(warning, label))
+        return {"source": "text", "template": f"{{{{ inputs.{name} }}}}"}, name
+
+    def on_input(self, event: InputEvent) -> None:
+        event = self.hide_password_like(event)
+        event = self.hide_password_by_name(event)
+        element = event.element
         key = _field_key(event)
         url = event.frame_url or self.document.url
         label = element_label(element)
         title = f"Digitar {article(label)} {lower_first(clip_label(label))}"
+        secret_input: str | None = None
+        pending: str | None = None
+        value: dict[str, Any]
         if element.is_password:
-            credential = self.credential(url, CredentialKind.PASSWORD)
-            value: dict[str, Any] = {
+            value = {
                 "source": "secret",
-                "credential": credential,
+                "credential": self.credential(url, CredentialKind.PASSWORD),
                 "field": "password",
             }
-            self.mark_username(credential, event)
         elif element.is_one_time_code:
             value = {
                 "source": "secret",
                 "credential": self.credential(url, CredentialKind.TOTP),
                 "field": "totp",
             }
-        elif element.sensitive:
+        elif element.sensitive and element.is_username and declared_username(element):
+            # A própria página declara o campo como usuário (autocomplete="username").
             value = {
                 "source": "secret",
                 "credential": self.credential(url, CredentialKind.PASSWORD),
                 "field": "username",
             }
+        elif event.index in self.username_groups or (
+            event.index in self.password_groups and password_by_name(element)
+        ):
+            # Depende do envio do login: ``finish_logins`` decide depois da classificação.
+            pending = "username" if event.index in self.username_groups else "password"
+            value = {"source": "text", "template": ""}
+        elif element.sensitive:
+            # O gravador escondeu o valor sem que o campo seja credencial de um login
+            # confirmado: quem chama informa o valor.
+            if element.is_username:
+                warning = _login_warning
+            elif password_by_name(element):
+                warning = _named_password_warning
+            else:
+                warning = _hidden_warning
+            value, secret_input = self.hidden_input(key, label, warning)
         elif event.value is None:
             self.warn(f"O valor do campo {quoted(label)} não foi gravado; o passo ficou de fora.")
             return
         else:
-            value = {"source": "text", "template": templates.escape(event.value)}
+            value, secret_input = self.literal(event, key, label)
         masked = event.script_modified or (event.typed is not None and event.typed != event.value)
         existing = self.merge_target(key, "fill")
         if existing is not None:
             existing.step["value"] = value
             existing.step["sequential"] = bool(existing.step.get("sequential")) or masked
             existing.event_index = event.index
+            existing.absorbed.append(event.index)
+            existing.secret_input = secret_input
+            existing.pending = pending
+            existing.source = event
+            existing.url = url
             self.draft_by_event[event.index] = existing
             return
         step: dict[str, Any] = {
@@ -502,33 +715,77 @@ class _Lowering:
                 field_key=key,
                 action_index=event.index,
                 document_index=self.document.index,
+                secret_input=secret_input,
+                pending=pending,
+                source=event,
+                url=url,
             )
         )
 
-    def mark_username(self, credential: str, password: InputEvent) -> None:
-        """O campo de texto preenchido logo antes da senha, na mesma página, é o usuário."""
-        if not self.drafts:
-            return
-        last = self.drafts[-1]
-        element = last.element
-        if (
-            last.step["kind"] != "fill"
-            or element is None
-            or last.document_index != self.document.index
-            or element.is_password
-            or element.is_one_time_code
-            or not _is_text_field(element)
-            or last.field_key == _field_key(password)
-        ):
-            return
-        last.step["value"] = {"source": "secret", "credential": credential, "field": "username"}
-        last.step.pop("sequential", None)
-        if last.field_key is not None:
-            self.username_fields.add(last.field_key)
+    def finish_logins(self) -> None:
+        """Usuário e senha dos logins, depois que a classificação confirmou os envios.
+
+        Num login confirmado, o campo vira o usuário do cofre (e a senha só pelo nome
+        acessível, a senha do cofre). Sem confirmação o cofre nunca é digitado nele:
+        um valor que já saiu da gravação (antes de uma senha de transação, com forma
+        de usuário ou marcado pelo script) vira entrada obrigatória com aviso, e o
+        resto fica literal.
+        """
+        groups = self.logins.groups
+        for draft in self.drafts:
+            source = draft.source
+            if draft.pending is None or source is None or draft.field_key is None:
+                continue
+            key = draft.field_key
+            element = source.element
+            label = element_label(element)
+            by_field = self.username_groups if draft.pending == "username" else self.password_groups
+            numbers = sorted({n for i in draft.absorbed for n in by_field.get(i, [])})
+            confirmed = [n for n in numbers if n in self.confirmed]
+            secret_input: str | None = None
+            if draft.pending == "password":
+                if confirmed:
+                    self.warn(
+                        f"O nome do campo {quoted(label)} fala em senha; o valor gravado foi "
+                        "descartado e o robô digita a senha do cofre."
+                    )
+                    value: dict[str, Any] = {
+                        "source": "secret",
+                        "credential": self.credential(draft.url, CredentialKind.PASSWORD),
+                        "field": "password",
+                    }
+                else:
+                    value, secret_input = self.hidden_input(key, label, _named_password_warning)
+            elif confirmed or declared_username(element):
+                # A credencial da senha que vai com o usuário (mesma origem, em geral).
+                url = draft.url
+                for number in confirmed or numbers:
+                    owner = self.draft_by_event.get(groups[number].password[0].index)
+                    if owner is not None and owner.url:
+                        url = owner.url
+                        break
+                value = {
+                    "source": "secret",
+                    "credential": self.credential(url, CredentialKind.PASSWORD),
+                    "field": "username",
+                }
+            elif any(groups[n].transaction for n in numbers):
+                value, secret_input = self.hidden_input(key, label, _hidden_warning)
+            elif element.sensitive or any(groups[n].login for n in numbers):
+                # O gravador tira da gravação o valor de um login com essa forma.
+                value, secret_input = self.hidden_input(key, label, _login_warning)
+            elif source.value is None:
+                value, secret_input = self.hidden_input(key, label, _login_warning)
+            else:
+                value, secret_input = self.literal(source, key, label)
+            draft.step["value"] = value
+            if value["source"] == "secret":
+                draft.step.pop("sequential", None)
+            draft.secret_input = secret_input
+            draft.pending = None
 
     def on_select(self, event: SelectEvent) -> None:
         element = event.element
-        self.document.fills.append(event)
         key = _field_key(event)
         if event.multiple:
             self.warn(
@@ -543,6 +800,7 @@ class _Lowering:
         if existing is not None:
             existing.step["option"] = option
             existing.event_index = event.index
+            existing.absorbed.append(event.index)
             self.draft_by_event[event.index] = existing
             return
         label = element_label(element)
@@ -573,6 +831,7 @@ class _Lowering:
             existing.step["checked"] = event.checked
             existing.step["title"] = f"{verb} {quoted(label)}"
             existing.event_index = event.index
+            existing.absorbed.append(event.index)
             self.draft_by_event[event.index] = existing
             return
         self.emit(
@@ -594,16 +853,9 @@ class _Lowering:
 
     def on_file(self, event: FileEvent) -> None:
         element = event.element
-        self.document.fills.append(event)
         label = element.label or element.name or element.name_attr or "Arquivo"
-        taken = {f["name"] for f in self.file_inputs}
-        base = name_from(label, "arquivo")
-        name = base
-        n = 2
-        while name in taken:
-            name = f"{base}_{n}"
-            n += 1
-        self.file_inputs.append(
+        name = self.input_name(label, "arquivo")
+        self.inputs.append(
             {
                 "name": name,
                 "title": clip_label(label, 200),
@@ -634,10 +886,11 @@ class _Lowering:
 
     def on_key(self, event: KeyEvent) -> None:
         if event.key == "Tab":
+            self.absorb_tab(event)
             return
         element = event.element
         if event.key == "Enter":
-            if _clickable(element):
+            if clickable(element):
                 return  # o clique de ativação vem em seguida
             nxt = self.next_action.get(event.index)
             if isinstance(nxt, ClickEvent) and nxt.detail == 0:
@@ -648,7 +901,7 @@ class _Lowering:
             "key": key_name,
             "title": f"Pressionar {key_name}",
         }
-        if element is not None and (event.key == "Enter" or not _clickable(element)):
+        if element is not None and (event.key == "Enter" or not clickable(element)):
             label = element_label(element)
             step["title"] = f"Pressionar {key_name} em {quoted(label)}"
             step["target"] = self.target(element)
@@ -660,38 +913,93 @@ class _Lowering:
                 element=element,
                 action_index=event.index,
                 document_index=self.document.index,
-                only_credentials=self.only_credentials(),
-                password_fields=self.password_fields(),
             )
         )
+
+    def absorb_tab(self, event: KeyEvent) -> None:
+        """Tab não vira passo, mas deixa o campo: o change/blur pode gravar algo.
+
+        As requisições depois do Tab passam a contar no efeito do passo do campo
+        que a pessoa deixou (o último passo, de digitar, escolher ou marcar, no
+        mesmo campo e na mesma página). Em qualquer outro caso ficam sem dono;
+        nunca vão para um clique ou tecla.
+        """
+        last = self.drafts[-1] if self.drafts else None
+        if (
+            last is None
+            or event.element is None
+            or last.step["kind"] not in ("fill", "select", "check")
+            or last.field_key is None
+            or last.field_key != field_key(event.page_id, event.element)
+            or last.document_index != self.document.index
+        ):
+            return
+        last.absorbed.append(event.index)
 
     # -- efeitos e verificações ------------------------------------------------
 
     def classify(self) -> None:
+        """Efeito de cada passo e logins confirmados, depois o usuário e a senha do login.
+
+        Começa supondo que todo login com a forma da regra se confirma (o "Continuar"
+        de um login em duas etapas também é autenticação). O login cujo envio não
+        passa (algo gravou antes, inclusive o próprio "Continuar") cai, e a
+        classificação recomeça sem ele: cair só sobe efeitos, então termina.
+        """
+        failed: set[int] = set()
+        while True:
+            confirmed, notes = self.classify_pass(failed)
+            dropped = {
+                number
+                for number, group in enumerate(self.logins.groups)
+                if group.login and number not in failed and number not in confirmed
+            }
+            if not dropped:
+                break
+            failed |= dropped
+        self.confirmed = confirmed
+        for message in notes:
+            self.warn(message)
+        self.finish_logins()
+
+    def classify_pass(self, failed: set[int]) -> tuple[set[int], list[str]]:
+        """Uma passada da classificação, com os logins ``failed`` fora da regra."""
+        alive = {
+            number
+            for number, group in enumerate(self.logins.groups)
+            if group.login and number not in failed
+        }
+        confirmed: set[int] = set()
+        notes: list[str] = []
         wrote_before = False
         for draft in self.drafts:
+            draft.step.pop("effect", None)
             if draft.action_index is None:
                 continue
             kind = draft.step["kind"]
-            requests = self.requests_after(draft.action_index)
+            # Requisições depois de cada ação que o passo absorveu: mais requisições
+            # só podem subir o efeito (leitura → gravação).
+            requests = [r for index in draft.absorbed for r in self.requests_of(index)]
             if kind in ("click", "download", "press"):
+                index = draft.action_index
                 result = classify_action(
                     ActionContext(
                         element=draft.element,
                         requests=requests,
-                        only_credentials_on_page=draft.only_credentials,
-                        password_fields_on_page=draft.password_fields,
-                        wrote_before=wrote_before,
-                        navigated_to_form=self.navigated_to_form(draft.action_index),
+                        navigated_to_form=self.navigated_to_form(index),
+                        authentication=not wrote_before
+                        and self.authenticates(draft, alive, confirmed),
                     )
                 )
                 effect = result.effect
+                if result.reason == AUTHENTICATION:
+                    confirmed.update(n for n in self.submit_groups.get(index, []) if n in alive)
                 if (
                     effect is Effect.READ
                     and result.reason.startswith("link")
                     and draft.element is not None
                 ):
-                    self.warn(
+                    notes.append(
                         f"O link {quoted(element_label(draft.element))} tem um verbo de ação, "
                         "mas só abriu um formulário; ficou como leitura."
                     )
@@ -701,6 +1009,26 @@ class _Lowering:
             if effect is not Effect.READ:
                 draft.step["effect"] = effect.value
                 wrote_before = True
+        return confirmed, notes
+
+    def authenticates(self, draft: _Draft, alive: set[int], confirmed: set[int]) -> bool:
+        """O clique ou Enter envia credenciais pela regra do login (sem contar o que gravou).
+
+        É o envio de um login com a forma da regra, o "Continuar" (ou o Enter) que
+        leva do usuário à senha num login em duas etapas, ou o envio de um código de
+        uso único numa página em que o resto são credenciais de logins já confirmados.
+        """
+        index = draft.action_index
+        if index is None:
+            return False
+        if any(n in alive for n in self.submit_groups.get(index, [])):
+            return True
+        if any(n in alive for n in self.bridge_groups.get(index, [])):
+            if draft.step["kind"] == "press":
+                return True
+            return plain_label(action_label(draft.element)) in LOGIN_WORDS
+        owners = self.logins.one_time_codes.get(index)
+        return owners is not None and all(ids & confirmed for ids in owners)
 
     def navigated_to_form(self, action_index: int) -> bool:
         navigation = self.navigation_by_trigger.get(action_index)
@@ -754,10 +1082,17 @@ class _Lowering:
             )
 
     def new_heading(self, draft: _Draft) -> tuple[str | None, PageTextEvent | None]:
-        """Título que apareceu depois da ação e não existia antes (confiança alta)."""
+        """Título que apareceu depois da ação e não existia antes (confiança alta).
+
+        Só valem as capturas feitas antes da próxima ação da pessoa (depois da
+        última que o passo absorveu): o que aparece depois dela é obra dela, e a
+        verificação não pode passar na frente. Título com um valor sigiloso apagado
+        pela limpeza da gravação (``REMOVIDO``) não serve.
+        """
         action_index = draft.action_index
         if action_index is None:
             return None, None
+        following = self.next_action.get(max(draft.absorbed, default=action_index))
         navigation = self.navigation_by_trigger.get(action_index)
         before = self.texts_of(draft.document_index)
         if navigation is not None and not navigation.same_document:
@@ -767,12 +1102,17 @@ class _Lowering:
                 e for e in before if e.after_index is not None and e.after_index >= action_index
             ]
             before = [e for e in before if e.after_index is None or e.after_index < action_index]
+        if following is not None:
+            after = [e for e in after if e.index < following.index]
         if not after:
             return None, None
         seen = {h.text for e in before for h in e.headings}
         for page in after:
             for heading in sorted(page.headings, key=lambda h: h.level):
                 text = " ".join(heading.text.split())
+                # Um título com um valor sigiloso apagado nunca aparece assim na página.
+                if REDACTED in text:
+                    continue
                 if heading.level <= 2 and 3 <= len(text) <= 200 and text not in seen:
                     return text, page
         return None, None
@@ -800,11 +1140,14 @@ class _Lowering:
             }
             for (origin, kind), cred_name in self.credentials.items()
         ]
+        # Entrada de literal com cara de segredo cujo campo virou usuário do login: sobra.
+        used = {draft.secret_input for draft in self.drafts}
+        unused = set(self.secret_inputs.values()) - used
         data: dict[str, Any] = {
             "name": name,
             "title": title,
             "description": description,
-            "inputs": self.file_inputs,
+            "inputs": [spec for spec in self.inputs if spec["name"] not in unused],
             "outputs": self.outputs,
             "credentials": credentials,
             "allowed_domains": self.hosts,

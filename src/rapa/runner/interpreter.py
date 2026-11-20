@@ -12,17 +12,51 @@ principais:
 - antes de um passo irreversível agir, o executor avisa (evento
   ``step_started`` com ``irreversivel: true``); qualquer falha depois disso
   deixa a execução "indeterminada", nunca "falhou";
-- eventos, mensagens e saídas nunca contêm valores de credenciais.
+- valores de entradas, variáveis e itens nunca mudam o alvo de um passo: não
+  entram em seletores CSS/XPath, cada um vira um único trecho codificado do
+  endereço (no caminho e na rota depois do ``#``, sem barras, sem ``%`` e nunca
+  vazio), e o texto que escolhe uma linha precisa ser o texto inteiro de um
+  elemento dela (uma célula, por exemplo), com as mesmas maiúsculas e sem
+  nenhum valor vazio;
+- esse texto é comparado com o texto do HTML (``textContent``), e não com o
+  que a página mostra: ``extract_table`` e ``extract_text`` leem o texto
+  mostrado (``innerText``), já com o ``text-transform`` do CSS. Numa página que
+  muda as maiúsculas pelo CSS, uma chave lida dela falha fechado: não escolhe
+  nenhuma linha (``elemento_nao_encontrado``, nada é feito) ou, se outra linha
+  tem no HTML o texto mostrado, escolhe essa outra. A comparação nunca ignora
+  maiúsculas, para uma chave nunca escolher a linha de outro código;
+- numa execução, o mesmo passo que grava (``write`` ou ``irreversible``) nunca
+  age duas vezes na linha escolhida pelo mesmo texto: na segunda vez, ele falha
+  com ``elemento_ambiguo`` antes de agir (e antes do aviso de passo
+  irreversível). Passos diferentes podem agir na mesma linha, e passos de
+  leitura podem voltar a ela. É a rede de segurança para itens repetidos e para
+  duas linhas lidas com o mesmo texto (``ab3x`` mostrado como ``AB3X`` ao lado
+  de ``AB3X``): a ação pode ter caído na outra linha, mas nunca se repete;
+- o que faria a execução falhar no meio por causa das entradas (campo de item
+  ausente, número que não pode ser digitado, lista maior que a repetição, valor
+  que não pode ir no caminho ou na rota do endereço, valor vazio no texto que
+  escolhe a linha) falha antes do primeiro passo. Valores usados só em passos
+  que não rodam não contam: um ramo de ``if`` cuja condição é um ``equals`` só
+  de entradas e itens de listas de entrada é decidido antes, como seria na
+  execução, e uma repetição sobre uma lista de entrada vazia não roda. Quando a
+  condição depende da página ou de variáveis, na dúvida o valor é recusado
+  antes, e a mensagem diz o passo e o ramo;
+- eventos, mensagens, saídas e nomes de artefatos nunca contêm valores de
+  credenciais; as chaves dos eventos e os valores que são constantes do
+  executor (efeito, estado, código de erro, id de passo) nunca são mascarados.
 """
 
 import asyncio
 import math
 import os
+import re
+import unicodedata
 import weakref
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any, Literal, Self, assert_never, cast
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from uuid import UUID
 
 from playwright.async_api import (
@@ -40,7 +74,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from rapa.core import templates
 from rapa.core.contracts import RunMode, RunnerJob, RunState
 from rapa.core.events import RunEvent, RunEventKind
-from rapa.core.policy import TEST_TLD
+from rapa.core.policy import RAW_SELECTORS, TEST_TLD
 from rapa.core.robot import (
     AssertStep,
     CheckStep,
@@ -56,6 +90,7 @@ from rapa.core.robot import (
     FillStep,
     ForEachStep,
     IfStep,
+    InputField,
     Locator,
     LocatorBy,
     Manifest,
@@ -92,11 +127,55 @@ _TIMEOUT_GRACE_S = 2.0
 _SCREENSHOT_TIMEOUT_MS = 5_000
 _DETAIL_MAX = 300
 _MIN_MASKED_LENGTH = 4
+#: Campos de evento com hashes que o próprio executor calcula (nunca dados da página).
 _HASH_KEYS = frozenset({"sha256", "fingerprint"})
+_HEX_DIGEST = re.compile(r"[0-9a-f]{64}")
+#: Campos de evento cujo valor é uma constante do executor, quando é um destes.
+_EVENT_CONSTANTS: dict[str, frozenset[str]] = {
+    "efeito": frozenset(effect.value for effect in Effect),
+    "estado": frozenset(state.value for state in RunState),
+    "codigo": frozenset(code.value for code in ErrorCode),
+    "modo": frozenset(mode.value for mode in RunMode),
+    "estrategia": frozenset(by.value for by in LocatorBy),
+    "estrategias": frozenset(by.value for by in LocatorBy),
+    "ramo": frozenset({"entao", "senao"}),
+    "origem": frozenset({"texto", "segredo"}),
+}
+#: Campos de evento com o id de um passo do robô.
+_STEP_ID_KEYS = ("passo", "passo_irreversivel", "passo_interno")
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+#: Problemas de entrada listados na mensagem de erro (o resto só é contado).
+_MAX_PROBLEMS = 20
+#: Maior inteiro que um float guarda sem perder precisão.
+_MAX_EXACT_FLOAT_INT = 2**53
+
+#: Brancos do JavaScript (os de ``trim()`` e de ``\s``), que o Playwright usa ao comparar
+#: textos. Não são os do Python: U+FEFF entra, U+001C a U+001F e U+0085 não.
+_JS_SPACES = re.compile(
+    "[\t\n\x0b\x0c\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+"
+)
+#: Caracteres que o Playwright descarta antes de comparar textos.
+_IGNORED_IN_TEXT = re.compile("[\u200b\u00ad]")
+# Trechos da expressão do texto inteiro de um elemento (avaliada no navegador).
+_TEXT_EDGE = r"[\s\u200b\u00ad]*"
+_INSIDE_WORD = r"[\u200b\u00ad]*"
+_BETWEEN_WORDS = r"[\u200b\u00ad]*\s[\s\u200b\u00ad]*"
 
 type _Root = Page | FrameLocator | PwLocator
 type _Action = Callable[[], Awaitable[dict[str, Any]]]
+#: Onde uma referência cai no endereço de um ``navigate``. ``rota`` é o fragmento
+#: até um ``?`` dentro dele: em aplicações de página única (``#!/notas/1``) é o caminho.
+type _UrlSlot = Literal["autoridade", "caminho", "consulta", "rota", "fragmento"]
+#: Trechos onde valem as regras do caminho, e como cada um aparece nas mensagens.
+_PATH_SLOTS: dict[_UrlSlot, str] = {
+    "caminho": "no caminho do endereço",
+    "rota": "na rota do endereço (depois do '#')",
+}
+#: Itens de uma repetição sobre uma entrada de lista: o nome da lista e as linhas que
+#: chegam a um bloco de passos, cada uma com a sua posição na lista.
+type _Rows = tuple[str, list[tuple[int, Mapping[str, object]]]]
+#: Ramos de ``if`` em volta de um bloco que só durante a execução se sabe se rodam.
+type _Undecided = tuple[str, ...]
 
 #: Contextos já usados por alguma execução: nunca se reaproveita um contexto.
 _claimed_contexts: weakref.WeakSet[BrowserContext] = weakref.WeakSet()
@@ -173,16 +252,28 @@ class _Redactor:
         return text
 
     def value(self, value: Any) -> Any:
+        """Mascara textos em qualquer profundidade, inclusive as chaves dos dicionários
+        (cabeçalhos de tabela viram chaves). Nenhuma chave fica de fora."""
         if isinstance(value, str):
             return self.text(value)
         if isinstance(value, Mapping):
-            # Hashes em hexadecimal não carregam segredos e precisam ficar intactos.
-            return {
-                key: item if key in _HASH_KEYS else self.value(item) for key, item in value.items()
-            }
+            masked: dict[Any, Any] = {}
+            for key, item in value.items():
+                name = self._free_key(self.text(key), masked) if isinstance(key, str) else key
+                masked[name] = self.value(item)
+            return masked
         if isinstance(value, (list, tuple)):
             return [self.value(item) for item in value]
         return value
+
+    @staticmethod
+    def _free_key(key: str, taken: Mapping[Any, Any]) -> str:
+        # Duas chaves que só diferem por um segredo ficariam iguais depois da máscara.
+        candidate, n = key, 1
+        while candidate in taken:
+            n += 1
+            candidate = f"{key}_{n}"
+        return candidate
 
 
 class _StepCtx:
@@ -220,21 +311,44 @@ def _host(url: str) -> str:
         return ""
 
 
+def _number_source(kind: FieldType, text: str) -> str:
+    """O texto que vira número: sem separadores de milhar e com ponto decimal."""
+    if kind is FieldType.INTEGER:
+        return text.replace(".", "").replace(" ", "")
+    number = text.replace(" ", "")
+    if "," in number:
+        number = number.replace(".", "").replace(",", ".")
+    return number
+
+
+def _number_texts(kind: FieldType, raw: str, converted: int | float) -> list[str]:
+    """Textos em que um número convertido pode mostrar um segredo.
+
+    Os dígitos de onde ele veio (um float arredonda o último dígito de um número
+    longo) e as suas formas decimais exatas: ``str()`` de um float grande usa
+    expoente (``1.2345678901234568e+16``) e esconderia os dígitos da conferência.
+    """
+    texts = [_number_source(kind, raw.strip()), str(converted)]
+    if isinstance(converted, float):
+        texts.append(format(Decimal(repr(converted)), "f"))
+        if converted.is_integer():
+            texts.append(str(int(converted)))
+    return texts
+
+
 def _coerce_output(kind: FieldType, value: Any) -> Any:
     """Converte o texto extraído no tipo declarado da saída, quando possível."""
     if not isinstance(value, str):
         return value
     text = value.strip()
     if kind is FieldType.INTEGER:
-        digits = text.replace(".", "").replace(" ", "")
+        digits = _number_source(kind, text)
         try:
             return int(digits)
         except ValueError:
             return value
     if kind is FieldType.NUMBER:
-        number = text.replace(" ", "")
-        if "," in number:
-            number = number.replace(".", "").replace(",", ".")
+        number = _number_source(kind, text)
         try:
             converted = float(number)
         except ValueError:
@@ -247,6 +361,185 @@ def _coerce_output(kind: FieldType, value: Any) -> Any:
         if folded in {"não", "nao", "false", "falso", "0"}:
             return False
     return value
+
+
+def _prepare_simple(spec: InputField, value: object, where: str, problems: list[str]) -> object:
+    """Normaliza um valor simples de entrada e confere que ele pode ser digitado."""
+    if spec.type is FieldType.INTEGER and isinstance(value, float):
+        # JSON e formulários mandam 5 como 5.0; digitar "5.0" seria outro número
+        # num portal em pt-BR. Um float grande demais já perdeu dígitos.
+        if not (value.is_integer() and abs(value) <= _MAX_EXACT_FLOAT_INT):
+            problems.append(f"a entrada '{where}' precisa ser um número inteiro")
+            return value
+        value = int(value)
+    try:
+        templates.format_value(value)
+    except templates.TemplateError as exc:
+        problems.append(f"a entrada '{where}' não pode ser digitada: {exc}")
+    return value
+
+
+def _url_slots(parts: list[templates.Part]) -> dict[int, _UrlSlot]:
+    """Em que trecho do endereço cai cada referência, pela posição dela em ``parts``.
+
+    Os valores são codificados e nunca trazem ``/``, ``?`` nem ``#``: só os trechos
+    literais antes de cada referência decidem onde ela cai. Sem ``//`` no começo,
+    vale a regra mais estrita (caminho). No fragmento, até um ``?`` dentro dele,
+    vale a mesma regra do caminho (rota): aplicações de página única escolhem a
+    tela por ele e muitas decodificam ``%2F`` antes (o AngularJS em modo
+    ``#!``, por exemplo).
+    """
+    slots: dict[int, _UrlSlot] = {}
+    before = ""
+    for index, part in enumerate(parts):
+        if isinstance(part, str):
+            before += part
+            continue
+        if (hash_at := before.find("#")) != -1:
+            slots[index] = "fragmento" if "?" in before[hash_at:] else "rota"
+        elif "?" in before:
+            slots[index] = "consulta"
+        elif (start := before.find("//")) != -1 and not any(
+            separator in before[start + 2 :] for separator in "/\\"
+        ):
+            slots[index] = "autoridade"
+        else:
+            slots[index] = "caminho"
+        before += "x"  # o valor ocupa o lugar, mas não muda o trecho
+    return slots
+
+
+def _path_value_problem(text: str) -> str | None:
+    """Por que um valor não pode ser um trecho do caminho do endereço (``None`` se pode).
+
+    Codificar não basta: muitos servidores (ASGI, WSGI, Laravel...) decodificam o
+    caminho antes de escolher a rota, e ``%2F`` volta a ser uma barra; os que
+    decodificam duas vezes fazem o mesmo com ``%252F``, por isso ``%`` também é
+    recusado. Um valor vazio some e junta os trechos vizinhos
+    (``/notas//cancelar``), e ``.`` e ``..`` mudam de pasta mesmo codificados. A
+    conferência vale também para a forma NFKC do valor, que alguns servidores
+    aplicam: a barra larga ``／`` vira ``/`` e ``‥`` vira ``..``.
+    """
+    if not text:
+        return "está vazio"
+    for form in (text, unicodedata.normalize("NFKC", text)):
+        if form in (".", ".."):
+            return f"é '{form}' (ou equivale a isso), que mudaria de pasta"
+        if "/" in form or "\\" in form:
+            return "contém '/' ou '\\' (ou um equivalente), que mudariam o caminho"
+        if "%" in form:
+            return "contém '%' (ou um equivalente), que um servidor poderia decodificar de novo"
+    return None
+
+
+def _encode_url_value(text: str, slot: _UrlSlot) -> str:
+    """Codifica um valor como um único trecho do endereço.
+
+    No caminho e na rota do fragmento, recusa os valores que mudariam a rota
+    mesmo codificados.
+    """
+    if (where := _PATH_SLOTS.get(slot)) is not None and (
+        problem := _path_value_problem(text)
+    ) is not None:
+        raise templates.TemplateError(f"não pode ir {where}: {problem}")
+    return quote(text, safe="")
+
+
+def _normalize_text(text: str) -> str:
+    """O texto como o Playwright o compara.
+
+    Sem U+200B e U+00AD, sem brancos do JavaScript nas pontas (U+FEFF inclusive) e
+    com cada sequência deles virando um espaço. Uma chave que fica vazia assim
+    escolheria qualquer elemento sem texto (uma célula vazia, um botão só com ícone).
+    """
+    return _JS_SPACES.sub(" ", _IGNORED_IN_TEXT.sub("", text)).strip(" ")
+
+
+def _row_key_value(_index: int, text: str) -> str:
+    """Confere um valor do texto que escolhe o contêiner (``encode`` de ``render``).
+
+    Um valor que fica vazio depois de normalizado nunca pode entrar: com
+    ``Nota {{ item.numero }}`` e o número vazio (ou só um BOM), sobraria
+    ``Nota``, que pode ser o texto inteiro de um rótulo dentro de outra linha.
+    """
+    if not _normalize_text(text):
+        raise templates.TemplateError(
+            "ficaria vazio no texto que escolhe o contêiner, e sem ele não há como saber qual usar"
+        )
+    return text
+
+
+def _js_escape(char: str) -> str:
+    # Letras e dígitos ASCII vão como estão; o resto do ASCII vira \xHH, que vale
+    # igual no Python e no JavaScript e nunca é aspas, barra ou ">>" para o seletor.
+    if char.isascii() and not char.isalnum():
+        return f"\\x{ord(char):02x}"
+    return char
+
+
+def _whole_text(key: str) -> re.Pattern[str]:
+    """Expressão, avaliada no navegador, do texto inteiro de um elemento igual a ``key``.
+
+    ``key`` já vem normalizada. O Playwright testa expressões no texto cru
+    (``textContent``), então a expressão aceita o que ele ignora ao comparar
+    textos: brancos nas pontas e repetidos, U+200B e U+00AD. Os caracteres
+    precisam ser os mesmos, com as mesmas maiúsculas e minúsculas: ``ab3x`` nunca
+    escolhe a linha de ``AB3X``. O ``text-transform`` do CSS não conta, porque o
+    texto é o do HTML (o gravador também grava a chave a partir dele).
+    """
+    words = (_INSIDE_WORD.join(_js_escape(char) for char in word) for word in key.split(" "))
+    body = _BETWEEN_WORDS.join(words)
+    return re.compile(f"^{_TEXT_EDGE}{body}{_TEXT_EDGE}$")
+
+
+def _step_targets(step: Step) -> list[Target]:
+    """Alvos de um passo, inclusive o da condição de ``if`` e ``assert``."""
+    targets: list[Target] = []
+    for holder in (step, getattr(step, "condition", None)):
+        target = getattr(holder, "target", None)
+        if isinstance(target, Target):
+            targets.append(target)
+    return targets
+
+
+def _static_holds(
+    condition: Condition, values: Mapping[str, Any], item: Mapping[str, object] | None
+) -> bool | None:
+    """O resultado de uma condição que dá para saber antes do primeiro passo.
+
+    Só um ``equals`` cujos dois lados usam apenas entradas e, numa repetição sobre
+    uma entrada de lista, o item: ele é avaliado como seria durante a execução.
+    ``None`` quando só a execução sabe (a página, variáveis, um template que falha).
+    """
+    if not isinstance(condition, EqualsCondition):
+        return None
+    scopes: dict[templates.Scope, Mapping[str, object]] = {templates.Scope.INPUTS: values}
+    if item is not None:
+        scopes[templates.Scope.ITEM] = item
+    try:
+        left = templates.render(condition.left, scopes)
+        right = templates.render(condition.right, scopes)
+    except templates.TemplateError:
+        return None  # variáveis só existem durante a execução; o resto falha lá
+    return (left == right) != condition.negate
+
+
+def _undecided_reason(undecided: _Undecided) -> str:
+    """Por que o valor de um passo que talvez nem rode é conferido antes do primeiro passo."""
+    if not undecided:
+        return ""
+    branches = "esse ramo roda" if len(undecided) == 1 else "esses ramos rodam"
+    return (
+        f" (o passo fica {' e '.join(undecided)}, e só durante a execução se sabe se "
+        f"{branches}; na dúvida, o valor é recusado antes do primeiro passo)"
+    )
+
+
+def _has_references(template: str) -> bool:
+    try:
+        return templates.has_references(template)
+    except templates.TemplateError:
+        return False  # o template inválido é recusado ao ser montado
 
 
 def _describe_condition(condition: Condition) -> str:
@@ -284,6 +577,7 @@ class Interpreter:
         events: EventSink,
         run_id: UUID,
         attempt: int,
+        first_seq: int = 0,
         mode: RunMode = RunMode.FULL,
         deadline: datetime | None = None,
         cancel: asyncio.Event | None = None,
@@ -296,6 +590,8 @@ class Interpreter:
     ) -> None:
         if attempt < 1:
             raise ValueError("attempt começa em 1")
+        if first_seq < 0:
+            raise ValueError("first_seq não pode ser negativo")
         self._manifest = manifest
         self._raw_inputs = dict(inputs)
         self._secrets = secrets
@@ -318,7 +614,15 @@ class Interpreter:
 
         self._credentials: dict[str, CredentialRef] = {c.name: c for c in manifest.credentials}
         self._allowed_hosts = frozenset(manifest.allowed_domains)
-        self._seq = 0
+        steps = [step for step, _ in manifest.iter_steps()]
+        step_ids = frozenset(step.id for step in steps)
+        self._event_constants: dict[str, frozenset[str]] = {
+            **_EVENT_CONSTANTS,
+            **dict.fromkeys(_STEP_ID_KEYS, step_ids),
+            "tipo": frozenset(step.kind for step in steps) | {kind.value for kind in ArtifactKind},
+        }
+        # A numeração dos eventos é da execução: cada tentativa continua a anterior.
+        self._seq = first_seq
         self._used = False
         self._page: Page | None = None
         self._deadline = math.inf
@@ -328,6 +632,9 @@ class Interpreter:
         self._items: list[tuple[Mapping[str, object], int]] = []
         self._steps_done = 0
         self._irreversible_step: Step | None = None
+        #: Linhas onde cada passo que grava já agiu: id do passo -> texto da linha ->
+        #: repetição em que agiu (``None`` fora de repetições).
+        self._acted_rows: dict[str, dict[str, int | None]] = {}
         self._artifacts: list[ArtifactRef] = []
         self._secret_locators: list[PwLocator] = []
         self._blocked_navigation: str | None = None
@@ -354,6 +661,7 @@ class Interpreter:
             events=events,
             run_id=job.run_id,
             attempt=job.attempt,
+            first_seq=job.first_seq,
             mode=job.mode,
             deadline=job.deadline,
             **options,
@@ -515,6 +823,14 @@ class Interpreter:
         )
 
     def _prepare_inputs(self) -> dict[str, Any]:
+        """Confere e normaliza as entradas antes do primeiro passo.
+
+        O que faria a execução falhar no meio por causa das entradas (campo de
+        item ausente, número que não pode ser digitado, lista maior que a
+        repetição aceita, valor que não pode ir no caminho ou na rota de um
+        endereço, valor vazio no texto que escolhe um contêiner) falha aqui, antes
+        de qualquer passo gravar. As entradas recebidas não são alteradas.
+        """
         values = dict(self._raw_inputs)
         problems: list[str] = []
         for spec in self._manifest.inputs:
@@ -529,29 +845,293 @@ class Interpreter:
                 else:
                     values[spec.name] = ""
                 continue
-            if spec.type is FieldType.LIST and not (
-                isinstance(value, list) and all(isinstance(item, Mapping) for item in value)
-            ):
-                problems.append(f"a entrada '{spec.name}' precisa ser uma lista de objetos")
-            elif spec.type is FieldType.FILE and not isinstance(value, str):
-                problems.append(f"a entrada '{spec.name}' precisa ser o identificador do arquivo")
+            if spec.type is FieldType.LIST:
+                if isinstance(value, list) and all(isinstance(item, Mapping) for item in value):
+                    values[spec.name] = self._prepare_items(spec, value, problems)
+                else:
+                    problems.append(f"a entrada '{spec.name}' precisa ser uma lista de objetos")
+            elif spec.type is FieldType.FILE:
+                if not isinstance(value, str):
+                    problems.append(
+                        f"a entrada '{spec.name}' precisa ser o identificador do arquivo"
+                    )
+            else:
+                values[spec.name] = _prepare_simple(spec, value, spec.name, problems)
+        self._check_input_uses(values, problems)
         if problems:
+            shown = problems[:_MAX_PROBLEMS]
+            if len(problems) > _MAX_PROBLEMS:
+                shown.append(f"e mais {len(problems) - _MAX_PROBLEMS} problemas")
             raise StepError(
                 ErrorCode.ENTRADA_INVALIDA,
-                "Entradas inválidas: " + "; ".join(problems) + ".",
-                details={"problemas": problems},
+                "Entradas inválidas: " + "; ".join(shown) + ".",
+                details={"problemas": shown},
             )
+        self._check_list_limits(values)
         return values
+
+    @staticmethod
+    def _prepare_items(
+        spec: InputField, items: list[Mapping[str, object]], problems: list[str]
+    ) -> list[dict[str, object]]:
+        """Itens de uma lista com os mesmos cuidados das entradas de cima."""
+        prepared: list[dict[str, object]] = []
+        for index, item in enumerate(items):
+            row = dict(item)
+            for field in spec.item_fields or ():
+                where = f"{spec.name}[{index}].{field.name}"
+                current = row.get(field.name)
+                if current is None:
+                    if field.required:
+                        problems.append(f"campo obrigatório ausente: {where}")
+                    else:
+                        # Campo opcional sem valor é digitado vazio (campos de item
+                        # nunca são listas nem arquivos).
+                        row[field.name] = ""
+                    continue
+                row[field.name] = _prepare_simple(field, current, where, problems)
+            prepared.append(row)
+        return prepared
+
+    def _check_input_uses(self, values: Mapping[str, Any], problems: list[str]) -> None:
+        """Confere os usos que só dependem das entradas e dos itens de listas de entrada.
+
+        São os valores que vão no caminho ou na rota (depois do ``#``) de um
+        endereço e os que vão no texto que escolhe um contêiner. Se um deles não
+        serve, a execução pararia nesse passo, talvez depois de outros já terem
+        gravado. Variáveis só existem durante a execução: essas são conferidas
+        quando o passo roda.
+
+        Só contam os passos que podem rodar. Um ``if`` cuja condição dá para
+        avaliar antes (:func:`_static_holds`) só tem conferido o ramo que vai
+        rodar (numa repetição sobre uma entrada de lista, item a item), e uma
+        repetição sobre uma lista de entrada vazia não roda. Quando a condição só
+        se conhece durante a execução, os dois ramos são conferidos, e a mensagem
+        diz em que ramo está o passo.
+        """
+        found: list[str] = []
+
+        def walk(steps: Iterable[Step], rows: _Rows | None, undecided: _Undecided) -> None:
+            for step in steps:
+                if isinstance(step, NavigateStep):
+                    found.extend(self._url_value_problems(step, values, rows, undecided))
+                for target in _step_targets(step):
+                    found.extend(self._row_key_problems(step, target, values, rows, undecided))
+                if isinstance(step, ForEachStep):
+                    inner = self._loop_rows(step, values)
+                    if inner is None or inner[1]:  # sobre uma lista de entrada vazia, nada roda
+                        walk(step.steps, inner, undecided)
+                elif isinstance(step, IfStep):
+                    for block, block_rows, block_undecided in self._branches(
+                        step, values, rows, undecided
+                    ):
+                        walk(block, block_rows, block_undecided)
+
+        walk(self._manifest.steps, None, ())
+        for condition in self._manifest.postconditions:
+            target = getattr(condition, "target", None)
+            if isinstance(target, Target):
+                found.extend(self._row_key_problems(None, target, values, None, ()))
+        seen = set(problems)
+        for problem in found:
+            if problem not in seen:  # a mesma entrada pode aparecer em vários passos
+                seen.add(problem)
+                problems.append(problem)
+
+    @staticmethod
+    def _loop_rows(step: ForEachStep, values: Mapping[str, Any]) -> _Rows | None:
+        """Os itens de uma repetição, quando ela percorre uma entrada de lista."""
+        scope, name = step.items.split(".", 1)
+        rows = values.get(name) if scope == "inputs" else None
+        if isinstance(rows, list) and all(isinstance(row, Mapping) for row in rows):
+            return name, list(enumerate(rows))
+        return None
+
+    @staticmethod
+    def _branches(
+        step: IfStep, values: Mapping[str, Any], rows: _Rows | None, undecided: _Undecided
+    ) -> list[tuple[list[Step], _Rows | None, _Undecided]]:
+        """Os ramos de um ``if`` que podem rodar, cada um com os itens que chegam a ele.
+
+        Se a condição dá para avaliar antes (para todos os itens, numa repetição
+        sobre uma entrada de lista), só entram os ramos que vão rodar, cada um com
+        os seus itens. Senão, entram os dois, marcados como ramos que só a
+        execução decide.
+        """
+        if rows is None:
+            holds = _static_holds(step.condition, values, None)
+            if holds is not None:
+                return [(step.then if holds else step.otherwise, None, undecided)]
+        else:
+            name, items = rows
+            decided = [
+                (index, row, _static_holds(step.condition, values, row)) for index, row in items
+            ]
+            if all(holds is not None for _, _, holds in decided):
+                then = [(index, row) for index, row, holds in decided if holds]
+                otherwise = [(index, row) for index, row, holds in decided if not holds]
+                return [
+                    (block, (name, part), undecided)
+                    for block, part in ((step.then, then), (step.otherwise, otherwise))
+                    if part
+                ]
+        return [
+            (step.then, rows, (*undecided, f"no ramo 'então' do passo '{step.id}'")),
+            (step.otherwise, rows, (*undecided, f"no ramo 'senão' do passo '{step.id}'")),
+        ]
+
+    @staticmethod
+    def _ref_values(
+        ref: templates.Ref, values: Mapping[str, Any], rows: _Rows | None
+    ) -> list[tuple[str, object]]:
+        """Os valores que uma referência pode ter, com a descrição de cada um."""
+        if ref.scope is templates.Scope.INPUTS and ref.name in values:
+            return [(f"a entrada '{ref.name}'", values[ref.name])]
+        if ref.scope is templates.Scope.ITEM and rows is not None:
+            name, items = rows
+            return [
+                (f"o campo '{name}[{index}].{ref.name}'", row[ref.name])
+                for index, row in items
+                if ref.name in row
+            ]
+        return []  # variáveis (e referências sem valor, recusadas ao montar o passo)
+
+    def _url_value_problems(
+        self,
+        step: NavigateStep,
+        values: Mapping[str, Any],
+        rows: _Rows | None,
+        undecided: _Undecided,
+    ) -> list[str]:
+        try:
+            parts = templates.parse(step.url)
+        except templates.TemplateError:
+            return []  # recusado ao montar o passo
+        found: list[str] = []
+        for index, slot in _url_slots(parts).items():
+            ref = parts[index]
+            place = _PATH_SLOTS.get(slot)
+            if place is None or not isinstance(ref, templates.Ref):
+                continue
+            for where, value in self._ref_values(ref, values, rows):
+                try:
+                    text = templates.format_value(value)
+                except templates.TemplateError:
+                    continue  # já recusado como valor que não pode ser digitado
+                problem = _path_value_problem(text)
+                if problem is not None:
+                    found.append(
+                        f"{where} não pode ir {place} do passo '{step.id}': {problem}"
+                        f"{_undecided_reason(undecided)}"
+                    )
+        return found
+
+    @staticmethod
+    def _row_key_problems(
+        step: Step | None,
+        target: Target,
+        values: Mapping[str, Any],
+        rows: _Rows | None,
+        undecided: _Undecided,
+    ) -> list[str]:
+        """Valores de entradas e de itens que ficariam vazios no texto que escolhe o contêiner.
+
+        Cada valor é conferido sozinho, como :func:`_row_key_value` faz quando o
+        passo roda: ``Nota {{ item.numero }}`` com o número vazio não fica vazio,
+        mas escolheria a linha por outro texto. Variáveis (e itens de uma tabela
+        lida da página) só existem durante a execução e são conferidas lá.
+        """
+        template = target.within_has_text
+        if template is None:
+            return []
+        try:
+            refs = list(dict.fromkeys(templates.references(template)))
+        except templates.TemplateError:
+            return []  # recusado ao montar o passo
+        where = f"no passo '{step.id}'" if step is not None else "nas pós-condições"
+        found: list[str] = []
+        for ref in refs:
+            checks: list[tuple[str, Mapping[str, object]]]
+            if ref.scope is templates.Scope.INPUTS:
+                checks = [("", values)]
+            elif ref.scope is templates.Scope.ITEM and rows is not None:
+                name, items = rows
+                checks = [(f" para '{name}[{index}]'", row) for index, row in items]
+            else:
+                continue  # variáveis e itens de uma tabela lida da página
+            for suffix, scope_values in checks:
+                if ref.name not in scope_values:
+                    continue  # recusado ao montar o passo
+                try:
+                    text = templates.format_value(scope_values[ref.name])
+                except templates.TemplateError:
+                    continue  # já recusado como valor que não pode ser digitado
+                if not _normalize_text(text):
+                    found.append(
+                        f"{ref} ficaria vazio no texto que escolhe o contêiner de "
+                        f"'{target.intent}' {where}{suffix}{_undecided_reason(undecided)}"
+                    )
+        return found
+
+    def _check_list_limits(self, values: Mapping[str, Any]) -> None:
+        """Recusa, antes do primeiro passo, uma lista maior que a repetição que a percorre."""
+        for step, _ in self._manifest.iter_steps():
+            if not isinstance(step, ForEachStep):
+                continue
+            scope, name = step.items.split(".", 1)
+            items = values.get(name) if scope == "inputs" else None
+            if isinstance(items, list) and len(items) > step.max_items:
+                err = self._too_many_items(step, len(items))
+                err.step_id = step.id
+                err.reported = True  # o passo nem começou: não há evento nem tela
+                raise err
+
+    @staticmethod
+    def _too_many_items(step: ForEachStep, count: int) -> StepError:
+        return StepError(
+            ErrorCode.LIMITE_DE_ITENS_EXCEDIDO,
+            f"'{step.items}' tem {count} itens, mais que o limite de "
+            f"{step.max_items} do passo '{step.title}'.",
+            details={"itens": count, "limite": step.max_items},
+        )
 
     def _collect_outputs(self) -> dict[str, Any]:
         outputs: dict[str, Any] = {}
         for spec in self._manifest.outputs:
             name = spec.source.split(".", 1)[1]
             outputs[spec.name] = (
-                _coerce_output(spec.type, self._vars[name]) if name in self._vars else None
+                self._output_value(spec.type, self._vars[name]) if name in self._vars else None
             )
-        redacted: dict[str, Any] = self._redactor.value(outputs)
-        return redacted
+        return outputs
+
+    def _output_value(self, kind: FieldType, raw: Any) -> Any:
+        """Valor de uma saída, já mascarado.
+
+        A máscara vem antes da conversão de tipo: um segredo só de dígitos viraria
+        número e escaparia dela. Se a máscara mudou algo, fica o texto mascarado.
+        """
+        if isinstance(raw, ArtifactRef):
+            # Só o hash, calculado pelo próprio executor, fica fora da máscara.
+            data = raw.model_dump(mode="json")
+            return {
+                key: item if key == "sha256" else self._redactor.value(item)
+                for key, item in data.items()
+            }
+        masked = self._redactor.value(raw)
+        if masked != raw:
+            return masked
+        converted = _coerce_output(kind, raw)
+        if (
+            isinstance(raw, str)
+            and isinstance(converted, (int, float))
+            and not isinstance(converted, bool)
+            and any(
+                self._redactor.text(text) != text for text in _number_texts(kind, raw, converted)
+            )
+        ):
+            # A conversão juntou um segredo (por exemplo, tirando os pontos de um número).
+            return MASK
+        return converted
 
     async def _check_postconditions(self) -> None:
         conditions = self._manifest.postconditions
@@ -592,10 +1172,39 @@ class Interpreter:
             at=datetime.now(UTC),
             kind=kind,
             step_id=step_id,
-            data=self._redactor.value(dict(data or {})),
+            data=self._mask_event_data(data or {}),
         )
         self._seq += 1
         await self._events.emit(event)
+
+    def _mask_event_data(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        """Mascara os dados de um evento.
+
+        As chaves de primeiro nível são constantes do executor e nunca são
+        mascaradas: o plano de controle decide por elas, e um segredo que fosse um
+        pedaço de uma delas (``vers`` em ``irreversivel``) apagaria o aviso do passo
+        irreversível, e o executor agiria sem esperar a confirmação. Também ficam
+        intactos os valores que são constantes do executor (efeito, estado, código
+        de erro, id de passo...) e os hashes que ele mesmo calcula, onde um segredo
+        curto poderia aparecer por acaso. O resto, inclusive as chaves de dentro,
+        que podem vir da página, é mascarado.
+        """
+        return {
+            key: item if self._is_event_constant(key, item) else self._redactor.value(item)
+            for key, item in data.items()
+        }
+
+    def _is_event_constant(self, key: str, item: Any) -> bool:
+        if key in _HASH_KEYS:
+            return isinstance(item, str) and _HEX_DIGEST.fullmatch(item) is not None
+        allowed = self._event_constants.get(key)
+        if allowed is None:
+            return False
+        if isinstance(item, str):
+            return item in allowed
+        return isinstance(item, list) and all(
+            isinstance(value, str) and value in allowed for value in item
+        )
 
     async def _emit_step_started(self, step: Step, *, irreversible: bool = False) -> None:
         data: dict[str, Any] = {
@@ -772,6 +1381,7 @@ class Interpreter:
         try:
             try:
                 async with asyncio.timeout_at(ctx.deadline + _TIMEOUT_GRACE_S):
+                    row = self._row_not_acted_on(step)
                     action = await self._prepare(step, ctx)
                     if irreversible:
                         # O aviso vai antes: com confirmação, ele pode esperar o plano de
@@ -780,6 +1390,10 @@ class Interpreter:
                         announced = True
                         # Daqui em diante, qualquer falha deixa a execução indeterminada.
                         self._irreversible_step = step
+                    if row is not None:
+                        # Registrada antes de agir: uma ação que falhou no meio também conta.
+                        iteration = self._items[-1][1] if self._items else None
+                        self._acted_rows.setdefault(step.id, {})[row] = iteration
                     data = await action()
                 self._check_page_domain(step)
             except StepError:
@@ -872,12 +1486,9 @@ class Interpreter:
                 f"'{step.items}' não é uma lista de itens no passo '{step.title}'.",
             )
         if len(value) > step.max_items:
-            raise StepError(
-                ErrorCode.LIMITE_DE_ITENS_EXCEDIDO,
-                f"'{step.items}' tem {len(value)} itens, mais que o limite de "
-                f"{step.max_items} do passo '{step.title}'.",
-                details={"itens": len(value), "limite": step.max_items},
-            )
+            # Listas de entradas já foram conferidas antes do primeiro passo; aqui
+            # sobram as tabelas extraídas da página.
+            raise self._too_many_items(step, len(value))
         return list(value)
 
     async def _prepare(self, step: Step, ctx: _StepCtx) -> _Action:
@@ -919,7 +1530,7 @@ class Interpreter:
         return self._page
 
     def _prepare_navigate(self, step: NavigateStep, ctx: _StepCtx) -> _Action:
-        url = self._render(step.url)
+        url = self._render_url(step)
         try:
             parts = urlsplit(url)
             host = (parts.hostname or "").lower()
@@ -961,6 +1572,39 @@ class Interpreter:
             return {"dominio": host, "status": response.status if response is not None else None}
 
         return act
+
+    def _render_url(self, step: NavigateStep) -> str:
+        """Monta o endereço codificando cada valor como um único trecho.
+
+        ``?``, ``#`` ou ``&`` num valor nunca mudam o caminho nem a consulta; no
+        caminho e na rota do fragmento (do ``#`` até um ``?`` dentro dele), valores
+        vazios, com ``/``, ``\\`` ou ``%`` ou iguais a ``.`` e ``..`` (também na
+        forma NFKC) são recusados. Domínio, porta e usuário vêm só do trecho
+        literal do começo. Valores de entradas e itens já foram conferidos antes
+        do primeiro passo; aqui a conferência pega os de variáveis.
+        """
+        try:
+            slots = _url_slots(templates.parse(step.url))
+        except templates.TemplateError:
+            slots = {}  # _render recusa o template antes de codificar qualquer valor
+        url = self._render(
+            step.url,
+            encode=lambda index, text: _encode_url_value(text, slots.get(index, "caminho")),
+        )
+        parts = templates.parse(step.url)  # já conferido por _render
+        prefix = parts[0] if parts and isinstance(parts[0], str) else ""
+        try:
+            fixed = urlsplit(prefix).netloc.lower() == urlsplit(url).netloc.lower()
+        except ValueError:
+            fixed = False
+        if not fixed:
+            raise StepError(
+                ErrorCode.DOMINIO_NAO_PERMITIDO,
+                f"O domínio do endereço do passo '{step.title}' precisa ser fixo; só o "
+                "caminho e a consulta podem usar valores.",
+                details={"dominio": _host(url)},
+            )
+        return url
 
     async def _prepare_click(self, step: ClickStep, ctx: _StepCtx) -> _Action:
         locator = await self._resolve(step.target, step, ctx)
@@ -1114,7 +1758,8 @@ class Interpreter:
 
         async def act() -> dict[str, Any]:
             raw = await locator.evaluate(_READ_TABLE_JS, step.max_rows, timeout=ctx.remaining_ms())
-            headers = [str(h) for h in raw.get("headers", [])]
+            # Cabeçalhos viram chaves: mascarados antes, os repetidos viram coluna_N.
+            headers = [self._redactor.text(str(h)) for h in raw.get("headers", [])]
             rows = [[str(cell) for cell in row] for row in raw.get("rows", [])]
             keys = self._table_keys(step.columns, headers, rows)
             table = [
@@ -1156,7 +1801,7 @@ class Interpreter:
         return act
 
     async def _prepare_download(self, step: DownloadStep, ctx: _StepCtx) -> _Action:
-        name = sanitize_filename(self._render(step.save_as), default=f"{step.id}.bin")
+        name = self._artifact_name(self._render(step.save_as), default=f"{step.id}.bin")
         locator = await self._resolve(step.target, step, ctx)
 
         async def act() -> dict[str, Any]:
@@ -1186,10 +1831,17 @@ class Interpreter:
                 except PlaywrightError:
                     pass
             await self._register_artifact(step.id, ref)
-            self._vars[step.into] = ref.model_dump(mode="json")
+            # A própria referência: na saída, só o hash dela fica fora da máscara.
+            self._vars[step.into] = ref
             return {"arquivo": ref.name, "tamanho": ref.size, "sha256": ref.sha256}
 
         return act
+
+    def _artifact_name(self, rendered: str, *, default: str) -> str:
+        """Nome saneado e sem segredos: vira o nome e o caminho do artefato."""
+        name = sanitize_filename(self._redactor.text(rendered), default=default)
+        # O saneamento tira acentos e separadores e poderia remontar um segredo.
+        return name if self._redactor.text(name) == name else default
 
     async def _prepare_upload(self, step: UploadStep, ctx: _StepCtx) -> _Action:
         file_id = self._inputs.get(step.file_input)
@@ -1218,7 +1870,7 @@ class Interpreter:
     # Templates, localizadores e condições
     # ------------------------------------------------------------------
 
-    def _render(self, template: str) -> str:
+    def _render(self, template: str, *, encode: Callable[[int, str], str] | None = None) -> str:
         scopes: dict[templates.Scope, Mapping[str, object]] = {
             templates.Scope.INPUTS: self._inputs,
             templates.Scope.VARS: self._vars,
@@ -1226,7 +1878,7 @@ class Interpreter:
         if self._items:
             scopes[templates.Scope.ITEM] = self._items[-1][0]
         try:
-            return templates.render(template, scopes)
+            return templates.render(template, scopes, encode=encode)
         except templates.TemplateError as exc:
             raise StepError(
                 ErrorCode.TEMPLATE_INVALIDO, f"Não consegui montar um valor do passo: {exc}."
@@ -1256,16 +1908,94 @@ class Interpreter:
                 assert_never(locator.by)
 
     def _candidates(self, target: Target) -> list[PwLocator]:
+        self._refuse_dynamic_selectors(target)
         root: Page | FrameLocator = self.page
         for selector in target.frames:
             root = root.frame_locator(selector)
         container: _Root = root
         if target.within is not None:
             within = self._build(root, target.within)
-            if target.within_has_text is not None:
-                within = within.filter(has_text=self._render(target.within_has_text))
+            key = self._row_key(target)
+            if key is not None:
+                # O texto precisa ser o texto inteiro de um elemento do contêiner (uma
+                # célula, por exemplo), com os mesmos caracteres e as mesmas
+                # maiúsculas: "12" não escolhe a linha da nota "120" nem a do valor
+                # "12,00", e "ab3x" não escolhe a de "AB3X". Mais de um contêiner com
+                # o texto continua ambíguo.
+                within = within.filter(has=self.page.get_by_text(_whole_text(key)))
             container = within
         return [self._build(container, locator) for locator in target.locators]
+
+    def _row_key(self, target: Target) -> str | None:
+        """O texto que escolhe o contêiner do alvo, normalizado (``None`` se não houver)."""
+        if target.within is None or target.within_has_text is None:
+            return None
+        # Normalizada como o Playwright normaliza: um texto só de U+200B, U+00AD ou
+        # U+FEFF (a célula vazia de um CSV do Excel) fica vazio. Cada valor é
+        # conferido sozinho (entradas e itens já foram antes do primeiro passo; aqui
+        # entram as variáveis): um valor vazio numa chave com trecho fixo deixaria só
+        # o trecho fixo.
+        key = _normalize_text(self._render(target.within_has_text, encode=_row_key_value))
+        if not key:
+            # Sem texto, qualquer elemento vazio (uma célula, um botão só com ícone)
+            # serviria, e qualquer contêiner seria escolhido.
+            raise StepError(
+                ErrorCode.TEMPLATE_INVALIDO,
+                f"O texto que escolhe o contêiner de '{target.intent}' ficou vazio; "
+                "sem ele não há como saber qual usar.",
+            )
+        return key
+
+    def _row_not_acted_on(self, step: Step) -> str | None:
+        """O texto da linha onde um passo que grava vai agir, se ele ainda não agiu nela.
+
+        Rede de segurança contra ações repetidas: numa execução, o mesmo passo que
+        grava nunca age duas vezes na linha escolhida pelo mesmo texto. Isso acontece
+        com itens repetidos numa lista e com duas linhas que a página mostra iguais
+        (``ab3x`` em maiúsculas pelo CSS ao lado de ``AB3X``), lidas com o mesmo texto
+        e que escolheriam a mesma linha. A segunda vez falha antes de agir, e antes do
+        aviso de passo irreversível. Passos de leitura e passos diferentes na mesma
+        linha não contam.
+        """
+        if step.effect is Effect.READ:
+            return None
+        target = getattr(step, "target", None)
+        if not isinstance(target, Target):
+            return None
+        key = self._row_key(target)
+        if key is None:
+            return None
+        acted = self._acted_rows.get(step.id, {})
+        if key in acted:
+            details: dict[str, object] = {"alvo": target.intent}
+            if (previous := acted[key]) is not None:
+                details["iteracao_anterior"] = previous
+            raise StepError(
+                ErrorCode.ELEMENTO_AMBIGUO,
+                f"O passo '{step.title}' já agiu, nesta execução, em '{target.intent}' na "
+                "linha escolhida por este mesmo texto; agir de novo repetiria a ação na "
+                "mesma linha, então nada foi feito agora. Confira se a lista tem itens "
+                "repetidos ou se a página mostra o texto da linha diferente do HTML (por "
+                "exemplo, em maiúsculas pelo text-transform do CSS).",
+                details=details,
+            )
+        return key
+
+    @staticmethod
+    def _refuse_dynamic_selectors(target: Target) -> None:
+        """Seletores CSS/XPath não escapam valores: um valor com aspas ou colchetes
+        escolheria outro elemento. Vale também para robôs publicados antes de o
+        portão de política recusar isso."""
+        locators = [*target.locators, *([target.within] if target.within is not None else [])]
+        for locator in locators:
+            if locator.by in RAW_SELECTORS and _has_references(locator.value):
+                raise StepError(
+                    ErrorCode.TEMPLATE_INVALIDO,
+                    f"O alvo '{target.intent}' usa uma entrada, variável ou item num "
+                    f"localizador {locator.by.value}, onde o valor entraria cru no seletor. "
+                    "O robô precisa de conserto.",
+                    details={"estrategia": locator.by.value},
+                )
 
     @staticmethod
     async def _count(locator: PwLocator) -> int:

@@ -29,7 +29,9 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from rapa.control.auth import (
     Authenticator,
@@ -49,9 +51,17 @@ from rapa.control.launcher import (
     StaticSecretSource,
 )
 from rapa.control.services import Dispatcher, PgPlatform, PgPrincipalResolver, PgRunQueue
+from rapa.control.services.queue import DEFAULT_MAX_DURATION
 from rapa.core.contracts import Principal
 
-__all__ = ["AuthenticatorLoginResolver", "ServerSettings", "create_server_app", "main"]
+__all__ = [
+    "AuthenticatorLoginResolver",
+    "DispatcherSupervisor",
+    "ServerSettings",
+    "create_server_app",
+    "dispatcher_pool_size",
+    "main",
+]
 
 logger = logging.getLogger("rapa.server")
 
@@ -110,6 +120,7 @@ class ServerSettings(BaseModel):
     )
     chromium: str | None = None
     browser_args: tuple[str, ...] = ()
+    #: Arquivos de entrada, numa subpasta por empresa (``<pasta>/<uuid da empresa>/``).
     files_dir: Path | None = None
 
     @model_validator(mode="after")
@@ -146,7 +157,10 @@ class ServerSettings(BaseModel):
           e ``RAPA_SEGREDOS_DEV`` (JSON ``{"uuid da empresa": {"credencial": {...}}}``);
         - ``RAPA_CONCORRENCIA``, ``RAPA_PASTA_TRABALHO``, ``RAPA_PASTA_ARTEFATOS``,
           ``RAPA_PASTA_ARQUIVOS``, ``RAPA_CHROMIUM_PATH`` e ``RAPA_ARGS_NAVEGADOR``
-          (argumentos separados por espaço, com aspas se preciso);
+          (argumentos separados por espaço, com aspas se preciso). A pasta de
+          arquivos de entrada tem uma subpasta por empresa:
+          ``<RAPA_PASTA_ARQUIVOS>/<uuid da empresa>/<arquivo>``; cada execução só
+          enxerga a subpasta da própria empresa, e arquivos soltos na raiz não valem;
         - ``RAPA_MCP_ORIGENS`` (separadas por vírgula), ``RAPA_LIMITE_POR_SEGUNDO``
           (0 desliga) e ``RAPA_COOKIE_SEGURO``.
         """
@@ -311,8 +325,201 @@ def _mount_ui(
     create_ui(
         app,
         backend_factory=ContractsBackendFactory.from_platform(platform),
-        auth=UiAuth(dev=dev_login, oidc=oidc, cookie_secure=settings.cookie_secure),
+        # A interface age direto nos serviços, então a sessão confere de novo no banco
+        # (conta ativa e papéis), como a API faz a cada pedido.
+        auth=UiAuth(
+            dev=dev_login,
+            oidc=oidc,
+            cookie_secure=settings.cookie_secure,
+            principals=authenticator.resolver,
+        ),
     )
+
+
+def dispatcher_pool_size(concurrency: int) -> int:
+    """Conexões do pool do banco do despachante para ``concurrency`` execuções juntas.
+
+    Cada execução em andamento pode usar duas conexões ao mesmo tempo (a renovação
+    da concessão e a gravação dos eventos ou do resultado), e o laço principal usa
+    mais duas (pegar a próxima execução e a manutenção da fila). Com menos, as
+    execuções disputam o pool e a renovação da concessão pode atrasar.
+    """
+    return 2 * concurrency + 2
+
+
+#: Espera máxima pelas execuções em andamento no encerramento. Toda execução termina
+#: sozinha antes disso: o prazo dela é de no máximo ``DEFAULT_MAX_DURATION``, o
+#: lançador para o executor logo depois do prazo e o despachante insiste em gravar o
+#: resultado por até 5 minutos além dele. Passar daqui é sinal de algo preso.
+_DRAIN_TIMEOUT_S = DEFAULT_MAX_DURATION.total_seconds() + 600.0
+
+
+class DispatcherSupervisor:
+    """Mantém o despachante deste processo rodando e diz se ele está de pé.
+
+    O laço do despachante já sobrevive aos erros de cada volta. Se mesmo assim ele
+    parar sem ter sido pedido (um erro inesperado), o supervisor registra o tipo do
+    erro e o reinicia depois de ``restart_delay_s``, espera que dobra a cada parada
+    seguida, até ``max_restart_delay_s``. Reiniciar é seguro: as execuções em
+    andamento continuam no mesmo :class:`Dispatcher`, que só volta a pegar novas.
+    Enquanto o despachante não está rodando, :attr:`healthy` é falso e ``/saude``
+    responde 503.
+
+    ``drain_timeout_s`` é quanto o encerramento espera, depois de o laço parar, as
+    execuções que ficaram em andamento (veja :func:`_stop_dispatcher`).
+    """
+
+    def __init__(
+        self,
+        dispatcher: Dispatcher,
+        *,
+        restart_delay_s: float = 1.0,
+        max_restart_delay_s: float = 30.0,
+        drain_timeout_s: float = _DRAIN_TIMEOUT_S,
+    ) -> None:
+        if restart_delay_s <= 0 or max_restart_delay_s < restart_delay_s:
+            raise ValueError("as esperas para reiniciar o despachante precisam ser positivas")
+        if drain_timeout_s <= 0:
+            raise ValueError("a espera pelas execuções no encerramento precisa ser positiva")
+        self.dispatcher = dispatcher
+        self.restart_delay_s = restart_delay_s
+        self.max_restart_delay_s = max_restart_delay_s
+        self.drain_timeout_s = drain_timeout_s
+        #: Quantas vezes o despachante parou sem pedido e foi reiniciado.
+        self.restarts = 0
+        self._task: asyncio.Task[None] | None = None
+        self._running = False
+
+    @property
+    def healthy(self) -> bool:
+        """O despachante está rodando e nenhuma etapa do laço falha (ou trava) há tempo demais."""
+        running = self._running and self._task is not None and not self._task.done()
+        return running and self.dispatcher.healthy
+
+    @property
+    def problem(self) -> dict[str, Any]:
+        """O que ``/saude`` mostra quando não está saudável: só nomes, nunca o texto do erro."""
+        if not (self._running and self._task is not None and not self._task.done()):
+            return {"estado": "despachante_parado"}
+        detail: dict[str, Any] = {"estado": "despachante_com_falha"}
+        if self.dispatcher.stalled:
+            detail["volta_presa"] = True
+        failing = sorted(self.dispatcher.failing)
+        if failing:
+            detail["etapas"] = failing
+        return detail
+
+    def start(self, stop: asyncio.Event) -> asyncio.Task[None]:
+        """Começa a supervisionar; a tarefa termina quando ``stop`` é acionado.
+
+        Só uma vez por supervisor: uma segunda chamada levanta ``RuntimeError``
+        antes de criar qualquer tarefa.
+        """
+        if self._task is not None:
+            raise RuntimeError("o despachante já foi iniciado")
+        self._running = True
+        self._task = asyncio.create_task(self._supervise(stop), name="despachante")
+        self._task.add_done_callback(self._ended)
+        return self._task
+
+    async def _supervise(self, stop: asyncio.Event) -> None:
+        loop = asyncio.get_running_loop()
+        delay = self.restart_delay_s
+        while True:
+            self._running = True
+            started = loop.time()
+            error: str | None = None
+            try:
+                await self.dispatcher.run(stop)
+            except Exception as exc:
+                # Só o tipo: a mensagem de um erro inesperado pode trazer dados.
+                error = type(exc).__name__
+            finally:
+                self._running = False
+            if stop.is_set():
+                if error is not None:
+                    logger.error("o despachante falhou ao encerrar: %s", error)
+                return
+            reason = error or "parou sem pedido"
+            if loop.time() - started >= self.max_restart_delay_s:
+                delay = self.restart_delay_s  # rodou bem por um tempo: espera curta de novo
+            self.restarts += 1
+            logger.error("o despachante parou (%s); reiniciando em %.1f s", reason, delay)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=delay)
+            if stop.is_set():
+                return
+            delay = min(delay * 2, self.max_restart_delay_s)
+
+    def _ended(self, task: asyncio.Task[None]) -> None:
+        self._running = False
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error("a supervisão do despachante parou: %s", type(error).__name__)
+
+
+async def _stop_dispatcher(
+    supervisor: DispatcherSupervisor, stop: asyncio.Event, task: asyncio.Task[None]
+) -> None:
+    """Pede a parada e espera o despachante terminar o que está em andamento.
+
+    Quando está rodando, o laço do despachante espera sozinho as execuções em
+    andamento ao parar. Mas, se ele estava parado na espera para reiniciar, ou se a própria
+    supervisão já tinha parado com erro (registrado em
+    :meth:`DispatcherSupervisor._ended`), as execuções continuam no despachante e
+    são esperadas aqui, antes de o ``lifespan`` fechar os bancos.
+
+    Essa espera vai até ``drain_timeout_s``. O que ainda estiver em andamento é
+    registrado (só a contagem) e interrompido: o lançador para o executor e nada é
+    gravado; quando a concessão vencer, o recolhimento devolve a execução à fila
+    ou, se um passo irreversível já tinha começado, a marca como indeterminada.
+    """
+    stop.set()
+    await asyncio.gather(task, return_exceptions=True)
+    dispatcher = supervisor.dispatcher
+    if dispatcher.in_flight == 0:
+        return
+    logger.warning(
+        "o laço do despachante já tinha parado; esperando %d execução(ões) em andamento",
+        dispatcher.in_flight,
+    )
+    draining = asyncio.ensure_future(dispatcher.drain())
+    try:
+        done, _ = await asyncio.wait({draining}, timeout=supervisor.drain_timeout_s)
+        if not done:
+            logger.error(
+                "%d execução(ões) ainda em andamento depois de %g s; interrompidas sem "
+                "gravar o resultado (o recolhimento decide quando a concessão vencer)",
+                dispatcher.in_flight,
+                supervisor.drain_timeout_s,
+            )
+    finally:
+        if not draining.done():
+            # Cancelar a espera cancela as execuções: o lançador para cada executor.
+            draining.cancel()
+            await asyncio.gather(draining, return_exceptions=True)
+
+
+class _DispatcherHealth:
+    """Faz ``/saude`` responder 503 enquanto o despachante deste processo estiver parado,
+    com uma etapa falhando há tempo demais ou com uma volta do laço presa."""
+
+    def __init__(self, app: ASGIApp, supervisor: DispatcherSupervisor) -> None:
+        self.app = app
+        self.supervisor = supervisor
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and scope["path"] == "/saude" and not self.supervisor.healthy:
+            response = JSONResponse(
+                self.supervisor.problem,
+                status_code=503,
+                headers={"Cache-Control": "no-store"},
+            )
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
 
 
 def build_dispatcher(settings: ServerSettings, db: Database) -> Dispatcher:
@@ -335,10 +542,20 @@ def build_dispatcher(settings: ServerSettings, db: Database) -> Dispatcher:
 
 
 def create_server_app(settings: ServerSettings) -> FastAPI:
-    """Monta a aplicação: REST e MCP, interface (opcional) e despachante (opcional)."""
+    """Monta a aplicação: REST e MCP, interface (opcional) e despachante (opcional).
+
+    O ``lifespan`` da aplicação roda uma vez só: para subir de novo, monte outra.
+    Ele envolve tudo, inclusive a interface: o despachante para (e espera as
+    execuções em andamento), depois o gateway MCP e a interface encerram, e só
+    então o verificador de tokens e os bancos são fechados, mesmo se a subida
+    falhar no meio.
+    """
     db = Database.from_url(settings.database_url)
     dispatcher_db = (
-        Database.from_url(settings.dispatcher_database_url)
+        Database.from_url(
+            settings.dispatcher_database_url,
+            pool_size=dispatcher_pool_size(settings.concurrency),
+        )
         if settings.dispatcher_database_url
         else None
     )
@@ -368,29 +585,49 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
             return {"estado": "ok"}
 
     dispatcher = build_dispatcher(settings, dispatcher_db) if dispatcher_db else None
+    supervisor = DispatcherSupervisor(dispatcher) if dispatcher else None
+    if supervisor is not None:
+        app.add_middleware(_DispatcherHealth, supervisor=supervisor)
+    app.state.dispatcher = dispatcher
+    app.state.dispatcher_supervisor = supervisor
+    if settings.http and settings.ui:
+        # Antes de envolver o lifespan: o NiceGUI (ui.run_with) envolve o que encontrar
+        # com a subida e o encerramento dele, e esse conjunto fica dentro do nosso.
+        _mount_ui(app, settings, platform, Authenticator(verifier, resolver))  # type: ignore[arg-type]
     inner = app.router.lifespan_context
+    started = False
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[Any]:
-        async with inner(application) as state:
-            stop = asyncio.Event()
-            task = asyncio.create_task(dispatcher.run(stop)) if dispatcher else None
-            try:
-                yield state
-            finally:
-                stop.set()
-                if task is not None:
-                    await task
-                if isinstance(verifier, TokenVerifier):
-                    await verifier.aclose()
-                await db.dispose()
-                if dispatcher_db is not None:
-                    await dispatcher_db.dispose()
+        # A interface, o gateway MCP e o despachante só sobem uma vez por aplicação.
+        # Uma segunda entrada (outro TestClient na mesma aplicação, por exemplo) é
+        # recusada aqui, por fora de tudo, antes de abrir qualquer coisa (nem a subida
+        # do NiceGUI roda de novo) ou de mexer no que já está rodando.
+        nonlocal started
+        if started:
+            raise RuntimeError(
+                "o serviço desta aplicação já foi iniciado uma vez; "
+                "monte outra com create_server_app"
+            )
+        started = True
+        async with contextlib.AsyncExitStack() as stack:
+            # Fechados por último e sempre, mesmo se a subida falhar no meio.
+            stack.push_async_callback(db.dispose)
+            if dispatcher_db is not None:
+                stack.push_async_callback(dispatcher_db.dispose)
+            if isinstance(verifier, TokenVerifier):
+                stack.push_async_callback(verifier.aclose)
+            # A interface (se houver) e o gateway MCP: encerram antes de fechar os bancos.
+            state = await stack.enter_async_context(inner(application))
+            if supervisor is not None:
+                stop = asyncio.Event()
+                stack.push_async_callback(
+                    _stop_dispatcher, supervisor, stop, supervisor.start(stop)
+                )
+            yield state
 
+    # Por último: nada instalado depois fica por fora da recusa da segunda entrada.
     app.router.lifespan_context = lifespan
-    app.state.dispatcher = dispatcher
-    if settings.http and settings.ui:
-        _mount_ui(app, settings, platform, Authenticator(verifier, resolver))  # type: ignore[arg-type]
     return app
 
 

@@ -198,6 +198,14 @@ class RunnerJob(_Model):
     mode: RunMode = RunMode.FULL
     #: Prazo da execução, sempre com fuso horário.
     deadline: AwareDatetime
+    first_seq: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Número do primeiro evento desta tentativa: a numeração continua a das "
+            "tentativas anteriores, para que (run_id, seq) seja único na execução"
+        ),
+    )
 
 
 class ContractError(Exception):

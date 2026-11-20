@@ -18,6 +18,14 @@ Os pedidos de login pendentes (o bilhete do login de desenvolvimento e o
 ``rapa_vinculo``, criado antes de a pessoa escolher como entrar. Assim um
 bilhete ou um retorno do provedor capturado por outra pessoa não serve em outro
 navegador (proteção contra CSRF de login).
+
+O principal guardado na sessão não vale pelas 8 horas da sessão: com um
+:class:`PrincipalResolver`, a sessão confere de novo no banco, a cada
+``principal_ttl`` (30 s por padrão), se a conta continua ativa e quais papéis
+tem, como a API faz a cada pedido. Conta desativada ou sem vínculo encerra a
+sessão; papéis mudados passam a valer na hora. No OIDC, cada renovação do token
+de acesso também passa o token novo pelo resolvedor do login, o que pega quem
+saiu da organização no Keycloak.
 """
 
 import asyncio
@@ -28,10 +36,11 @@ import re
 import secrets
 import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
 from urllib.parse import quote, urlencode, urlsplit
+from uuid import UUID
 
 import httpx2
 from authlib.integrations.httpx_client import AsyncOAuth2Client
@@ -57,6 +66,7 @@ __all__ = [
     "OidcLogin",
     "OidcSettings",
     "PendingLogin",
+    "PrincipalResolver",
     "SessionStore",
     "TokenSet",
     "UiAuth",
@@ -87,6 +97,7 @@ _BINDING_MAX_AGE = timedelta(hours=12)
 _DEV_TICKET_TTL = timedelta(minutes=2)
 _OIDC_PENDING_TTL = timedelta(minutes=10)
 _TOUCH_EVERY = timedelta(seconds=30)
+_PRINCIPAL_TTL = timedelta(seconds=30)
 _REFRESH_MARGIN_S = 30.0
 _PROFILE_KEY = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 
@@ -155,6 +166,9 @@ class UiSession:
     expires_at: datetime
     last_seen: datetime
     tokens: TokenSet | None = field(default=None, repr=False)
+    #: Última vez que o principal foi conferido no :class:`PrincipalResolver`
+    #: (``None``: ainda não conferido desde o login).
+    principal_checked_at: datetime | None = None
 
     @property
     def access_token(self) -> str | None:
@@ -175,10 +189,69 @@ class PendingLogin:
     code_verifier: str | None = field(default=None, repr=False)
 
 
-class SessionStore(Protocol):
-    """Onde ficam as sessões e os logins pendentes (memória, ou uma tabela do Postgres)."""
+class PrincipalResolver(Protocol):
+    """Busca o principal atual (conta ativa e papéis) de quem já entrou.
 
-    async def save(self, session: UiSession) -> None: ...
+    Mesma forma de ``rapa.control.auth.PrincipalResolver``; na integração, o
+    ``PgPrincipalResolver`` do plano de controle. ``None`` quer dizer sem acesso.
+    """
+
+    async def resolve(self, subject: str, company_id: UUID) -> Principal | None: ...
+
+
+class SessionStore(Protocol):
+    """Onde ficam as sessões e os logins pendentes (memória, ou uma tabela do Postgres).
+
+    A chave de uma sessão nunca se repete (é o hash de um cookie aleatório), então
+    uma sessão apagada só voltaria se alguém a regravasse, e nenhuma das gravações
+    de uma sessão existente faz isso: se ela não está mais guardada (saída, novo
+    login, conta sem acesso, ou venceu enquanto quem chama esperava o banco ou o
+    provedor), nada é gravado e o resultado é ``None``.
+
+    Uma sessão existente nunca é regravada inteira, só os campos de quem grava.
+    Assim, duas requisições da mesma sessão (abas, temporizadores) que leram
+    versões diferentes não desfazem uma o que a outra gravou: a conferência do
+    principal nunca mexe nos tokens, e a renovação dos tokens nunca troca um
+    principal conferido depois do começo dela. Cada gravação devolve a sessão
+    como ficou guardada; numa tabela, é um único ``UPDATE ... RETURNING``.
+    """
+
+    async def save(self, session: UiSession) -> None:
+        """Grava uma sessão nova, sem condição (só no login)."""
+        ...
+
+    async def update_principal(
+        self, key: str, principal: Principal, checked_at: datetime
+    ) -> UiSession | None:
+        """Grava o principal conferido em ``checked_at``, sem tocar em nenhum outro campo.
+
+        Não troca uma conferência mais nova: se a guardada tem ``principal_checked_at``
+        posterior a ``checked_at``, fica a guardada. Numa tabela::
+
+            UPDATE sessoes SET
+              principal = CASE WHEN principal_checked_at IS NULL
+                OR principal_checked_at <= :conferida THEN :principal ELSE principal END,
+              principal_checked_at = CASE WHEN principal_checked_at IS NULL
+                OR principal_checked_at <= :conferida THEN :conferida
+                ELSE principal_checked_at END
+            WHERE chave = :chave RETURNING *
+        """
+        ...
+
+    async def update_tokens(
+        self, key: str, tokens: TokenSet, principal: Principal, checked_at: datetime
+    ) -> UiSession | None:
+        """Grava os tokens renovados e o principal conferido com eles em ``checked_at``.
+
+        Os tokens são sempre gravados (as renovações de uma sessão são feitas uma de
+        cada vez); o principal e ``principal_checked_at`` seguem a mesma condição de
+        :meth:`update_principal`. Nenhum outro campo muda.
+        """
+        ...
+
+    async def touch(self, key: str, last_seen: datetime) -> UiSession | None:
+        """Grava só o último uso, e só para a frente (``GREATEST`` numa tabela)."""
+        ...
 
     async def load(self, key: str) -> UiSession | None: ...
 
@@ -191,8 +264,17 @@ class SessionStore(Protocol):
     async def prune(self, now: datetime) -> None: ...
 
 
+def _checked_later(stored: UiSession, checked_at: datetime) -> bool:
+    """A sessão guardada tem uma conferência do principal mais nova que ``checked_at``."""
+    return stored.principal_checked_at is not None and stored.principal_checked_at > checked_at
+
+
 class MemorySessionStore:
-    """Sessões em memória, para desenvolvimento, testes e uma réplica só."""
+    """Sessões em memória, para desenvolvimento, testes e uma réplica só.
+
+    Cada gravação troca a sessão guardada por uma cópia com os campos novos, sem
+    nenhuma espera no meio: quem guardou uma versão anterior não a vê mudar.
+    """
 
     def __init__(self, *, max_sessions: int = 10_000, max_pending: int = 10_000) -> None:
         self._sessions: dict[str, UiSession] = {}
@@ -207,6 +289,37 @@ class MemorySessionStore:
         self._sessions[session.key] = session
         while len(self._sessions) > self._max_sessions:
             del self._sessions[next(iter(self._sessions))]
+
+    def _set(self, stored: UiSession, **fields: Any) -> UiSession:
+        changed = replace(stored, **fields)
+        self._sessions[stored.key] = changed
+        return changed
+
+    async def update_principal(
+        self, key: str, principal: Principal, checked_at: datetime
+    ) -> UiSession | None:
+        stored = self._sessions.get(key)
+        if stored is None or _checked_later(stored, checked_at):
+            return stored
+        return self._set(stored, principal=principal, principal_checked_at=checked_at)
+
+    async def update_tokens(
+        self, key: str, tokens: TokenSet, principal: Principal, checked_at: datetime
+    ) -> UiSession | None:
+        stored = self._sessions.get(key)
+        if stored is None:
+            return None
+        if _checked_later(stored, checked_at):
+            return self._set(stored, tokens=tokens)
+        return self._set(
+            stored, tokens=tokens, principal=principal, principal_checked_at=checked_at
+        )
+
+    async def touch(self, key: str, last_seen: datetime) -> UiSession | None:
+        stored = self._sessions.get(key)
+        if stored is None or stored.last_seen >= last_seen:
+            return stored
+        return self._set(stored, last_seen=last_seen)
 
     async def load(self, key: str) -> UiSession | None:
         return self._sessions.get(key)
@@ -284,6 +397,10 @@ class LoginResolver(Protocol):
     papéis vêm do banco, nunca do token; ``None`` quer dizer sem acesso. Na
     integração, use o autenticador da camada HTTP, por exemplo
     ``await authenticator.authenticate(f"Bearer {access_token}")``.
+
+    Também é chamado a cada renovação do token de acesso, para conferir que a
+    conta ainda tem acesso; aí não há ID token conferido e as declarações vêm
+    vazias, então a decisão precisa sair do token de acesso.
     """
 
     async def resolve(self, claims: Mapping[str, Any], access_token: str) -> Principal | None: ...
@@ -448,6 +565,21 @@ class OidcLogin:
             raise OidcError("renovação recusada") from None
         return self._token_set(token, previous=tokens)
 
+    async def recheck(self, tokens: TokenSet) -> Principal | None:
+        """Confere, com o token de acesso renovado, se a conta ainda tem acesso.
+
+        Passa o token pelo mesmo resolvedor do login (sem declarações: a renovação
+        não traz ID token conferido). ``None`` quer dizer sem acesso; uma falha do
+        resolvedor vira :class:`OidcError`, e quem chama encerra a sessão.
+        """
+        try:
+            return await self._resolver.resolve({}, tokens.access_token)
+        except Exception as exc:
+            logger.warning(
+                "falha ao conferir o acesso com o token renovado: %s", type(exc).__name__
+            )
+            raise OidcError("conferência do acesso falhou") from None
+
     async def logout_url(self) -> str | None:
         """Endereço de saída no provedor (sem mandar o ID token ao navegador)."""
         try:
@@ -476,6 +608,10 @@ class LoginError(Exception):
         self.code = code
 
 
+def _same_identity(a: Principal, b: Principal) -> bool:
+    return a.subject == b.subject and a.company_id == b.company_id
+
+
 def _no_store(response: Response) -> Response:
     response.headers["Cache-Control"] = "no-store"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -494,6 +630,8 @@ class UiAuth:
         cookie_secure: bool = True,
         session_ttl: timedelta = timedelta(hours=8),
         idle_timeout: timedelta = timedelta(minutes=30),
+        principals: PrincipalResolver | None = None,
+        principal_ttl: timedelta = _PRINCIPAL_TTL,
         clock: Callable[[], datetime] = _utcnow,
     ) -> None:
         if dev is None and oidc is None:
@@ -504,6 +642,11 @@ class UiAuth:
         self.cookie_secure = cookie_secure
         self.session_ttl = session_ttl
         self.idle_timeout = idle_timeout
+        #: Confere o principal no banco. Sem ele (no mundo em memória de
+        #: desenvolvimento, ou com o backend REST, em que a API confere a cada
+        #: pedido), a sessão fica com o principal do login.
+        self.principals = principals
+        self.principal_ttl = principal_ttl
         self._clock = clock
         self._refresh_locks: dict[str, asyncio.Lock] = {}
 
@@ -517,6 +660,19 @@ class UiAuth:
         return await self.session_by_key(_digest(cookie))
 
     async def session_by_key(self, key: str) -> UiSession | None:
+        """Sessão guardada, se ainda vale e se a conta ainda tem acesso.
+
+        Com um :class:`PrincipalResolver`, confere o principal de novo quando a
+        última conferência passou de ``principal_ttl``. Uma falha do resolvedor
+        sobe para quem chamou: a ação nunca segue com o principal antigo.
+
+        Só grava os campos que esta conferência muda (o principal com a hora da
+        conferência, e o último uso), nunca a sessão inteira carregada antes da
+        espera. Assim, uma saída ou uma conta desativada vista por outra requisição
+        enquanto esta esperava o banco nunca é desfeita aqui, uma conferência mais
+        nova continua valendo e os tokens renovados no meio-tempo ficam (o provedor
+        pode já ter trocado o token de renovação).
+        """
         session = await self.store.load(key)
         if session is None:
             return None
@@ -524,10 +680,40 @@ class UiAuth:
         if now >= session.expires_at or now - session.last_seen >= self.idle_timeout:
             await self.end_session(key)
             return None
+        if self.principals is not None and self._principal_due(session, now):
+            # A conferência vale a partir de antes da consulta, nunca do fim dela.
+            current = await self._current_principal(self.principals, session)
+            if current is None:
+                await self.end_session(key)
+                return None
+            stored = await self.store.update_principal(key, current, now)
+            if stored is None:  # encerrada no meio-tempo: continua encerrada
+                return None
+            session = stored
         if now - session.last_seen >= _TOUCH_EVERY:
-            session.last_seen = now
-            await self.store.save(session)
+            return await self.store.touch(key, now)
         return session
+
+    def _principal_due(self, session: UiSession, now: datetime) -> bool:
+        checked = session.principal_checked_at
+        return checked is None or now - checked >= self.principal_ttl
+
+    @staticmethod
+    async def _current_principal(
+        resolver: PrincipalResolver, session: UiSession
+    ) -> Principal | None:
+        """Principal atual no banco, ou ``None`` se a conta perdeu o acesso."""
+        old = session.principal
+        current = await resolver.resolve(old.subject, old.company_id)
+        if current is None:
+            logger.info("sessão da interface encerrada: a conta não tem mais acesso")
+            return None
+        if not _same_identity(current, old):
+            logger.warning("principal recalculado não confere com a sessão; sessão encerrada")
+            return None
+        if current.client_id is None and old.client_id is not None:
+            current = current.model_copy(update={"client_id": old.client_id})
+        return current
 
     async def fresh_session(self, key: str) -> UiSession | None:
         """Como :meth:`session_by_key`, renovando o token de acesso se estiver para vencer."""
@@ -552,13 +738,24 @@ class UiAuth:
             return None
         if not session.tokens.expires_soon(time.time()):
             return session
+        # A conferência vale a partir de antes da consulta, nunca do fim dela.
+        checked_at = self._clock()
         try:
-            session.tokens = await self.oidc.refresh(session.tokens)
+            tokens = await self.oidc.refresh(session.tokens)
+            # O token novo passa pela mesma conferência do login: quem saiu da
+            # organização no provedor, ou perdeu o acesso no banco, sai daqui também.
+            current = await self.oidc.recheck(tokens)
         except OidcError:
             await self.end_session(key)
             return None
-        await self.store.save(session)
-        return session
+        if current is None or not _same_identity(current, session.principal):
+            logger.info("sessão da interface encerrada: o token renovado não dá mais acesso")
+            await self.end_session(key)
+            return None
+        # Só os tokens e o principal conferido com eles. Encerrada no meio-tempo:
+        # continua encerrada (None). Conferida por outra requisição depois do começo
+        # desta: fica o principal dela, com os tokens novos.
+        return await self.store.update_tokens(key, tokens, current, checked_at)
 
     async def start_session(
         self,

@@ -4,11 +4,13 @@ A "pessoa" é simulada com ações do Playwright que disparam eventos reais do D
 (fill, click, select_option, check, set_input_files, press).
 """
 
+import html
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
+from urllib.parse import parse_qsl, quote, urlsplit
 
 import pytest
-from playwright.async_api import Browser, Page, async_playwright
+from playwright.async_api import Browser, Page, Route, async_playwright
 
 from rapa.compiler import CompileResult, lower
 from rapa.core import policy
@@ -31,7 +33,9 @@ from rapa.core.robot import (
 )
 from rapa.fixtures.portal import DEFAULT_PASSWORD, DEFAULT_USER, current_totp
 from rapa.fixtures.server import HOST_RESOLVER_ARG, RunningPortal
+from rapa.llm.generalize import build_user_prompt
 from rapa.recorder import (
+    REDACTED,
     ClickEvent,
     InputEvent,
     NavigationCause,
@@ -140,14 +144,16 @@ async def test_login_totp_and_issue_protocol(browser: Browser, portal_v1: Runnin
 
     recording = await record(browser, scenario)
     assert portal_v1.state.protocolos[0]["cpf"] == "529.982.247-25"
-    assert_no_secrets(recording.model_dump_json(), codes, username=False)
+    # Nem o nome de usuário que o portal mostra depois do login ("Olá, ...") fica na gravação.
+    assert_no_secrets(recording.model_dump_json(), codes)
+    assert any(f"Olá, {REDACTED}" in text for text in recording.observed_texts())
     sensitive = [e for e in recording.events if isinstance(e, InputEvent) and e.element.sensitive]
     assert len(sensitive) == 3 and all(e.value is None for e in sensitive)
 
     result = compile_(recording, "emitir_protocolo_gravado")
     manifest = result.manifest
     assert_no_secrets(manifest.model_dump_json(), codes)
-    assert_no_secrets(result.model_dump_json(exclude={"observed_texts"}), codes)
+    assert_no_secrets(result.model_dump_json(), codes)
     assert_login_steps(result)
 
     emitir = manifest.step_by_id("clicar_emitir")
@@ -256,7 +262,7 @@ async def test_read_notes_and_download_one_file(browser: Browser, portal_v1: Run
 
     recording = await record(browser, scenario)
     assert portal_v1.state.downloads == ["001003"]
-    assert_no_secrets(recording.model_dump_json(), codes, username=False)
+    assert_no_secrets(recording.model_dump_json(), codes)
     result = compile_(recording, "baixar_nota_gravada")
     manifest = result.manifest
     assert_no_secrets(manifest.model_dump_json(), codes)
@@ -381,3 +387,384 @@ async def test_recording_starts_on_an_open_page(browser: Browser, portal_v1: Run
     result = compile_(recording, "tentar_entrar")
     assert [s.kind for s in result.manifest.steps] == ["navigate", "fill", "fill", "click"]
     assert "Usuário ou senha incorretos." in result.observed_texts
+
+
+# -- logins que o portal de teste não tem (páginas servidas pela rota do contexto) --
+
+ROUTED = "https://portal.exemplo.com.br"
+SPA_USER = "ana.souza@exemplo.com.br"
+SPA_PASSWORD = "S3nh@Forte!"
+#: Quatro campos de texto soltos antes do login: o script não reconhece o usuário
+#: pelo grupo de campos (no máximo três), só a regra do gravador ao fechar.
+MANY_FIELDS = (
+    '<div><input aria-label="Busca"><input aria-label="Filtro 1">'
+    '<input aria-label="Filtro 2"><input aria-label="Filtro 3"></div>'
+)
+
+
+def spa_login(extra: str = "") -> str:
+    """Login de SPA: campos soltos numa <div>, sem <form> e sem autocomplete."""
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>Entrar</title></head>
+<body><h1>Portal</h1>{extra}
+<div class="login">
+  <label for="u">Usuário</label><input id="u" name="usuario">
+  <label for="p">Senha</label><input id="p" name="senha" type="password">
+  <button id="entrar" type="button">Entrar</button>
+</div>
+<script>
+document.getElementById('entrar').addEventListener('click', () => {{
+  const u = encodeURIComponent(document.getElementById('u').value);
+  location.href = '/inicio?usuario=' + u + '&quem=' + u;
+}});
+</script></body></html>"""
+
+
+def form_login(label: str, name: str, style: str) -> str:
+    """Login de banco: a senha é um campo type=text (mascarado por CSS ou não)."""
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>Entrar</title></head>
+<body><h1>Banco</h1>
+<form action="/entrar" method="post">
+  <label for="c">Conta</label><input id="c" name="conta">
+  <label for="s">{label}</label>
+  <input id="s" name="{name}" type="text" inputmode="numeric" style="{style}">
+  <button>Entrar</button>
+</form></body></html>"""
+
+
+async def record_routed(browser: Browser, login_html: str, scenario: Scenario) -> Recording:
+    context = await browser.new_context()
+
+    async def handle(route: Route) -> None:
+        parts = urlsplit(route.request.url)
+        if parts.path == "/login":
+            body = login_html
+        else:
+            quem = html.escape(dict(parse_qsl(parts.query)).get("quem", ""))
+            # O cabeçalho em maiúsculas por CSS chega assim pelo innerText.
+            body = (
+                '<!doctype html><html><head><meta charset="utf-8"><title>Início</title></head>'
+                f'<body><header style="text-transform: uppercase">{quem}</header>'
+                f"<h1>Início</h1><p>Olá, {quem}</p></body></html>"
+            )
+        await route.fulfill(status=200, content_type="text/html; charset=utf-8", body=body)
+
+    await context.route("**/*", handle)
+    try:
+        recorder = Recorder()
+        await recorder.start(context)
+        page = await context.new_page()
+        await recorder.goto(page, f"{ROUTED}/login")
+        await scenario(page)
+        await page.get_by_role("heading", name="Início").wait_for()
+        return await recorder.stop()
+    finally:
+        await context.close()
+
+
+def assert_spa_username_hidden(recording: Recording) -> None:
+    dumped = recording.model_dump_json()
+    for leaked in (SPA_USER, SPA_USER.upper(), quote(SPA_USER, safe=""), SPA_PASSWORD):
+        assert leaked not in dumped
+    usuario = next(
+        e
+        for e in recording.events
+        if isinstance(e, InputEvent) and e.element.name_attr == "usuario"
+    )
+    assert usuario.element.is_username and usuario.element.sensitive
+    assert usuario.value is None and usuario.typed is None
+    assert any(f"Olá, {REDACTED}" in text for text in recording.observed_texts())
+    inicio = [e for e in recording.events if isinstance(e, NavigationEvent) and "/inicio" in e.url]
+    assert inicio and all(f"usuario={REDACTED}" in e.url for e in inicio)
+
+    result = compile_(recording, "entrar_no_portal")
+    fills = [s for s in result.manifest.steps if isinstance(s, FillStep)]
+    assert all(isinstance(s.value, SecretValue) for s in fills)
+    assert sorted(s.value.field for s in fills if isinstance(s.value, SecretValue)) == [
+        "password",
+        "username",
+    ]
+    assert SPA_USER not in result.model_dump_json()
+    assert not any(SPA_USER in text for text in result.observed_texts)
+    prompt = build_user_prompt(result.manifest, result.observed_texts)
+    assert SPA_USER not in prompt and SPA_USER.upper() not in prompt
+
+
+async def test_username_of_a_login_without_form_never_reaches_the_recording(
+    browser: Browser,
+) -> None:
+    async def scenario(page: Page) -> None:
+        await page.get_by_label("Usuário").fill(SPA_USER)
+        await page.get_by_label("Senha").fill(SPA_PASSWORD)
+        await page.get_by_role("button", name="Entrar").click()
+
+    assert_spa_username_hidden(await record_routed(browser, spa_login(), scenario))
+
+
+async def test_page_script_finds_the_username_of_a_login_without_form(browser: Browser) -> None:
+    # A senha antes do usuário: só o script (campo de texto logo antes da senha na
+    # página) reconhece o usuário; a regra do gravador olha a ordem das entradas.
+    async def scenario(page: Page) -> None:
+        await page.get_by_label("Senha").fill(SPA_PASSWORD)
+        await page.get_by_label("Usuário").fill(SPA_USER)
+        await page.get_by_role("button", name="Entrar").click()
+
+    assert_spa_username_hidden(await record_routed(browser, spa_login(), scenario))
+
+
+async def test_recorder_hides_the_username_the_page_script_missed(browser: Browser) -> None:
+    async def scenario(page: Page) -> None:
+        await page.get_by_label("Usuário").fill(SPA_USER)
+        await page.get_by_label("Senha").fill(SPA_PASSWORD)
+        await page.get_by_role("button", name="Entrar").click()
+
+    assert_spa_username_hidden(await record_routed(browser, spa_login(MANY_FIELDS), scenario))
+
+
+async def test_hidden_password_does_not_turn_a_field_without_form_into_username(
+    browser: Browser,
+) -> None:
+    page_html = """<!doctype html><html><head><meta charset="utf-8"><title>Cadastro</title></head>
+<body><h1>Cadastro</h1>
+<div><label for="n">Nome</label><input id="n" name="nome"></div>
+<div style="display:none"><label for="p">Senha</label><input id="p" type="password"></div>
+<button type="button" onclick="location.href='/inicio'">Continuar</button>
+</body></html>"""
+
+    async def scenario(page: Page) -> None:
+        await page.get_by_label("Nome").fill("Ana Lima")
+        await page.get_by_role("button", name="Continuar").click()
+
+    recording = await record_routed(browser, page_html, scenario)
+    nome = next(e for e in recording.events if isinstance(e, InputEvent))
+    assert not nome.element.sensitive and nome.value == "Ana Lima"
+
+
+@pytest.mark.parametrize(
+    ("label", "name", "style", "login"),
+    [
+        ("Chave pessoal", "chave", "-webkit-text-security: disc", True),
+        ("Senha", "senha", "", True),
+        # Assinatura eletrônica é segredo de transação: some da gravação, mas não é login.
+        ("Assinatura eletrônica", "assinatura", "-webkit-text-security: disc", False),
+    ],
+    ids=["mascara-css", "rotulo", "assinatura-mascarada"],
+)
+async def test_password_in_a_text_field_is_never_recorded(
+    browser: Browser, label: str, name: str, style: str, login: bool
+) -> None:
+    async def scenario(page: Page) -> None:
+        await page.get_by_label("Conta").fill("12345-6")
+        await page.get_by_label(label).fill(SPA_PASSWORD)
+        await page.get_by_role("button", name="Entrar").click()
+
+    recording = await record_routed(browser, form_login(label, name, style), scenario)
+    dumped = recording.model_dump_json()
+    assert SPA_PASSWORD not in dumped and "12345-6" not in dumped
+    inputs = {e.element.name_attr: e for e in recording.events if isinstance(e, InputEvent)}
+    assert inputs[name].element.is_password and inputs[name].value is None
+    assert inputs["conta"].element.sensitive and inputs["conta"].value is None
+    assert inputs["conta"].element.is_username is login
+
+    result = compile_(recording, "entrar_no_banco")
+    manifest = result.manifest
+    conta, senha = (s for s in manifest.steps if isinstance(s, FillStep))
+    if login:
+        assert conta.value == SecretValue(credential="portal", field="username")
+    else:
+        # Antes de uma assinatura eletrônica o campo não vira o usuário do cofre.
+        assert conta.value == TextValue(template="{{ inputs.conta }}")
+    assert senha.value == SecretValue(credential="portal", field="password")
+    assert [c.kind for c in manifest.credentials] == [CredentialKind.PASSWORD]
+    entrar = manifest.step_by_id("clicar_entrar")
+    assert isinstance(entrar, ClickStep)
+    # Login fica como leitura; com assinatura de transação, o POST grava.
+    assert entrar.effect is (Effect.READ if login else Effect.WRITE)
+    assert SPA_PASSWORD not in result.model_dump_json()
+
+
+_GO_HOME = (
+    "const u = encodeURIComponent(document.getElementById('u').value);"
+    "location.href = '/inicio?usuario=' + u + '&quem=' + u;"
+)
+
+
+def two_step_login(reveal: str) -> str:
+    """Login de SPA em duas etapas: a senha só aparece depois do usuário."""
+    show = "document.getElementById('s2').style.display = 'block';"
+    if reveal == "continuar":
+        user_step = (
+            '<label for="u">Usuário</label><input id="u" name="usuario">'
+            f'<button type="button" onclick="{show}">Continuar</button>'
+        )
+    else:
+        user_step = (
+            '<label for="u">Usuário</label><input id="u" name="usuario" onkeydown="'
+            f"if (event.key === 'Enter') {{ {show} document.getElementById('p').focus(); }}\">"
+        )
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>Entrar</title></head>
+<body><h1>Portal</h1>
+<div>{user_step}</div>
+<div id="s2" style="display: none">
+  <label for="p">Senha</label><input id="p" name="senha" type="password">
+  <button id="entrar" type="button">Entrar</button>
+</div>
+<script>
+document.getElementById('entrar').addEventListener('click', () => {{ {_GO_HOME} }});
+</script></body></html>"""
+
+
+@pytest.mark.parametrize("reveal", ["continuar", "enter"])
+async def test_username_of_a_two_step_login_never_reaches_the_recording(
+    browser: Browser, reveal: str
+) -> None:
+    async def scenario(page: Page) -> None:
+        await page.get_by_label("Usuário").fill(SPA_USER)
+        if reveal == "continuar":
+            await page.get_by_role("button", name="Continuar").click()
+        else:
+            await page.get_by_label("Usuário").press("Enter")
+        await page.get_by_label("Senha").fill(SPA_PASSWORD)
+        await page.get_by_role("button", name="Entrar").click()
+
+    assert_spa_username_hidden(await record_routed(browser, two_step_login(reveal), scenario))
+
+
+def payment_page(fields: str) -> str:
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>Pagamento</title></head>
+<body><h1>Pagamento de boleto</h1><p>Valor: R$ 1.250,00</p>
+<form action="/pagar" method="post">{fields}<button>Confirmar pagamento</button></form>
+</body></html>"""
+
+
+@pytest.mark.parametrize(
+    ("fields", "secret_label"),
+    [
+        (
+            '<label for="a">Assinatura eletrônica</label><input id="a" name="assinatura" '
+            'type="text" inputmode="numeric" style="-webkit-text-security: disc">',
+            "Assinatura eletrônica",
+        ),
+        (
+            '<label for="v">Valor</label><input id="v" name="valor">'
+            '<label for="a">PIN</label><input id="a" name="pin" type="tel" maxlength="4">',
+            "PIN",
+        ),
+    ],
+    ids=["mascara-css", "valor-e-pin"],
+)
+async def test_payment_confirmation_with_a_transaction_password_is_irreversible(
+    browser: Browser, fields: str, secret_label: str
+) -> None:
+    async def scenario(page: Page) -> None:
+        if secret_label == "PIN":
+            await page.get_by_label("Valor").fill("1250,00")
+        await page.get_by_label(secret_label).fill("4829")
+        await page.get_by_role("button", name="Confirmar pagamento").click()
+
+    recording = await record_routed(browser, payment_page(fields), scenario)
+    dumped = recording.model_dump_json()
+    assert "4829" not in dumped
+    result = compile_(recording, "pagar_boleto")
+    manifest = result.manifest
+    confirmar = manifest.step_by_id("clicar_confirmar_pagamento")
+    assert isinstance(confirmar, ClickStep) and confirmar.effect is Effect.IRREVERSIBLE
+    assert manifest.effect() is Effect.IRREVERSIBLE
+    fills = {s.id: s for s in manifest.steps if isinstance(s, FillStep)}
+    if secret_label == "PIN":
+        # O valor do pagamento nunca vira o usuário do cofre: vira uma entrada.
+        valor = fills["digitar_valor"]
+        assert valor.value == TextValue(template="{{ inputs.valor }}")
+        assert "1250,00" not in dumped
+        usuario = next(e for e in recording.events if isinstance(e, InputEvent))
+        assert usuario.element.sensitive and not usuario.element.is_username
+    assert "4829" not in result.model_dump_json()
+
+
+async def test_page_script_and_recorder_agree_on_a_username_named_like_a_password(
+    browser: Browser,
+) -> None:
+    page_html = """<!doctype html><html><head><meta charset="utf-8"><title>Entrar</title></head>
+<body><h1 id="t">Entre com seu CPF e senha</h1>
+<form action="/entrar" method="post">
+  <label for="cpf">CPF</label><input id="cpf" name="cpf" aria-labelledby="t">
+  <label for="s">Senha</label><input id="s" name="senha" type="password">
+  <button>Entrar</button>
+</form></body></html>"""
+
+    async def scenario(page: Page) -> None:
+        await page.locator("#cpf").fill("12345678900")
+        await page.locator("#s").fill(SPA_PASSWORD)
+        await page.get_by_role("button", name="Entrar").click()
+
+    recording = await record_routed(browser, page_html, scenario)
+    inputs = {e.element.name_attr: e for e in recording.events if isinstance(e, InputEvent)}
+    assert inputs["cpf"].element.is_username and not inputs["cpf"].element.is_password
+    assert "12345678900" not in recording.model_dump_json()
+    result = compile_(recording, "entrar_com_cpf")
+    cpf, senha = (s for s in result.manifest.steps if isinstance(s, FillStep))
+    assert cpf.value == SecretValue(credential="portal", field="username")
+    assert senha.value == SecretValue(credential="portal", field="password")
+    entrar = result.manifest.step_by_id("clicar_entrar")
+    assert isinstance(entrar, ClickStep) and entrar.effect is Effect.READ
+
+
+@pytest.mark.parametrize("leave", ["tab", "clique"])
+async def test_autosave_while_typing_makes_the_field_write(browser: Browser, leave: str) -> None:
+    page_html = """<!doctype html><html><head><meta charset="utf-8"><title>Cadastro</title></head>
+<body><h1>Cadastro</h1>
+<label for="o">Observação</label>
+<input id="o" name="obs" oninput="clearTimeout(window.t); window.t = setTimeout(
+  () => fetch('/api/rascunho', {method: 'POST', body: this.value}), 100)">
+<label for="n">Nome</label><input id="n" name="nome">
+<button type="button" onclick="location.href = '/inicio'">Voltar</button>
+</body></html>"""
+
+    async def scenario(page: Page) -> None:
+        await page.get_by_label("Observação").click()
+        await page.keyboard.type("abc")
+        await page.wait_for_timeout(500)  # o rascunho é salvo com o campo ainda em foco
+        if leave == "tab":
+            await page.keyboard.press("Tab")
+        else:
+            await page.get_by_label("Nome").click()
+        await page.get_by_role("button", name="Voltar").click()
+
+    recording = await record_routed(browser, page_html, scenario)
+    result = compile_(recording, "cadastrar")
+    observacao = result.manifest.step_by_id("digitar_observacao")
+    assert observacao is not None and observacao.effect is Effect.WRITE
+    assert result.manifest.effect() is Effect.WRITE
+
+
+async def test_row_key_is_the_text_the_runner_compares(browser: Browser) -> None:
+    page_html = """<!doctype html><html><head><meta charset="utf-8"><title>Notas</title></head>
+<body><h1>Notas</h1>
+<table>
+  <tr><th>Nota</th><th>Ação</th></tr>
+  <tr><td style="text-transform: uppercase">Nota 12</td>
+      <td><button type="button" onclick="location.href = '/inicio'">Abrir</button></td></tr>
+  <tr><td style="text-transform: uppercase">Nota 120</td>
+      <td><button type="button" onclick="location.href = '/inicio'">Abrir</button></td></tr>
+</table></body></html>"""
+
+    async def scenario(page: Page) -> None:
+        row = page.get_by_role("row").filter(has=page.get_by_text("Nota 12", exact=True))
+        await row.get_by_role("button", name="Abrir").click()
+
+    recording = await record_routed(browser, page_html, scenario)
+    result = compile_(recording, "abrir_nota")
+    abrir = result.manifest.step_by_id("clicar_abrir")
+    assert isinstance(abrir, ClickStep)
+    assert abrir.target.within is not None and abrir.target.within.value == "row"
+    key = abrir.target.within_has_text
+    # O texto da célula (textContent), não o que o CSS mostra ("NOTA 12").
+    assert key == "Nota 12"
+    # O executor compara o texto inteiro do elemento, com maiúsculas: uma linha só.
+    context = await browser.new_context()
+    try:
+        page = await context.new_page()
+        await page.set_content(page_html)
+        rows = page.get_by_role("row").filter(has=page.get_by_text(key, exact=True))
+        assert await rows.count() == 1
+    finally:
+        await context.close()

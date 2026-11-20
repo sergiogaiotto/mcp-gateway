@@ -248,6 +248,33 @@ def test_redactor_masks_values_but_keeps_hashes() -> None:
     }
 
 
+def test_redactor_masks_keys_without_collisions_and_no_key_is_exempt() -> None:
+    from rapa.runner.interpreter import MASK, _Redactor
+
+    redactor = _Redactor([DEFAULT_PASSWORD, DEFAULT_USER])
+    # Chaves vindas da página (cabeçalhos de tabela), em qualquer profundidade.
+    data = [
+        {
+            f"Total {DEFAULT_PASSWORD}": "1",
+            f"Total {DEFAULT_USER}": "2",
+            f"Total {MASK}_2": "3",
+            "sha256": f"x{DEFAULT_PASSWORD}",
+            "fingerprint": {DEFAULT_USER: DEFAULT_USER},
+            7: DEFAULT_USER,
+        }
+    ]
+    assert redactor.value(data) == [
+        {
+            f"Total {MASK}": "1",
+            f"Total {MASK}_2": "2",
+            f"Total {MASK}_2_2": "3",
+            "sha256": f"x{MASK}",
+            "fingerprint": {MASK: MASK},
+            7: MASK,
+        }
+    ]
+
+
 # -- confirmação antes do passo irreversível -------------------------------------
 
 

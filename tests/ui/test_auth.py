@@ -1,5 +1,6 @@
 """Login e sessões da interface: rotas /auth, login de desenvolvimento e OIDC simulado."""
 
+import asyncio
 import base64
 import hashlib
 import time
@@ -27,6 +28,7 @@ from rapa.ui.auth import (
     OidcSettings,
     TokenSet,
     UiAuth,
+    UiSession,
     safe_return_path,
 )
 
@@ -453,3 +455,518 @@ async def test_failed_refresh_ends_session() -> None:
     assert len(store) == 0
     with pytest.raises(LoginError):
         await auth.create_dev_ticket("vinculo", "ana", "/")
+
+
+# ---------------------------------------------------------------------------
+# O principal da sessão acompanha o banco e o provedor
+# ---------------------------------------------------------------------------
+
+
+class Principals:
+    """Resolvedor de principais com papéis que o teste muda (como o banco)."""
+
+    def __init__(self, principal: Principal | None) -> None:
+        self.current: Principal | None = principal
+        self.calls: list[tuple[str, Any]] = []
+        self.error: Exception | None = None
+
+    async def resolve(self, subject: str, company_id: Any) -> Principal | None:
+        self.calls.append((subject, company_id))
+        if self.error is not None:
+            raise self.error
+        return self.current
+
+
+async def test_session_principal_is_rechecked_and_follows_role_changes() -> None:
+    clock, store = Clock(), MemorySessionStore()
+    principals = Principals(PRINCIPAL)
+    auth = UiAuth(
+        dev=_dev(),
+        store=store,
+        clock=clock,
+        principals=principals,
+        principal_ttl=timedelta(seconds=30),
+    )
+    # O perfil de desenvolvimento é configurado na subida: o primeiro uso já confere.
+    _, session = await auth.start_session(PRINCIPAL, "Ana", "dev")
+    found = await auth.session_by_key(session.key)
+    assert found is not None and principals.calls == [("ana@empresa", COMPANY)]
+
+    # Dentro do prazo curto, sem nova consulta (a tela consulta a cada 2 s).
+    clock.now += timedelta(seconds=10)
+    assert await auth.session_by_key(session.key) is not None
+    assert len(principals.calls) == 1
+
+    # Papéis mudaram no banco: a sessão passa a usar os novos, sem pedir login de novo.
+    approver = PRINCIPAL.model_copy(update={"company_roles": frozenset({Role.APPROVER})})
+    principals.current = approver
+    clock.now += timedelta(seconds=25)
+    found = await auth.session_by_key(session.key)
+    assert found is not None and found.principal == approver
+    assert len(principals.calls) == 2
+    stored = await store.load(session.key)
+    assert stored is not None and stored.principal == approver
+
+    # Conta desativada (ou sem vínculo com a empresa): a sessão acaba no próximo uso.
+    principals.current = None
+    clock.now += timedelta(seconds=31)
+    assert await auth.session_by_key(session.key) is None
+    assert len(store) == 0
+
+
+async def test_session_ends_when_the_rechecked_principal_is_someone_else() -> None:
+    clock, store = Clock(), MemorySessionStore()
+    principals = Principals(PRINCIPAL.model_copy(update={"subject": "outra@empresa"}))
+    auth = UiAuth(dev=_dev(), store=store, clock=clock, principals=principals)
+    _, session = await auth.start_session(PRINCIPAL, "Ana", "dev")
+    assert await auth.session_by_key(session.key) is None
+    assert len(store) == 0
+
+    principals.current = PRINCIPAL.model_copy(update={"company_id": new_id()})
+    _, session = await auth.start_session(PRINCIPAL, "Ana", "dev")
+    assert await auth.session_by_key(session.key) is None
+
+
+async def test_recheck_failure_never_falls_back_to_the_old_principal() -> None:
+    clock, store = Clock(), MemorySessionStore()
+    principals = Principals(PRINCIPAL)
+    auth = UiAuth(dev=_dev(), store=store, clock=clock, principals=principals)
+    _, session = await auth.start_session(PRINCIPAL, "Ana", "dev")
+    principals.error = ConnectionError("banco fora do ar")
+    with pytest.raises(ConnectionError):
+        await auth.session_by_key(session.key)
+    # A sessão não foi dada como conferida: a próxima tentativa consulta de novo.
+    principals.error = None
+    principals.current = None
+    assert await auth.session_by_key(session.key) is None
+
+
+async def test_client_id_from_login_is_kept_after_recheck() -> None:
+    clock = Clock()
+    with_client = PRINCIPAL.model_copy(update={"client_id": "rapa-ui"})
+    auth = UiAuth(dev=_dev(), clock=clock, principals=Principals(PRINCIPAL))
+    _, session = await auth.start_session(with_client, "Ana", "oidc")
+    found = await auth.session_by_key(session.key)
+    assert found is not None and found.principal == with_client
+
+
+async def test_token_refresh_rechecks_access_with_the_new_token() -> None:
+    keycloak, store = FakeKeycloak(), MemorySessionStore()
+    resolver = Resolver(PRINCIPAL)
+    auth = UiAuth(oidc=_oidc(keycloak, resolver), store=store)
+    async with _client(auth) as client:
+        await _oidc_login(client, keycloak)
+    (session,) = store._sessions.values()
+    assert session.tokens is not None
+
+    # Renovou e a conta ainda tem acesso: papéis atualizados com o token novo.
+    approver = PRINCIPAL.model_copy(update={"company_roles": frozenset({Role.APPROVER})})
+    resolver.principal = approver
+    session.tokens.expires_at = time.time() + 5
+    fresh = await auth.fresh_session(session.key)
+    assert fresh is not None and fresh.access_token == "acesso-renovado-1"
+    assert fresh.principal == approver
+    assert resolver.calls[-1] == ({}, "acesso-renovado-1")
+
+    # Tirada da organização no Keycloak: o token renovado não dá mais acesso.
+    resolver.principal = None
+    assert fresh.tokens is not None
+    fresh.tokens.expires_at = time.time() + 5
+    assert await auth.fresh_session(session.key) is None
+    assert resolver.calls[-1] == ({}, "acesso-renovado-2")
+    assert len(store) == 0
+
+
+@pytest.mark.parametrize("problem", ["outra pessoa", "erro"])
+async def test_token_refresh_ends_session_on_identity_change_or_error(problem: str) -> None:
+    keycloak, store = FakeKeycloak(), MemorySessionStore()
+    resolver = Resolver(PRINCIPAL)
+    auth = UiAuth(oidc=_oidc(keycloak, resolver), store=store)
+    async with _client(auth) as client:
+        await _oidc_login(client, keycloak)
+    (session,) = store._sessions.values()
+    assert session.tokens is not None
+    if problem == "erro":
+
+        async def broken(claims: Mapping[str, Any], access_token: str) -> Principal | None:
+            raise ConnectionError("banco fora do ar")
+
+        resolver.resolve = broken  # type: ignore[method-assign]
+    else:
+        resolver.principal = PRINCIPAL.model_copy(update={"subject": "outra@empresa"})
+    session.tokens.expires_at = time.time() + 5
+    assert await auth.fresh_session(session.key) is None
+    assert len(store) == 0
+
+
+# ---------------------------------------------------------------------------
+# Corridas: o que encerrou a sessão no meio de uma conferência continua valendo
+# ---------------------------------------------------------------------------
+
+
+class SlowPrincipals:
+    """Resolvedor que lê o banco na hora e só responde quando ``release`` é acionado."""
+
+    def __init__(self, principal: Principal | None) -> None:
+        self.current = principal
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def resolve(self, subject: str, company_id: Any) -> Principal | None:
+        answer = self.current  # lido antes da latência, como uma consulta ao banco
+        self.entered.set()
+        await self.release.wait()
+        return answer
+
+
+@pytest.mark.parametrize("how", ["end_session", "rota /auth/sair", "novo login"])
+async def test_logout_during_the_principal_check_is_not_undone(how: str) -> None:
+    clock, store = Clock(), MemorySessionStore()
+    slow = SlowPrincipals(PRINCIPAL)
+    auth = UiAuth(dev=_dev(), store=store, clock=clock, principals=slow)
+    cookie, session = await auth.start_session(PRINCIPAL, "Ana", "dev")
+    # O temporizador de uma aba começa a conferir o principal; o banco demora.
+    poll = asyncio.create_task(auth.session_by_key(session.key))
+    await slow.entered.wait()
+    # Enquanto isso, a pessoa sai (ou entra de novo, o que encerra a sessão anterior).
+    if how == "end_session":
+        await auth.end_session(session.key)
+    else:
+        async with _client(auth) as client:
+            client.cookies.set(SESSION_COOKIE, cookie, domain="rapa.test")
+            if how == "rota /auth/sair":
+                assert (await client.get("/auth/sair")).status_code == 303
+            else:
+                await client.get("/auth/vinculo")
+                ticket = await auth.create_dev_ticket(client.cookies[BINDING_COOKIE], "ana", "/")
+                done = await client.get("/auth/dev/concluir", params={"bilhete": ticket})
+                assert done.status_code == 303
+                assert client.cookies[SESSION_COOKIE] != cookie
+    assert await store.load(session.key) is None
+    slow.release.set()
+    # A conferência que estava no meio não traz a sessão encerrada de volta.
+    assert await poll is None
+    assert await store.load(session.key) is None
+    clock.now += timedelta(seconds=1)
+    assert await auth.session_by_key(session.key) is None
+
+
+async def test_revocation_seen_by_another_request_is_not_undone() -> None:
+    clock, store = Clock(), MemorySessionStore()
+    slow = SlowPrincipals(PRINCIPAL)
+    auth = UiAuth(dev=_dev(), store=store, clock=clock, principals=slow)
+    _, session = await auth.start_session(PRINCIPAL, "Ana", "dev")
+    first = asyncio.create_task(auth.session_by_key(session.key))  # leu "conta ativa"
+    await slow.entered.wait()
+    # O administrador desativa a conta; outra aba confere depois, com uma consulta mais
+    # rápida (outra réplica, por exemplo), vê a conta sem acesso e encerra a sessão.
+    clock.now += timedelta(seconds=1)
+    other = UiAuth(dev=_dev(), store=store, clock=clock, principals=Principals(None))
+    assert await other.session_by_key(session.key) is None
+    assert await store.load(session.key) is None
+    slow.release.set()
+    assert await first is None
+    clock.now += timedelta(seconds=1)
+    assert await auth.session_by_key(session.key) is None
+    assert len(store) == 0
+
+
+async def test_an_older_principal_check_never_overwrites_a_newer_one() -> None:
+    clock, store = Clock(), MemorySessionStore()
+    approver = PRINCIPAL.model_copy(update={"company_roles": frozenset({Role.APPROVER})})
+    slow = SlowPrincipals(approver)
+    auth = UiAuth(dev=_dev(), store=store, clock=clock, principals=slow)
+    _, session = await auth.start_session(approver, "Ana", "dev")
+    first = asyncio.create_task(auth.session_by_key(session.key))  # leu "aprovadora"
+    await slow.entered.wait()
+    # Ela perde o papel de aprovadora; outra aba confere depois e vê o papel novo.
+    clock.now += timedelta(seconds=1)
+    other = UiAuth(dev=_dev(), store=store, clock=clock, principals=Principals(PRINCIPAL))
+    seen = await other.session_by_key(session.key)
+    assert seen is not None and seen.principal == PRINCIPAL
+    slow.release.set()
+    # A conferência mais antiga termina depois, mas não devolve o papel tirado.
+    late = await first
+    assert late is not None and late.principal == PRINCIPAL
+    stored = await store.load(session.key)
+    assert stored is not None and stored.principal == PRINCIPAL
+    assert stored.principal_checked_at == clock.now
+
+
+async def test_logout_during_a_token_refresh_is_not_undone() -> None:
+    keycloak, store = FakeKeycloak(), MemorySessionStore()
+    oidc = _oidc(keycloak, Resolver(PRINCIPAL))
+    auth = UiAuth(oidc=oidc, store=store)
+    _, session = await auth.start_session(
+        PRINCIPAL,
+        "Ana",
+        "oidc",
+        TokenSet("acesso-1", refresh_token="renovacao-1", expires_at=time.time() + 5),
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+    recheck = oidc.recheck
+
+    async def slow_recheck(tokens: TokenSet) -> Principal | None:
+        entered.set()
+        await release.wait()
+        return await recheck(tokens)
+
+    oidc.recheck = slow_recheck  # type: ignore[method-assign]
+    refreshing = asyncio.create_task(auth.fresh_session(session.key))
+    await entered.wait()
+    await auth.end_session(session.key)
+    release.set()
+    assert await refreshing is None
+    assert len(store) == 0 and keycloak.refreshes == 1
+
+
+async def test_token_refresh_keeps_a_newer_principal_check() -> None:
+    clock, keycloak, store = Clock(), FakeKeycloak(), MemorySessionStore()
+    approver = PRINCIPAL.model_copy(update={"company_roles": frozenset({Role.APPROVER})})
+    oidc = _oidc(keycloak, Resolver(approver))
+    auth = UiAuth(oidc=oidc, store=store, clock=clock)
+    _, session = await auth.start_session(
+        approver,
+        "Ana",
+        "oidc",
+        TokenSet("acesso-1", refresh_token="renovacao-1", expires_at=time.time() + 5),
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+    recheck = oidc.recheck
+
+    async def slow_recheck(tokens: TokenSet) -> Principal | None:
+        answer = await recheck(tokens)  # leu "aprovadora"
+        entered.set()
+        await release.wait()
+        return answer
+
+    oidc.recheck = slow_recheck  # type: ignore[method-assign]
+    refreshing = asyncio.create_task(auth.fresh_session(session.key))
+    await entered.wait()
+    # Durante a renovação, outra aba confere no banco e vê o papel tirado.
+    clock.now += timedelta(seconds=1)
+    other = UiAuth(oidc=oidc, store=store, clock=clock, principals=Principals(PRINCIPAL))
+    seen = await other.session_by_key(session.key)
+    assert seen is not None and seen.principal == PRINCIPAL
+    release.set()
+    # Fica o principal da conferência mais nova, com os tokens renovados.
+    fresh = await refreshing
+    assert fresh is not None and fresh.principal == PRINCIPAL
+    assert fresh.access_token == "acesso-renovado-1"
+    stored = await store.load(session.key)
+    assert stored is not None and stored.principal == PRINCIPAL
+    assert stored.access_token == "acesso-renovado-1"
+
+
+class RotatingKeycloak(FakeKeycloak):
+    """Como o Keycloak com rotação: cada renovação devolve um token de renovação novo."""
+
+    def handler(self, request: httpx2.Request) -> httpx2.Response:
+        response = super().handler(request)
+        if request.url.path.endswith("/token") and self.token_requests:
+            form = self.token_requests[-1]
+            if form["grant_type"] == ["refresh_token"]:
+                body = response.json()
+                body["refresh_token"] = f"renovacao-{self.refreshes + 1}"
+                return httpx2.Response(200, json=body)
+        return response
+
+
+class GatedPrincipals:
+    """Resolvedor do banco; com ``gate`` ligado, só responde depois de ``release``."""
+
+    def __init__(self, principal: Principal | None) -> None:
+        self.current = principal
+        self.gate = False
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def resolve(self, subject: str, company_id: Any) -> Principal | None:
+        answer = self.current  # lido antes da latência, como uma consulta ao banco
+        if self.gate:
+            self.entered.set()
+            await self.release.wait()
+        return answer
+
+
+async def _refresh_overtakes_a_principal_check(
+    oidc: OidcLogin, auth: UiAuth, principals: GatedPrincipals, clock: Clock, key: str
+) -> UiSession | None:
+    """Uma renovação começa (o provedor demora), uma conferência do principal começa
+    depois (o banco demora), a renovação termina primeiro e a conferência por último.
+    Devolve o que a renovação devolveu."""
+    t0 = clock.now
+    entered, release = asyncio.Event(), asyncio.Event()
+    refresh = oidc.refresh
+
+    async def slow_refresh(tokens: TokenSet) -> TokenSet:
+        entered.set()
+        await release.wait()
+        return await refresh(tokens)
+
+    oidc.refresh = slow_refresh  # type: ignore[method-assign]
+    # 25 s depois da última conferência, uma ação renova o token (a conferência não vence).
+    clock.now = t0 + timedelta(seconds=25)
+    renewing = asyncio.create_task(auth.fresh_session(key))
+    await entered.wait()
+    # Aos 31 s, o temporizador de outra aba confere o principal no banco.
+    clock.now = t0 + timedelta(seconds=31)
+    principals.gate = True
+    checking = asyncio.create_task(auth.session_by_key(key))
+    await principals.entered.wait()
+    release.set()
+    renewed = await renewing
+    principals.release.set()
+    await checking
+    principals.gate = False
+    oidc.refresh = refresh  # type: ignore[method-assign]
+    return renewed
+
+
+async def test_principal_check_never_reverts_rotated_tokens() -> None:
+    """A conferência do principal que começou antes do fim de uma renovação não devolve
+    à sessão os tokens velhos: o provedor já girou o token de renovação."""
+    clock, keycloak, store = Clock(), RotatingKeycloak(), MemorySessionStore()
+    oidc = _oidc(keycloak, Resolver(PRINCIPAL))
+    principals = GatedPrincipals(PRINCIPAL)
+    auth = UiAuth(oidc=oidc, store=store, clock=clock, principals=principals)
+    _, session = await auth.start_session(
+        PRINCIPAL,
+        "Ana",
+        "oidc",
+        TokenSet("acesso-0", refresh_token="renovacao-0", expires_at=time.time() + 5),
+    )
+    assert await auth.session_by_key(session.key) is not None  # primeira conferência
+    renewed = await _refresh_overtakes_a_principal_check(oidc, auth, principals, clock, session.key)
+    assert renewed is not None and renewed.access_token == "acesso-renovado-1"
+    stored = await store.load(session.key)
+    assert stored is not None and stored.tokens is not None
+    assert stored.access_token == "acesso-renovado-1"
+    assert stored.tokens.refresh_token == "renovacao-2"
+    # A conferência, mais nova que a da renovação, fica com a hora dela.
+    assert stored.principal == PRINCIPAL and stored.principal_checked_at == clock.now
+
+    # A próxima ação não renova de novo com o token de renovação já gasto.
+    clock.now += timedelta(seconds=1)
+    fresh = await auth.fresh_session(session.key)
+    assert fresh is not None and fresh.access_token == "acesso-renovado-1"
+    used = [
+        form["refresh_token"][0]
+        for form in keycloak.token_requests
+        if form["grant_type"] == ["refresh_token"]
+    ]
+    assert used == ["renovacao-0"]
+
+
+async def test_principal_check_after_a_refresh_keeps_the_renewed_tokens() -> None:
+    """Sem conferência atrasada: a conferência que vence logo depois da renovação só
+    troca o principal e a hora, e os tokens renovados ficam."""
+    clock, keycloak, store = Clock(), RotatingKeycloak(), MemorySessionStore()
+    oidc = _oidc(keycloak, Resolver(PRINCIPAL))
+    approver = PRINCIPAL.model_copy(update={"company_roles": frozenset({Role.APPROVER})})
+    principals = GatedPrincipals(PRINCIPAL)
+    auth = UiAuth(oidc=oidc, store=store, clock=clock, principals=principals)
+    _, session = await auth.start_session(
+        PRINCIPAL,
+        "Ana",
+        "oidc",
+        TokenSet("acesso-0", refresh_token="renovacao-0", expires_at=time.time() + 5),
+    )
+    renewed = await auth.fresh_session(session.key)
+    assert renewed is not None and renewed.access_token == "acesso-renovado-1"
+    principals.current = approver
+    clock.now += timedelta(seconds=31)
+    seen = await auth.session_by_key(session.key)
+    assert seen is not None and seen.principal == approver
+    assert seen.access_token == "acesso-renovado-1"
+    assert seen.tokens is not None and seen.tokens.refresh_token == "renovacao-2"
+
+
+async def test_role_removed_after_a_refresh_started_stays_removed() -> None:
+    """A renovação lê "aprovadora" no provedor; depois a conferência no banco vê o papel
+    tirado e grava; a renovação termina por último e não devolve o papel."""
+    clock, keycloak, store = Clock(), RotatingKeycloak(), MemorySessionStore()
+    approver = PRINCIPAL.model_copy(update={"company_roles": frozenset({Role.APPROVER})})
+    oidc = _oidc(keycloak, Resolver(approver))
+    principals = GatedPrincipals(approver)
+    auth = UiAuth(oidc=oidc, store=store, clock=clock, principals=principals)
+    _, session = await auth.start_session(
+        approver,
+        "Ana",
+        "oidc",
+        TokenSet("acesso-0", refresh_token="renovacao-0", expires_at=time.time() + 5),
+    )
+    t0 = clock.now
+    await auth.session_by_key(session.key)
+    entered, release = asyncio.Event(), asyncio.Event()
+    recheck = oidc.recheck
+
+    async def slow_recheck(tokens: TokenSet) -> Principal | None:
+        answer = await recheck(tokens)  # leu "aprovadora"
+        entered.set()
+        await release.wait()
+        return answer
+
+    oidc.recheck = slow_recheck  # type: ignore[method-assign]
+    clock.now = t0 + timedelta(seconds=25)
+    renewing = asyncio.create_task(auth.fresh_session(session.key))
+    await entered.wait()
+    clock.now = t0 + timedelta(seconds=31)
+    principals.current = PRINCIPAL  # papel tirado no banco
+    seen = await auth.session_by_key(session.key)
+    assert seen is not None and seen.principal == PRINCIPAL
+    release.set()
+    fresh = await renewing
+    assert fresh is not None and fresh.principal == PRINCIPAL
+    assert fresh.access_token == "acesso-renovado-1"
+    stored = await store.load(session.key)
+    assert stored is not None and stored.principal == PRINCIPAL
+    assert stored.principal_checked_at == t0 + timedelta(seconds=31)
+    assert stored.access_token == "acesso-renovado-1"
+    assert stored.tokens is not None and stored.tokens.refresh_token == "renovacao-2"
+
+
+async def test_memory_store_writes_only_their_fields_and_never_bring_back_a_session() -> None:
+    clock, store = Clock(), MemorySessionStore()
+    auth = UiAuth(dev=_dev(), store=store, clock=clock)
+    tokens = TokenSet("acesso-1", refresh_token="renovacao-1")
+    _, session = await auth.start_session(PRINCIPAL, "Ana", "oidc", tokens)
+    approver = PRINCIPAL.model_copy(update={"company_roles": frozenset({Role.APPROVER})})
+    earlier, later = clock.now - timedelta(seconds=1), clock.now + timedelta(seconds=1)
+
+    checked = await store.update_principal(session.key, approver, clock.now)
+    assert checked is not None and checked.principal == approver
+    assert checked.principal_checked_at == clock.now
+    # A conferência do principal não mexe nos tokens.
+    assert checked.tokens is tokens
+    # Uma conferência de antes dessa (outra requisição) não passa por cima dela.
+    assert await store.update_principal(session.key, PRINCIPAL, earlier) is checked
+    assert await store.load(session.key) is checked
+
+    # A renovação grava os tokens, mas não troca um principal conferido depois do começo dela.
+    rotated = TokenSet("acesso-2", refresh_token="renovacao-2")
+    renewed = await store.update_tokens(session.key, rotated, PRINCIPAL, earlier)
+    assert renewed is not None and renewed.tokens is rotated
+    assert renewed.principal == approver and renewed.principal_checked_at == clock.now
+
+    # A mesma conferência e uma mais nova são gravadas, sem desfazer os tokens renovados.
+    same = await store.update_principal(session.key, PRINCIPAL, clock.now)
+    assert same is not None and same.principal == PRINCIPAL and same.tokens is rotated
+    newer = await store.update_tokens(session.key, tokens, approver, later)
+    assert newer is not None and newer.principal == approver
+    assert newer.principal_checked_at == later and newer.tokens is tokens
+
+    # O último uso só anda para a frente e não mexe no resto.
+    touched = await store.touch(session.key, clock.now + timedelta(minutes=1))
+    assert touched is not None and touched.last_seen == clock.now + timedelta(minutes=1)
+    assert await store.touch(session.key, clock.now) is touched
+    assert touched.principal == approver and touched.tokens is tokens
+    # Quem guardou uma versão anterior não a vê mudar (como uma linha lida de uma tabela).
+    assert session.principal == PRINCIPAL and session.principal_checked_at is None
+
+    # Nenhuma gravação traz de volta uma sessão encerrada.
+    await store.delete(session.key)
+    assert await store.update_principal(session.key, approver, later) is None
+    assert await store.update_tokens(session.key, rotated, approver, later) is None
+    assert await store.touch(session.key, later) is None
+    assert await store.load(session.key) is None and len(store) == 0

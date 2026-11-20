@@ -14,10 +14,21 @@ from typing import TYPE_CHECKING
 
 from rapa.control.db.session import Database
 from rapa.control.services.audit import ChainReport, verify_chain
-from rapa.control.services.dispatcher import Dispatcher, Launcher, failure_result
+from rapa.control.services.dispatcher import (
+    Dispatcher,
+    Launcher,
+    WorkerNotStarted,
+    failure_result,
+)
 from rapa.control.services.principals import PgPrincipalResolver
 from rapa.control.services.provisioning import PgProvisioning, set_platform_capacity
-from rapa.control.services.queue import PgRunQueue, ReapReport, RunnerOutcome, StaleAttempt
+from rapa.control.services.queue import (
+    EventConflict,
+    PgRunQueue,
+    ReapReport,
+    RunnerOutcome,
+    StaleAttempt,
+)
 from rapa.control.services.robots import PgRobotAdmin, PgRobotCatalog
 from rapa.control.services.runs import PgRunService
 from rapa.core.contracts import RobotAdmin, RobotCatalog, RunService
@@ -25,6 +36,7 @@ from rapa.core.contracts import RobotAdmin, RobotCatalog, RunService
 __all__ = [
     "ChainReport",
     "Dispatcher",
+    "EventConflict",
     "Launcher",
     "PgPlatform",
     "PgPrincipalResolver",
@@ -36,6 +48,7 @@ __all__ = [
     "ReapReport",
     "RunnerOutcome",
     "StaleAttempt",
+    "WorkerNotStarted",
     "failure_result",
     "set_platform_capacity",
     "verify_chain",

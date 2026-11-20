@@ -11,6 +11,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 from rapa.control.auth import StaticTokenVerifier
 from rapa.control.mcp import IDEMPOTENCY_META_KEY, RESERVED_NAMES
+from rapa.core import policy
 from rapa.core.contracts import RunState, RunTrigger
 from rapa.core.ids import new_id
 from tests.control.api.support import (
@@ -35,6 +36,11 @@ MODES = ["legacy", "auto"]
 
 def _text(result: Any) -> str:
     return "\n".join(block.text for block in result.content)
+
+
+def test_meta_tool_names_are_reserved_for_robots() -> None:
+    # Um robô novo com o nome de uma ferramenta fixa nunca passa do portão de política.
+    assert RESERVED_NAMES <= policy.RESERVED_NAMES
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -72,7 +78,12 @@ async def test_initialize_and_list_tools_per_company(
     assert notas.destructive_hint is False
     cadastro = tools["atualizar_cadastro"].annotations
     assert cadastro is not None
-    assert cadastro.read_only_hint is False and cadastro.destructive_hint is False
+    # Um robô que grava pode sobrescrever dados: o cliente MCP precisa tratá-lo como
+    # destrutivo (destructiveHint=false prometeria só acréscimos).
+    assert cadastro.read_only_hint is False and cadastro.destructive_hint is True
+    assert "Grava dados" in (tools["atualizar_cadastro"].description or "")
+    assert "irreversível" in (emitir.description or "")
+    assert "irreversível" not in (tools["atualizar_cadastro"].description or "")
 
     assert sorted(tools_b) == sorted([*META, "consultar_saldo", "emitir_protocolo"])
     assert tools_b["emitir_protocolo"].title == "Emitir protocolo (B)"

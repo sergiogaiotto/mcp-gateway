@@ -190,6 +190,54 @@ def test_documents_and_money() -> None:
     assert field_error(fields["nome"], "x" * 4001) == "Use no máximo 4000 caracteres."
 
 
+def test_huge_money_values_get_the_field_message() -> None:
+    fields = {f.name: f for f in fields_from_schema(SCHEMA)}
+    money = fields["valor"]
+    # O maior valor que cabe no esquema (20 caracteres antes da vírgula, com os pontos).
+    assert convert_values([money], {"valor": "9" * 15 + ",99"}) == {
+        "valor": "999.999.999.999.999,99"
+    }
+    # Com 27 dígitos ou mais, o arredondamento para centavos passava da precisão do
+    # Decimal e escapava como decimal.InvalidOperation em vez da mensagem do campo.
+    for raw in ("1" * 16, "1" * 27, "1" * 60, "-" + "9" * 40 + ",99", 1e30, -1e300, 10**40):
+        assert field_error(money, raw) == "Valor grande demais.", raw
+        with pytest.raises(FormValidationError) as caught:
+            convert_values([money], {"valor": raw})
+        assert caught.value.errors == {"valor": "Valor grande demais."}
+    # O mesmo dentro de uma lista (coluna de valor em reais).
+    itens = fields["itens"]
+    row = {**VALID["itens"][0], "preco": "1" * 30}
+    with pytest.raises(FormValidationError) as caught:
+        convert_values([itens], {"itens": [row]})
+    assert "Valor grande demais." in " ".join(caught.value.errors.values())
+
+
+def test_whole_numbers_are_sent_as_int() -> None:
+    fields = {f.name: f for f in fields_from_schema(SCHEMA)}
+    quantidade, taxa, itens = fields["quantidade"], fields["taxa"], fields["itens"]
+    # O campo numérico do navegador sempre entrega float (5.0); no JSON vai 5.
+    for spec in (quantidade, taxa):
+        converted = convert_values([spec], {spec.name: 5.0})[spec.name]
+        assert converted == 5 and type(converted) is int, spec.name
+    assert type(convert_values([taxa], {"taxa": "7"})["taxa"]) is int
+    assert convert_values([taxa], {"taxa": 2.5}) == {"taxa": 2.5}
+    row = {**VALID["itens"][0], "qtd": 4.0}
+    (item,) = convert_values([itens], {"itens": [row]})["itens"]
+    assert item["qtd"] == 4 and type(item["qtd"]) is int
+    # Um texto só com dígitos não passa por float, que perderia o último dígito.
+    assert convert_values([taxa], {"taxa": "12345678901234567"}) == {"taxa": 12345678901234567}
+    # Acima de 2**53 o float do navegador já trocou dígitos (12345678901234567 chega
+    # como 12345678901234568): melhor recusar que mandar outro número.
+    assert field_error(quantidade, 12345678901234567.0) == "Número grande demais."
+    assert convert_values([quantidade], {"quantidade": float(2**53)}) == {"quantidade": 2**53}
+    assert field_error(quantidade, 10**18) == "Número grande demais."
+    assert field_error(quantidade, "1" * 19) == "Número grande demais."
+    assert field_error(taxa, "1" * 19) == "Número grande demais."
+    # Número que o executor não conseguiria digitar: recusado no campo, não na execução.
+    for raw in (1e30, "1" * 30 + ",5", 1e-30, "0,0000000000000000000001"):
+        assert field_error(taxa, raw) == "Número grande ou pequeno demais.", raw
+
+
 def test_split_server_errors() -> None:
     fields = fields_from_schema(SCHEMA)
     by_field, general = split_server_errors(
