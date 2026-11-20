@@ -98,11 +98,14 @@ principais:
   passo falhar com ``acao_falhou`` sem agir. Num clique, numa marcação ou numa
   escolha, o vigia confere de novo, no primeiro evento, os campos digitados do
   documento do alvo (a página que troca o campo enquanto o clique espera uma camada
-  sair). O campo digitado de novo vale pela última vez, e o que saiu da página (ou
-  cujo documento acabou) deixa de contar; cada campo é lido no próprio documento.
+  sair); com campos digitados noutro documento, o clique espera o alvo ficar livre
+  antes da releitura, só lendo a página, e um primeiro evento que chega mais de 2 s
+  depois do vigia (um documento de outra origem por cima do alvo) é recusado. O
+  campo digitado de novo vale pela última vez, e o que saiu da página (ou cujo
+  documento acabou) deixa de contar; cada campo é lido no próprio documento.
   Resíduos: a mudança que chega durante um clique, uma tecla ou uma escolha do robô
   vira a referência, e a que chega entre a releitura e a ação de um passo de digitar
-  ou de teclar não é vista. Os valores do campo nunca vão para eventos nem
+  ou de teclar (ou, noutro documento, até 2 s depois da releitura) não é vista. Os valores do campo nunca vão para eventos nem
   mensagens;
 - valores de entradas, variáveis e itens nunca mudam o alvo de um passo: não
   entram em seletores CSS/XPath, cada um vira um único trecho codificado do
@@ -329,6 +332,10 @@ _ACTS_ON_TARGET = (ClickStep, FillStep, SelectStep, CheckStep, PressStep, Upload
 #: Prazo, em segundos, para ler os campos digitados fora da conferência antes de gravar (no
 #: fim de um passo e logo antes de agir): sem resposta, nenhum ganha referência nova.
 _TYPED_READ_S = 5.0
+#: Com campos digitados noutro documento que o do alvo, o vigia recusa o primeiro evento de
+#: um clique, marcação ou escolha que chega mais que isso (em ms) depois dele: o Playwright
+#: esperou o alvo ficar livre, e esses campos podem ter mudado nessa espera sem ser vistos.
+_LATE_EVENT_MS = 2000.0
 
 
 def _refreshes_typed(step: Step) -> bool:
@@ -336,6 +343,11 @@ def _refreshes_typed(step: Step) -> bool:
     (:meth:`Interpreter._refresh_typed`): age na página sem digitar (um clique, uma tecla,
     uma escolha, um endereço). Os que só leem e os que digitam, não."""
     return not isinstance(step, (*_PAGE_READS, FillStep))
+
+
+def _held(read: list[tuple[_Typed, str]]) -> set[int]:
+    """Os campos que a conferência antes de gravar leu com a referência deles."""
+    return {id(entry.handle) for entry, _ in read}
 
 
 def _effective_effect(step: Step, inherited: Iterable[Effect]) -> Effect:
@@ -394,7 +406,7 @@ const fieldState = (element, text) => {
   const field = fieldOf(element);
   // Pelo nome da etiqueta, e não por instanceof: o campo pode ser de outro documento (um
   // iframe), com outras classes.
-  const tag = field.tagName;
+  const tag = field.tagName.toUpperCase();
   if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') {
     return [null, false, null, false];
   }
@@ -679,14 +691,16 @@ _PINNED_ROW_JS = (
 # texto, com o elemento ainda dentro dela e um elemento dela cujo texto do HTML, inteiro, é a
 # chave (a mesma regra da escolha da linha), e com os campos digitados deste documento ainda
 # com o valor que a conferência deles leu (``typed``: a página pode mudá-los enquanto o
-# Playwright espera o alvo ficar livre). Então o vigia sai. Um clique cujos eventos não
-# chegaram à janela do alvo (o Playwright clicou noutro documento por cima dele) também
-# conta como recusa; marcar uma caixa que já está como deve ficar não manda evento nenhum
-# (``marca``) e não é recusa. ``stop()`` devolve o motivo da recusa (``alvo`` ou
-# ``campo``) ou ``null``. Senão, ele cancela esse evento e todos os seguintes da ação (``preventDefault`` e
-# ``stopImmediatePropagation``) e marca a recusa, que o executor lê depois de agir.
+# Playwright espera o alvo ficar livre) e, se há campos digitados noutro documento (que o
+# vigia não lê), até ``late`` ms depois de o vigia ser posto. Então o vigia sai. Um clique
+# cujos eventos não chegaram à janela do alvo (o Playwright clicou noutro documento por cima
+# dele) também conta como recusa; marcar uma caixa que já está como deve ficar não manda
+# evento nenhum (``marca``) e não é recusa. ``stop()`` devolve o motivo da recusa (``alvo``,
+# ``campo`` ou ``espera``) ou ``null``. Senão, ele cancela esse evento e todos os seguintes
+# da ação (``preventDefault`` e ``stopImmediatePropagation``) e marca a recusa, que o
+# executor lê depois de agir.
 _DISPATCH_GUARD_JS = (
-    "(element, [kind, row, key, typed]) => {"
+    "(element, [kind, row, key, typed, late]) => {"
     + _FIELD_OF_FN
     + r"""
 const view = element.ownerDocument.defaultView;
@@ -753,6 +767,9 @@ const fieldValue = (node) => {
   return typeof field.value === 'string' ? field.value : null;
 };
 const typedHold = () => (typed || []).every(([node, value]) => fieldValue(node) === value);
+// Com campos digitados noutro documento, que o vigia não lê: o primeiro evento não demorou.
+const armedAt = view.performance.now();
+const prompt = () => late === null || view.performance.now() - armedAt <= late;
 const types = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'keydown',
   'keypress', 'keyup', 'beforeinput', 'input', 'change'];
 let state = 'armado';
@@ -766,12 +783,13 @@ const listener = (event) => {
     const onTarget = event.composedPath().includes(target);
     if (!onTarget && (event.type === 'change' || !event.isTrusted)) return;
     if (onTarget && !moved() && inRow()) {
-      if (typedHold()) {
+      const hold = typedHold();
+      if (hold && prompt()) {
         state = 'passou';
         off();
         return;
       }
-      reason = 'campo';
+      reason = hold ? 'espera' : 'campo';
     }
     state = 'recusou';
   }
@@ -788,6 +806,66 @@ return {
 };
 }"""
 )
+
+
+# Se um clique no centro do elemento (da primeira caixa dele na janela) chegaria a ele: o
+# elemento do ponto, também dentro de shadow roots abertos, é ele, algo dentro dele ou o
+# hospedeiro de um shadow root fechado em volta dele; e, num iframe da mesma origem, o
+# elemento do ponto no documento de cima é o iframe, e assim por diante. Fora da janela, ou
+# num documento de outra origem acima, não dá para saber: vale ``true`` (o vigia confere a
+# demora do primeiro evento).
+_UNCOVERED_JS = r"""(element) => {
+let want = element;
+if (!want.matches('input, textarea, select') && !want.isContentEditable) {
+  want = want.closest('button, [role=button], a, [role=link]') || want;
+}
+let view = element.ownerDocument.defaultView;
+let box = null;
+for (const rect of element.getClientRects()) {
+  const left = Math.max(rect.left, 0);
+  const top = Math.max(rect.top, 0);
+  const right = Math.min(rect.right, view.innerWidth);
+  const bottom = Math.min(rect.bottom, view.innerHeight);
+  if (right - left >= 1 && bottom - top >= 1) {
+    box = [left, top, right, bottom];
+    break;
+  }
+}
+if (box === null) return true;
+let x = (box[0] + box[2]) / 2;
+let y = (box[1] + box[3]) / 2;
+const up = (node) => node.parentNode ?? node.host ?? null;
+for (;;) {
+  const doc = want.ownerDocument;
+  let hit = doc.elementFromPoint(x, y);
+  while (hit && hit.shadowRoot) {
+    const inner = hit.shadowRoot.elementFromPoint(x, y);
+    if (!inner || inner === hit) break;
+    hit = inner;
+  }
+  if (!hit) return false;
+  let at = hit;
+  while (at && at !== want) at = up(at);
+  if (at !== want) {
+    // O ponto cai num hospedeiro de shadow root fechado em volta do alvo: não dá para ver.
+    let around = up(want);
+    while (around && around !== hit) around = up(around);
+    if (!(around === hit && hit.shadowRoot === null)) return false;
+  }
+  let frame = null;
+  try {
+    frame = doc.defaultView.frameElement;
+  } catch (error) {
+    frame = null;
+  }
+  if (!frame) return true;
+  const rect = frame.getBoundingClientRect();
+  const style = frame.ownerDocument.defaultView.getComputedStyle(frame);
+  x += rect.left + frame.clientLeft + (parseFloat(style.paddingLeft) || 0);
+  y += rect.top + frame.clientTop + (parseFloat(style.paddingTop) || 0);
+  want = frame;
+}
+}"""
 
 
 class _StopBeforeWrite(Exception):
@@ -938,7 +1016,8 @@ class _Typed(NamedTuple):
 
     ``accepted`` é o valor que o campo tinha no fim do último passo do robô (o primeiro, o
     da digitação aceita: :meth:`Interpreter._refresh_typed`); ``intent`` e ``title`` vêm
-    do robô (nunca valores), para a mensagem.
+    do robô (nunca valores), para a mensagem; ``frame`` é o do documento do campo, lido
+    uma vez ao anotar.
     """
 
     handle: ElementHandle
@@ -946,6 +1025,8 @@ class _Typed(NamedTuple):
     accepted: str
     intent: str
     title: str
+    #: O frame do documento do campo (para o vigia saber quais são do documento do alvo).
+    frame: Frame | None
 
 
 def _typed_value_matches(
@@ -959,10 +1040,11 @@ def _typed_value_matches(
     editável, o espaço rígido) normalizados; e, num texto sem letras, a máscara da página:
     os
     mesmos dígitos, na mesma ordem (CPF, CNPJ, CEP, telefone, datas, centavos), com o sinal
-    de menos que o texto tem; num número com casas decimais ou com o ponto dos milhares
+    de menos que o texto tem (e sem um que ele não tem); num número com casas decimais ou com o ponto dos milhares
     ("1.234,56", "10,5", "1234.56", "1.234"), o mesmo número ("1234,5" vira
     "R$ 1.234,50", mas "10,5" nunca vira "1,05", nem "1.234,00" vira "123.400,00"); e um
-    inteiro pode ganhar casas decimais zeradas ("10" vira "10,00"). Um campo vazio nunca vale por um texto que não é branco
+    inteiro pode ganhar uma ou duas casas decimais zeradas ("10" vira "10,00", "10.00" ou
+    "10,00 €"). Um campo vazio nunca vale por um texto que não é branco
     (o navegador apaga o que um ``input[type=number]`` não aceita), e num
     ``input[type=number]`` (``number``) a regra dos dígitos não vale. Qualquer outra
     diferença não vale: o ``maxlength`` que cortou o texto, uma página que troca letras.
@@ -979,7 +1061,8 @@ def _typed_value_matches(
     digits = _NOT_DIGIT.sub("", text)
     if not digits:
         return False
-    if text.strip().startswith("-") and not _NEGATIVE.match(value):
+    if text.strip().startswith("-") != bool(_NEGATIVE.match(value)):
+        # O sinal de menos que o texto tem precisa ficar, e o que ele não tem não aparece.
         return False
     decimal = _decimal_parts(text, typed=True)
     if decimal is not None:
@@ -987,18 +1070,25 @@ def _typed_value_matches(
     if _NOT_DIGIT.sub("", value) == digits:
         return True
     # Um inteiro que a página mostra com uma ou duas casas decimais zeradas ("10" vira
-    # "10,00"), com os mesmos dígitos ("0012" não vira "12", nem "10" vira "10,000").
-    whole, comma, fraction = value.rpartition(",")
+    # "10,00", "10.00" sem vírgula, "10,00 €"), com os mesmos dígitos ("0012" não vira
+    # "12", nem "10" vira "10,000").
+    whole, mark, fraction = value.rpartition(",")
+    if not mark:
+        whole, mark, fraction = value.rpartition(".")
+        if "." in whole:
+            return False
     return (
         text.strip().lstrip("-").isdigit()
-        and bool(comma)
-        and fraction.strip() in ("0", "00")
+        and bool(mark)
+        and _ZERO_FRACTION.fullmatch(fraction) is not None
         and _NOT_DIGIT.sub("", whole) == digits
     )
 
 
 #: Um valor com o sinal de menos antes do primeiro dígito.
 _NEGATIVE = re.compile(r"^[^0-9]*-")
+#: Uma ou duas casas decimais zeradas, com o que vem depois que não é dígito (" €", "%").
+_ZERO_FRACTION = re.compile(r"\s*0{1,2}[^0-9]*")
 #: Números como se digitam: com casas decimais ("1.234,56", "1234,56", "-10,5", "1234.56")
 #: ou com o ponto dos milhares ("1.234").
 _PT_DECIMAL = re.compile(r"-?(?:\d{1,3}(?:\.\d{3})+|\d+),\d+")
@@ -1041,7 +1131,7 @@ def _decimal_parts(text: str, *, typed: bool) -> tuple[str, str] | None:
 
 
 class _StepCtx:
-    __slots__ = ("checked_at", "deadline", "element", "guard", "locator", "step")
+    __slots__ = ("checked_at", "deadline", "element", "guard", "held", "locator", "step")
 
     def __init__(self, step: Step, deadline: float) -> None:
         self.step = step
@@ -1055,6 +1145,9 @@ class _StepCtx:
         self.element: ElementHandle | None = None
         #: O vigia posto na página logo antes de agir (:meth:`Interpreter._arm_guard`).
         self.guard: JSHandle | None = None
+        #: Os campos digitados que a conferência antes de gravar leu com a referência
+        #: deles (:meth:`Interpreter._typed_fields_hold`), quando ela foi feita.
+        self.held: set[int] | None = None
 
     def remaining_ms(self) -> float:
         """Tempo que resta ao passo, em ms (nunca 0, que no Playwright é 'sem limite')."""
@@ -2634,7 +2727,12 @@ class Interpreter:
                         if act is not None:
                             # Anotada antes de agir: uma ação que falhou no meio também conta.
                             act = self._record_act(act)
-                        held = await self._typed_held() if _refreshes_typed(step) else set()
+                        if not _refreshes_typed(step):
+                            held: set[int] = set()
+                        elif ctx.held is not None:
+                            held = ctx.held  # a conferência antes de gravar já leu
+                        else:
+                            held = await self._typed_held()
                         try:
                             data = await action()
                         finally:
@@ -3044,9 +3142,13 @@ class Interpreter:
                 handle = await locator.element_handle(timeout=ctx.remaining_ms())
         except PlaywrightError:
             return
+        try:
+            frame = await handle.owner_frame()
+        except PlaywrightError:
+            frame = None
         entries = self._typed
         same = await self._same_elements(handle, [entry.handle for entry in entries])
-        typed = _Typed(handle, text, value, step.target.intent, step.title)
+        typed = _Typed(handle, text, value, step.target.intent, step.title, frame)
         if self._typed is not entries:
             # Outra conferência trocou a lista no meio: o campo entra na nova.
             self._typed.append(typed)
@@ -3123,7 +3225,7 @@ class Interpreter:
 
     async def _typed_fields_hold(
         self, step: Step, current: ElementHandle | None
-    ) -> list[tuple[ElementHandle, str]]:
+    ) -> list[tuple[_Typed, str]]:
         """Antes de um passo que grava: os campos de texto que o robô digitou ainda têm o
         valor da referência deles (a digitação, ou o fim do último clique, tecla ou
         escolha do robô).
@@ -3138,7 +3240,8 @@ class Interpreter:
         que o passo vai digitar agora (``current``) também. Se algum mudou, o passo falha
         com ``acao_falhou`` sem agir; os valores nunca vão para a mensagem. Devolve o
         valor que leu de cada campo (para o vigia conferir de novo no primeiro evento da
-        ação: :meth:`_arm_guard`).
+        ação: :meth:`_arm_guard`; os campos lidos são os que ainda têm a referência, para
+        :meth:`_refresh_typed`).
         """
         entries = self._typed
         if not entries:
@@ -3146,7 +3249,7 @@ class Interpreter:
         states = await self._typed_states(entries, current)
         kept: list[_Typed] = []
         gone: list[ElementHandle] = []
-        read: list[tuple[ElementHandle, str]] = []
+        read: list[tuple[_Typed, str]] = []
         changed: _Typed | None = None
         for entry, state in zip(entries, states, strict=True):
             if state is None:
@@ -3168,7 +3271,7 @@ class Interpreter:
             if not holds:
                 changed = entry
             elif isinstance(value, str):
-                read.append((entry.handle, value))
+                read.append((entry, value))
         if self._typed is entries:  # senão, a página principal navegou no meio
             self._typed = kept
             for handle in gone:
@@ -3695,7 +3798,7 @@ class Interpreter:
         target = getattr(step, "target", None)
         if not isinstance(target, Target) or ctx.locator is None:
             # ``press`` sem alvo: a tecla vai para a página (e pode enviar o formulário).
-            await self._typed_fields_hold(step, None)
+            ctx.held = _held(await self._typed_fields_hold(step, None))
             return act
         if again:
             await self._resolve(target, step, ctx)
@@ -3730,10 +3833,18 @@ class Interpreter:
             if ctx.checked_at != checked_at or _page_key(self.page.url) != page:
                 raise self._page_changed(step, target)
             act = self._row_not_acted_on(step)
+        frame = await self._frame_of(ctx.element) if self._typed else None
+        if any(
+            frame is None or entry.frame is not frame for entry in self._typed
+        ) and await self._points_at(step, ctx.element):
+            # Há campos digitados noutro documento: o vigia não os lê no primeiro evento.
+            # A espera pelo alvo livre vem antes da releitura (:meth:`_wait_uncovered`).
+            await self._wait_uncovered(ctx, ctx.element)
         typed = await self._typed_fields_hold(
             step, ctx.element if isinstance(step, FillStep) else None
         )
-        await self._arm_guard(step, ctx, target, page, typed)
+        ctx.held = _held(typed)
+        await self._arm_guard(step, ctx, target, page, typed, frame)
         return act
 
     def _raise_if_page_changed(self, step: Step, target: Target, ctx: _StepCtx, page: str) -> None:
@@ -3785,7 +3896,8 @@ class Interpreter:
         ctx: _StepCtx,
         target: Target,
         page: str,
-        typed: list[tuple[ElementHandle, str]],
+        typed: list[tuple[_Typed, str]],
+        frame: Frame | None,
     ) -> None:
         """Põe o vigia (:data:`_DISPATCH_GUARD_JS`) e faz a conferência da hora de agir.
 
@@ -3796,7 +3908,12 @@ class Interpreter:
         escolha, o vigia também leva os campos digitados do mesmo documento do alvo, com o
         valor que :meth:`_typed_fields_hold` leu: se a página muda algum enquanto o
         Playwright espera o alvo ficar livre (uma camada de "buscando CEP"), o primeiro
-        evento da ação é cancelado e o passo falha com ``acao_falhou``.
+        evento da ação é cancelado e o passo falha com ``acao_falhou``. Os campos digitados
+        de outro documento (``frame`` é o do alvo) foram relidos depois de o alvo ficar
+        livre (:meth:`_wait_uncovered`); se, mesmo assim, o primeiro evento chega mais de
+        :data:`_LATE_EVENT_MS` depois do vigia (o Playwright esperou algo que a espera não
+        viu, como um documento de outra origem por cima do alvo), ele é cancelado e o passo
+        falha com ``acao_falhou``.
         """
         element = ctx.element
         if element is None:  # pragma: no cover - preso em _confirm_target
@@ -3825,14 +3942,17 @@ class Interpreter:
             # antes perde o foco, e a página pode formatá-lo): o vigia só confere os campos
             # digitados nos cliques, marcações e escolhas, cujo primeiro evento vem antes de
             # o foco mudar.
-            same = (
-                await self._same_document(element, typed)
-                if kind in ("clique", "marca", "campo")
-                else []
-            )
+            same: list[list[Any]] = []
+            late: float | None = None
+            if kind in ("clique", "marca", "campo"):
+                for entry, value in typed:
+                    if frame is not None and entry.frame is frame:
+                        same.append([entry.handle, value])
+                    else:
+                        late = _LATE_EVENT_MS
             ctx.guard = await element.evaluate_handle(
                 _DISPATCH_GUARD_JS,
-                [kind, row, choice.key if choice is not None else None, same],
+                [kind, row, choice.key if choice is not None else None, same, late],
             )
             self._raise_if_page_changed(step, target, ctx, page)
             if choice is not None and row is not None:
@@ -3849,24 +3969,45 @@ class Interpreter:
                 await self._dispose(row)
 
     @staticmethod
-    async def _same_document(
-        element: ElementHandle, typed: list[tuple[ElementHandle, str]]
-    ) -> list[list[Any]]:
-        """Os campos digitados (com o valor lido) que estão no mesmo frame do elemento."""
-        if not typed:
-            return []
+    async def _frame_of(element: ElementHandle) -> Frame | None:
         try:
-            frame = await element.owner_frame()
+            return await element.owner_frame()
         except PlaywrightError:
-            return []
-        same: list[list[Any]] = []
-        for handle, value in typed:
+            return None
+
+    @staticmethod
+    async def _points_at(step: Step, element: ElementHandle) -> bool:
+        """Se a ação do passo é um clique do mouse no elemento (que o Playwright só manda
+        com o alvo livre): um clique, um download ou uma marcação que muda a caixa."""
+        if isinstance(step, (ClickStep, DownloadStep)):
+            return True
+        if isinstance(step, CheckStep):
             try:
-                if await handle.owner_frame() is frame:
-                    same.append([handle, value])
+                return await element.is_checked() != step.checked
             except PlaywrightError:
-                continue
-        return same
+                return True
+        return False
+
+    async def _wait_uncovered(self, ctx: _StepCtx, element: ElementHandle) -> None:
+        """Espera, só lendo a página, que um clique no centro do elemento chegue a ele
+        (:data:`_UNCOVERED_JS`: nada do documento dele, nem dos documentos da mesma origem
+        acima dele, por cima), como o Playwright esperaria antes de clicar.
+
+        Só antes de a releitura dos campos digitados valer para outro documento: o que a
+        página muda nesses campos enquanto uma camada de "buscando CEP" cobre o alvo é visto
+        pela releitura, depois. Nunca falha: se o elemento sai da página, ou o prazo do
+        passo está no fim, a própria ação decide (e o vigia recusa um primeiro evento que
+        demorou).
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            await element.scroll_into_view_if_needed(timeout=ctx.remaining_ms())
+            while not await element.evaluate(_UNCOVERED_JS):
+                if loop.time() + self._poll_s + _LATE_EVENT_MS / 1000 >= ctx.deadline:
+                    return
+                await asyncio.sleep(self._poll_s)
+        except PlaywrightError:
+            return
 
     async def _act_on(
         self,
@@ -3894,7 +4035,9 @@ class Interpreter:
     async def _dispatched(self, step: Step, ctx: _StepCtx, action: Awaitable[object]) -> None:
         """Age e lê o vigia: se ele recusou o primeiro evento da ação (outro endereço, outro
         elemento, a linha mudou), o evento foi cancelado e o passo falha com
-        ``elemento_ambiguo``; se um campo digitado mudou, com ``acao_falhou``."""
+        ``elemento_ambiguo``; se um campo digitado mudou, ou pode ter mudado sem ser visto
+        (o primeiro evento demorou, com campos digitados noutro documento), com
+        ``acao_falhou``."""
         failure: Exception | None = None
         try:
             await action
@@ -3910,14 +4053,22 @@ class Interpreter:
                 "foi digitado, então nada foi feito.",
                 details={"alvo": target.intent if isinstance(target, Target) else step.title},
             ) from None
+        if reason == "espera":
+            raise StepError(
+                ErrorCode.ACAO_FALHOU,
+                f"O passo '{step.title}' esperou o alvo ficar livre, e um campo que o robô "
+                "digitou noutro documento (um iframe) pode ter mudado nessa espera sem ser "
+                "visto: ele enviaria um valor que não foi digitado, então nada foi feito.",
+                details={"alvo": target.intent if isinstance(target, Target) else step.title},
+            ) from None
         if reason is not None and isinstance(target, Target):
             raise self._page_changed(step, target) from None
         if failure is not None:
             raise failure
 
     async def _guard_refused(self, ctx: _StepCtx) -> str | None:
-        """Tira o vigia da página e diz por que ele recusou um evento (``alvo`` ou
-        ``campo``), ou ``None``.
+        """Tira o vigia da página e diz por que ele recusou um evento (``alvo``, ``campo``
+        ou ``espera``), ou ``None``.
 
         Se o documento já foi trocado (a própria ação navegou), não há o que ler, e vale o
         resultado da ação: um evento recusado é cancelado e não leva a página a outro

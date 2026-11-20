@@ -12,7 +12,9 @@ gravou é o do servidor (o corpo de cada ``POST /api``).
 - O que a página muda num campo digitado durante os passos do robô que agem (a sugestão do
   autocompletar, a formatação quando o foco sai, a busca limpa depois do Enter) vale; o que
   ela muda sozinha depois do último passo que agiu (durante uma espera, depois de um
-  ``replaceState``) é recusado antes de gravar.
+  ``replaceState``) é recusado antes de gravar. Com campos digitados noutro documento
+  que o do alvo, a releitura vem depois de o alvo ficar livre, e um primeiro evento que
+  demora (um documento de outra origem por cima) é recusado.
 """
 
 from __future__ import annotations
@@ -602,6 +604,16 @@ async def test_a_cents_mask_that_changes_the_number_stops_a_write(
         ("10", "10,000", False, False),
         ("0012345", "12345", False, False),
         ("0800", "800", False, False),
+        ("10", "10.00", False, True),
+        ("1000", "1000.00", False, True),
+        ("10", "10,00 €", False, True),
+        ("10", "10,00%", False, True),
+        ("10", "10.000", False, False),
+        ("10", "1.000.00", False, False),
+        ("10", "10,00 1", False, False),
+        ("100,00", "-100,00", False, False),
+        ("10", "-10", False, False),
+        ("10", "R$ -10,00", False, False),
     ],
 )
 def test_the_typed_text_and_the_field_value(
@@ -828,3 +840,128 @@ async def test_fields_typed_in_another_frame_are_read_in_their_own_document(
     items = [{"produto": f"P{i}", "qtd": str(i + 1)} for i in range(3)]
     outcome = await _run(run_robot, manifest, inputs={"itens": items})
     _wrote(outcome, srv, RunState.SUCCEEDED, "P0=1;P1=2;P2=3;")
+
+
+# -- campos digitados noutro documento que o do alvo -----------------------------------------
+
+
+def _cross_document_app(srv: _Server, field: str, cover: str, change: bool) -> App:
+    """O logradouro fica na página principal (``principal``) ou noutro iframe (``outro``);
+    o CEP e o Salvar, no iframe ``#f``. O CEP põe uma camada de "buscando CEP" por cima do
+    Salvar (no próprio iframe, ou na página de cima, ``pai``) por 1 s; ``change`` troca o
+    logradouro antes de tirar a camada."""
+    log_doc = "parent.document" if field == "principal" else "parent.frames['g'].document"
+    if cover == "iframe":
+        show = (
+            "const c=document.createElement('div');c.id='cobre';c.textContent='Buscando CEP';"
+            "c.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.3);z-index:10';"
+            "document.body.appendChild(c);"
+        )
+        hide = "document.getElementById('cobre').remove();"
+    else:
+        show = "parent.document.getElementById('capa').hidden=false;"
+        hide = "parent.document.getElementById('capa').hidden=true;"
+    swap = f"{log_doc}.getElementById('log').value='Rua do CEP';" if change else ""
+    form = _page(
+        "<label for='cep'>CEP</label><input id='cep'>"
+        "<button type='button' onclick=\"fetch('/api',{method:'POST',body:"
+        f"{log_doc}.getElementById('log').value+';'}})\">Salvar</button>"
+        "<script>let feito=false;document.getElementById('cep').addEventListener('input',(e)=>{"
+        f"if(feito||e.target.value.length<8)return;feito=true;{show}"
+        f"setTimeout(()=>{{{swap}{hide}}},1000);}})</script>"
+    )
+    log_input = "<label for='log'>Logradouro</label><input id='log'>"
+    host = _page(
+        "<div id='capa' hidden style='position:fixed;inset:0;z-index:10;"
+        "background:rgba(0,0,0,.2)'></div>"
+        + (log_input if field == "principal" else "")
+        + "<iframe id='f' name='f' src='/form' style='width:600px;height:200px'></iframe>"
+        + (
+            "<iframe id='g' name='g' src='/log' style='width:600px;height:100px'></iframe>"
+            if field != "principal"
+            else ""
+        )
+    )
+    return _api_app(srv, {"/host": host, "/form": form, "/log": _page(log_input)})
+
+
+def _cross_document_robot(srv: _Server, field: str, effect: str = "write") -> Manifest:
+    log = _fill("digitar_log", "Logradouro", "Praça da Sé")
+    if field != "principal":
+        log["target"]["frames"] = ["#g"]
+    cep = _fill("digitar_cep", "CEP", "01001000")
+    cep["target"]["frames"] = ["#f"]
+    save = _click("salvar", "Salvar", effect=effect, timeout=6_000)
+    save["target"]["frames"] = ["#f"]
+    return _manifest([_nav(srv.base, "/host"), log, cep, save])
+
+
+@pytest.mark.parametrize("cover", ["iframe", "pai"])
+@pytest.mark.parametrize("field", ["principal", "outro"])
+async def test_a_field_of_another_document_changed_while_the_click_waits_is_never_sent(
+    run_robot: RobotRunner, srv: _Server, field: str, cover: str
+) -> None:
+    # N4: o logradouro está noutro documento que o Salvar, e o vigia do clique só lê os
+    # campos do documento do alvo. A releitura vem depois de o Salvar ficar livre.
+    srv.app = _cross_document_app(srv, field, cover, change=True)
+    outcome = await _run(run_robot, _cross_document_robot(srv, field))
+    _wrote(outcome, srv, RunState.FAILED, "")
+    assert outcome.result.error_code == ErrorCode.ACAO_FALHOU
+
+
+@pytest.mark.parametrize("cover", ["iframe", "pai"])
+@pytest.mark.parametrize("field", ["principal", "outro"])
+async def test_a_cover_over_the_click_with_fields_in_another_document_only_delays_it(
+    run_robot: RobotRunner, srv: _Server, field: str, cover: str
+) -> None:
+    srv.app = _cross_document_app(srv, field, cover, change=False)
+    outcome = await _run(run_robot, _cross_document_robot(srv, field, effect="irreversible"))
+    _wrote(outcome, srv, RunState.SUCCEEDED, "Praça da Sé;")
+
+
+OTHER_HOST = "outro.rapa.test"
+
+
+def _cross_origin_app(srv: _Server) -> App:
+    """O Salvar fica num iframe de outra origem; a página principal o cobre por 2,5 s quando
+    o CEP é digitado e, no fim, troca o logradouro e tira a capa (o iframe não vê nada
+    disso)."""
+    form = _page(
+        "<label for='cep'>CEP</label><input id='cep'>"
+        f"<button type='button' onclick=\"{_post(chr(39) + 'S;' + chr(39))}\">Salvar</button>"
+        "<script>let feito=false;document.getElementById('cep').addEventListener('input',(e)=>{"
+        "if(feito||e.target.value.length<8)return;feito=true;parent.postMessage('cep','*')})"
+        "</script>"
+    )
+    host = _page(
+        "<div id='capa' hidden style='position:fixed;inset:0;z-index:10;"
+        "background:rgba(0,0,0,.2)'></div>"
+        "<label for='log'>Logradouro</label><input id='log'>"
+        f"<iframe id='f' src='http://{OTHER_HOST}:{srv.port}/form' "
+        "style='width:600px;height:200px'></iframe>"
+        "<script>addEventListener('message',()=>{const c=document.getElementById('capa');"
+        "c.hidden=false;setTimeout(()=>{document.getElementById('log').value='Rua do CEP';"
+        "c.hidden=true},2500)})</script>"
+    )
+    return _api_app(srv, {"/host": host, "/form": form})
+
+
+async def test_a_click_that_waits_for_another_origin_with_fields_elsewhere_is_refused(
+    run_robot: RobotRunner, srv: _Server
+) -> None:
+    # O Salvar está num iframe de outra origem, e a capa da página principal por cima dele
+    # não pode ser vista de dentro: o Playwright espera, e o primeiro evento chega mais de
+    # 2 s depois do vigia. O logradouro, da página principal, pode ter mudado nessa espera.
+    srv.app = _cross_origin_app(srv)
+    log = _fill("digitar_log", "Logradouro", "Praça da Sé")
+    cep = _fill("digitar_cep", "CEP", "01001000")
+    cep["target"]["frames"] = ["#f"]
+    save = _click("salvar", "Salvar", effect="write", timeout=8_000)
+    save["target"]["frames"] = ["#f"]
+    manifest = _manifest(
+        [_nav(srv.base, "/host"), log, cep, save], allowed_domains=[HOST, OTHER_HOST]
+    )
+    outcome = await _run(run_robot, manifest)
+    _wrote(outcome, srv, RunState.FAILED, "")
+    assert outcome.result.error_code == ErrorCode.ACAO_FALHOU
+    assert "pode ter mudado" in (outcome.result.error_message or "")
