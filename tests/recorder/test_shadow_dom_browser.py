@@ -1016,14 +1016,16 @@ QUADRO_VER = page(
 
 
 @pytest.mark.parametrize("stop", [False, True], ids=["troca", "para_e_troca"])
-async def test_a_value_the_component_takes_away_before_the_recorder_sees_it_is_kept(
+async def test_a_value_the_component_takes_away_before_the_recorder_sees_it_is_an_input(
     browser: Browser, stop: bool
 ) -> None:
     # E3b/E3d: a pessoa sai da célula clicando num iframe (sem pointerdown nem keydown
     # neste documento) e o change do componente troca o input antes do ouvinte do
     # gravador (ou também para o change). O gravador acha o campo fora da página (no
-    # change do shadow root ou no blur da janela) e manda o descritor e o valor
-    # guardados no último input da pessoa.
+    # change do shadow root ou no blur da janela) e só tem o retrato de depois da
+    # última tecla: o passo fica, com o alvo e o efeito, mas o valor só sai como
+    # segredo e o robô o pede numa entrada (a página pode ter mudado o campo depois do
+    # retrato, e o valor nunca é repetido nem gravado).
     html = page(
         "Grade",
         xcell(stop) + "<h1>Grade</h1>"
@@ -1041,11 +1043,15 @@ async def test_a_value_the_component_takes_away_before_the_recorder_sees_it_is_k
     recording = await record_site(
         browser, {"/grade": html, "/quadro": QUADRO_VER}, "/grade", scenario
     )
-    assert [(e.element.label, e.value) for e in inputs_of(recording)] == [("Valor", "V-42")]
+    (valor,) = inputs_of(recording)
+    assert (valor.element.label, valor.element.sensitive, valor.value) == ("Valor", True, None)
+    assert not has_text(recording, "V-42")
     result = compile_(recording)
     found = fill_steps(result)
-    assert [(s.id, s.value) for s in found] == [("digitar_valor", TextValue(template="V-42"))]
+    assert [(s.id, s.value) for s in found] == [("digitar_valor", an_input("valor"))]
     assert await marks_of(browser, html, found) == ["c"]
+    manifest, prompt = dumps(result)
+    assert "V-42" not in manifest and "V-42" not in prompt
     # O POST do change grava no passo do campo (ou no clique no iframe, que tira o foco
     # no robô, se a requisição chegar depois dele). Nunca fica sem um passo que grava.
     effects = {s.id: s.effect for s in result.manifest.steps}
@@ -1266,11 +1272,14 @@ function sortRows() { data.reverse(); document.querySelectorAll('#tb tr').forEac
 )
 
 
-async def test_a_reused_row_input_keeps_the_row_the_person_typed_in(browser: Browser) -> None:
+async def test_a_reused_row_input_keeps_the_row_the_person_typed_in_and_asks_the_value(
+    browser: Browser,
+) -> None:
     # W1s: a pessoa foca o campo da linha A, clica em "Ordenar" (o mesmo input passa a
     # ser o da linha B), digita 99 e sai para o iframe; o componente tira o input da
     # página no próprio change. Antes, o descritor guardado no primeiro foco (linha A)
-    # saía com o valor, e o robô digitava 99 na linha A.
+    # saía com o valor, e o robô digitava 99 na linha A. O passo fica na linha B; o
+    # valor, que só o retrato de depois da última tecla tem, vira uma entrada.
     html = page("Boletos", ROWS_REUSED)
 
     async def scenario(p: Page) -> None:
@@ -1285,12 +1294,12 @@ async def test_a_reused_row_input_keeps_the_row_the_person_typed_in(browser: Bro
         browser, {"/boletos": html, "/quadro": QUADRO_VER}, "/boletos", scenario
     )
     (valor,) = inputs_of(recording)
-    assert valor.value == "99"
+    assert valor.value is None and valor.element.sensitive
     assert valor.element.row is not None and valor.element.row.key == "Boleto B"
     result = compile_(recording)
     found = fill_steps(result)
     assert [(s.id, s.value, s.target.within_has_text) for s in found] == [
-        ("digitar_valor", TextValue(template="99"), "Boleto B")
+        ("digitar_valor", an_input("valor"), "Boleto B")
     ]
 
     async def ordenar(p: Page) -> None:
@@ -1461,10 +1470,14 @@ customElements.define('x-amt', class extends HTMLElement { connectedCallback() {
 </script>"""
 
 
-async def test_a_component_mask_that_types_by_script_keeps_the_last_key(browser: Browser) -> None:
+async def test_a_component_mask_that_types_by_script_never_replays_a_value(
+    browser: Browser,
+) -> None:
     # W9s: a pessoa digita 1234 no ritmo de uma pessoa (120 ms por tecla) e sai para o
-    # iframe; o componente tira o input da página no change. O valor guardado é o de
-    # depois de cada tecla (no beforeinput ele fica desconhecido). Antes, saía 123.
+    # iframe; o componente tira o input da página no change. O retrato de depois da
+    # última tecla pode ser de antes da tecla que o componente põe num temporizador
+    # dele: o valor nunca é repetido (antes, saía 123); o passo pede o valor numa
+    # entrada.
     html = page(
         "Grade",
         XAMOUNT
@@ -1481,10 +1494,11 @@ async def test_a_component_mask_that_types_by_script_keeps_the_last_key(browser:
     recording = await record_site(
         browser, {"/grade": html, "/quadro": QUADRO_VER}, "/grade", scenario
     )
-    assert [(e.element.label, e.value) for e in inputs_of(recording)] == [("Valor", "1234")]
+    assert [(e.element.label, e.value) for e in inputs_of(recording)] == [("Valor", None)]
+    assert not has_text(recording, "123")
     result = compile_(recording)
     found = fill_steps(result)
-    assert [(s.id, s.value) for s in found] == [("digitar_valor", TextValue(template="1234"))]
+    assert [(s.id, s.value) for s in found] == [("digitar_valor", an_input("valor"))]
     assert await marks_of(browser, html, found) == ["c"]
 
 
@@ -1736,3 +1750,178 @@ async def test_a_double_click_on_a_login_button_the_page_recreates_is_one_click(
     steps = [s for s in result.manifest.steps if isinstance(s, ClickStep)]
     assert [(s.id, s.effect) for s in steps] == [("clicar_entrar", Effect.READ)]
     assert usernames_in(result) == ["digitar_usuario"]
+
+
+# -- rodada 11: assinatura pelo nome, máscara tardia, foco sem retrato ------------------
+
+#: Botão que grava (a transferência), fora do componente.
+TRANSFERIR = (
+    "<button id='b' onclick=\"fetch('/api/transferir', {method: 'POST', body: '{}'})"
+    ".then(() => document.body.insertAdjacentHTML('beforeend', '<p>Ok</p>'))\">Transferir</button>"
+)
+
+
+def signature_component(conversion: str) -> str:
+    """Componente "Assinatura eletrônica" que para o change no próprio shadow root e
+    mostra o texto enquanto tem o foco; ``conversion`` o deixa como senha depois (no
+    focusout, como o onBlur do React, ou num temporizador do blur)."""
+    return (
+        """<script>
+customElements.define('x-pin', class extends HTMLElement { connectedCallback() {
+  if (this.shadowRoot) return;
+  const r = this.attachShadow({mode: 'open'});
+  r.addEventListener('change', (e) => e.stopImmediatePropagation(), true);
+  r.innerHTML = '<label for="s">Assinatura eletrônica</label><input id="s">';
+  const inp = r.getElementById('s');
+  """
+        + conversion
+        + """
+  inp.addEventListener('focus', () => { inp.type = 'text'; });
+} });
+</script>"""
+    )
+
+
+@pytest.mark.parametrize(
+    "conversion",
+    [
+        "inp.addEventListener('focusout', () => { inp.type = 'password'; });",
+        "inp.addEventListener('blur', () => { setTimeout(() => { inp.type = 'password'; }, 0); });",
+        "inp.addEventListener('blur', () => { requestAnimationFrame(() => { inp.type = 'password'; }); });",
+    ],
+    ids=["focusout", "temporizador", "quadro"],
+)
+@pytest.mark.parametrize("leave", ["botao", "iframe"])
+async def test_a_signature_field_is_secret_by_its_name(
+    browser: Browser, conversion: str, leave: str
+) -> None:
+    # Y1/Y2: o componente só vira senha depois de o gravador decidir (no focusout, num
+    # setTimeout ou num requestAnimationFrame do blur). O nome do campo ("Assinatura
+    # eletrônica", a senha de transação) já o faz sigiloso: o valor nunca sai, e o robô
+    # o pede numa entrada (nunca a senha do cofre, que é a do login).
+    secret = "7531"
+    html = page(
+        "Transferência",
+        signature_component(conversion)
+        + "<h1>Confirmar transferência</h1>"
+        + QUADRO_IFRAME
+        + "<div style='height:40px'><x-pin></x-pin></div>"
+        + TRANSFERIR,
+    )
+
+    async def scenario(p: Page) -> None:
+        await p.locator("x-pin").locator("#s").click()
+        await p.keyboard.type(secret, delay=60)
+        if leave == "iframe":
+            await leave_to_the_iframe(p)
+        await p.get_by_role("button", name="Transferir").click()
+        await p.get_by_text("Ok").wait_for()
+
+    recording = await record_site(browser, {"/t": html, "/quadro": QUADRO_VER}, "/t", scenario)
+    assert not has_text(recording, secret)
+    result = compile_(recording)
+    assert {s.id: s.value for s in fill_steps(result)} == {
+        "digitar_assinatura_eletronica": an_input("assinatura_eletronica")
+    }
+    manifest, prompt = dumps(result)
+    assert secret not in manifest and secret not in prompt
+    assert click_effect(result, "clicar_transferir") is Effect.IRREVERSIBLE
+
+
+#: Componente "Senha de confirmação" que mascara o campo por CSS 300 ms depois da última
+#: tecla e, no próprio change, troca o input por pontos e grava.
+LATE_MASK = """<script>
+customElements.define('x-sig', class extends HTMLElement { connectedCallback() {
+  if (this.shadowRoot) return;
+  const r = this.attachShadow({mode: 'open'});
+  r.innerHTML = '<style>.m { -webkit-text-security: disc; }</style>'
+    + '<label for="s">Confirmação</label><input id="s" placeholder="Digite">';
+  const inp = r.getElementById('s');
+  let t = null;
+  inp.addEventListener('input', () => {
+    clearTimeout(t); t = setTimeout(() => inp.classList.add('m'), 300);
+  });
+  r.addEventListener('change', (e) => {
+    const x = e.composedPath()[0];
+    if (!x || x.tagName !== 'INPUT') return;
+    const s = document.createElement('span'); s.textContent = '••••'; x.replaceWith(s);
+    fetch('/api/assinar', {method: 'POST', body: x.value});
+  }, true);
+} });
+</script>"""
+
+
+async def test_a_mask_that_appears_after_the_last_key_of_a_removed_field_never_leaks(
+    browser: Browser,
+) -> None:
+    # Y3a: a máscara aparece depois do retrato da última tecla, e o componente tira o
+    # campo da página no change quando a pessoa sai para o iframe. O gravador só tem o
+    # retrato (de antes da máscara): o valor só sai como segredo e vira uma entrada.
+    secret = "8642"
+    html = page(
+        "Transferência",
+        LATE_MASK
+        + "<h1>Confirmar transferência</h1>"
+        + QUADRO_IFRAME
+        + "<div style='height:40px'><x-sig></x-sig></div>"
+        + TRANSFERIR,
+    )
+
+    async def scenario(p: Page) -> None:
+        await p.locator("x-sig").locator("#s").click()
+        await p.keyboard.type(secret, delay=60)
+        await p.wait_for_timeout(700)
+        await leave_to_the_iframe(p)
+        await p.get_by_role("button", name="Transferir").click()
+        await p.get_by_text("Ok").wait_for()
+
+    recording = await record_site(browser, {"/t": html, "/quadro": QUADRO_VER}, "/t", scenario)
+    assert not has_text(recording, secret)
+    (field,) = inputs_of(recording)
+    assert field.element.sensitive and field.value is None
+    result = compile_(recording)
+    assert [s.id for s in fill_steps(result)] == ["digitar_confirmacao"]
+    manifest, prompt = dumps(result)
+    assert secret not in manifest and secret not in prompt
+
+
+@pytest.mark.parametrize("phase", ["senha", "codigo"])
+async def test_a_focus_only_visit_never_marks_an_input_the_page_reuses(
+    browser: Browser, phase: str
+) -> None:
+    # Y11: a pessoa só foca o campo na fase de senha (ou de código), a página o
+    # reaproveita como "Valor (R$)" e ela digita 150. O foco sozinho não tira retrato:
+    # o robô digita 150, nunca a senha (ou o código) do cofre no valor do pagamento.
+    if phase == "senha":
+        first = '<label id="lb" for="f">Senha</label><input id="f" type="password">'
+        switch = "f.type = 'text'; lb.textContent = 'Valor (R$)'; f.value = '';"
+    else:
+        first = (
+            '<label id="lb" for="f">Código de verificação</label>'
+            '<input id="f" autocomplete="one-time-code">'
+        )
+        switch = "f.removeAttribute('autocomplete'); lb.textContent = 'Valor (R$)'; f.value = '';"
+    html = page(
+        "Pagamento",
+        "<h1>Pagamento</h1>"
+        + first
+        + "<button id='sw' onclick=\"const f = document.getElementById('f'); "
+        "const lb = document.getElementById('lb'); " + switch + '">Pagar sem confirmação</button>'
+        "<button id='pay' onclick=\"fetch('/api/pagar', {method: 'POST', "
+        "body: document.getElementById('f').value})"
+        ".then(() => document.body.insertAdjacentHTML('beforeend', '<p>Ok</p>'))\">Pagar</button>",
+    )
+
+    async def scenario(p: Page) -> None:
+        await p.locator("#f").click()
+        await p.get_by_role("button", name="Pagar sem confirmação").click()
+        await p.locator("#f").click()
+        await p.keyboard.type("150", delay=40)
+        await p.get_by_role("button", name="Pagar", exact=True).click()
+        await p.get_by_text("Ok").wait_for()
+
+    recording = await record_site(browser, {"/p": html}, "/p", scenario)
+    result = compile_(recording)
+    assert [(s.id, s.value) for s in fill_steps(result)] == [
+        ("digitar_valor_r", TextValue(template="150"))
+    ]

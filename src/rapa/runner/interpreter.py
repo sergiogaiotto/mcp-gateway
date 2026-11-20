@@ -47,11 +47,16 @@ principais:
   ``replaceState``, ``#``), a página e, numa linha escolhida pelo texto, que ela
   ainda é a única com ele e que o elemento conferido ainda está nela (uma lista
   que reaproveita a linha no lugar, com outro texto, é vista). A ação vai em
-  seguida, sem nova espera; antes dela, um vigia na fase de captura da janela
-  confere o primeiro evento da ação: se ele não cai no alvo (o botão ou link em
-  volta dele, num clique; o campo, ao digitar), se o endereço mudou ou se a linha
-  já não tem a chave, o evento e os seguintes da ação são cancelados e o passo
-  falha. Uma mudança de endereço (também no mesmo documento) ou de linha falha com
+  seguida, sem ``force``: o Playwright ainda confere, sem esperar de novo o que já
+  esperou, que o alvo não está coberto (também por outro documento: um iframe por
+  cima do botão, a página por cima de um iframe) nem inerte (um diálogo modal), e
+  espera ficar livre. Antes dela, um vigia na fase de captura da janela confere o
+  primeiro evento da ação: se ele não cai no alvo (o botão ou link em volta dele,
+  num clique; o campo, ao digitar), se o endereço mudou ou se a linha já não tem
+  um elemento cujo texto inteiro do HTML é a chave (a mesma regra da escolha da
+  linha: a linha reaproveitada de "12" para "120" não vale), o evento e os
+  seguintes da ação são cancelados e o passo falha; um clique cujos eventos não
+  chegam à janela do alvo também falha. Uma mudança de endereço (também no mesmo documento) ou de linha falha com
   ``elemento_ambiguo``, e nada é feito; se a página troca de documento durante a
   espera, o elemento sai da página e o passo falha com ``acao_falhou``. Um
   elemento que sai da página durante a espera sem navegação (o botão montado de
@@ -59,8 +64,9 @@ principais:
   contador, rede e linha única), uma vez; na segunda vez, o passo falha
   (``acao_falhou``). Ficam de fora (resíduos conhecidos) os shadow roots fechados,
   a chave que só o CSS mostra, uma lista virtual que troca o que a linha é sem
-  trocar o texto dela e um ouvinte da própria página, na janela, posto antes do
-  vigia. Perdas de disponibilidade aceitas: qualquer mudança de endereço da
+  trocar o texto dela, a linha trocada entre o primeiro evento do clique e o
+  último (o vigia decide no primeiro) e um ouvinte da própria página, na janela,
+  posto antes do vigia. Perdas de disponibilidade aceitas: qualquer mudança de endereço da
   página principal entre a conferência do alvo e a ação (também um filtro que
   muda a consulta do endereço), e uma tecla para um elemento que não recebe o
   foco. Um segredo vai para o elemento em que a origem foi conferida, sem o
@@ -73,20 +79,25 @@ principais:
   senão, o passo falha. Num passo que grava, nada que gravou é repetido: sem
   digitar de novo, vale o texto como o navegador o guarda (posto numa cópia solta
   do campo: ``\\r\\n`` vira ``\\n``, um e-mail ou endereço perde os espaços das
-  pontas), com os brancos e o espaço rígido normalizados num elemento editável,
-  ou, num texto sem letras, com os mesmos dígitos na mesma ordem (a máscara de
-  CPF, CNPJ, CEP, telefone, moeda ou data); qualquer outra diferença (o
-  ``maxlength`` que cortou o texto, uma página que troca letras) faz o passo
-  falhar. Os campos de texto digitados desde a última navegação da página
-  principal (também ``pushState``) são lidos de novo antes de cada passo que
-  grava e age na página: se a página mudou algum depois (uma consulta de CEP que
-  responde depois da conferência), o passo falha com ``acao_falhou`` sem agir.
-  Vale o valor da conferência da digitação ou a mesma regra de comparação (uma
-  máscara que a página só põe quando o foco sai do campo vale); o campo digitado
-  de novo vale pela última vez, e o que saiu da página deixa de contar. Perda de
-  disponibilidade aceita: um campo digitado antes que a página muda depois de uma
-  gravação (limpa ou formata com letras), sem o robô digitar de novo, faz a
-  próxima gravação no mesmo documento falhar. Os valores do campo nunca vão para
+  pontas), com os brancos (e o espaço rígido) normalizados, ou, num texto sem
+  letras, a máscara da página (:func:`_typed_value_matches`):
+  os mesmos dígitos na mesma ordem (CPF, CNPJ, CEP, telefone, data, centavos),
+  com o sinal de menos, e, num número com casas decimais ou com o ponto dos
+  milhares, o mesmo número ("10,5" que vira "1,05" não vale). Um campo vazio
+  nunca vale por um texto, e num ``input[type=number]`` a regra dos dígitos não
+  vale. Qualquer outra diferença (o ``maxlength`` que cortou o texto, uma página
+  que troca letras) faz o passo falhar. Os campos de texto que o robô digitou são
+  lidos de novo antes de cada passo que grava e age na página, comparados com a
+  referência (:meth:`_refresh_typed`): o valor da digitação, ou o do fim do último
+  clique, tecla ou escolha do robô. O que muda durante esses passos vale (a
+  sugestão escolhida num autocompletar, a busca limpa depois do Enter), e a
+  formatação quando o foco sai do campo vale pela comparação; o que a página muda
+  sozinha enquanto o robô espera ou digita noutro campo, também depois de um
+  ``pushState``/``replaceState`` (uma consulta de CEP que responde depois), faz o
+  passo falhar com ``acao_falhou`` sem agir. O campo digitado de novo vale pela
+  última vez, e o que saiu da página (ou cujo documento acabou) deixa de contar.
+  Resíduos: a mudança que chega durante um clique, uma tecla ou uma escolha do robô
+  vira a referência, e a que chega entre a releitura e a ação não é vista. Os valores do campo nunca vão para
   eventos nem mensagens;
 - valores de entradas, variáveis e itens nunca mudam o alvo de um passo: não
   entram em seletores CSS/XPath, cada um vira um único trecho codificado do
@@ -355,20 +366,20 @@ const fieldOf = (element) => {
 };
 """
 
-# [valor do campo, se ele é um elemento editável, o valor que o navegador dá ao texto]: o
-# texto posto numa cópia solta do campo (``cloneNode``), que o navegador guarda como guardaria
-# no campo (``\r\n`` vira ``\n``, um e-mail ou endereço perde os espaços das pontas). O
-# ``maxlength`` só limita o que se digita, não o que um script põe: a cópia fica com o
-# texto inteiro.
+# [valor do campo, se ele é um elemento editável, o valor que o navegador dá ao texto, se é
+# um ``input[type=number]``]: o texto posto numa cópia solta do campo (``cloneNode``), que o
+# navegador guarda como guardaria no campo (``\r\n`` vira ``\n``, um e-mail ou endereço perde
+# os espaços das pontas). O ``maxlength`` só limita o que se digita, não o que um script
+# põe: a cópia fica com o texto inteiro.
 _FIELD_STATE_FN = (
     _FIELD_OF_FN
     + r"""
 const fieldState = (element, text) => {
-  if (element.isContentEditable === true) return [element.innerText, true, null];
+  if (element.isContentEditable === true) return [element.innerText, true, null, false];
   const field = fieldOf(element);
   if (!(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement
       || field instanceof HTMLSelectElement)) {
-    return [null, false, null];
+    return [null, false, null, false];
   }
   let browser = null;
   if (!(field instanceof HTMLSelectElement)) {
@@ -380,7 +391,8 @@ const fieldState = (element, text) => {
       browser = null;
     }
   }
-  return [field.value, false, browser];
+  return [field.value, false, browser,
+    field instanceof HTMLInputElement && field.type === 'number'];
 };
 """
 )
@@ -648,8 +660,10 @@ _PINNED_ROW_JS = (
 # ``change`` só no alvo, porque o de outro campo que perde o foco não é da ação). O evento
 # vale se cai no alvo (o elemento, ou o botão ou link em volta dele num clique, como o
 # Playwright confere), com o mesmo endereço da conferência e, numa linha escolhida pelo
-# texto, com o elemento ainda dentro dela e a chave ainda no texto do HTML dela. Então o vigia
-# sai. Senão, ele cancela esse evento e todos os seguintes da ação (``preventDefault`` e
+# texto, com o elemento ainda dentro dela e um elemento dela cujo texto do HTML, inteiro, é a
+# chave (a mesma regra da escolha da linha). Então o vigia sai. Um clique cujos eventos não
+# chegaram à janela do alvo (o Playwright clicou noutro documento por cima dele) também
+# conta como recusa. Senão, ele cancela esse evento e todos os seguintes da ação (``preventDefault`` e
 # ``stopImmediatePropagation``) e marca a recusa, que o executor lê depois de agir.
 _DISPATCH_GUARD_JS = (
     "(element, [kind, row, key]) => {"
@@ -697,11 +711,19 @@ const moved = () => {
   const now = topHref();
   return now === null || now !== top;
 };
+const hasWhole = (node) => {
+  if (node.nodeType === 1 && skipped.has(node.nodeName)) return false;
+  if (node.nodeType === 1 && normalize(htmlText(node)) === key) return true;
+  for (let child = node.firstChild; child; child = child.nextSibling) {
+    if (child.nodeType === 1 && hasWhole(child)) return true;
+  }
+  return !!node.shadowRoot && hasWhole(node.shadowRoot);
+};
 const inRow = () => {
   if (!row) return true;
   let at = element;
   while (at && at !== row) at = at.parentNode ?? at.host;
-  return at === row && normalize(htmlText(row)).includes(key);
+  return at === row && hasWhole(row);
 };
 const types = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'keydown',
   'keypress', 'keyup', 'beforeinput', 'input', 'change'];
@@ -728,7 +750,7 @@ for (const type of types) view.addEventListener(type, listener, true);
 return {
   stop: () => {
     off();
-    return state === 'recusou';
+    return state !== 'passou' && (state === 'recusou' || kind === 'clique');
   },
 };
 }"""
@@ -881,8 +903,9 @@ class _ListLoop:
 class _Typed(NamedTuple):
     """Um campo em que o robô digitou um texto, para conferir antes de gravar.
 
-    ``accepted`` é o valor que o campo tinha quando a digitação foi aceita; ``intent`` e
-    ``title`` vêm do robô (nunca valores), para a mensagem.
+    ``accepted`` é o valor que o campo tinha no fim do último passo do robô (o primeiro, o
+    da digitação aceita: :meth:`Interpreter._refresh_typed`); ``intent`` e ``title`` vêm
+    do robô (nunca valores), para a mensagem.
     """
 
     handle: ElementHandle
@@ -892,25 +915,91 @@ class _Typed(NamedTuple):
     title: str
 
 
-def _typed_value_matches(text: str, value: str, *, editable: bool, browser: str | None) -> bool:
+def _typed_value_matches(
+    text: str, value: str, *, browser: str | None, number: bool = False
+) -> bool:
     """Se o campo tem o texto que o robô digitou, como o navegador ou a página o guardam.
 
     Vale o próprio texto; num ``input`` ou ``textarea``, o valor que o navegador dá a ele
     (``browser``, de :data:`_TYPED_STATE_JS`: ``\\r\\n`` vira ``\\n``, um e-mail ou
-    endereço perde os espaços das pontas); num elemento editável, o texto com os brancos
-    (e o espaço rígido) normalizados; e, num texto sem letras, a máscara da página: os
-    mesmos dígitos, na mesma ordem (CPF, CNPJ, CEP, telefone, moeda, datas). Qualquer outra
+    endereço perde os espaços das pontas); o texto com os brancos (e, num elemento
+    editável, o espaço rígido) normalizados; e, num texto sem letras, a máscara da página:
+    os
+    mesmos dígitos, na mesma ordem (CPF, CNPJ, CEP, telefone, datas, centavos), com o sinal
+    de menos que o texto tem; num número com casas decimais ou com o ponto dos milhares
+    ("1.234,56", "10,5", "1234.56", "1.234"), o mesmo número ("1234,5" vira
+    "R$ 1.234,50", mas "10,5" nunca vira "1,05", nem "1.234,00" vira "123.400,00"); e um
+    inteiro pode ganhar casas decimais zeradas ("10" vira "10,00"). Um campo vazio nunca vale por um texto que não é branco
+    (o navegador apaga o que um ``input[type=number]`` não aceita), e num
+    ``input[type=number]`` (``number``) a regra dos dígitos não vale. Qualquer outra
     diferença não vale: o ``maxlength`` que cortou o texto, uma página que troca letras.
     """
+    if text.strip() and not value.strip():
+        return False
     if value == text or (browser is not None and value == browser):
         return True
-    if editable and value.split() == text.split():
+    if value.split() == text.split():
+        # Só os brancos mudaram (os espaços das pontas, dois espaços seguidos).
         return True
+    if number or any(char.isalpha() for char in text):
+        return False
     digits = _NOT_DIGIT.sub("", text)
+    if not digits:
+        return False
+    if text.strip().startswith("-") and not _NEGATIVE.match(value):
+        return False
+    decimal = _decimal_parts(text, typed=True)
+    if decimal is not None:
+        return _decimal_parts(value, typed=False) == decimal
+    if _NOT_DIGIT.sub("", value) == digits:
+        return True
+    # Um inteiro que a página mostra com casas decimais zeradas ("10" vira "10,00").
+    return text.strip().lstrip("-").isdigit() and _decimal_parts(value, typed=False) == (
+        digits.lstrip("0"),
+        "",
+    )
+
+
+#: Um valor com o sinal de menos antes do primeiro dígito.
+_NEGATIVE = re.compile(r"^[^0-9]*-")
+#: Números como se digitam: com casas decimais ("1.234,56", "1234,56", "-10,5", "1234.56")
+#: ou com o ponto dos milhares ("1.234").
+_PT_DECIMAL = re.compile(r"-?(?:\d{1,3}(?:\.\d{3})+|\d+),\d+")
+_DOT_DECIMAL = re.compile(r"-?\d+\.(?:\d{1,2}|\d{4,})")
+_THOUSANDS = re.compile(r"-?\d{1,3}(?:\.\d{3})+")
+
+
+def _decimal_parts(text: str, *, typed: bool) -> tuple[str, str] | None:
+    """A parte inteira e a decimal de um número (só os dígitos, sem zeros que não contam).
+
+    ``typed``: o texto que o robô digita, que só é lido como número num dos formatos de
+    :data:`_PT_DECIMAL`, :data:`_DOT_DECIMAL` ou :data:`_THOUSANDS` (senão, ``None``: só
+    dígitos, como num CPF ou num valor de centavos, seguem a regra dos dígitos). No valor
+    do campo, a vírgula é o separador decimal; sem vírgula, o último ponto que não separa
+    milhares; sem nenhum dos dois, o número é inteiro.
+    """
+    stripped = text.strip()
+    if typed:
+        if _PT_DECIMAL.fullmatch(stripped):
+            whole, _, fraction = stripped.rpartition(",")
+        elif _DOT_DECIMAL.fullmatch(stripped):
+            whole, _, fraction = stripped.rpartition(".")
+        elif _THOUSANDS.fullmatch(stripped):
+            whole, fraction = stripped, ""
+        else:
+            return None
+    elif "," in stripped:
+        whole, _, fraction = stripped.rpartition(",")
+    else:
+        head, dot, tail = stripped.rpartition(".")
+        tail_digits = _NOT_DIGIT.sub("", tail)
+        if dot and len(tail_digits) != 3:
+            whole, fraction = head, tail
+        else:
+            whole, fraction = stripped, ""
     return (
-        bool(digits)
-        and not any(char.isalpha() for char in text)
-        and _NOT_DIGIT.sub("", value) == digits
+        _NOT_DIGIT.sub("", whole).lstrip("0"),
+        _NOT_DIGIT.sub("", fraction).rstrip("0"),
     )
 
 
@@ -1460,10 +1549,9 @@ class Interpreter:
         #: Quantas vezes a página principal mudou de documento ou de endereço (ver
         #: :meth:`_confirm_target`).
         self._main_frame_changes = 0
-        #: Os campos de texto digitados desde a última navegação da página principal
-        #: (:meth:`_typed_fields_hold`), e os de antes dela, ainda por descartar.
+        #: Os campos de texto que o robô digitou e que ainda estão na página
+        #: (:meth:`_typed_fields_hold`, :meth:`_refresh_typed`).
         self._typed: list[_Typed] = []
-        self._typed_gone: list[ElementHandle] = []
         #: A página (:func:`_page_key`) que o passo ``navigate`` em andamento abre, e os
         #: pedidos dele: o primeiro para essa página e os redirecionamentos desse.
         self._robot_navigation: str | None = None
@@ -1648,14 +1736,13 @@ class Interpreter:
 
         Onde o passo ``navigate`` do robô para não conta nas voltas que já acabaram
         (:meth:`_on_request`); qualquer outro endereço conta. Os campos digitados até aqui
-        deixam de ser conferidos antes de gravar (:meth:`_typed_fields_hold`).
+        continuam conferidos antes de gravar enquanto o documento deles existe (uma
+        mudança de endereço no mesmo documento, por ``pushState`` ou ``#``, não os
+        tira): o campo de um documento que acabou sai da lista na conferência seguinte
+        (:meth:`_typed_fields_hold`, :meth:`_refresh_typed`).
         """
         if frame.parent_frame is None:
             self._main_frame_changes += 1
-            if self._typed:
-                # Uma lista nova: quem está lendo a antiga (num ``await``) segue com ela.
-                self._typed_gone.extend(entry.handle for entry in self._typed)
-                self._typed = []
             robot = self._robot_navigation is not None and _page_key(frame.url) in {
                 self._robot_navigation,
                 *(_page_key(request.url) for request in self._robot_requests),
@@ -2531,6 +2618,11 @@ class Interpreter:
                 await self._emit_step_started(step, effect)
             await self._report_failure(step, err, started)
             raise
+        if not isinstance(step, (*_PAGE_READS, FillStep)):
+            # O que o passo mudou nos campos digitados vira a referência deles. O que muda
+            # enquanto um passo só lê (uma espera) ou digita noutro campo é da própria
+            # página (a resposta do CEP que chega enquanto o robô digita o número).
+            await self._refresh_typed()
         self._steps_done += 1
         await self._emit(
             RunEventKind.STEP_SUCCEEDED,
@@ -2887,12 +2979,12 @@ class Interpreter:
             state = await on.evaluate(_TYPED_STATE_JS, text)
         else:
             state = await on.evaluate(_TYPED_STATE_JS, text, timeout=ctx.remaining_ms())
-        _, editable, browser = state
+        _, _, browser, number = state
         return _typed_value_matches(
             text,
             value,
-            editable=editable is True,
             browser=browser if isinstance(browser, str) else None,
+            number=number is True,
         )
 
     async def _remember_typed(
@@ -2914,12 +3006,11 @@ class Interpreter:
                 handle = await locator.element_handle(timeout=ctx.remaining_ms())
         except PlaywrightError:
             return
-        await self._dispose_gone()
         entries = self._typed
         same = await self._same_elements(handle, [entry.handle for entry in entries])
         typed = _Typed(handle, text, value, step.target.intent, step.title)
         if self._typed is not entries:
-            # A página principal navegou no meio: a lista antiga já vai ser descartada.
+            # Outra conferência trocou a lista no meio: o campo entra na nova.
             self._typed.append(typed)
             return
         kept: list[_Typed] = []
@@ -2953,26 +3044,56 @@ class Interpreter:
                 result.append(False)
         return result
 
-    async def _dispose_gone(self) -> None:
-        gone, self._typed_gone = self._typed_gone, []
-        for handle in gone:
-            await self._dispose(handle)
+    async def _refresh_typed(self) -> None:
+        """No fim de cada passo do robô que age na página sem digitar (um clique, uma
+        tecla, uma escolha; não os que só leem, como uma espera, :data:`_PAGE_READS`, nem
+        os que digitam, que anotam só o próprio campo), o valor de agora de cada campo
+        digitado vira a referência dele (``accepted``).
+
+        O que muda durante esses passos é aceito: a sugestão escolhida numa busca com
+        autocompletar, a busca que a página limpa depois do Enter. O que a página muda
+        sozinha num campo enquanto o robô espera ou digita noutro campo (o CEP que
+        preenche o logradouro enquanto o robô digita o número ou espera o aviso) é
+        recusado antes de um passo que grava (:meth:`_typed_fields_hold`); a formatação
+        que a página põe quando o foco sai do campo vale pela comparação
+        (:func:`_typed_value_matches`). O campo que saiu da página (ou cujo documento
+        acabou) sai da lista. Nunca falha o passo e nunca anota os valores.
+        """
+        entries = self._typed
+        if not entries:
+            return
+        try:
+            states = await self._typed_states(entries, None)
+        except PlaywrightError:
+            return
+        kept: list[_Typed] = []
+        gone: list[ElementHandle] = []
+        for entry, state in zip(entries, states, strict=True):
+            if state is None:
+                gone.append(entry.handle)
+                continue
+            value = state[0] if isinstance(state, list) and state else None
+            kept.append(entry._replace(accepted=value) if isinstance(value, str) else entry)
+        if self._typed is entries:  # senão, outro passo mexeu na lista no meio
+            self._typed = kept
+            for handle in gone:
+                await self._dispose(handle)
 
     async def _typed_fields_hold(self, step: Step, current: ElementHandle | None) -> None:
-        """Antes de um passo que grava: os campos de texto digitados desde a última navegação
-        da página principal ainda têm o que o robô digitou.
+        """Antes de um passo que grava: os campos de texto que o robô digitou ainda têm o
+        valor da referência deles (a digitação, ou o fim do último clique, tecla ou
+        escolha do robô).
 
         A página pode mudar um campo depois da conferência da digitação, sozinha (o CEP
         que preenche o logradouro depois de uma consulta), e o passo que grava enviaria um
-        valor que ninguém digitou. Cada campo vale como na conferência da digitação: o
-        valor que ele tinha quando ela foi aceita, ou o texto como o navegador ou a máscara
-        da página o guardam (:func:`_typed_value_matches`; a máscara que a página só põe
-        quando o foco sai do campo também vale). Um campo que saiu da página deixa de ser
-        conferido, e o campo em que o passo vai digitar agora (``current``) também. Se
-        algum mudou, o passo falha com ``acao_falhou`` sem agir; os valores nunca vão
-        para a mensagem.
+        valor que ninguém digitou. Cada campo vale com o valor da referência
+        (:meth:`_refresh_typed`: o que mudou durante um clique, uma tecla ou uma escolha do
+        robô, como a sugestão de um autocompletar, já é a referência), ou com o texto como o
+        navegador ou a máscara da página o guardam (:func:`_typed_value_matches`). Um campo
+        que saiu da página, ou cujo documento acabou, deixa de ser conferido, e o campo em
+        que o passo vai digitar agora (``current``) também. Se algum mudou, o passo falha
+        com ``acao_falhou`` sem agir; os valores nunca vão para a mensagem.
         """
-        await self._dispose_gone()
         entries = self._typed
         if not entries:
             return
@@ -2987,14 +3108,14 @@ class Interpreter:
             kept.append(entry)
             if state == "mesmo" or changed is not None:
                 continue
-            value, editable, browser = state
+            value, _, browser, number = state
             holds = isinstance(value, str) and (
                 value == entry.accepted
                 or _typed_value_matches(
                     entry.text,
                     value,
-                    editable=editable is True,
                     browser=browser if isinstance(browser, str) else None,
+                    number=number is True,
                 )
             )
             if not holds:
@@ -3082,9 +3203,7 @@ class Interpreter:
         locator = await self._resolve(step.target, step, ctx)
 
         async def act() -> dict[str, Any]:
-            await self._act_on(
-                step, ctx, locator, lambda on, kw: on.press(step.key, **kw), force=False
-            )
+            await self._act_on(step, ctx, locator, lambda on, kw: on.press(step.key, **kw))
             return {"tecla": step.key}
 
         return act
@@ -3224,9 +3343,7 @@ class Interpreter:
         locator = await self._resolve(step.target, step, ctx)
 
         async def act() -> dict[str, Any]:
-            await self._act_on(
-                step, ctx, locator, lambda on, kw: on.set_input_files(path, **kw), force=False
-            )
+            await self._act_on(step, ctx, locator, lambda on, kw: on.set_input_files(path, **kw))
             size = await asyncio.to_thread(os.path.getsize, path)
             return {"tamanho": size}
 
@@ -3477,7 +3594,8 @@ class Interpreter:
         vez; na segunda, o passo falha. Depois da espera, os campos digitados são
         conferidos (:meth:`_typed_fields_hold`) e, com o vigia já na página
         (:meth:`_arm_guard`), o contador de navegações da página principal, a página e a
-        linha; a ação vai em seguida, sem nova espera (``force``), e o vigia confere o
+        linha; a ação vai em seguida (sem ``force``: o Playwright confere que o alvo não
+        está coberto nem inerte, também por outro documento), e o vigia confere o
         primeiro evento dela (:meth:`_dispatched`). Se a página principal mudou de endereço
         ou de documento desde a última conferência, o passo falha com
         ``elemento_ambiguo`` e nada é feito. Um segredo já vai para o elemento em que a
@@ -3620,14 +3738,14 @@ class Interpreter:
         ctx: _StepCtx,
         locator: PwLocator,
         action: Callable[[PwLocator | ElementHandle, dict[str, Any]], Awaitable[object]],
-        *,
-        force: bool = True,
     ) -> None:
         """Faz ``action`` no localizador (num passo de leitura) ou no elemento conferido.
 
         No elemento conferido, a espera já foi feita antes da conferência da hora de agir
-        (:meth:`_confirm_target`): a ação vai sem esperar de novo (``force``, quando ela
-        tem essa espera), e o vigia confere o primeiro evento dela (:meth:`_dispatched`).
+        (:meth:`_confirm_target`). A ação vai sem ``force``: o Playwright ainda confere,
+        sem esperar de novo o que já esperou, que o elemento não está coberto (também por
+        outro documento, como um iframe por cima dele) nem inerte, e o vigia confere os
+        eventos dela (:meth:`_dispatched`).
         O prazo continua o do passo: o Playwright ainda espera, depois de agir, a
         navegação que a ação começou.
         """
@@ -3635,8 +3753,6 @@ class Interpreter:
             await action(locator, {"timeout": ctx.remaining_ms()})
             return
         options: dict[str, Any] = {"timeout": ctx.remaining_ms()}
-        if force:
-            options["force"] = True
         await self._dispatched(step, ctx, action(ctx.element, options))
 
     async def _dispatched(self, step: Step, ctx: _StepCtx, action: Awaitable[object]) -> None:

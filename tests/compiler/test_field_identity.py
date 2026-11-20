@@ -441,6 +441,37 @@ def test_another_text_name_label_or_test_id_is_another_target(field: str) -> Non
     assert not other_target(base, base.model_copy(update={"serial": 2, "css": "#outro"}))
 
 
+@pytest.mark.parametrize(
+    ("names", "first_kw", "second_kw"),
+    [
+        (
+            ("Pagar", "Pagar"),
+            {"row": RowInfo(text="Boleto 1 Pendente Pagar", key="Pendente")},
+            {"row": RowInfo(text="Boleto 1 Processando Pagar", key="Processando")},
+        ),
+        (("Pagar", "Pagando…"), {}, {}),
+    ],
+    ids=["a_linha_mudou", "o_botao_mudou"],
+)
+def test_a_double_click_that_repeats_the_same_write_is_one_click(
+    names: tuple[str, str], first_kw: dict[str, Any], second_kw: dict[str, Any]
+) -> None:
+    # Y5: um botão sem trava que o primeiro clique recria com outro texto ("Pagando…") ou
+    # numa linha que mudou ("Processando"); os dois cliques gravam no mesmo endereço. O
+    # texto e a chave diferentes vieram do próprio primeiro clique: o robô paga uma vez.
+    rec = RecordingBuilder()
+    rec.navigate("/boletos")
+    first = rec.click(row_button(names[0], 1, **first_kw))
+    after_first = [rec.request("POST", "/api/pagar", "fetch")]
+    second = rec.click(row_button(names[1], 2, **second_kw), detail=2)
+    after_second = [rec.request("POST", "/api/pagar", "fetch")]
+    result = compile_(rec.build())
+    clicks = [s for s in result.manifest.steps if isinstance(s, ClickStep)]
+    assert [s.effect for s in clicks] == [Effect.IRREVERSIBLE]
+    assert other_target(first.element, second.element)
+    assert second_click(first.element, after_first, second.element, after_second)
+
+
 def test_a_second_click_that_lands_on_another_button_after_a_login_is_its_own_step() -> None:
     # Login de SPA com clique duplo no "Entrar": o primeiro clique entra (POST), a página
     # troca de tela e o segundo cai no "Transferir" do mesmo lugar (o mesmo caminho

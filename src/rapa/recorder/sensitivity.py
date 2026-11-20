@@ -11,7 +11,8 @@ fica fora da gravação. As regras:
   ou password (o script também olha a máscara por CSS,
   ``-webkit-text-security``, que só a página conhece);
 - campo cujo ``aria-label`` ou ``aria-labelledby`` (ou o nome acessível) fala em
-  senha, mas o rótulo não (``password_by_name``): o valor sempre sai da gravação,
+  senha ou em assinatura eletrônica ou digital (a senha de transação dos bancos),
+  mas o rótulo não diz senha (``password_by_name``): o valor sempre sai da gravação,
   mesmo que o próprio campo também diga ser o usuário e que nada mais no grupo
   seja sigiloso; o campo, ambíguo, nunca é credencial (nem usuário, nem senha) e
   o robô pede o valor numa entrada;
@@ -46,11 +47,13 @@ fica fora da gravação. As regras:
   depois dos ouvintes de blur do componente (o campo que virou senha ou código só
   sai como segredo; o que saiu da página sai com o retrato). Se o componente já
   tirou o campo da página quando o ``change``, o ``blur`` ou o ``focusout`` chega
-  (ou quando a janela perde o foco para um iframe), sai o retrato que o script
-  tirou depois da última tecla da pessoa (o descritor e o valor do mesmo momento,
-  com a tecla aplicada); o campo que saiu antes desse retrato é esquecido. As
-  marcas de sigilo do campo só sobem até o valor sair (com uma senha ou um código
-  no documento, o valor do campo que saiu da página só sai como segredo);
+  (ou quando a janela perde o foco para um iframe), o passo fica com o alvo do
+  retrato que o script tirou depois da última tecla da pessoa (com a tecla
+  aplicada), mas o valor dele só sai como segredo e vira uma entrada do robô (a
+  página pode ter mudado o campo depois do retrato); só o retrato que o script
+  tirou ao guardar o campo para decidir depois vale como o valor. O campo que saiu
+  antes do retrato é esquecido. As marcas de sigilo do campo só sobem até o valor
+  sair, e só os retratos de depois de uma tecla contam (nunca o foco sozinho);
 - identidade do campo (``field_key``): aba, iframes, hospedeiros, seletor, id,
   nome e tudo o que a pessoa vê ou o compilador usa como localizador (etiqueta,
   tipo, papel, nome acessível, rótulo, placeholder, ``data-testid`` e a chave da
@@ -146,6 +149,7 @@ __all__ = [
     "is_transaction_secret",
     "looks_secret",
     "mentions_password",
+    "mentions_secret_name",
     "names_another_party",
     "other_target",
     "password_by_name",
@@ -173,6 +177,9 @@ _NAMED_PASSWORD_TYPES = _PASSWORD_LABEL_TYPES | _USERNAME_TYPES
 _PASSWORD_WORDS = re.compile(
     r"(?<!re)senha|password|passwd|passphrase|(?:^|[^a-z0-9])(?:pwd|pin)(?:[^a-z0-9]|$)"
 )
+#: A assinatura eletrônica ou digital (a senha de transação dos bancos), no nome do campo.
+#: Igual a ``SIGNATURE_WORDS`` em ``capture.js``.
+_SIGNATURE_WORDS = re.compile(r"assinatura (?:eletronica|digital)")
 #: Palavra inteira de usuário no próprio campo. Igual a ``USERNAME_WORDS`` em ``capture.js``.
 _USERNAME_WORDS = re.compile(
     r"(?:^|[^a-z0-9])"
@@ -254,6 +261,18 @@ def _plain(text: str) -> str:
 def mentions_password(text: str | None) -> bool:
     """O texto fala em senha (rótulo, nome, id ou placeholder de um campo)."""
     return bool(text) and _PASSWORD_WORDS.search(_plain(text or "")) is not None
+
+
+def mentions_secret_name(text: str | None) -> bool:
+    """O nome do campo fala em senha ou em assinatura eletrônica ou digital.
+
+    Só para o nome (``password_by_name``): a assinatura é um segredo, mas não a senha
+    do cofre. Igual a ``mentionsSecretName`` em ``capture.js``.
+    """
+    plain = _plain(text or "")
+    return bool(text) and (
+        _PASSWORD_WORDS.search(plain) is not None or _SIGNATURE_WORDS.search(plain) is not None
+    )
 
 
 def _autocomplete(element: ElementDescriptor) -> list[str]:
@@ -348,7 +367,8 @@ def username_by_signal(element: ElementDescriptor) -> bool:
 
 
 def password_by_name(element: ElementDescriptor) -> bool:
-    """Campo de texto que só o ``aria-label`` ou o ``aria-labelledby`` diz ser senha.
+    """Campo de texto que só o nome (``aria-label``, ``aria-labelledby`` ou o nome
+    acessível) diz ser senha ou assinatura eletrônica ou digital.
 
     O valor sempre sai da gravação (o campo fica sensível), sem a marca de senha: o
     robô pede o valor numa entrada. Vale também para o campo que diz ser o usuário
@@ -362,7 +382,7 @@ def password_by_name(element: ElementDescriptor) -> bool:
         return False
     if (element.input_type or "") not in _NAMED_PASSWORD_TYPES:
         return False
-    named = element.aria_mentions_password or mentions_password(element.name)
+    named = element.aria_mentions_password or mentions_secret_name(element.name)
     return named and not is_password_like_text(element)
 
 
@@ -588,21 +608,32 @@ def second_click(
     número do elemento ficam só com o seletor), é sempre o segundo clique. Noutro
     elemento com o mesmo seletor, o clique só é outro passo com prova de um segundo
     alvo (``other_target``: outra chave da linha, outro texto, outro nome acessível,
-    outro rótulo ou outro ``data-testid``) e quando cada um dos dois cliques gravou
-    algo (``writes_in`` nas requisições entre ele e a ação seguinte). Sem essa prova,
+    outro rótulo ou outro ``data-testid``), quando cada um dos dois cliques gravou
+    algo (``writes_in`` nas requisições entre ele e a ação seguinte) e quando o segundo
+    gravou noutro endereço (ou com outro método) que o primeiro: a mesma gravação de
+    novo é o clique duplo num botão que o primeiro clique mudou ("Pagar" que vira
+    "Pagando…", a linha que vira "Processando"), e o robô age uma vez. Sem essa prova,
     o número do elemento sozinho não separa os cliques: o clique duplo num botão sem
     trava que a página recria entre os dois cliques (cada clique grava) continua um
     passo só, e as requisições do segundo contam no passo do primeiro; o robô nunca
     age mais vezes que a pessoa. Resíduo (agir menos, nunca mais): o botão de outra
     linha que sobe para o lugar do que a pessoa clicou, com o mesmo seletor cortado e
-    nada mais diferente, também continua absorvido, e o robô age uma vez onde a pessoa
-    agiu duas.
+    nada mais diferente, ou que grava no mesmo endereço (a linha só no corpo ou na
+    consulta da requisição, que o gravador não guarda), também continua absorvido, e o robô age uma vez onde a pessoa agiu
+    duas.
     """
     if first.css != second.css:
         return False
     if same_element(first, second) or not other_target(first, second):
         return True
-    return not (writes_in(first_requests) and writes_in(second_requests))
+    first_writes = writes_in(first_requests)
+    second_writes = writes_in(second_requests)
+    if not (first_writes and second_writes):
+        return True
+    # A mesma gravação de novo (o mesmo método no mesmo endereço): o texto ou a chave da
+    # linha que mudaram foram o próprio primeiro clique ("Pagando…", "Processando").
+    done = {(request.method, request.url) for request in first_writes}
+    return {(request.method, request.url) for request in second_writes} <= done
 
 
 def other_target(first: ElementDescriptor, second: ElementDescriptor) -> bool:

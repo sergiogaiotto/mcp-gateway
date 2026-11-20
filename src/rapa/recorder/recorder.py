@@ -23,9 +23,9 @@ de texto de shadow root sai no ``change`` dele (que o script escuta em cada shad
 root que aparece no caminho de um evento), antes do blur e na ordem da pessoa, ou
 no ``blur`` na fase de captura e antes da próxima ação, quando o script decide
 depois dos ouvintes de blur do componente; o campo que o componente já tirou da
-página sai com o retrato (o descritor e o valor) que o script tirou depois da
-última tecla da pessoa, e as marcas de sigilo só sobem; e um campo de shadow root
-nunca é credencial de login. Cada elemento leva um número (``serial``) que dois
+página sai com o alvo do retrato que o script tirou depois da última tecla da
+pessoa, mas o valor só como segredo (vira uma entrada do robô), e as marcas de
+sigilo só sobem; e um campo de shadow root nunca é credencial de login. Cada elemento leva um número (``serial``) que dois
 elementos nunca têm igual: só edições do mesmo elemento viram um passo. A limpeza ignora
 maiúsculas em tudo o que pode chegar ao robô ou ao modelo de linguagem: o texto
 livre da página (títulos, texto, iframes) e, nos elementos, nomes acessíveis,

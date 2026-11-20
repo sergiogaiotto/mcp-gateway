@@ -21,10 +21,15 @@
 // senha ou código só sai como segredo; o que saiu da página sai com o retrato).
 // O campo que o componente já tirou da página quando o change, o blur ou o
 // focusout chega (ou quando a janela perde o foco, só campos de shadow root)
-// sai com o retrato tirado depois da última tecla da pessoa (num setTimeout,
-// com a tecla aplicada: o descritor e o valor do mesmo momento); o que saiu
-// antes desse retrato é esquecido. As marcas de sigilo de um campo só sobem até
-// o valor sair. O elemento leva o caminho dos hospedeiros (shadow_path) e um
+// sai com o retrato: o que o gravador tirou ao guardar o campo (na próxima ação
+// ou no blur, com o campo na página) vale como o valor; com só o retrato de
+// depois da última tecla (num setTimeout, com a tecla aplicada), o passo fica
+// com o alvo, mas o valor só sai como segredo: o robô nunca o repete (pede o
+// valor numa entrada) e ele nunca é gravado. O que saiu antes desse retrato é
+// esquecido. As marcas de sigilo de um campo só sobem
+// até o valor sair, e só os retratos de depois de uma tecla contam (o foco
+// sozinho não tira retrato: o mesmo input que a página reaproveita de "Senha"
+// para "Valor" não leva a marca de senha). O elemento leva o caminho dos hospedeiros (shadow_path) e um
 // seletor CSS que atravessa os shadow roots abertos ("#hospedeiro > #campo"),
 // para que dois componentes iguais (o mesmo id por dentro) nunca virem o mesmo
 // campo. Cada elemento também leva um número (serial) que dois elementos nunca
@@ -316,6 +321,15 @@
     const t = plainWords(s);
     return !!t && PASSWORD_WORDS.test(t);
   };
+  // No nome do campo (aria-label, aria-labelledby ou o nome acessível), a assinatura
+  // eletrônica ou digital (a senha de transação dos bancos) também é um segredo: o valor
+  // nunca sai, e o campo não vira senha do cofre (isPasswordByName). A mesma regra está
+  // em rapa/recorder/sensitivity.py (mentions_secret_name).
+  const SIGNATURE_WORDS = /assinatura (?:eletronica|digital)/;
+  const mentionsSecretName = (s) => {
+    const t = plainWords(s);
+    return !!t && (PASSWORD_WORDS.test(t) || SIGNATURE_WORDS.test(t));
+  };
 
   const isMaskedText = (el) => {
     const st = styleOf(el);
@@ -341,7 +355,7 @@
   // O aria-label ou o texto do aria-labelledby fala em senha: os dois, porque o
   // nome acessível guarda só um deles (o aria-labelledby, quando há).
   const ariaMentionsPassword = (el) =>
-    mentionsPassword(el.getAttribute('aria-label')) || mentionsPassword(labelledByText(el));
+    mentionsSecretName(el.getAttribute('aria-label')) || mentionsSecretName(labelledByText(el));
 
   // Campo que só o nome (aria-label, aria-labelledby ou o nome acessível) diz ser
   // senha: o valor nunca sai, mas o campo não vira senha nem usuário, mesmo que o
@@ -352,7 +366,7 @@
     if (el.tagName !== 'INPUT' || isPassword(el) || isOneTimeCode(el)) return false;
     const type = inputType(el);
     if (!PASSWORD_LABEL_TYPES.has(type) && !USERNAME_TYPES.has(type)) return false;
-    return ariaMentionsPassword(el) || mentionsPassword(clip(accessibleName(el, roleOf(el)), MAX_NAME));
+    return ariaMentionsPassword(el) || mentionsSecretName(clip(accessibleName(el, roleOf(el)), MAX_NAME));
   };
 
   // Os textos do próprio campo falam de outra pessoa ou de um cadastro ("CPF do
@@ -892,6 +906,10 @@
         get() { return desc.get.call(this); },
         set(v) {
           if (this === editing) { const st = fields.get(this); if (st) st.scriptSet = true; }
+          // Um valor posto por script depois do retrato: o retrato deixa de valer como o
+          // valor do campo (goneDescriptor).
+          const seen = lastSeen.get(this);
+          if (seen) seen.taken = false;
           desc.set.call(this, v);
         },
       });
@@ -907,15 +925,15 @@
 
   // elemento -> {desc, value, fresh, pending}: o retrato do campo, o descritor e o
   // valor tirados juntos, com o campo na página: depois de cada tecla confiável
-  // (beforeinput ou input, num setTimeout, com a tecla já aplicada), no foco quando
-  // não há retrato e quando o gravador guarda o campo para decidir depois (blur,
-  // pointerdown, keydown, beforeinput). Na tecla, o valor fica desconhecido até o
+  // (beforeinput ou input, num setTimeout, com a tecla já aplicada) e quando o
+  // gravador guarda o campo para decidir depois (blur, pointerdown, keydown,
+  // beforeinput), nunca só no foco. Na tecla, o valor fica desconhecido até o
   // retrato seguinte: o campo que sai da página antes dele é esquecido (nunca sai
   // com um valor de antes da tecla). As marcas de sigilo do retrato só sobem
   // (raise) até o valor sair; depois do envio, o retrato recomeça (o próximo valor é
-  // outra edição). O valor e o descritor guardados só saem pelo campo que já saiu
-  // da página quando o change, o blur ou o focusout chega (o componente trocou o
-  // input antes do ouvinte do gravador).
+  // outra edição). O retrato só é usado pelo campo que já saiu da página quando o
+  // change, o blur ou o focusout chega (o componente trocou o input antes do ouvinte
+  // do gravador), e então o valor só sai como segredo (goneDescriptor).
   const lastSeen = new WeakMap();
   // O último campo em que a pessoa digitou (beforeinput ou input confiável).
   let lastTyped = null;
@@ -928,13 +946,16 @@
   const seenOf = (el) => {
     let seen = lastSeen.get(el);
     if (!seen) {
-      seen = { desc: null, value: undefined, fresh: false, pending: false };
+      seen = { desc: null, value: undefined, fresh: false, taken: false, pending: false };
       lastSeen.set(el, seen);
     }
     return seen;
   };
   // Retrato do campo na página; se o descritor não sai (exceção), fica o anterior.
-  const snapshot = (el) => {
+  // ``taken``: o retrato que o gravador tirou ao guardar o campo para decidir depois
+  // (deferField), com o campo na página, depois das teclas da pessoa; uma tecla ou um
+  // valor posto por script depois dele o desfazem.
+  const snapshot = (el, taken) => {
     const seen = seenOf(el);
     if (!el.isConnected) return;
     try {
@@ -943,6 +964,7 @@
       seen.desc = desc;
       seen.value = value;
       seen.fresh = true;
+      seen.taken = taken === true;
     } catch (e) { /* ignora */ }
   };
   // Uma tecla da pessoa: o valor guardado fica desconhecido e o retrato sai depois
@@ -951,24 +973,33 @@
     const seen = seenOf(el);
     seen.value = undefined;
     seen.fresh = false;
+    seen.taken = false;
     if (seen.pending) return;
     seen.pending = true;
     setTimeout(() => { seen.pending = false; if (el.isConnected) snapshot(el); }, 0);
   };
 
-  // O descritor guardado de um campo que saiu da página, com pelo menos a marca de
-  // sigilo que um envio com o campo na página teria agora (as marcas só sobem): o
-  // próprio campo é senha ou código, ou é o usuário ou outro campo de um login, ou
-  // há uma senha ou um código em qualquer raiz do documento (ou o documento é
-  // grande demais para olhar), ou o retrato não saiu depois da última tecla. Então o
-  // valor só sai como segredo.
+  // O descritor guardado de um campo que saiu da página antes de o valor sair, com as
+  // marcas de sigilo do retrato. O valor só vale como o que a pessoa digitou quando o
+  // retrato é o que o gravador tirou ao guardar o campo para decidir depois
+  // (``taken``: na próxima ação noutro elemento ou no blur, com o campo na página e
+  // nenhuma tecla nem valor de script depois dele); então o campo leva pelo menos a
+  // marca de sigilo que um envio com o campo na página teria agora (o próprio campo é
+  // senha ou código, ou é o usuário ou outro campo de um login, ou há uma senha ou um
+  // código em qualquer raiz do documento, ou o documento é grande demais para olhar).
+  // Com só o retrato de depois da última tecla (o componente tirou o campo antes de o
+  // gravador guardá-lo), o campo é sempre sigiloso: a página pode tê-lo mudado depois
+  // do retrato (uma máscara que só aparece depois, uma tecla que ela aplica num
+  // temporizador). O valor sigiloso só sai como segredo (para a limpeza dos textos
+  // capturados) e nunca é repetido nem gravado: o robô pede o valor numa entrada, ou
+  // usa a credencial do cofre se o retrato diz que o campo é senha, código ou usuário.
   const goneDescriptor = (el, seen) => {
     const out = Object.assign({}, seen.desc);
     let secret = true;
     try {
       if (isPassword(el)) out.is_password = true;
       if (isOneTimeCode(el)) out.is_one_time_code = true;
-      secret = !seen.fresh || out.sensitive || out.is_password || out.is_one_time_code || isSecretField(el) ||
+      secret = !seen.taken || out.sensitive || out.is_password || out.is_one_time_code || isSecretField(el) ||
         loginRole(el) !== null || !rootsUnder(el.ownerDocument) || secretIn(el, false, null);
     } catch (e) { /* na dúvida, sigiloso */ }
     if (secret) out.sensitive = true;
@@ -1021,7 +1052,7 @@
     st.scriptSet = false;
     // A próxima edição começa outro retrato (as marcas valem para o valor que saiu).
     const seen = lastSeen.get(el);
-    if (seen) { seen.desc = null; seen.value = undefined; seen.fresh = false; }
+    if (seen) { seen.desc = null; seen.value = undefined; seen.fresh = false; seen.taken = false; }
   };
 
   const flushPending = (except) => {
@@ -1043,7 +1074,7 @@
     try { value = currentValue(el); } catch (e) { return; }
     if (value === st.lastSent || st.deferred) return;
     st.deferred = true;
-    snapshot(el);
+    snapshot(el, true);
     setTimeout(() => { if (fields.get(el) === st && st.deferred) sendField(el, true); }, 0);
   };
 
@@ -1073,16 +1104,6 @@
     startSession(el, st, el.isContentEditable ? false : currentValue(el) === '' || allSelected(el));
     keyPressed(el);
     lastTyped = el;
-  };
-
-  // O foco confiável de um campo sem retrato: as marcas de sigilo dele contam na
-  // edição que começa (snapshot).
-  const onFocusIn = (event) => {
-    if (!event.isTrusted) return;
-    const el = realTarget(event);
-    if (!el || el.nodeType !== 1 || !isEditable(el)) return;
-    const seen = lastSeen.get(el);
-    if (!seen || !seen.desc) snapshot(el);
   };
 
   const onInput = (event) => {
@@ -1272,7 +1293,6 @@
   W.addEventListener('keyup', onKeyFlag, opts);
   W.addEventListener('keypress', onKeyFlag, opts);
   W.addEventListener('keydown', onKeyDown, opts);
-  W.addEventListener('focusin', onFocusIn, opts);
   W.addEventListener('change', onChange, opts);
   W.addEventListener('blur', onBlur, opts);
   W.addEventListener('focusout', onFocusOut, opts);
