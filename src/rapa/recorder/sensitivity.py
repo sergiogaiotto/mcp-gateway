@@ -177,9 +177,12 @@ _NAMED_PASSWORD_TYPES = _PASSWORD_LABEL_TYPES | _USERNAME_TYPES
 _PASSWORD_WORDS = re.compile(
     r"(?<!re)senha|password|passwd|passphrase|(?:^|[^a-z0-9])(?:pwd|pin)(?:[^a-z0-9]|$)"
 )
-#: A assinatura eletrônica ou digital (a senha de transação dos bancos), no nome do campo.
+#: A assinatura eletrônica ou digital (a senha de transação dos bancos) e o código de
+#: transação ou de segurança, no nome do campo.
 #: Igual a ``SIGNATURE_WORDS`` em ``capture.js``.
-_SIGNATURE_WORDS = re.compile(r"assinatura (?:eletronica|digital)")
+_SIGNATURE_WORDS = re.compile(
+    r"assinatura[\s_-]*(?:eletronica|digital)|codigo[\s_-]*de[\s_-]*(?:transacao|seguranca)"
+)
 #: Palavra inteira de usuário no próprio campo. Igual a ``USERNAME_WORDS`` em ``capture.js``.
 _USERNAME_WORDS = re.compile(
     r"(?:^|[^a-z0-9])"

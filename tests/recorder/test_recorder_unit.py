@@ -25,6 +25,7 @@ from rapa.recorder.recorder import redact_url
 from rapa.recorder.sensitivity import (
     field_key,
     is_password_like_text,
+    mentions_secret_name,
     password_by_name,
     same_element,
     username_by_signal,
@@ -640,3 +641,23 @@ def test_only_the_same_element_merges_when_the_recording_numbers_them() -> None:
     # Um com número e outro sem: nunca o mesmo (na dúvida, dois passos).
     assert not same_element(field(serial=1), field())
     assert same_element(None, None) and not same_element(field(), None)
+
+
+@pytest.mark.parametrize(
+    ("name", "secret"),
+    [
+        ("Assinatura eletrônica", True),
+        ("Assinatura-eletrônica", True),
+        ("assinatura_digital", True),
+        ("Código de transação", True),
+        ("Código de segurança", True),
+        ("Senha", True),
+        ("Assinatura mensal", False),
+        ("Tipo de assinatura", False),
+        ("Código do produto", False),
+    ],
+)
+def test_the_name_of_a_signature_or_a_transaction_code_is_secret(name: str, secret: bool) -> None:
+    # A assinatura eletrônica ou digital e o código de transação ou de segurança, no nome
+    # do campo, o fazem sigiloso (nunca a senha do cofre); a assinatura de um plano, não.
+    assert mentions_secret_name(name) is secret

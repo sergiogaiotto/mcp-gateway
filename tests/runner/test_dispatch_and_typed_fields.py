@@ -599,9 +599,232 @@ async def test_a_cents_mask_that_changes_the_number_stops_a_write(
         ("10", "10,00", False, True),
         ("10", "10,50", False, False),
         ("10", "0,10", False, False),
+        ("10", "10,000", False, False),
+        ("0012345", "12345", False, False),
+        ("0800", "800", False, False),
     ],
 )
 def test_the_typed_text_and_the_field_value(
     text: str, value: str, number: bool, matches: bool
 ) -> None:
     assert _typed_value_matches(text, value, browser=None, number=number) is matches
+
+
+# -- rodada 11b: a referência dos campos, o vigia e as caixas já marcadas -------------------
+
+_LOG_POST = _post("document.getElementById('log').value+';'").replace('"', "&quot;")
+
+#: O CEP preenche o logradouro 150 ms depois de mudar, enquanto o robô espera o aviso; a
+#: página tem uma aba, uma lista e uma caixa que um passo de leitura pode usar no meio.
+_CEP_TABS = _page(
+    "<label for='cep'>CEP</label><input id='cep'>"
+    "<label for='log'>Logradouro</label><input id='log'>"
+    "<label for='num'>Número</label><input id='num'>"
+    "<label for='tipo'>Tipo</label><select id='tipo'><option>Casa</option>"
+    "<option>Apartamento</option></select>"
+    "<p id='ok' hidden>Endereço conferido</p>"
+    "<button type='button' onclick=\"document.getElementById('pg').hidden=false\">Pagamento</button>"
+    "<section id='pg' hidden><p>Pagamento</p></section>"
+    f"<button type='button' onclick=\"{_LOG_POST}\">Salvar</button>"
+    "<script>document.getElementById('cep').addEventListener('change',()=>{"
+    "setTimeout(()=>{document.getElementById('log').value='Rua do CEP'},150);"
+    "setTimeout(()=>{document.getElementById('ok').hidden=false},600)})</script>"
+)
+
+
+def _wait_text(step_id: str, text: str) -> dict[str, Any]:
+    return {
+        "kind": "wait_for",
+        "id": step_id,
+        "title": "Esperar o aviso",
+        "target": _target("aviso", {"by": "text", "value": text, "exact": True}),
+        "state": "visible",
+        "timeout_ms": 5_000,
+    }
+
+
+@pytest.mark.parametrize("middle", ["clique", "tecla", "escolha", "endereco"])
+async def test_a_read_step_after_a_wait_never_makes_the_page_change_the_reference(
+    run_robot: RobotRunner, srv: _Server, middle: str
+) -> None:
+    # Z1: a resposta do CEP chega durante a espera; um passo de leitura que age (uma aba,
+    # um Tab, uma escolha, um #) vem antes do Salvar. Só ganham referência nova os campos
+    # que ainda a tinham logo antes de o passo agir: o logradouro mudado fica com a
+    # antiga, e o Salvar falha sem gravar.
+    srv.app = _api_app(srv, {"/p": _CEP_TABS})
+    middle_step: dict[str, Any] = {
+        "clique": _click("aba", "Pagamento", effect="read"),
+        "tecla": {
+            "kind": "press",
+            "id": "tab",
+            "title": "Teclar Tab",
+            "effect": "read",
+            "key": "Tab",
+            "target": _target("campo Número", {"by": "label", "value": "Número", "exact": True}),
+        },
+        "escolha": {
+            "kind": "select",
+            "id": "tipo",
+            "title": "Escolher o tipo",
+            "effect": "read",
+            "option": "Apartamento",
+            "target": _target("lista Tipo", {"by": "label", "value": "Tipo", "exact": True}),
+        },
+        "endereco": _nav(srv.base, "/p#pagamento", "ir_pagamento"),
+    }[middle]
+    manifest = _manifest(
+        [
+            _nav(srv.base, "/p"),
+            _fill("digitar_cep", "CEP", "01001000"),
+            _fill("digitar_log", "Logradouro", "Praça da Sé"),
+            _fill("digitar_num", "Número", "100"),
+            _wait_text("esperar", "Endereço conferido"),
+            middle_step,
+            _save(),
+        ]
+    )
+    outcome = await _run(run_robot, manifest)
+    _wrote(outcome, srv, RunState.FAILED, "")
+    assert outcome.result.failed_step_id == "salvar"
+    assert outcome.result.error_code == ErrorCode.ACAO_FALHOU
+
+
+def _cover_cep(kind: str) -> dict[str, str]:
+    """O CEP põe uma camada ("buscando CEP") ou um diálogo modal por cima da página e, 1 s
+    depois, preenche o logradouro e tira a camada."""
+    if kind == "camada":
+        show = (
+            "const c=document.createElement('div');c.id='cobre';c.textContent='Buscando CEP';"
+            "c.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.3);z-index:10';"
+            "document.body.appendChild(c);"
+        )
+        hide = "document.getElementById('cobre').remove();"
+    else:
+        show = "document.getElementById('d').showModal();"
+        hide = "document.getElementById('d').close();"
+    later = f"setTimeout(()=>{{document.getElementById('log').value='Rua do CEP';{hide}}},1000);"
+    page = _page(
+        "<label for='log'>Logradouro</label><input id='log'>"
+        "<label for='num'>Número</label><input id='num'>"
+        "<label for='cep'>CEP</label><input id='cep'>"
+        "<dialog id='d'><p>Buscando CEP</p></dialog>"
+        f"<button type='button' onclick=\"{_LOG_POST}\">Salvar</button>"
+        "<script>let feito=false;document.getElementById('cep').addEventListener('input',(e)=>{"
+        f"if(feito||e.target.value.length<8)return;feito=true;{show}{later}}})</script>"
+    )
+    return {"/p": page}
+
+
+@pytest.mark.parametrize("kind", ["camada", "modal"])
+@pytest.mark.parametrize("effect", ["write", "irreversible"])
+async def test_a_field_the_page_changes_while_the_click_waits_for_a_cover_is_never_sent(
+    run_robot: RobotRunner, srv: _Server, kind: str, effect: str
+) -> None:
+    # Z2: o Salvar espera a camada sair (o clique vai sem force); nesse tempo a página
+    # troca o logradouro. O vigia confere os campos digitados no primeiro evento do clique.
+    srv.app = _api_app(srv, _cover_cep(kind))
+    manifest = _manifest(
+        [
+            _nav(srv.base, "/p"),
+            _fill("digitar_log", "Logradouro", "Praça da Sé"),
+            _fill("digitar_num", "Número", "100"),
+            _fill("digitar_cep", "CEP", "01001000"),
+            _click("salvar", "Salvar", effect=effect, timeout=5_000),
+        ]
+    )
+    outcome = await _run(run_robot, manifest)
+    state = RunState.FAILED if effect == "write" else RunState.INDETERMINATE
+    _wrote(outcome, srv, state, "")
+    assert outcome.result.error_code == ErrorCode.ACAO_FALHOU
+
+
+_ALREADY = _page(
+    "<label><input type='checkbox' id='a' checked "
+    "onchange=\"fetch('/api',{method:'POST',body:'A'+this.checked+';'})\"> Aceito</label>"
+    "<label><input type='checkbox' id='n' "
+    "onchange=\"fetch('/api',{method:'POST',body:'N'+this.checked+';'})\"> Notificar</label>"
+    f"<button type='button' onclick=\"{_post(chr(39) + 'S;' + chr(39))}\">Salvar</button>"
+)
+
+
+@pytest.mark.parametrize(("label", "checked"), [("Aceito", True), ("Notificar", False)])
+@pytest.mark.parametrize("effect", ["write", "irreversible"])
+async def test_a_box_already_as_it_should_be_is_not_a_refusal(
+    run_robot: RobotRunner, srv: _Server, label: str, checked: bool, effect: str
+) -> None:
+    # Z3: o Playwright não clica numa caixa que já está como deve ficar, e o vigia não vê
+    # nenhum evento: isso não é recusa.
+    srv.app = _api_app(srv, {"/p": _ALREADY})
+    step = {
+        "kind": "check",
+        "id": "marcar",
+        "title": f"Marcar {label}",
+        "effect": effect,
+        "timeout_ms": 3_000,
+        "checked": checked,
+        "target": _target(f"caixa {label}", {"by": "label", "value": label, "exact": True}),
+    }
+    outcome = await _run(run_robot, _manifest([_nav(srv.base, "/p"), step, _save()]))
+    _wrote(outcome, srv, RunState.SUCCEEDED, "S;")
+
+
+def _cart_with_notes(n: int) -> dict[str, str]:
+    rows = "".join(
+        f"<tr><td>P{i}</td><td><input aria-label='Quantidade' value=''></td><td><button "
+        "type='button' onclick=\"const q=this.closest('tr').querySelector('input');"
+        f"fetch('/api',{{method:'POST',body:'P{i}='+q.value+';'}})\">Salvar</button></td></tr>"
+        for i in range(n)
+    )
+    return {
+        "/itens": _page(
+            "<iframe id='obsf' src='/obs' style='width:400px;height:80px'></iframe>"
+            "<table aria-label='Itens'><thead><tr><th>produto</th><th>qtd</th><th>acao</th>"
+            f"</tr></thead><tbody>{rows}</tbody></table>"
+        ),
+        "/obs": _page("<label for='o'>Obs</label><input id='o'>"),
+    }
+
+
+async def test_fields_typed_in_another_frame_are_read_in_their_own_document(
+    run_robot: RobotRunner, srv: _Server
+) -> None:
+    # Z9: um campo digitado num iframe e as quantidades da página principal: a releitura
+    # antes de cada Salvar lê cada campo no documento dele (antes, o do iframe vinha vazio e
+    # a primeira gravação falhava).
+    srv.app = _api_app(srv, _cart_with_notes(3))
+    obs = _fill("digitar_obs", "Obs", "observação")
+    obs["target"]["frames"] = ["#obsf"]
+    qty = _fill("digitar_qtd", "Quantidade", "{{ item.qtd }}", effect="write")
+    qty["target"] = _target(
+        "quantidade",
+        {"by": "role", "value": "textbox", "name": "Quantidade", "exact": True},
+        **_row("{{ item.produto }}"),
+    )
+    save = _click("salvar", "Salvar", key="{{ item.produto }}", effect="write")
+    manifest = _manifest(
+        [
+            _nav(srv.base, "/itens"),
+            obs,
+            {
+                "kind": "for_each",
+                "id": "cada",
+                "title": "Para cada",
+                "items": "inputs.itens",
+                "steps": [qty, save],
+            },
+        ],
+        inputs=[
+            {
+                "name": "itens",
+                "title": "itens",
+                "type": "list",
+                "item_fields": [
+                    {"name": "produto", "title": "produto", "type": "string"},
+                    {"name": "qtd", "title": "qtd", "type": "string"},
+                ],
+            }
+        ],
+    )
+    items = [{"produto": f"P{i}", "qtd": str(i + 1)} for i in range(3)]
+    outcome = await _run(run_robot, manifest, inputs={"itens": items})
+    _wrote(outcome, srv, RunState.SUCCEEDED, "P0=1;P1=2;P2=3;")

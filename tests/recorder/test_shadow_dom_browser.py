@@ -1890,8 +1890,10 @@ async def test_a_focus_only_visit_never_marks_an_input_the_page_reuses(
     browser: Browser, phase: str
 ) -> None:
     # Y11: a pessoa só foca o campo na fase de senha (ou de código), a página o
-    # reaproveita como "Valor (R$)" e ela digita 150. O foco sozinho não tira retrato:
-    # o robô digita 150, nunca a senha (ou o código) do cofre no valor do pagamento.
+    # reaproveita como "Valor (R$)" e ela digita 150. O foco sozinho não tira retrato
+    # (as marcas de credencial só vêm de depois de uma tecla), mas o campo que era senha
+    # ou código no foco só sai como segredo: o robô pede o valor numa entrada, nunca
+    # digita a senha (ou o código) do cofre no valor do pagamento.
     if phase == "senha":
         first = '<label id="lb" for="f">Senha</label><input id="f" type="password">'
         switch = "f.type = 'text'; lb.textContent = 'Valor (R$)'; f.value = '';"
@@ -1923,5 +1925,40 @@ async def test_a_focus_only_visit_never_marks_an_input_the_page_reuses(
     recording = await record_site(browser, {"/p": html}, "/p", scenario)
     result = compile_(recording)
     assert [(s.id, s.value) for s in fill_steps(result)] == [
-        ("digitar_valor_r", TextValue(template="150"))
+        ("digitar_valor_r", an_input("valor_r"))
     ]
+
+
+@pytest.mark.parametrize("label", ["Palavra-passe", "Chave de acesso"])
+async def test_a_password_the_person_reveals_before_typing_never_leaves_as_text(
+    browser: Browser, label: str
+) -> None:
+    # R1: o campo é type=password no foco; a pessoa clica no "olho" (vira type=text) e
+    # digita. O rótulo não fala em senha, então o descritor do envio é de um campo de
+    # texto: a marca do foco faz o valor sair só como segredo, e o robô o pede numa
+    # entrada.
+    secret = "Qw7#zz19"
+    html = page(
+        "Acesso",
+        f"<h1>Acesso</h1><label for='p'>{label}</label><input id='p' type='password'>"
+        "<button id='olho' type='button' onclick=\"const p = document.getElementById('p');"
+        " p.type = p.type === 'password' ? 'text' : 'password'\">Mostrar</button>"
+        "<button id='ok' onclick=\"fetch('/api/confirmar', {method: 'POST', body: '{}'})"
+        ".then(() => document.body.insertAdjacentHTML('beforeend', '<p>Ok</p>'))\">Confirmar</button>",
+    )
+
+    async def scenario(p: Page) -> None:
+        await p.locator("#p").click()
+        await p.get_by_role("button", name="Mostrar").click()
+        await p.locator("#p").click()
+        await p.keyboard.type(secret, delay=30)
+        await p.get_by_role("button", name="Confirmar").click()
+        await p.get_by_text("Ok").wait_for()
+
+    recording = await record_site(browser, {"/acesso": html}, "/acesso", scenario)
+    assert not has_text(recording, secret)
+    (field,) = inputs_of(recording)
+    assert field.element.sensitive and field.value is None
+    result = compile_(recording)
+    manifest, prompt = dumps(result)
+    assert secret not in manifest and secret not in prompt

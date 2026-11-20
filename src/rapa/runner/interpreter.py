@@ -90,15 +90,20 @@ principais:
   lidos de novo antes de cada passo que grava e age na página, comparados com a
   referência (:meth:`_refresh_typed`): o valor da digitação, ou o do fim do último
   clique, tecla ou escolha do robô. O que muda durante esses passos vale (a
-  sugestão escolhida num autocompletar, a busca limpa depois do Enter), e a
-  formatação quando o foco sai do campo vale pela comparação; o que a página muda
-  sozinha enquanto o robô espera ou digita noutro campo, também depois de um
+  sugestão escolhida num autocompletar, a busca limpa depois do Enter), só para os
+  campos que ainda tinham a referência logo antes de o passo agir; a formatação
+  quando o foco sai do campo vale pela comparação; o que a página muda sozinha
+  enquanto o robô espera ou digita noutro campo, também depois de um
   ``pushState``/``replaceState`` (uma consulta de CEP que responde depois), faz o
-  passo falhar com ``acao_falhou`` sem agir. O campo digitado de novo vale pela
-  última vez, e o que saiu da página (ou cujo documento acabou) deixa de contar.
+  passo falhar com ``acao_falhou`` sem agir. Num clique, numa marcação ou numa
+  escolha, o vigia confere de novo, no primeiro evento, os campos digitados do
+  documento do alvo (a página que troca o campo enquanto o clique espera uma camada
+  sair). O campo digitado de novo vale pela última vez, e o que saiu da página (ou
+  cujo documento acabou) deixa de contar; cada campo é lido no próprio documento.
   Resíduos: a mudança que chega durante um clique, uma tecla ou uma escolha do robô
-  vira a referência, e a que chega entre a releitura e a ação não é vista. Os valores do campo nunca vão para
-  eventos nem mensagens;
+  vira a referência, e a que chega entre a releitura e a ação de um passo de digitar
+  ou de teclar não é vista. Os valores do campo nunca vão para eventos nem
+  mensagens;
 - valores de entradas, variáveis e itens nunca mudam o alvo de um passo: não
   entram em seletores CSS/XPath, cada um vira um único trecho codificado do
   endereço (no caminho e na rota depois do ``#``, sem barras, sem ``%`` e nunca
@@ -321,6 +326,16 @@ type _RowAction = tuple[object, ...]
 _PAGE_READS = (ExtractTextStep, ExtractTableStep, AssertStep, WaitForStep)
 #: Passos que agem num elemento da página (o ``press`` só quando tem alvo).
 _ACTS_ON_TARGET = (ClickStep, FillStep, SelectStep, CheckStep, PressStep, UploadStep, DownloadStep)
+#: Prazo, em segundos, para ler os campos digitados fora da conferência antes de gravar (no
+#: fim de um passo e logo antes de agir): sem resposta, nenhum ganha referência nova.
+_TYPED_READ_S = 5.0
+
+
+def _refreshes_typed(step: Step) -> bool:
+    """O passo, no fim, dá a referência nova aos campos digitados
+    (:meth:`Interpreter._refresh_typed`): age na página sem digitar (um clique, uma tecla,
+    uma escolha, um endereço). Os que só leem e os que digitam, não."""
+    return not isinstance(step, (*_PAGE_READS, FillStep))
 
 
 def _effective_effect(step: Step, inherited: Iterable[Effect]) -> Effect:
@@ -377,12 +392,14 @@ _FIELD_STATE_FN = (
 const fieldState = (element, text) => {
   if (element.isContentEditable === true) return [element.innerText, true, null, false];
   const field = fieldOf(element);
-  if (!(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement
-      || field instanceof HTMLSelectElement)) {
+  // Pelo nome da etiqueta, e não por instanceof: o campo pode ser de outro documento (um
+  // iframe), com outras classes.
+  const tag = field.tagName;
+  if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') {
     return [null, false, null, false];
   }
   let browser = null;
-  if (!(field instanceof HTMLSelectElement)) {
+  if (tag !== 'SELECT') {
     try {
       const copy = field.cloneNode(false);
       copy.value = text;
@@ -391,8 +408,7 @@ const fieldState = (element, text) => {
       browser = null;
     }
   }
-  return [field.value, false, browser,
-    field instanceof HTMLInputElement && field.type === 'number'];
+  return [field.value, false, browser, tag === 'INPUT' && field.type === 'number'];
 };
 """
 )
@@ -661,12 +677,16 @@ _PINNED_ROW_JS = (
 # vale se cai no alvo (o elemento, ou o botão ou link em volta dele num clique, como o
 # Playwright confere), com o mesmo endereço da conferência e, numa linha escolhida pelo
 # texto, com o elemento ainda dentro dela e um elemento dela cujo texto do HTML, inteiro, é a
-# chave (a mesma regra da escolha da linha). Então o vigia sai. Um clique cujos eventos não
+# chave (a mesma regra da escolha da linha), e com os campos digitados deste documento ainda
+# com o valor que a conferência deles leu (``typed``: a página pode mudá-los enquanto o
+# Playwright espera o alvo ficar livre). Então o vigia sai. Um clique cujos eventos não
 # chegaram à janela do alvo (o Playwright clicou noutro documento por cima dele) também
-# conta como recusa. Senão, ele cancela esse evento e todos os seguintes da ação (``preventDefault`` e
+# conta como recusa; marcar uma caixa que já está como deve ficar não manda evento nenhum
+# (``marca``) e não é recusa. ``stop()`` devolve o motivo da recusa (``alvo`` ou
+# ``campo``) ou ``null``. Senão, ele cancela esse evento e todos os seguintes da ação (``preventDefault`` e
 # ``stopImmediatePropagation``) e marca a recusa, que o executor lê depois de agir.
 _DISPATCH_GUARD_JS = (
-    "(element, [kind, row, key]) => {"
+    "(element, [kind, row, key, typed]) => {"
     + _FIELD_OF_FN
     + r"""
 const view = element.ownerDocument.defaultView;
@@ -680,7 +700,7 @@ const topHref = () => {
 const href = view.location.href;
 const top = topHref();
 let target = element;
-if (kind === 'clique') {
+if (kind === 'clique' || kind === 'marca') {
   if (!target.matches('input, textarea, select') && !target.isContentEditable) {
     target = target.closest('button, [role=button], a, [role=link]') || target;
   }
@@ -725,9 +745,18 @@ const inRow = () => {
   while (at && at !== row) at = at.parentNode ?? at.host;
   return at === row && hasWhole(row);
 };
+// Os campos digitados deste documento ainda têm o valor que a conferência leu.
+const fieldValue = (node) => {
+  if (!node.isConnected) return null;
+  if (node.isContentEditable === true) return node.innerText;
+  const field = fieldOf(node);
+  return typeof field.value === 'string' ? field.value : null;
+};
+const typedHold = () => (typed || []).every(([node, value]) => fieldValue(node) === value);
 const types = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'keydown',
   'keypress', 'keyup', 'beforeinput', 'input', 'change'];
 let state = 'armado';
+let reason = 'alvo';
 const off = () => {
   for (const type of types) view.removeEventListener(type, listener, true);
 };
@@ -737,9 +766,12 @@ const listener = (event) => {
     const onTarget = event.composedPath().includes(target);
     if (!onTarget && (event.type === 'change' || !event.isTrusted)) return;
     if (onTarget && !moved() && inRow()) {
-      state = 'passou';
-      off();
-      return;
+      if (typedHold()) {
+        state = 'passou';
+        off();
+        return;
+      }
+      reason = 'campo';
     }
     state = 'recusou';
   }
@@ -750,7 +782,8 @@ for (const type of types) view.addEventListener(type, listener, true);
 return {
   stop: () => {
     off();
-    return state !== 'passou' && (state === 'recusou' || kind === 'clique');
+    if (state === 'recusou') return reason;
+    return state === 'armado' && kind === 'clique' ? 'alvo' : null;
   },
 };
 }"""
@@ -953,10 +986,14 @@ def _typed_value_matches(
         return _decimal_parts(value, typed=False) == decimal
     if _NOT_DIGIT.sub("", value) == digits:
         return True
-    # Um inteiro que a página mostra com casas decimais zeradas ("10" vira "10,00").
-    return text.strip().lstrip("-").isdigit() and _decimal_parts(value, typed=False) == (
-        digits.lstrip("0"),
-        "",
+    # Um inteiro que a página mostra com uma ou duas casas decimais zeradas ("10" vira
+    # "10,00"), com os mesmos dígitos ("0012" não vira "12", nem "10" vira "10,000").
+    whole, comma, fraction = value.rpartition(",")
+    return (
+        text.strip().lstrip("-").isdigit()
+        and bool(comma)
+        and fraction.strip() in ("0", "00")
+        and _NOT_DIGIT.sub("", whole) == digits
     )
 
 
@@ -2597,6 +2634,7 @@ class Interpreter:
                         if act is not None:
                             # Anotada antes de agir: uma ação que falhou no meio também conta.
                             act = self._record_act(act)
+                        held = await self._typed_held() if _refreshes_typed(step) else set()
                         try:
                             data = await action()
                         finally:
@@ -2618,11 +2656,11 @@ class Interpreter:
                 await self._emit_step_started(step, effect)
             await self._report_failure(step, err, started)
             raise
-        if not isinstance(step, (*_PAGE_READS, FillStep)):
+        if _refreshes_typed(step):
             # O que o passo mudou nos campos digitados vira a referência deles. O que muda
             # enquanto um passo só lê (uma espera) ou digita noutro campo é da própria
             # página (a resposta do CEP que chega enquanto o robô digita o número).
-            await self._refresh_typed()
+            await self._refresh_typed(held)
         self._steps_done += 1
         await self._emit(
             RunEventKind.STEP_SUCCEEDED,
@@ -3044,7 +3082,7 @@ class Interpreter:
                 result.append(False)
         return result
 
-    async def _refresh_typed(self) -> None:
+    async def _refresh_typed(self, held: set[int]) -> None:
         """No fim de cada passo do robô que age na página sem digitar (um clique, uma
         tecla, uma escolha; não os que só leem, como uma espera, :data:`_PAGE_READS`, nem
         os que digitam, que anotam só o próprio campo), o valor de agora de cada campo
@@ -3056,15 +3094,17 @@ class Interpreter:
         preenche o logradouro enquanto o robô digita o número ou espera o aviso) é
         recusado antes de um passo que grava (:meth:`_typed_fields_hold`); a formatação
         que a página põe quando o foco sai do campo vale pela comparação
-        (:func:`_typed_value_matches`). O campo que saiu da página (ou cujo documento
+        (:func:`_typed_value_matches`). Só ganham a referência nova os campos que ainda a
+        tinham logo antes de o passo agir (``held``, de :meth:`_typed_held`): o campo
+        que a página já tinha mudado antes (durante uma espera) fica com a antiga, e o
+        próximo passo que grava falha. O campo que saiu da página (ou cujo documento
         acabou) sai da lista. Nunca falha o passo e nunca anota os valores.
         """
         entries = self._typed
         if not entries:
             return
-        try:
-            states = await self._typed_states(entries, None)
-        except PlaywrightError:
+        states = await self._typed_states_soon(entries)
+        if states is None:
             return
         kept: list[_Typed] = []
         gone: list[ElementHandle] = []
@@ -3073,13 +3113,17 @@ class Interpreter:
                 gone.append(entry.handle)
                 continue
             value = state[0] if isinstance(state, list) and state else None
-            kept.append(entry._replace(accepted=value) if isinstance(value, str) else entry)
+            if isinstance(value, str) and id(entry.handle) in held:
+                entry = entry._replace(accepted=value)
+            kept.append(entry)
         if self._typed is entries:  # senão, outro passo mexeu na lista no meio
             self._typed = kept
             for handle in gone:
                 await self._dispose(handle)
 
-    async def _typed_fields_hold(self, step: Step, current: ElementHandle | None) -> None:
+    async def _typed_fields_hold(
+        self, step: Step, current: ElementHandle | None
+    ) -> list[tuple[ElementHandle, str]]:
         """Antes de um passo que grava: os campos de texto que o robô digitou ainda têm o
         valor da referência deles (a digitação, ou o fim do último clique, tecla ou
         escolha do robô).
@@ -3092,14 +3136,17 @@ class Interpreter:
         navegador ou a máscara da página o guardam (:func:`_typed_value_matches`). Um campo
         que saiu da página, ou cujo documento acabou, deixa de ser conferido, e o campo em
         que o passo vai digitar agora (``current``) também. Se algum mudou, o passo falha
-        com ``acao_falhou`` sem agir; os valores nunca vão para a mensagem.
+        com ``acao_falhou`` sem agir; os valores nunca vão para a mensagem. Devolve o
+        valor que leu de cada campo (para o vigia conferir de novo no primeiro evento da
+        ação: :meth:`_arm_guard`).
         """
         entries = self._typed
         if not entries:
-            return
+            return []
         states = await self._typed_states(entries, current)
         kept: list[_Typed] = []
         gone: list[ElementHandle] = []
+        read: list[tuple[ElementHandle, str]] = []
         changed: _Typed | None = None
         for entry, state in zip(entries, states, strict=True):
             if state is None:
@@ -3120,18 +3167,62 @@ class Interpreter:
             )
             if not holds:
                 changed = entry
+            elif isinstance(value, str):
+                read.append((entry.handle, value))
         if self._typed is entries:  # senão, a página principal navegou no meio
             self._typed = kept
             for handle in gone:
                 await self._dispose(handle)
         if changed is not None:
-            raise StepError(
-                ErrorCode.ACAO_FALHOU,
-                f"O campo '{changed.intent}' (passo '{changed.title}') não tem mais o que o "
-                f"robô digitou: a página o mudou depois. O passo '{step.title}' enviaria um "
-                "valor que não foi digitado, então nada foi feito.",
-                details={"alvo": changed.intent},
-            )
+            raise self._typed_changed(step, changed.intent, changed.title)
+        return read
+
+    async def _typed_held(self) -> set[int]:
+        """Os campos digitados que ainda têm o valor da referência (ou o texto, como o
+        navegador ou a máscara da página o guardam): só esses ganham uma referência nova no
+        fim do passo (:meth:`_refresh_typed`). Nunca falha e nunca anota os valores."""
+        entries = self._typed
+        if not entries:
+            return set()
+        states = await self._typed_states_soon(entries)
+        held: set[int] = set()
+        if states is None:
+            return held
+        for entry, state in zip(entries, states, strict=True):
+            if not isinstance(state, list) or len(state) < 4:
+                continue
+            value, _, browser, number = state
+            if isinstance(value, str) and (
+                value == entry.accepted
+                or _typed_value_matches(
+                    entry.text,
+                    value,
+                    browser=browser if isinstance(browser, str) else None,
+                    number=number is True,
+                )
+            ):
+                held.add(id(entry.handle))
+        return held
+
+    @staticmethod
+    def _typed_changed(step: Step, intent: str, title: str) -> StepError:
+        # Nunca com os valores: o campo pode ser sigiloso.
+        return StepError(
+            ErrorCode.ACAO_FALHOU,
+            f"O campo '{intent}' (passo '{title}') não tem mais o que o robô digitou: a "
+            f"página o mudou depois. O passo '{step.title}' enviaria um valor que não foi "
+            "digitado, então nada foi feito.",
+            details={"alvo": intent},
+        )
+
+    async def _typed_states_soon(self, entries: list[_Typed]) -> list[Any] | None:
+        """:meth:`_typed_states` com um prazo curto (uma página travada não prende a
+        execução); ``None`` se não deu."""
+        try:
+            async with asyncio.timeout(_TYPED_READ_S):
+                return await self._typed_states(entries, None)
+        except TimeoutError, PlaywrightError:
+            return None
 
     async def _typed_states(
         self, entries: list[_Typed], current: ElementHandle | None
@@ -3639,8 +3730,10 @@ class Interpreter:
             if ctx.checked_at != checked_at or _page_key(self.page.url) != page:
                 raise self._page_changed(step, target)
             act = self._row_not_acted_on(step)
-        await self._typed_fields_hold(step, ctx.element if isinstance(step, FillStep) else None)
-        await self._arm_guard(step, ctx, target, page)
+        typed = await self._typed_fields_hold(
+            step, ctx.element if isinstance(step, FillStep) else None
+        )
+        await self._arm_guard(step, ctx, target, page, typed)
         return act
 
     def _raise_if_page_changed(self, step: Step, target: Target, ctx: _StepCtx, page: str) -> None:
@@ -3686,13 +3779,24 @@ class Interpreter:
                     return  # a própria ação espera o resto do prazo e falha
                 await asyncio.sleep(self._poll_s)
 
-    async def _arm_guard(self, step: Step, ctx: _StepCtx, target: Target, page: str) -> None:
+    async def _arm_guard(
+        self,
+        step: Step,
+        ctx: _StepCtx,
+        target: Target,
+        page: str,
+        typed: list[tuple[ElementHandle, str]],
+    ) -> None:
         """Põe o vigia (:data:`_DISPATCH_GUARD_JS`) e faz a conferência da hora de agir.
 
         Com o vigia já na página, o contador de navegações da página principal e a página
         são os da conferência do alvo e, numa linha escolhida pelo texto, ela ainda é a
         única com ele (:meth:`_row_issue`) e o elemento conferido ainda está nela. Senão, o
-        passo falha com ``elemento_ambiguo`` sem agir.
+        passo falha com ``elemento_ambiguo`` sem agir. Num clique, numa marcação ou numa
+        escolha, o vigia também leva os campos digitados do mesmo documento do alvo, com o
+        valor que :meth:`_typed_fields_hold` leu: se a página muda algum enquanto o
+        Playwright espera o alvo ficar livre (uma camada de "buscando CEP"), o primeiro
+        evento da ação é cancelado e o passo falha com ``acao_falhou``.
         """
         element = ctx.element
         if element is None:  # pragma: no cover - preso em _confirm_target
@@ -3707,16 +3811,28 @@ class Interpreter:
                         await self._dispose(handle)
                     raise self._page_changed(step, target)
                 row = rows[0]
-            if isinstance(step, (ClickStep, CheckStep, DownloadStep)):
+            if isinstance(step, (ClickStep, DownloadStep)):
                 kind = "clique"
+            elif isinstance(step, CheckStep):
+                kind = "marca"
             elif isinstance(step, FillStep):
                 kind = "texto"
             elif isinstance(step, PressStep):
                 kind = "tecla"
             else:
                 kind = "campo"
+            # Digitar e teclar põem o foco no alvo antes do primeiro evento (o campo de
+            # antes perde o foco, e a página pode formatá-lo): o vigia só confere os campos
+            # digitados nos cliques, marcações e escolhas, cujo primeiro evento vem antes de
+            # o foco mudar.
+            same = (
+                await self._same_document(element, typed)
+                if kind in ("clique", "marca", "campo")
+                else []
+            )
             ctx.guard = await element.evaluate_handle(
-                _DISPATCH_GUARD_JS, [kind, row, choice.key if choice is not None else None]
+                _DISPATCH_GUARD_JS,
+                [kind, row, choice.key if choice is not None else None, same],
             )
             self._raise_if_page_changed(step, target, ctx, page)
             if choice is not None and row is not None:
@@ -3731,6 +3847,26 @@ class Interpreter:
         finally:
             if row is not None:
                 await self._dispose(row)
+
+    @staticmethod
+    async def _same_document(
+        element: ElementHandle, typed: list[tuple[ElementHandle, str]]
+    ) -> list[list[Any]]:
+        """Os campos digitados (com o valor lido) que estão no mesmo frame do elemento."""
+        if not typed:
+            return []
+        try:
+            frame = await element.owner_frame()
+        except PlaywrightError:
+            return []
+        same: list[list[Any]] = []
+        for handle, value in typed:
+            try:
+                if await handle.owner_frame() is frame:
+                    same.append([handle, value])
+            except PlaywrightError:
+                continue
+        return same
 
     async def _act_on(
         self,
@@ -3758,21 +3894,30 @@ class Interpreter:
     async def _dispatched(self, step: Step, ctx: _StepCtx, action: Awaitable[object]) -> None:
         """Age e lê o vigia: se ele recusou o primeiro evento da ação (outro endereço, outro
         elemento, a linha mudou), o evento foi cancelado e o passo falha com
-        ``elemento_ambiguo``."""
+        ``elemento_ambiguo``; se um campo digitado mudou, com ``acao_falhou``."""
         failure: Exception | None = None
         try:
             await action
         except Exception as exc:
             failure = exc
-        if await self._guard_refused(ctx):
-            target = getattr(step, "target", None)
-            if isinstance(target, Target):
-                raise self._page_changed(step, target) from None
+        reason = await self._guard_refused(ctx)
+        target = getattr(step, "target", None)
+        if reason == "campo":
+            raise StepError(
+                ErrorCode.ACAO_FALHOU,
+                "Um campo que o robô digitou mudou enquanto o passo "
+                f"'{step.title}' esperava o alvo ficar livre: ele enviaria um valor que não "
+                "foi digitado, então nada foi feito.",
+                details={"alvo": target.intent if isinstance(target, Target) else step.title},
+            ) from None
+        if reason is not None and isinstance(target, Target):
+            raise self._page_changed(step, target) from None
         if failure is not None:
             raise failure
 
-    async def _guard_refused(self, ctx: _StepCtx) -> bool:
-        """Tira o vigia da página e diz se ele recusou um evento.
+    async def _guard_refused(self, ctx: _StepCtx) -> str | None:
+        """Tira o vigia da página e diz por que ele recusou um evento (``alvo`` ou
+        ``campo``), ou ``None``.
 
         Se o documento já foi trocado (a própria ação navegou), não há o que ler, e vale o
         resultado da ação: um evento recusado é cancelado e não leva a página a outro
@@ -3780,11 +3925,12 @@ class Interpreter:
         """
         guard, ctx.guard = ctx.guard, None
         if guard is None:
-            return False
+            return None
         try:
-            return await guard.evaluate("(guard) => guard.stop()") is True
+            reason = await guard.evaluate("(guard) => guard.stop()")
+            return reason if isinstance(reason, str) else None
         except PlaywrightError:
-            return False
+            return None
         finally:
             await self._dispose(guard)
 

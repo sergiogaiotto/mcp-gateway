@@ -29,7 +29,9 @@
 // esquecido. As marcas de sigilo de um campo só sobem
 // até o valor sair, e só os retratos de depois de uma tecla contam (o foco
 // sozinho não tira retrato: o mesmo input que a página reaproveita de "Senha"
-// para "Valor" não leva a marca de senha). O elemento leva o caminho dos hospedeiros (shadow_path) e um
+// para "Valor" não leva a marca de senha). O campo que era senha, código ou de
+// um login no foco só sai como segredo e vira uma entrada (a senha que a pessoa
+// mostra com o "olho" antes de digitar nunca sai como texto). O elemento leva o caminho dos hospedeiros (shadow_path) e um
 // seletor CSS que atravessa os shadow roots abertos ("#hospedeiro > #campo"),
 // para que dois componentes iguais (o mesmo id por dentro) nunca virem o mesmo
 // campo. Cada elemento também leva um número (serial) que dois elementos nunca
@@ -325,7 +327,11 @@
   // eletrônica ou digital (a senha de transação dos bancos) também é um segredo: o valor
   // nunca sai, e o campo não vira senha do cofre (isPasswordByName). A mesma regra está
   // em rapa/recorder/sensitivity.py (mentions_secret_name).
-  const SIGNATURE_WORDS = /assinatura (?:eletronica|digital)/;
+  const SIGNATURE_WORDS = /assinatura[\s_-]*(?:eletronica|digital)|codigo[\s_-]*de[\s_-]*(?:transacao|seguranca)/;
+  const mentionsSignature = (s) => {
+    const t = plainWords(s);
+    return !!t && SIGNATURE_WORDS.test(t);
+  };
   const mentionsSecretName = (s) => {
     const t = plainWords(s);
     return !!t && (PASSWORD_WORDS.test(t) || SIGNATURE_WORDS.test(t));
@@ -355,7 +361,8 @@
   // O aria-label ou o texto do aria-labelledby fala em senha: os dois, porque o
   // nome acessível guarda só um deles (o aria-labelledby, quando há).
   const ariaMentionsPassword = (el) =>
-    mentionsSecretName(el.getAttribute('aria-label')) || mentionsSecretName(labelledByText(el));
+    mentionsSecretName(el.getAttribute('aria-label')) || mentionsSecretName(labelledByText(el)) ||
+    mentionsSignature(el.getAttribute('name')) || mentionsSignature(el.id);
 
   // Campo que só o nome (aria-label, aria-labelledby ou o nome acessível) diz ser
   // senha: o valor nunca sai, mas o campo não vira senha nem usuário, mesmo que o
@@ -935,6 +942,9 @@
   // change, o blur ou o focusout chega (o componente trocou o input antes do ouvinte
   // do gravador), e então o valor só sai como segredo (goneDescriptor).
   const lastSeen = new WeakMap();
+  // Campos que eram senha, código ou de um login no foco confiável (onFocusIn): o valor
+  // da edição seguinte só sai como segredo, sem virar outra credencial.
+  const secretAtFocus = new WeakSet();
   // O último campo em que a pessoa digitou (beforeinput ou input confiável).
   let lastTyped = null;
   const SECRET_MARKS = ['is_password', 'is_one_time_code', 'is_username', 'sensitive', 'aria_mentions_password'];
@@ -1031,6 +1041,10 @@
       value = seen.value;
       desc = goneDescriptor(el, seen);
     }
+    // O campo era senha, código ou de um login quando a pessoa o focou (antes de mostrar
+    // a senha com o "olho", ou antes de a página o reaproveitar): o valor só sai como
+    // segredo e vira uma entrada do robô, nunca outra credencial do cofre.
+    if (secretAtFocus.has(el)) desc.sensitive = true;
     const sensitive = desc.sensitive;
     send({
       kind: 'input',
@@ -1053,6 +1067,7 @@
     // A próxima edição começa outro retrato (as marcas valem para o valor que saiu).
     const seen = lastSeen.get(el);
     if (seen) { seen.desc = null; seen.value = undefined; seen.fresh = false; seen.taken = false; }
+    secretAtFocus.delete(el);
   };
 
   const flushPending = (except) => {
@@ -1104,6 +1119,19 @@
     startSession(el, st, el.isContentEditable ? false : currentValue(el) === '' || allSelected(el));
     keyPressed(el);
     lastTyped = el;
+  };
+
+  // O foco confiável de um campo que é senha, código ou de um login: a próxima edição dele
+  // só sai como segredo (o "olho" que mostra a senha troca o type antes da primeira tecla;
+  // a página pode reaproveitar o campo). Não tira retrato: as marcas de credencial (que
+  // escolhem a do cofre) só vêm de depois de uma tecla.
+  const onFocusIn = (event) => {
+    if (!event.isTrusted) return;
+    const el = realTarget(event);
+    if (!el || el.nodeType !== 1 || !isEditable(el)) return;
+    try {
+      if (isSecretField(el) || loginRole(el) !== null) secretAtFocus.add(el);
+    } catch (e) { secretAtFocus.add(el); }
   };
 
   const onInput = (event) => {
@@ -1295,6 +1323,7 @@
   W.addEventListener('keydown', onKeyDown, opts);
   W.addEventListener('change', onChange, opts);
   W.addEventListener('blur', onBlur, opts);
+  W.addEventListener('focusin', onFocusIn, opts);
   W.addEventListener('focusout', onFocusOut, opts);
   W.addEventListener('click', onClick, opts);
   // Depois de todos os ouvintes da página: fim da janela em que ela pode mascarar o valor.
