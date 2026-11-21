@@ -11,9 +11,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Executor: interpreta a lista de passos sobre Playwright, sem LLM.
+# Executor: interpreta a lista de passos sobre Playwright, sem LLM. Também o hospedeiro
+# das sessões de gravação (python -m rapa.session.host), que serve o canal por websocket.
 runner = [
     "playwright==1.65.2",
+    "websockets>=17.4,<18",
 ]
 # Cliente do hub de LLM (API compatível com OpenAI).
 llm = [
@@ -30,6 +32,7 @@ control = [
     "mcp==2.3.0",
     "jsonschema-rs>=0.61",
     "httpx2>=2.16,<3",
+    "websockets>=17.4,<18",
 ]
 # Interface web em Python.
 ui = [

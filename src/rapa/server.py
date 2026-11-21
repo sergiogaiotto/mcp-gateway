@@ -52,12 +52,22 @@ from rapa.control.launcher import (
 )
 from rapa.control.services import Dispatcher, PgPlatform, PgPrincipalResolver, PgRunQueue
 from rapa.control.services.queue import DEFAULT_MAX_DURATION
+from rapa.control.services.sessions import PgSessionStore
+from rapa.control.sessions import (
+    GeneralizationAssistant,
+    HubAssistant,
+    LocalSessionLauncher,
+    LocalSessionSettings,
+    RecordingSessions,
+    SessionLimits,
+)
 from rapa.core.contracts import Principal
 
 __all__ = [
     "AuthenticatorLoginResolver",
     "DispatcherSupervisor",
     "ServerSettings",
+    "build_sessions",
     "create_server_app",
     "dispatcher_pool_size",
     "main",
@@ -122,6 +132,20 @@ class ServerSettings(BaseModel):
     browser_args: tuple[str, ...] = ()
     #: Arquivos de entrada, numa subpasta por empresa (``<pasta>/<uuid da empresa>/``).
     files_dir: Path | None = None
+    #: Sessões de gravação (o navegador na nuvem da demonstração) neste processo.
+    sessions: bool = True
+    sessions_per_company: int = Field(default=2, ge=1, le=1000)
+    #: Sessões abertas ao mesmo tempo neste processo; None usa a reserva interativa.
+    sessions_max: int | None = Field(default=None, ge=1, le=10_000)
+    session_idle_s: float = Field(default=600.0, gt=0, le=86_400)
+    session_max_s: float = Field(default=3600.0, gt=0, le=86_400)
+    #: Pasta dos perfis temporários dos navegadores das sessões (apagados no fim de cada uma).
+    sessions_dir: Path | None = None
+    #: Hub de LLM para as propostas da revisão (sem ele, só as sugestões das regras).
+    llm_base_url: str | None = None
+    llm_model: str | None = None
+    llm_api_key: str | None = Field(default=None, repr=False)
+    llm_capabilities_file: Path | None = None
 
     @model_validator(mode="after")
     def _check(self) -> ServerSettings:
@@ -137,6 +161,15 @@ class ServerSettings(BaseModel):
             )
         if (self.dev_tokens_file or self.dev_secrets_file) and not self.dev:
             raise ValueError("tokens e segredos em arquivo só valem com RAPA_DEV=1")
+        llm = (self.llm_base_url, self.llm_model)
+        if any(llm) and not all(llm):
+            raise ValueError("para o hub de LLM, informe o endereço e o modelo (RAPA_LLM_*)")
+        if self.llm_base_url and self.llm_capabilities_file is None:
+            raise ValueError(
+                "para usar o hub de LLM, informe a matriz da sonda em RAPA_LLM_CAPACIDADES"
+            )
+        if self.session_idle_s > self.session_max_s:
+            raise ValueError("o tempo sem atividade de uma sessão não pode passar do prazo máximo")
         oidc = (self.oidc_client_id, self.oidc_redirect_uri)
         if any(oidc) and not all(oidc):
             raise ValueError("para o login OIDC, informe o cliente e o endereço de retorno")
@@ -162,7 +195,19 @@ class ServerSettings(BaseModel):
           ``<RAPA_PASTA_ARQUIVOS>/<uuid da empresa>/<arquivo>``; cada execução só
           enxerga a subpasta da própria empresa, e arquivos soltos na raiz não valem;
         - ``RAPA_MCP_ORIGENS`` (separadas por vírgula), ``RAPA_LIMITE_POR_SEGUNDO``
-          (0 desliga) e ``RAPA_COOKIE_SEGURO``.
+          (0 desliga) e ``RAPA_COOKIE_SEGURO``;
+        - sessões de gravação (a demonstração no navegador da nuvem): ``RAPA_SESSOES``
+          (1 ou 0; liga por padrão), ``RAPA_SESSOES_POR_EMPRESA`` (abertas ao mesmo tempo
+          por empresa; padrão 2), ``RAPA_SESSOES_MAX`` (abertas ao mesmo tempo neste
+          processo; padrão: o tamanho da reserva interativa, 10% das vagas),
+          ``RAPA_SESSAO_OCIOSA_S`` (segundos sem entrada até encerrar; padrão 600),
+          ``RAPA_SESSAO_MAX_S`` (prazo máximo; padrão 3600) e ``RAPA_PASTA_SESSOES``
+          (onde ficam os perfis temporários dos navegadores, apagados no fim). Os
+          navegadores usam ``RAPA_CHROMIUM_PATH`` e ``RAPA_ARGS_NAVEGADOR``;
+        - hub de LLM para as propostas da revisão: ``RAPA_LLM_BASE_URL``,
+          ``RAPA_LLM_MODEL``, ``RAPA_LLM_API_KEY`` e ``RAPA_LLM_CAPACIDADES`` (a
+          matriz gravada por ``python -m rapa.llm.probe --out``). Sem o hub, a revisão
+          mostra só as sugestões das regras, com um aviso.
         """
         env = os.environ if env is None else env
         data: dict[str, Any] = {
@@ -184,7 +229,21 @@ class ServerSettings(BaseModel):
             "chromium": env.get("RAPA_CHROMIUM_PATH") or None,
             "browser_args": tuple(shlex.split(env.get("RAPA_ARGS_NAVEGADOR", ""))),
             "files_dir": _path(env, "RAPA_PASTA_ARQUIVOS"),
+            "sessions": _flag(env, "RAPA_SESSOES", True),
+            "sessions_dir": _path(env, "RAPA_PASTA_SESSOES"),
+            "llm_base_url": env.get("RAPA_LLM_BASE_URL") or None,
+            "llm_model": env.get("RAPA_LLM_MODEL") or None,
+            "llm_api_key": env.get("RAPA_LLM_API_KEY") or None,
+            "llm_capabilities_file": _path(env, "RAPA_LLM_CAPACIDADES"),
         }
+        for key, name, kind in (
+            ("sessions_per_company", "RAPA_SESSOES_POR_EMPRESA", int),
+            ("sessions_max", "RAPA_SESSOES_MAX", int),
+            ("session_idle_s", "RAPA_SESSAO_OCIOSA_S", float),
+            ("session_max_s", "RAPA_SESSAO_MAX_S", float),
+        ):
+            if raw := env.get(name, "").strip():
+                data[key] = kind(raw)
         if aliases := env.get("RAPA_ORGANIZATION_ALIASES"):
             data["organization_aliases"] = json.loads(aliases)
         if origins := env.get("RAPA_MCP_ORIGENS"):
@@ -289,6 +348,7 @@ def _mount_ui(
     settings: ServerSettings,
     platform: PgPlatform,
     authenticator: Authenticator,
+    sessions: RecordingSessions | None = None,
 ) -> None:
     from rapa.ui.app import create_ui
     from rapa.ui.auth import DevLogin, DevProfile, OidcLogin, OidcSettings, UiAuth
@@ -324,7 +384,7 @@ def _mount_ui(
         raise ValueError("a interface precisa do login OIDC (RAPA_OIDC_*) ou do modo RAPA_DEV")
     create_ui(
         app,
-        backend_factory=ContractsBackendFactory.from_platform(platform),
+        backend_factory=ContractsBackendFactory.from_platform(platform, sessions=sessions),
         # A interface age direto nos serviços, então a sessão confere de novo no banco
         # (conta ativa e papéis), como a API faz a cada pedido.
         auth=UiAuth(
@@ -543,6 +603,79 @@ def build_dispatcher(settings: ServerSettings, db: Database) -> Dispatcher:
     )
 
 
+def _assistant(settings: ServerSettings) -> GeneralizationAssistant | None:
+    if not (settings.llm_base_url and settings.llm_model):
+        return None
+    from rapa.llm.client import HubClient
+
+    capabilities = str(settings.llm_capabilities_file) if settings.llm_capabilities_file else None
+    return HubAssistant(
+        lambda: HubClient(
+            base_url=settings.llm_base_url,
+            model=settings.llm_model,
+            api_key=settings.llm_api_key,
+            timeout_s=60.0,
+            max_retries=1,
+        ),
+        capabilities,
+    )
+
+
+def build_sessions(
+    settings: ServerSettings, db: Database, platform: PgPlatform
+) -> tuple[RecordingSessions, LocalSessionLauncher]:
+    """Serviço das sessões de gravação com o lançador local (um processo por sessão)."""
+    launcher = LocalSessionLauncher(
+        LocalSessionSettings(
+            chromium=settings.chromium,
+            browser_args=settings.browser_args,
+            profile_dir=settings.sessions_dir,
+        )
+    )
+    service = RecordingSessions(
+        PgSessionStore(db),
+        launcher,
+        platform,
+        limits=SessionLimits(
+            per_company=settings.sessions_per_company,
+            global_max=settings.sessions_max,
+            idle_timeout_s=settings.session_idle_s,
+            max_duration_s=settings.session_max_s,
+        ),
+        assistant=_assistant(settings),
+    )
+    return service, launcher
+
+
+#: Intervalo da varredura que encerra as sessões cujo navegador sumiu.
+_SWEEP_INTERVAL_S = 15.0
+
+
+async def _sweep_sessions(sessions: RecordingSessions, stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=_SWEEP_INTERVAL_S)
+        if stop.is_set():
+            return
+        try:
+            await sessions.sweep()
+        except Exception as exc:
+            logger.warning("falha na varredura das sessões de gravação: %s", type(exc).__name__)
+
+
+async def _close_sessions(
+    sessions: RecordingSessions,
+    launcher: LocalSessionLauncher,
+    stop: asyncio.Event,
+    task: asyncio.Task[None],
+) -> None:
+    stop.set()
+    await asyncio.gather(task, return_exceptions=True)
+    with contextlib.suppress(Exception):
+        await sessions.aclose()
+    await launcher.aclose()
+
+
 def create_server_app(settings: ServerSettings) -> FastAPI:
     """Monta a aplicação: REST e MCP, interface (opcional) e despachante (opcional).
 
@@ -564,6 +697,11 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
     platform = PgPlatform(db)
     resolver = PgPrincipalResolver(db)
     verifier = _verifier(settings) if settings.http else None
+    sessions, session_launcher = (
+        build_sessions(settings, db, platform)
+        if settings.http and settings.sessions
+        else (None, None)
+    )
     if verifier is not None:
         app = create_http_app(
             catalog=platform,
@@ -578,6 +716,7 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
                 mcp_allowed_origins=settings.mcp_allowed_origins,
                 rate_limit_per_s=settings.rate_limit_per_s,
             ),
+            sessions=sessions,
         )
     else:
         app = FastAPI(title="RaPA (despachante)", docs_url=None, redoc_url=None, openapi_url=None)
@@ -592,10 +731,11 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
         app.add_middleware(_DispatcherHealth, supervisor=supervisor)
     app.state.dispatcher = dispatcher
     app.state.dispatcher_supervisor = supervisor
+    app.state.sessions = sessions
     if settings.http and settings.ui:
         # Antes de envolver o lifespan: o NiceGUI (ui.run_with) envolve o que encontrar
         # com a subida e o encerramento dele, e esse conjunto fica dentro do nosso.
-        _mount_ui(app, settings, platform, Authenticator(verifier, resolver))  # type: ignore[arg-type]
+        _mount_ui(app, settings, platform, Authenticator(verifier, resolver), sessions)  # type: ignore[arg-type]
     inner = app.router.lifespan_context
     started = False
 
@@ -621,6 +761,15 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
                 stack.push_async_callback(verifier.aclose)
             # A interface (se houver) e o gateway MCP: encerram antes de fechar os bancos.
             state = await stack.enter_async_context(inner(application))
+            if sessions is not None and session_launcher is not None:
+                # Os navegadores das sessões fecham antes dos bancos (a situação é gravada).
+                sweep_stop = asyncio.Event()
+                sweep = asyncio.create_task(
+                    _sweep_sessions(sessions, sweep_stop), name="sessoes-de-gravacao"
+                )
+                stack.push_async_callback(
+                    _close_sessions, sessions, session_launcher, sweep_stop, sweep
+                )
             if supervisor is not None:
                 stop = asyncio.Event()
                 stack.push_async_callback(

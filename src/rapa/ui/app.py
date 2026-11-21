@@ -24,6 +24,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from rapa.ui.auth import HOME_PATH, UiAuth
 from rapa.ui.context import BackendFactory, UiContext, UiSettings
 from rapa.ui.pages import register_pages
+from rapa.ui.recording import STATIC_DIR, STATIC_PATH
 
 __all__ = ["SecurityHeadersMiddleware", "create_ui"]
 
@@ -79,6 +80,8 @@ def create_ui(
     ctx = UiContext(backend_factory, auth, settings)
     app.include_router(auth.router())
     register_pages(ctx)
+    # Só o JavaScript que o time mantém (a visão ao vivo); nada com dados.
+    nicegui_app.add_static_files(STATIC_PATH, STATIC_DIR, max_cache_age=300)
     nicegui_app.on_page_exception(_page_error)
     nicegui_app.add_middleware(SecurityHeadersMiddleware)
     ui.run_with(

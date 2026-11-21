@@ -24,6 +24,7 @@ from rapa.core.contracts import (
     InvalidInput,
     NotFound,
     QuotaExceeded,
+    ServiceUnavailable,
 )
 
 __all__ = [
@@ -45,6 +46,7 @@ _STATUS: tuple[tuple[type[ContractError], int], ...] = (
     (Conflict, 409),
     (InvalidInput, 422),
     (QuotaExceeded, 429),
+    (ServiceUnavailable, 503),
 )
 
 _HTTP_CODES = {
@@ -108,6 +110,8 @@ def contract_error_response(exc: ContractError) -> JSONResponse:
         details = list(exc.errors)
     if isinstance(exc, QuotaExceeded):
         headers["Retry-After"] = str(max(1, math.ceil(exc.retry_after_s)))
+    if isinstance(exc, ServiceUnavailable):
+        headers["Retry-After"] = "5"
     return error_response(status_for(exc), exc.code, exc.message, details, headers)
 
 

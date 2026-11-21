@@ -9,7 +9,7 @@ import logging
 from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +26,9 @@ from rapa.control.auth import Authenticator, BearerVerifier, PrincipalResolver, 
 from rapa.control.mcp.server import McpGateway, McpSettings
 from rapa.control.validation import InputValidator
 from rapa.core.contracts import RobotAdmin, RobotCatalog, RunService
+
+if TYPE_CHECKING:
+    from rapa.control.sessions.service import RecordingSessions
 
 __all__ = ["BodySizeLimitMiddleware", "CatchAllMiddleware", "HttpSettings", "create_http_app"]
 
@@ -162,8 +165,13 @@ def create_http_app(
     verifier: BearerVerifier,
     resolver: PrincipalResolver,
     settings: HttpSettings | None = None,
+    sessions: RecordingSessions | None = None,
 ) -> FastAPI:
-    """Monta a aplicação FastAPI com REST, MCP, saúde e as proteções comuns."""
+    """Monta a aplicação FastAPI com REST, MCP, saúde e as proteções comuns.
+
+    ``sessions`` liga as sessões de gravação (``/v1/sessoes`` e a visão ao vivo);
+    elas não entram no MCP, que só executa robôs publicados.
+    """
     settings = settings or HttpSettings()
     if isinstance(verifier, StaticTokenVerifier) and not settings.allow_static_tokens:
         raise ValueError(
@@ -218,6 +226,7 @@ def create_http_app(
         limiter=limiter,
         validator=validator,
         public_url=public_url,
+        sessions=sessions,
     )
     app.include_router(create_api_router(services))
     app.router.routes.append(Route("/mcp", endpoint=gateway, include_in_schema=False))
