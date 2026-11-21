@@ -622,9 +622,17 @@ def _assistant(settings: ServerSettings) -> GeneralizationAssistant | None:
 
 
 def build_sessions(
-    settings: ServerSettings, db: Database, platform: PgPlatform
+    settings: ServerSettings,
+    db: Database,
+    platform: PgPlatform,
+    fleet: Database | None = None,
 ) -> tuple[RecordingSessions, LocalSessionLauncher]:
-    """Serviço das sessões de gravação com o lançador local (um processo por sessão)."""
+    """Serviço das sessões de gravação com o lançador local (um processo por sessão).
+
+    ``fleet`` é o banco do papel do despachante, se este processo o tiver: com ele, as
+    vagas contam as sessões e as validações de toda a plataforma, e a varredura encerra
+    as sessões que nenhum processo segura (a API caiu).
+    """
     launcher = LocalSessionLauncher(
         LocalSessionSettings(
             chromium=settings.chromium,
@@ -633,7 +641,7 @@ def build_sessions(
         )
     )
     service = RecordingSessions(
-        PgSessionStore(db),
+        PgSessionStore(db, fleet=fleet),
         launcher,
         platform,
         limits=SessionLimits(
@@ -647,20 +655,20 @@ def build_sessions(
     return service, launcher
 
 
-#: Intervalo da varredura que encerra as sessões cujo navegador sumiu.
+#: Intervalo da varredura que renova as sessões deste processo e encerra as que acabaram.
 _SWEEP_INTERVAL_S = 15.0
 
 
 async def _sweep_sessions(sessions: RecordingSessions, stop: asyncio.Event) -> None:
+    # A primeira varredura é na subida: as sessões que uma queda deixou "abertas" (ninguém
+    # mais as renova) são encerradas assim que passam da folga, e liberam as vagas.
     while not stop.is_set():
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(stop.wait(), timeout=_SWEEP_INTERVAL_S)
-        if stop.is_set():
-            return
         try:
             await sessions.sweep()
         except Exception as exc:
             logger.warning("falha na varredura das sessões de gravação: %s", type(exc).__name__)
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=_SWEEP_INTERVAL_S)
 
 
 async def _close_sessions(
@@ -698,7 +706,7 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
     resolver = PgPrincipalResolver(db)
     verifier = _verifier(settings) if settings.http else None
     sessions, session_launcher = (
-        build_sessions(settings, db, platform)
+        build_sessions(settings, db, platform, dispatcher_db)
         if settings.http and settings.sessions
         else (None, None)
     )
