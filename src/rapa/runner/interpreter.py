@@ -850,19 +850,25 @@ const prompt = () => late === null || view.performance.now() - armedAt <= late;
 // seguir outro aria-labelledby, como o nome também não segue). Uma vez por id em cada leitura
 // do rótulo: muitos elementos de dentro podem apontar para o mesmo.
 const memo = new Map();
-const refName = (id) => {
-  const node = target.getRootNode().getElementById?.(id) ?? null;
+const refName = (root, id) => {
+  const node = root.getElementById?.(id) ?? null;
   if (!node) return '';
   const sub = [];
-  const text = normalize(nameText(node, sub, false));
+  const text = normalize(embedded(node) ?? nameText(node, sub, false));
   return [node.getAttribute('aria-label') ?? '', node.getAttribute('title') ?? '', text, ...sub]
     .join(' ');
 };
-const named = (ids) => (ids ?? '').split(/\s+/).filter(Boolean)
-  .map((id) => {
-    if (!memo.has(id)) memo.set(id, refName(id));
-    return memo.get(id);
+// O id vale no documento ou no shadow root de quem aponta (o nó posto num <slot> aponta para o
+// documento dele).
+const named = (ids, from) => {
+  const root = from.getRootNode();
+  if (!memo.has(root)) memo.set(root, new Map());
+  const known = memo.get(root);
+  return (ids ?? '').split(/\s+/).filter(Boolean).map((id) => {
+    if (!known.has(id)) known.set(id, refName(root, id));
+    return known.get(id);
   }).join(' ');
+};
 // O valor de um campo embutido (o nome também o usa).
 const embedded = (node) => {
   if (node instanceof HTMLSelectElement) return [...node.selectedOptions].map((o) => o.text).join(' ');
@@ -886,14 +892,17 @@ const nameText = (node, into = inner, follow = true) => {
     return node.getAttribute('alt') ?? '';
   }
   let text = '';
-  for (let child = node.firstChild; child; child = child.nextSibling) {
+  // Um <slot> vale com o que a página pôs nele (o botão de dentro de um componente).
+  const kids = node instanceof HTMLSlotElement && node.assignedNodes().length
+    ? node.assignedNodes() : node.childNodes;
+  for (const child of kids) {
     if (child.nodeType === 3) text += child.nodeValue ?? '';
     else if (child.nodeType === 1) {
       const own = child.getAttribute('aria-label');
       const refs = follow ? child.getAttribute('aria-labelledby') : null;
       const sub = embedded(child) ?? nameText(child, into, follow);
       if (own) into.push(own);
-      if (refs) into.push(named(refs));
+      if (refs) into.push(named(refs, child));
       // O title de um elemento de dentro, também com texto (o texto pode ser aria-hidden).
       const tip = child.getAttribute('title');
       if (tip && !own && !refs) into.push(tip);
@@ -903,16 +912,19 @@ const nameText = (node, into = inner, follow = true) => {
   if (node.shadowRoot) text += nameText(node.shadowRoot, into, follow);
   return text;
 };
+// A <label> vale também com o aria-label, o title e o aria-labelledby dela (o nome os usa).
 const labelText = (node) => {
   const sub = [];
-  return [normalize(nameText(node, sub)), ...sub].join(' ');
+  return [node.getAttribute('aria-label') ?? '', node.getAttribute('title') ?? '',
+    named(node.getAttribute('aria-labelledby'), node), normalize(nameText(node, sub)), ...sub]
+    .join(' ');
 };
 const parts = () => {
   inner.length = 0;
   memo.clear();
   const text = normalize(nameText(target));
   return [target.getAttribute('aria-label') ?? '', target.getAttribute('title') ?? '',
-    named(target.getAttribute('aria-labelledby')),
+    named(target.getAttribute('aria-labelledby'), target),
     [...(target.labels ?? [])].map(labelText).join(' '),
     target.getAttribute('data-testid') ?? '', text, inner.join(' ')];
 };
@@ -1049,28 +1061,15 @@ if (!want.matches('input, textarea, select') && !want.isContentEditable) {
 }
 let view = element.ownerDocument.defaultView;
 let box = null;
-// Um elemento com display: contents não tem caixa: valem as dos filhos, também as do texto e
-// as do shadow root ou dos nós de um <slot>, na ordem em que são desenhados (o Playwright
-// clica no meio da primeira). O ::before dele vem antes delas e não tem retângulo que se leia:
-// com ele, não dá para dizer onde o clique cai.
-let unsure = false;
-const boxes = (node) => {
-  const own = [...node.getClientRects()];
-  if (own.length || view.getComputedStyle(node).display !== 'contents') return own;
-  const before = view.getComputedStyle(node, '::before').content;
-  if (before && before !== 'none' && before !== 'normal') unsure = true;
-  const kids = node.shadowRoot ? node.shadowRoot.childNodes
-    : node.localName === 'slot' && node.assignedNodes().length ? node.assignedNodes() : node.childNodes;
-  return [...kids].flatMap((child) => {
-    if (child.nodeType === 1) return boxes(child);
-    if (child.nodeType !== 3) return [];
-    const range = node.ownerDocument.createRange();
-    range.selectNodeContents(child);
-    return [...range.getClientRects()];
-  });
-};
-const drawn = boxes(element);
-if (unsure) return false;
+// Um elemento sem caixa própria (display: contents) não diz onde o clique cai: o Playwright
+// clica no meio do primeiro pedaço desenhado, que pode ser um texto, um ::before ou o shadow
+// root fechado de um componente. Conta como coberto.
+const drawn = [...element.getClientRects()];
+// Num iframe, o Playwright corta as caixas só pela janela de cima: uma caixa que passa da
+// janela do iframe (um alvo maior que ela) pode levar o clique para fora dele. Só vale com
+// todas as caixas dentro da janela de cada iframe.
+let rects = drawn.filter((rect) => rect.width > 0 && rect.height > 0)
+  .map((rect) => [rect.left, rect.top, rect.right, rect.bottom]);
 for (const rect of drawn) {
   const left = Math.max(rect.left, 0);
   const top = Math.max(rect.top, 0);
@@ -1140,6 +1139,11 @@ for (;;) {
     frame = null;
   }
   if (!frame) return true;
+  const here = doc.defaultView;
+  if (rects.some((r) => r[0] < -1 || r[1] < -1 || r[2] > here.innerWidth + 1
+      || r[3] > here.innerHeight + 1)) {
+    return false;
+  }
   const outer = frame.ownerDocument.defaultView;
   for (let node = frame; node && node.nodeType === 1;
       node = node.parentElement ?? node.parentNode?.host ?? null) {
@@ -1151,6 +1155,7 @@ for (;;) {
   const sy = frame.offsetHeight ? rect.height / frame.offsetHeight : 1;
   const ox = rect.left + (frame.clientLeft + (parseFloat(style.paddingLeft) || 0)) * sx;
   const oy = rect.top + (frame.clientTop + (parseFloat(style.paddingTop) || 0)) * sy;
+  rects = rects.map((r) => [ox + r[0] * sx, oy + r[1] * sy, ox + r[2] * sx, oy + r[3] * sy]);
   box = [Math.max(ox + box[0] * sx, 0), Math.max(oy + box[1] * sy, 0),
     Math.min(ox + box[2] * sx, outer.innerWidth), Math.min(oy + box[3] * sy, outer.innerHeight)];
   // Fora da janela de cima (uma gaveta que ainda entra): ainda não dá para clicar.
