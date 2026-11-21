@@ -31,15 +31,22 @@
 // sozinho não tira retrato: o mesmo input que a página reaproveita de "Senha"
 // para "Valor" não leva a marca de senha). O campo que era senha, código ou de
 // um login no foco só sai como segredo e vira uma entrada (a senha que a pessoa
-// mostra com o "olho" antes de digitar nunca sai como texto). O elemento leva o caminho dos hospedeiros (shadow_path) e um
-// seletor CSS que atravessa os shadow roots abertos ("#hospedeiro > #campo"),
+// mostra com o "olho" antes de digitar nunca sai como texto), e também o que já foi
+// senha nesta página (wasPassword: o "olho" antes do foco, a senha que a página mostra
+// no próprio focus do campo, o input de texto que entra no lugar da senha), que conta
+// como a senha do grupo. O campo sem rótulo que só o texto da página diz ser um código
+// (codeByText) só sai como segredo. O campo que saiu da página relê o rótulo que tinha
+// (labelSaysSecret: o componente que o troca no próprio blur). O elemento leva o
+// caminho dos hospedeiros (shadow_path) e um seletor CSS que atravessa os shadow
+// roots abertos ("#hospedeiro > #campo"),
 // para que dois componentes iguais (o mesmo id por dentro) nunca virem o mesmo
 // campo. Cada elemento também leva um número (serial) que dois elementos nunca
 // têm igual. Nenhum método de shadow DOM ou de eventos é embrulhado para isso; o
 // único nativo trocado é a propriedade value de HTMLInputElement e
 // HTMLTextAreaElement (hookValueSetter, o getter e o setter): o getter só
 // repassa, e o setter só marca o valor que a página muda enquanto a pessoa
-// digita.
+// digita. O MutationObserver (o construtor guardado antes dos scripts da página) só
+// observa o type dos inputs e os inputs que entram e saem.
 (() => {
   'use strict';
   const CONFIG = __RAPA_CONFIG__;
@@ -52,6 +59,9 @@
   const MAX_TEXT = 300;
   const MAX_NAME = 300;
   const MAX_SCAN = 6000;
+  // Construtor guardado antes dos scripts da página (wasPassword).
+  const Observer = W.MutationObserver;
+  const observeNative = Observer && Observer.prototype ? Observer.prototype.observe : null;
   // Relógio guardado antes dos scripts da página (que podem trocar o performance.now).
   const clock = (() => {
     try { const p = W.performance; const now = p.now.bind(p); now(); return now; } catch (e) { return Date.now; }
@@ -298,8 +308,38 @@
     'codverificacao', 'codigoautenticacao', 'codigoseguranca', 'codigoacesso', 'codigosms',
     'verificationcode', 'onetimecode', 'otpcode', 'authcode', 'smscode', 'mfacode', 'totpcode',
   ]);
-  const OTP_LABEL = /(c[oó]digo\s+de\s+(verifica[cç][aã]o|seguran[cç]a|autentica[cç][aã]o|acesso)|c[oó]digo\s+(otp|totp|sms)|token|autentica[cç][aã]o\s+em\s+duas|dois\s+fatores|\b2fa\b|one[-\s]?time|verification\s+code)/i;
+  const OTP_LABEL = /(c[oó]digo\s+de\s+(verifica[cç][aã]o|seguran[cç]a|autentica[cç][aã]o|acesso)|c[oó]digo\s+(otp|totp|sms)|token|autentica[cç][aã]o\s+em\s+duas|dois\s+fatores|\b2fa\b|one[-\s]?time|verification\s+code|c[oó]digo\s[^.]{0,40}?\b(?:sms|enviad[oa]|recebid[oa]|e-?mail|celular|whatsapp)\b)/i;
+  const OTP_TOKEN = /(?:^|[^a-z0-9])(?:otp|totp|mfa|2fa)(?:[^a-z0-9]|$)/;
   const squash = (s) => norm(s).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]/g, '');
+
+  // O texto do aria-describedby do campo ou, sem ele, o do elemento logo antes do campo
+  // (ou de um dos três primeiros pais), cortado em MAX_NAME.
+  const nearText = (el) => {
+    const ids = norm(el.getAttribute('aria-describedby'));
+    if (ids) {
+      const root = el.getRootNode ? el.getRootNode() : el.ownerDocument;
+      const scope = root && typeof root.getElementById === 'function' ? root : el.ownerDocument;
+      const text = norm(ids.split(' ').map((id) => {
+        const ref = scope.getElementById(id);
+        return ref ? contentText(ref, null, 0) : '';
+      }).join(' '));
+      if (text) return clip(text, MAX_NAME);
+    }
+    // O texto de antes só no campo com cara de código (numérico ou curto).
+    const max = Number(el.getAttribute('maxlength'));
+    const shaped = norm(el.getAttribute('inputmode')).toLowerCase() === 'numeric' ||
+      ['tel', 'number'].indexOf(inputType(el)) >= 0 || (max >= 4 && max <= 10);
+    if (!shaped) return '';
+    let cur = el;
+    for (let depth = 0; cur && depth < 4; depth++, cur = cur.parentElement) {
+      for (let sib = cur.previousElementSibling, n = 0; sib && n < 3; sib = sib.previousElementSibling, n++) {
+        if (sib.tagName === 'SCRIPT' || sib.tagName === 'STYLE') continue;
+        const text = norm(String(sib.textContent || '').slice(0, 4 * MAX_NAME));
+        if (text) return clip(text, MAX_NAME);
+      }
+    }
+    return '';
+  };
 
   const isOneTimeCode = (el) => {
     if (el.tagName !== 'INPUT') return false;
@@ -308,8 +348,14 @@
     const ac = norm(el.getAttribute('autocomplete')).toLowerCase();
     if (ac.split(' ').indexOf('one-time-code') >= 0) return true;
     if (OTP_NAMES.has(squash(el.getAttribute('name'))) || OTP_NAMES.has(squash(el.id))) return true;
+    if (OTP_TOKEN.test(norm(el.getAttribute('name')).toLowerCase()) || OTP_TOKEN.test(norm(el.id).toLowerCase())) return true;
     return OTP_LABEL.test(labelText(el) || norm(el.getAttribute('placeholder')));
   };
+  // Campo sem rótulo que só o texto da página diz ser um código (o aria-describedby, ou o
+  // texto logo antes dele: "Digite o código que enviamos por SMS"): o valor só sai como
+  // segredo (vira uma entrada), sem a marca de código (nunca o código do cofre).
+  const codeByText = (el) => el.tagName === 'INPUT' && TEXT_TYPES.has(inputType(el)) && !labelText(el) &&
+    OTP_LABEL.test(nearText(el));
 
   // Senha em campo de texto (portais de banco mascaram por CSS): máscara
   // -webkit-text-security, autocomplete de senha, ou rótulo, título, placeholder,
@@ -393,7 +439,8 @@
   const USERNAME_WORDS = /(?:^|[^a-z0-9])(?:usuario|user|username|login|e-mail|email|cpf|cnpj|matricula|codigo do usuario)(?:[^a-z0-9]|$)/;
   const isUsernameField = (el) => {
     if (el.tagName !== 'INPUT' || !USERNAME_TYPES.has(inputType(el))) return false;
-    if (isPassword(el) || isOneTimeCode(el) || isPasswordByName(el) || namesAnotherParty(el)) return false;
+    if (isPassword(el) || isOneTimeCode(el) || isPasswordByName(el) || wasPassword.has(el) ||
+        namesAnotherParty(el)) return false;
     const ac = norm(el.getAttribute('autocomplete')).toLowerCase().split(' ');
     if (ac.indexOf('username') >= 0 || ac.indexOf('email') >= 0 || inputType(el) === 'email') return true;
     return [labelText(el), el.getAttribute('name'), el.id, el.getAttribute('placeholder')]
@@ -401,6 +448,25 @@
   };
 
   const isSecretField = (el) => isPassword(el) || isOneTimeCode(el) || isPasswordByName(el);
+
+  // Campos que já foram senha nesta página (rapa/recorder/sensitivity.py, was_password):
+  // o type=password e a máscara por CSS vistos antes dos ouvintes da página (no
+  // pointerdown confiável, no Tab, no Enter, no espaço fora de um campo e no fim da carga
+  // do documento: markPasswords), o input cujo type a página tira de password (o
+  // MutationObserver vê a troca antes do focusin do gravador, também quando a página
+  // mostra a senha no próprio focus do campo), o input que entra no lugar de uma senha
+  // que saiu da página, antes ou depois dela (o "olho" que troca um input pelo outro: o
+  // mesmo id ou o mesmo name, o mesmo pai ou lugar quando o registro tirou um campo só,
+  // ou a mesma posição num registro que pôs no mesmo lugar tantos campos quantos o da
+  // saída tirou, em menos de SWAP_MS) e o campo de texto com o valor de uma senha da
+  // mesma raiz (sameAsPassword: o gêmeo de texto). O código de uso único mascarado por
+  // CSS também leva a marca (markPasswords), mesmo sem a pessoa o mostrar: o descritor
+  // dele sai com was_password, e as versões anteriores recusam essa gravação (falha
+  // fechada). A marca não sai mais do elemento: o valor só
+  // sai como segredo e vira uma entrada do robô (nunca outra credencial do cofre), e o
+  // campo conta como a senha do grupo (o usuário digitado depois é o usuário).
+  const wasPassword = new WeakSet();
+  const everSecret = (el) => isSecretField(el) || wasPassword.has(el);
 
   const isTextLike = (el) => (el.tagName === 'INPUT' && TEXT_TYPES.has(inputType(el))) || el.tagName === 'TEXTAREA';
 
@@ -434,7 +500,7 @@
       let found;
       try { found = root.querySelectorAll('input'); } catch (e) { continue; }
       for (const f of found) {
-        if (f !== el && (!loose || !formOf(f)) && !hiddenForAria(f) && isSecretField(f)) return true;
+        if (f !== el && (!loose || !formOf(f)) && !hiddenForAria(f) && everSecret(f)) return true;
       }
     }
     return false;
@@ -451,12 +517,13 @@
   // dele fale de outra pessoa ou de um cadastro. O campo de um shadow root sai da
   // gravação com qualquer senha ou código visível no documento, em qualquer raiz e
   // em qualquer <form> (ele nunca é credencial de login: o compilador pede o valor
-  // numa entrada).
+  // numa entrada). O campo que já foi senha (wasPassword) conta como a senha do grupo:
+  // o usuário digitado depois da senha que a pessoa mostrou com o "olho" é o usuário.
   const loginRole = (el) => {
-    if (!isTextLike(el) || isSecretField(el)) return null;
+    if (!isTextLike(el) || everSecret(el)) return null;
     const ac = norm(el.getAttribute('autocomplete')).toLowerCase().split(' ');
     const declared = ac.indexOf('username') >= 0;
-    if (!declared && !groupFields(el).some((f) => f !== el && isSecretField(f)) &&
+    if (!declared && !groupFields(el).some((f) => f !== el && everSecret(f)) &&
         !looseSecretElsewhere(el) && !(inShadow(el) && secretIn(el, false, null))) return null;
     return isUsernameField(el) ? 'username' : 'hidden';
   };
@@ -815,6 +882,8 @@
     const otp = isOneTimeCode(el);
     const byName = isPasswordByName(el);
     const login = loginRole(el);
+    // O campo que já foi senha e agora não é (a senha mostrada com o "olho").
+    const revealed = !password && wasPassword.has(el);
     const isControl = tag === 'input' || tag === 'select' || tag === 'textarea';
     let text = '';
     if (!isControl) text = clip(el.innerText || el.textContent, MAX_TEXT);
@@ -825,7 +894,7 @@
     const shadow = inShadow(el);
     const root = rootsUnder(el.ownerDocument) || (shadow ? null : [el.ownerDocument]);
     const textForCount = text && text.length <= 100 ? text : null;
-    return {
+    const out = {
       tag,
       input_type: type,
       role: orNull(role),
@@ -846,7 +915,7 @@
       is_password: password,
       is_one_time_code: otp,
       is_username: login === 'username',
-      sensitive: password || otp || login !== null || byName,
+      sensitive: password || otp || login !== null || byName || revealed || (!otp && codeByText(el)),
       aria_mentions_password: tag === 'input' && ariaMentionsPassword(el),
       row: rowInfo(el, role, name, textForCount),
       form: formInfo(el),
@@ -860,6 +929,10 @@
         name_attr: countAttr(root, 'name', nameAttr),
       },
     };
+    // A marca só vai quando é verdade: o descritor sem ela é o de antes (a gravação sem
+    // senha mostrada continua a mesma das versões anteriores).
+    if (revealed) out.was_password = true;
+    return out;
   };
 
   // -- máscaras e valores pendentes ---------------------------------------------
@@ -947,7 +1020,9 @@
   const secretAtFocus = new WeakSet();
   // O último campo em que a pessoa digitou (beforeinput ou input confiável).
   let lastTyped = null;
-  const SECRET_MARKS = ['is_password', 'is_one_time_code', 'is_username', 'sensitive', 'aria_mentions_password'];
+  const SECRET_MARKS = [
+    'is_password', 'is_one_time_code', 'is_username', 'was_password', 'sensitive', 'aria_mentions_password',
+  ];
   // O descritor novo com as marcas de sigilo que o campo já teve nesta edição.
   const raise = (desc, old) => {
     if (old) for (const mark of SECRET_MARKS) if (old[mark]) desc[mark] = true;
@@ -956,10 +1031,45 @@
   const seenOf = (el) => {
     let seen = lastSeen.get(el);
     if (!seen) {
-      seen = { desc: null, value: undefined, fresh: false, taken: false, pending: false };
+      seen = {
+        desc: null, value: undefined, fresh: false, taken: false, pending: false, labels: [], labelIds: [], root: null, id: '',
+      };
       lastSeen.set(el, seen);
     }
     return seen;
+  };
+  // Os elementos do rótulo do campo: os <label> dele e os do aria-labelledby.
+  const labelNodes = (el) => {
+    const out = [];
+    if (isLabelable(el) && el.labels) for (const label of el.labels) out.push(label);
+    const ids = norm(el.getAttribute('aria-labelledby'));
+    if (ids) {
+      const root = rootOf(el);
+      const scope = root && typeof root.getElementById === 'function' ? root : el.ownerDocument;
+      for (const id of ids.split(' ')) { const ref = scope.getElementById(id); if (ref) out.push(ref); }
+    }
+    return out;
+  };
+  // O rótulo que o campo tinha (os elementos guardados nos retratos e os <label for> do
+  // id dele na mesma raiz), relido agora: o componente pode tê-lo trocado depois do
+  // retrato (no próprio blur, ou no pointerdown do botão) e tirado o campo da página. As
+  // marcas só sobem: se agora fala em senha, assinatura ou código, o valor é sigiloso.
+  const labelSaysSecret = (seen, el) => {
+    const nodes = seen.labels.slice();
+    const refs = seen.labelIds.slice();
+    for (const ref of norm(el.getAttribute('aria-labelledby')).split(' ')) if (ref) refs.push(ref);
+    if (seen.root && typeof seen.root.getElementById === 'function') {
+      for (const ref of refs) { const node = seen.root.getElementById(ref); if (node) nodes.push(node); }
+    }
+    if (seen.root && seen.id) {
+      let found = [];
+      try { found = seen.root.querySelectorAll('label[for]'); } catch (e) { /* ignora */ }
+      for (const label of found) if (label.getAttribute('for') === seen.id) nodes.push(label);
+    }
+    return nodes.some((node) => {
+      const text = clip(norm(node.getAttribute('aria-label')) || contentText(node, null, 0), MAX_NAME);
+      return mentionsSecretName(text) || OTP_LABEL.test(text);
+    });
   };
   // Retrato do campo na página; se o descritor não sai (exceção), fica o anterior.
   // ``taken``: o retrato que o gravador tirou ao guardar o campo para decidir depois
@@ -975,6 +1085,14 @@
       seen.value = value;
       seen.fresh = true;
       seen.taken = taken === true;
+      for (const node of labelNodes(el)) {
+        if (seen.labels.length < 8 && seen.labels.indexOf(node) < 0) seen.labels.push(node);
+      }
+      for (const ref of norm(el.getAttribute('aria-labelledby')).split(' ')) {
+        if (ref && seen.labelIds.length < 8 && seen.labelIds.indexOf(ref) < 0) seen.labelIds.push(ref);
+      }
+      seen.root = rootOf(el);
+      seen.id = el.id || '';
     } catch (e) { /* ignora */ }
   };
   // Uma tecla da pessoa: o valor guardado fica desconhecido e o retrato sai depois
@@ -996,7 +1114,10 @@
   // nenhuma tecla nem valor de script depois dele); então o campo leva pelo menos a
   // marca de sigilo que um envio com o campo na página teria agora (o próprio campo é
   // senha ou código, ou é o usuário ou outro campo de um login, ou há uma senha ou um
-  // código em qualquer raiz do documento, ou o documento é grande demais para olhar).
+  // código em qualquer raiz do documento, ou o documento é grande demais para olhar), e
+  // também quando o campo já foi senha nesta página (wasPassword) ou quando o rótulo que
+  // ele tinha agora fala em senha, assinatura ou código (labelSaysSecret: o componente o
+  // trocou no próprio blur ou no pointerdown do botão, depois do retrato).
   // Com só o retrato de depois da última tecla (o componente tirou o campo antes de o
   // gravador guardá-lo), o campo é sempre sigiloso: a página pode tê-lo mudado depois
   // do retrato (uma máscara que só aparece depois, uma tecla que ela aplica num
@@ -1009,8 +1130,10 @@
     try {
       if (isPassword(el)) out.is_password = true;
       if (isOneTimeCode(el)) out.is_one_time_code = true;
-      secret = !seen.taken || out.sensitive || out.is_password || out.is_one_time_code || isSecretField(el) ||
-        loginRole(el) !== null || !rootsUnder(el.ownerDocument) || secretIn(el, false, null);
+      if (!out.is_password && wasPassword.has(el)) out.was_password = true;
+      secret = !seen.taken || out.sensitive || out.is_password || out.is_one_time_code || wasPassword.has(el) ||
+        isSecretField(el) || loginRole(el) !== null || labelSaysSecret(seen, el) || !rootsUnder(el.ownerDocument) ||
+        secretIn(el, false, null);
     } catch (e) { /* na dúvida, sigiloso */ }
     if (secret) out.sensitive = true;
     return out;
@@ -1022,6 +1145,17 @@
   // depois: ``deferred``), se a pessoa digitou nele desde o último envio. Fora
   // disso, o campo que saiu da página é esquecido, como antes. Com o campo na
   // página, o descritor é o de agora, com as marcas de sigilo do retrato.
+  // Um campo de texto com o mesmo valor de uma senha da mesma raiz (o "olho" que mostra
+  // um gêmeo de texto da senha e esconde o type=password): o valor é a senha.
+  const sameAsPassword = (el, value) => {
+    if (el.tagName !== 'INPUT' || typeof value !== 'string' || value.length < 4) return false;
+    let found;
+    try { found = rootOf(el).querySelectorAll('input'); } catch (e) { return false; }
+    for (const f of found) {
+      if (f !== el && (inputType(f) === 'password' || wasPassword.has(f)) && f.value === value) return true;
+    }
+    return false;
+  };
   const sendField = (el, gone) => {
     const st = fields.get(el);
     if (!st) return;
@@ -1034,6 +1168,13 @@
       if (value === st.lastSent) return;
       const seen = lastSeen.get(el);
       desc = raise(describe(el), seen ? seen.desc : null);
+      try {
+        if (!desc.sensitive && sameAsPassword(el, String(value))) {
+          wasPassword.add(el);
+          desc.was_password = true;
+          desc.sensitive = true;
+        }
+      } catch (e) { desc.sensitive = true; }
     } else {
       fields.delete(el);
       const seen = gone || deferred ? lastSeen.get(el) : null;
@@ -1042,9 +1183,10 @@
       desc = goneDescriptor(el, seen);
     }
     // O campo era senha, código ou de um login quando a pessoa o focou (antes de mostrar
-    // a senha com o "olho", ou antes de a página o reaproveitar): o valor só sai como
-    // segredo e vira uma entrada do robô, nunca outra credencial do cofre.
-    if (secretAtFocus.has(el)) desc.sensitive = true;
+    // a senha com o "olho", ou antes de a página o reaproveitar), ou já foi senha nesta
+    // página (wasPassword): o valor só sai como segredo e vira uma entrada do robô, nunca
+    // outra credencial do cofre.
+    if (secretAtFocus.has(el) || wasPassword.has(el)) desc.sensitive = true;
     const sensitive = desc.sensitive;
     send({
       kind: 'input',
@@ -1066,7 +1208,7 @@
     st.scriptSet = false;
     // A próxima edição começa outro retrato (as marcas valem para o valor que saiu).
     const seen = lastSeen.get(el);
-    if (seen) { seen.desc = null; seen.value = undefined; seen.fresh = false; seen.taken = false; }
+    if (seen) { seen.desc = null; seen.value = undefined; seen.fresh = false; seen.taken = false; seen.labels = []; seen.labelIds = []; }
     secretAtFocus.delete(el);
   };
 
@@ -1272,6 +1414,7 @@
     for (const node of path) {
       if (!node || node.nodeType !== 11 || !hostOf(node) || watchedRoots.has(node)) continue;
       watchedRoots.add(node);
+      observeRoot(node);
       try {
         node.addEventListener('change', onShadowChange, { capture: true, passive: true });
         node.addEventListener('blur', onBlurField, { capture: true, passive: true });
@@ -1279,6 +1422,145 @@
       } catch (e) { /* ignora */ }
     }
   };
+
+  // -- campos que já foram senha (wasPassword) ------------------------------------
+
+  // O type=password e a máscara por CSS de agora, em todas as raízes do documento: no
+  // pointerdown confiável e no Tab, no Enter e no espaço fora de um campo (antes dos
+  // ouvintes da página, que podem mostrar a senha no clique do "olho" ou no focus do
+  // campo) e no fim da carga do documento.
+  const markPasswords = () => {
+    const roots = rootsUnder(document) || [document];
+    for (const root of roots) {
+      let found;
+      try { found = root.querySelectorAll('input'); } catch (e) { continue; }
+      for (const f of found) {
+        const type = inputType(f);
+        if (type === 'password' || (TEXT_TYPES.has(type) && isMaskedText(f))) wasPassword.add(f);
+      }
+    }
+  };
+  const SCAN_KEYS = new Set(['Tab', 'Enter', ' ']);
+  const onScanEvent = (event) => {
+    if (!event.isTrusted) return;
+    if (event.type === 'keydown') {
+      if (!SCAN_KEYS.has(event.key)) return;
+      const target = realTarget(event);
+      if (event.key === ' ' && target && target.nodeType === 1 && isEditable(target)) return;
+    }
+    try { markPasswords(); } catch (e) { /* ignora */ }
+  };
+
+  // Lugares de onde uma senha saiu da página há menos de SWAP_MS (departed) e campos que
+  // entraram há menos de SWAP_MS (arrived, para o input novo que entra antes de a senha
+  // sair, como num <transition>): o input com o mesmo id ou o mesmo name e, se o registro
+  // tirou um campo só, o que entra no mesmo pai ou no mesmo lugar (o invólucro recriado)
+  // é a senha que o "olho" trocou; se tirou mais de um, também o da mesma posição de um
+  // registro que pôs a mesma quantidade de campos no mesmo lugar (groups).
+  const SWAP_MS = 1000;
+  let departed = [];
+  let arrived = [];
+  // Os campos que um registro pôs de uma vez num lugar (o formulário redesenhado), na ordem:
+  // a senha que saiu num registro com N campos é o campo da mesma posição de um registro que
+  // pôs N campos no mesmo lugar (o "olho" que redesenha o formulário sem id nem name).
+  let groups = [];
+  const inputsIn = (node) => {
+    if (!node || node.nodeType !== 1) return [];
+    if (node.tagName === 'INPUT') return [node];
+    try { return Array.from(node.querySelectorAll('input')); } catch (e) { return []; }
+  };
+  // Os campos em que se digita (texto ou senha) dentro do nó: um input escondido ao lado
+  // da senha não conta.
+  const typedIn = (node) => inputsIn(node).filter((f) => isTextLike(f) || inputType(f) === 'password');
+  const onMutations = (records) => {
+    try {
+      const now = clock();
+      departed = departed.filter((d) => now - d.at < SWAP_MS);
+      arrived = arrived.filter((a) => now - a.at < SWAP_MS && a.el.isConnected && !wasPassword.has(a.el));
+      const added = [];
+      for (const record of records) {
+        if (record.type === 'attributes') {
+          // A página tirou o type=password do campo (o "olho", ou o focus do próprio campo).
+          const el = record.target;
+          if (el.tagName === 'INPUT' && norm(record.oldValue).toLowerCase() === 'password' &&
+              inputType(el) !== 'password') wasPassword.add(el);
+          continue;
+        }
+        // Uma troca do "olho" tira uma senha só. O registro que tira mais de um campo (a tela
+        // do login inteira que a SPA troca por outra, ou o "olho" que redesenha o formulário
+        // pequeno) só conta pelo mesmo id ou pelo mesmo name, nunca pelo mesmo pai, ou pela
+        // posição da senha entre os campos que ele tirou (groups, mais abaixo): a SPA que
+        // troca o login por uma busca de um campo só fica com a busca.
+        const removedTyped = [];
+        for (const node of record.removedNodes) for (const f of typedIn(node)) removedTyped.push(f);
+        const removedFields = removedTyped.length;
+        const single = removedFields === 1;
+        for (const node of record.removedNodes) {
+          for (const f of inputsIn(node)) {
+            if (f.isConnected || (inputType(f) !== 'password' && !wasPassword.has(f))) continue;
+            departed.push({
+              at: now,
+              parent: single ? (f === node ? record.target : f.parentNode) : null,
+              id: f.id,
+              name: f.getAttribute('name'),
+              site: single && typedIn(node).length === 1 ? record.target : null,
+              target: single ? null : record.target,
+              slot: removedTyped.indexOf(f),
+              count: removedFields,
+            });
+          }
+        }
+        const addedTyped = [];
+        for (const node of record.addedNodes) {
+          added.push([node, record.target]);
+          for (const f of typedIn(node)) addedTyped.push(f);
+        }
+        if (addedTyped.length > 1) groups.push({ at: now, target: record.target, fields: addedTyped });
+      }
+      for (const [node, site] of added) {
+        const inner = inputsIn(node);
+        const fields = inner.filter((f) => isTextLike(f) || inputType(f) === 'password');
+        for (const f of fields) {
+          if (!f.isConnected) continue;
+          arrived.push({ at: now, el: f, site: fields.length === 1 ? site : null });
+        }
+      }
+      groups = groups.filter((g) => now - g.at < SWAP_MS);
+      if (departed.length > 16) departed = departed.slice(-16);
+      if (groups.length > 16) groups = groups.slice(-16);
+      if (departed.length) {
+        for (const a of arrived) {
+          const f = a.el;
+          if (!f.isConnected) continue;
+          const name = f.getAttribute('name');
+          if (departed.some((d) => (d.parent && f.parentNode === d.parent) || (d.site && a.site === d.site) ||
+              (d.id && f.id === d.id) || (d.name && name === d.name))) {
+            wasPassword.add(f);
+          }
+        }
+        for (const d of departed) {
+          if (!d.target) continue;
+          for (const g of groups) {
+            const f = g.target === d.target && g.fields.length === d.count ? g.fields[d.slot] : null;
+            if (f && f.isConnected) wasPassword.add(f);
+          }
+        }
+      }
+      // O limite vem depois da procura: um registro que põe muitos campos de uma vez (o
+      // formulário grande redesenhado) não tira da procura a senha que ele trocou.
+      if (arrived.length > 64) arrived = arrived.slice(-64);
+    } catch (e) { /* ignora */ }
+  };
+  let observer = null;
+  try { observer = new Observer(onMutations); } catch (e) { observer = null; }
+  const OBSERVED = { subtree: true, childList: true, attributes: true, attributeFilter: ['type'], attributeOldValue: true };
+  // O documento desde o começo; os shadow roots abertos quando aparecem no caminho de um
+  // evento (watchRoots).
+  function observeRoot(root) {
+    if (!observer || !observeNative) return;
+    try { observeNative.call(observer, root, OBSERVED); } catch (e) { /* ignora */ }
+  }
+  observeRoot(document);
 
   const SKIP_CLICK_TYPES = new Set(['checkbox', 'radio', 'file']);
   const onClick = (event) => {
@@ -1309,7 +1591,11 @@
   };
 
   const opts = { capture: true, passive: true };
-  // Primeiro os shadow roots do caminho e o valor pendente de outro campo; depois a ação.
+  // Primeiro as senhas de agora (antes de a página mostrar alguma), os shadow roots do
+  // caminho e o valor pendente de outro campo; depois a ação.
+  W.addEventListener('pointerdown', onScanEvent, opts);
+  W.addEventListener('keydown', onScanEvent, opts);
+  document.addEventListener('DOMContentLoaded', () => { try { markPasswords(); } catch (e) { /* ignora */ } }, opts);
   for (const type of ['focusin', 'pointerdown', 'mousedown', 'keydown', 'beforeinput', 'input']) {
     W.addEventListener(type, watchRoots, opts);
   }
