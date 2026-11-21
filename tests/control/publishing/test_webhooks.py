@@ -507,3 +507,15 @@ async def test_database_refuses_delivery_ids_with_a_dot(
                 {"c": world.a.company_id, "w": hook.webhook_id, "r": delivery.run_id},
             )
     assert getattr(caught.value.orig, "sqlstate", None) == "23514"
+
+
+def test_body_depth_is_bounded_before_reading() -> None:
+    # O limite vale do mesmo jeito em qualquer máquina: o leitor de JSON aguentaria mais ou
+    # menos níveis conforme a pilha.
+    from rapa.control.services.webhooks import MAX_BODY_DEPTH, _check_depth
+
+    _check_depth(b"[" * MAX_BODY_DEPTH + b"]" * MAX_BODY_DEPTH)
+    _check_depth(b'{"a": "' + b"[" * 1000 + b'"}')  # dentro de um texto não conta
+    _check_depth(b'{"a": "\\"}')  # barra escapada fecha o texto
+    with pytest.raises(ValueError):
+        _check_depth(b"[" * (MAX_BODY_DEPTH + 1))

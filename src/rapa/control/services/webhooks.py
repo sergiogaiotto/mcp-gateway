@@ -393,6 +393,34 @@ def _info(row: RowMapping) -> WebhookInfo:
     )
 
 
+#: Quantos níveis de objetos e listas um corpo de webhook pode ter.
+MAX_BODY_DEPTH = 64
+
+
+def _check_depth(body: bytes) -> None:
+    """Recusa (``ValueError``) um corpo com mais de :data:`MAX_BODY_DEPTH` níveis de ``{`` e
+    ``[`` fora de textos, sem ler o JSON."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for byte in body:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:  # \
+                escaped = True
+            elif byte == 0x22:  # "
+                in_string = False
+        elif byte == 0x22:
+            in_string = True
+        elif byte in (0x5B, 0x7B):  # [ {
+            depth += 1
+            if depth > MAX_BODY_DEPTH:
+                raise ValueError("aninhamento demais")
+        elif byte in (0x5D, 0x7D):  # ] }
+            depth -= 1
+
+
 def _refuse_constant(name: str) -> Any:
     raise ValueError(f"constante {name} não é JSON")
 
@@ -716,7 +744,10 @@ class PgWebhooks(PgService):
             raise Conflict("o webhook está desligado")
         self.limiter.check(webhook_id, int(hook["rate_per_minute"]))
         try:
-            # NaN e Infinity não são JSON (o banco os recusaria): o corpo é recusado antes.
+            # O aninhamento é limitado antes de ler (a profundidade que o leitor aguenta
+            # muda com a pilha de cada máquina). NaN e Infinity não são JSON (o banco os
+            # recusaria): o corpo é recusado antes.
+            _check_depth(body)
             inputs = json.loads(body, parse_constant=_refuse_constant)
         except UnicodeDecodeError, ValueError, RecursionError:
             raise InvalidInput(
