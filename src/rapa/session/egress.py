@@ -188,7 +188,7 @@ class EgressGuard:
         self.on_refused = on_refused
         self.max_connections = max_connections
         self._server: asyncio.Server | None = None
-        self._clients: set[asyncio.StreamWriter] = set()
+        self._clients: set[asyncio.Task[None]] = set()
         #: Contagens (para diagnóstico e testes; nunca os destinos).
         self.allowed = 0
         self.refused = 0
@@ -219,9 +219,11 @@ class EgressGuard:
         if server is None:
             return
         server.close()
-        for writer in list(self._clients):
-            with contextlib.suppress(Exception):
-                writer.transport.abort()
+        tasks = list(self._clients)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        server.abort_clients()
         with contextlib.suppress(Exception):
             await asyncio.wait_for(server.wait_closed(), timeout=5)
 
@@ -267,10 +269,11 @@ class EgressGuard:
     # -- protocolo -----------------------------------------------------------------
 
     async def _client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        if len(self._clients) >= self.max_connections:
+        task = asyncio.current_task()
+        if task is None or len(self._clients) >= self.max_connections or self._server is None:
             writer.transport.abort()
             return
-        self._clients.add(writer)
+        self._clients.add(task)
         upstream: asyncio.StreamWriter | None = None
         try:
             request = await asyncio.wait_for(self._handshake(reader, writer), HANDSHAKE_TIMEOUT_S)
@@ -296,11 +299,16 @@ class EgressGuard:
         except OSError, TimeoutError, asyncio.IncompleteReadError, ValueError:
             return
         finally:
-            self._clients.discard(writer)
+            self._clients.discard(task)
+            # No fim da sessão (a guarda fechando), derruba; senão, fecha depois de mandar o resto.
+            closing = self._server is None
             for stream in (upstream, writer):
                 if stream is not None:
                     with contextlib.suppress(Exception):
-                        stream.close()
+                        if closing:
+                            stream.transport.abort()
+                        else:
+                            stream.close()
 
     async def _handshake(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
