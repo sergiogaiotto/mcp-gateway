@@ -110,6 +110,59 @@ def test_recording_sessions_and_llm_configuration(tmp_path: Path) -> None:
             ServerSettings.from_env({**base, **env})
 
 
+def test_publishing_configuration(tmp_path: Path) -> None:
+    base = {"RAPA_DATABASE_URL": DB, "RAPA_DEV": "1", "RAPA_TOKENS_DEV": str(_tokens(tmp_path))}
+    defaults = ServerSettings.from_env(base)
+    assert defaults.webhook_key is None
+    assert (defaults.schedule_catch_up_s, defaults.schedule_interval_s) == (600.0, 5.0)
+    assert (defaults.batch_max_rows, defaults.batch_max_bytes) == (1000, 5 * 1024 * 1024)
+    key = "chave-dos-webhooks-que-nunca-aparece-em-lugar-nenhum"
+    settings = ServerSettings.from_env(
+        {
+            **base,
+            "RAPA_CHAVE_WEBHOOKS": key,
+            "RAPA_AGENDA_TOLERANCIA_S": "120",
+            "RAPA_AGENDA_INTERVALO_S": "1",
+            "RAPA_LOTE_MAX_LINHAS": "50",
+            "RAPA_LOTE_MAX_BYTES": "65536",
+        }
+    )
+    assert settings.webhook_key == key and key not in repr(settings)
+    assert (settings.schedule_catch_up_s, settings.schedule_interval_s) == (120.0, 1.0)
+    assert (settings.batch_max_rows, settings.batch_max_bytes) == (50, 65536)
+    for env, field in (
+        ({"RAPA_CHAVE_WEBHOOKS": "curta"}, "webhook_key"),
+        ({"RAPA_LOTE_MAX_LINHAS": "0"}, "batch_max_rows"),
+        ({"RAPA_AGENDA_TOLERANCIA_S": "-1"}, "schedule_catch_up_s"),
+    ):
+        with pytest.raises(ValueError, match=field):
+            ServerSettings.from_env({**base, **env})
+    # Sem a chave, o serviço sobe sem webhooks; com ela, os três serviços existem.
+    app = create_server_app(ServerSettings.from_env({**base, "RAPA_UI": "0"}))
+    assert app.state.publishing.webhooks is None and app.state.publishing.schedules is not None
+    app = create_server_app(
+        ServerSettings.from_env({**base, "RAPA_UI": "0", "RAPA_CHAVE_WEBHOOKS": key})
+    )
+    publishing = app.state.publishing
+    assert publishing.webhooks is publishing.receiver is not None
+    assert publishing.batches is not None and publishing.batch_max_bytes == 5 * 1024 * 1024
+
+
+def test_dispatcher_gets_the_scheduler(tmp_path: Path) -> None:
+    base = {
+        "RAPA_DATABASE_URL": DB,
+        "RAPA_DISPATCHER_DATABASE_URL": "postgresql://rapa_dispatcher:x@banco:5432/rapa",
+        "RAPA_HTTP": "0",
+        "RAPA_AGENDA_INTERVALO_S": "2",
+        "RAPA_AGENDA_TOLERANCIA_S": "90",
+    }
+    app = create_server_app(ServerSettings.from_env(base))
+    dispatcher = app.state.dispatcher
+    assert isinstance(dispatcher, Dispatcher)
+    assert dispatcher.scheduler is not None and dispatcher.schedule_interval == 2.0
+    assert dispatcher.scheduler.catch_up == timedelta(seconds=90)  # type: ignore[attr-defined]
+
+
 def test_keycloak_configuration() -> None:
     settings = ServerSettings.from_env(
         {

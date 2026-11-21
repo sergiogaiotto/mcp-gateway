@@ -23,11 +23,13 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engin
 
 __all__ = [
     "TENANT_SETTING",
+    "WEBHOOK_SETTING",
     "Database",
     "create_engine",
     "dispatcher_session",
     "psycopg_url",
     "tenant_session",
+    "webhook_lookup_session",
 ]
 
 #: Parâmetro de configuração lido pelas políticas de isolamento por linha.
@@ -35,6 +37,9 @@ TENANT_SETTING = "rapa.company_id"
 
 _SET_TENANT = text("SELECT set_config('rapa.company_id', :company_id, true)")
 _CLEAR_TENANT = text("SELECT set_config('rapa.company_id', '', true)")
+#: Parâmetro lido pela política de ``webhooks`` numa transação sem empresa.
+WEBHOOK_SETTING = "rapa.webhook_id"
+_SET_WEBHOOK = text("SELECT set_config('rapa.webhook_id', :webhook_id, true)")
 
 _ACCEPTED_SCHEMES = {"postgres", "postgresql", "postgresql+psycopg", "postgresql+psycopg_async"}
 
@@ -90,6 +95,26 @@ async def tenant_session(engine: AsyncEngine, company_id: UUID) -> AsyncIterator
 
 
 @asynccontextmanager
+async def webhook_lookup_session(
+    engine: AsyncEngine, webhook_id: UUID
+) -> AsyncIterator[AsyncSession]:
+    """Abre uma transação sem empresa que só enxerga o webhook ``webhook_id``.
+
+    Serve à entrega de um webhook, que chega sem token: antes de conferir a
+    assinatura, ninguém sabe a empresa. A política de ``webhooks`` deixa ver,
+    numa transação sem empresa, só a linha do identificador em
+    ``rapa.webhook_id``; nenhuma outra tabela mostra nada, e nada se grava.
+    """
+    if not isinstance(webhook_id, UUID):
+        raise TypeError("o webhook deve ser um UUID")
+    async with AsyncSession(engine, expire_on_commit=False, autoflush=False) as session:
+        async with session.begin():
+            await session.execute(_CLEAR_TENANT)
+            await session.execute(_SET_WEBHOOK, {"webhook_id": str(webhook_id)})
+            yield session
+
+
+@asynccontextmanager
 async def dispatcher_session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
     """Abre uma transação sem empresa, para o despachante."""
     async with AsyncSession(engine, expire_on_commit=False, autoflush=False) as session:
@@ -115,6 +140,10 @@ class Database:
     def dispatcher_session(self) -> AbstractAsyncContextManager[AsyncSession]:
         """Transação sem empresa, para o despachante (ver :func:`dispatcher_session`)."""
         return dispatcher_session(self.engine)
+
+    def webhook_lookup_session(self, webhook_id: UUID) -> AbstractAsyncContextManager[AsyncSession]:
+        """Transação que só enxerga um webhook (ver :func:`webhook_lookup_session`)."""
+        return webhook_lookup_session(self.engine, webhook_id)
 
     async def dispose(self) -> None:
         await self.engine.dispose()

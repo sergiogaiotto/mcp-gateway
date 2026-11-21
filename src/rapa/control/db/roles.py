@@ -38,6 +38,14 @@ As tabelas das sessões de gravação (revisão 0003) têm um bloco próprio
 sessões e gravações, e só muda a situação de uma sessão (e a renova enquanto está
 aberta); nunca apaga nada. O despachante só lê a situação das sessões, para contar
 as abertas na reserva de vagas interativas e achar as que nenhum processo segura.
+
+As tabelas da publicação (revisão 0004: agendas, webhooks e lotes) também têm um
+bloco próprio (:func:`publishing_grants_sql`). A aplicação lê e inclui; só muda as
+colunas editáveis das agendas e dos webhooks (nunca a empresa, o robô ou o
+autor), e as ocorrências, entregas e lotes só aceitam inclusões. O despachante só
+lê a fila das agendas (empresa, identificador, ligada, próxima ocorrência e
+arquivada): as ocorrências viram execuções pelo papel da aplicação, numa
+transação fixada na empresa da agenda.
 """
 
 import os
@@ -50,6 +58,7 @@ __all__ = [
     "RoleNames",
     "all_grants_sql",
     "grants_sql",
+    "publishing_grants_sql",
     "session_grants_sql",
 ]
 
@@ -118,15 +127,39 @@ GRANT SELECT (company_id, id, status, expires_at, seen_at) ON recording_sessions
 
 _SESSION_TABLES = ("recording_sessions", "recordings")
 
+_PUBLISHING_APP_GRANTS = """
+GRANT SELECT, INSERT ON schedules, schedule_occurrences, webhooks, webhook_deliveries,
+    batches, batch_rows TO {role};
+GRANT UPDATE (title, cron, timezone, inputs, enabled, next_run_at, last_occurrence_at,
+    updated_by, updated_at, archived_at) ON schedules TO {role};
+GRANT UPDATE (title, enabled, rate_per_minute, key_salt, key_version, rotated_at,
+    updated_by, updated_at, archived_at) ON webhooks TO {role};
+"""
 
-def _block(role: str, grants: str, *, tables: tuple[str, ...] = ()) -> str:
+_PUBLISHING_DISPATCHER_GRANTS = """
+GRANT SELECT (company_id, id, enabled, next_run_at, archived_at) ON schedules TO {role};
+"""
+
+_PUBLISHING_TABLES = (
+    "schedules",
+    "schedule_occurrences",
+    "webhooks",
+    "webhook_deliveries",
+    "batches",
+    "batch_rows",
+)
+
+
+def _block(
+    role: str, grants: str, *, tables: tuple[str, ...] = (), what: str = "das sessões"
+) -> str:
     body = grants.format(role=f'"{role}"').strip()
     condition = f"EXISTS (SELECT FROM pg_roles WHERE rolname = '{role}')"
     missing = "papel % não existe; permissões não concedidas"
     for table in tables:
         condition += f" AND to_regclass('public.{table}') IS NOT NULL"
     if tables:
-        missing = "papel % ou tabelas das sessões ausentes; permissões não concedidas"
+        missing = f"papel % ou tabelas {what} ausentes; permissões não concedidas"
     return (
         "DO $grants$\nBEGIN\n"
         f"    IF {condition} THEN\n"
@@ -154,6 +187,17 @@ def session_grants_sql(roles: RoleNames) -> list[str]:
     ]
 
 
+def publishing_grants_sql(roles: RoleNames) -> list[str]:
+    """Permissões das agendas, webhooks e lotes (revisão 0004), se as tabelas existirem."""
+    what = "da publicação"
+    return [
+        _block(roles.app, _PUBLISHING_APP_GRANTS, tables=_PUBLISHING_TABLES, what=what),
+        _block(
+            roles.dispatcher, _PUBLISHING_DISPATCHER_GRANTS, tables=_PUBLISHING_TABLES, what=what
+        ),
+    ]
+
+
 def all_grants_sql(roles: RoleNames) -> list[str]:
     """Todas as permissões, das tabelas que existirem na revisão atual do banco."""
-    return [*grants_sql(roles), *session_grants_sql(roles)]
+    return [*grants_sql(roles), *session_grants_sql(roles), *publishing_grants_sql(roles)]

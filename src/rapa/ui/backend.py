@@ -28,6 +28,12 @@ import httpx2
 from pydantic import TypeAdapter, ValidationError
 
 from rapa.core.contracts import (
+    BatchFile,
+    BatchFormat,
+    BatchInfo,
+    BatchPreview,
+    BatchRow,
+    BatchService,
     Conflict,
     ContractError,
     DraftChoices,
@@ -47,7 +53,17 @@ from rapa.core.contracts import (
     RunService,
     RunStatus,
     RunTrigger,
+    ScheduleChanges,
+    ScheduleInfo,
+    ScheduleOccurrence,
+    ScheduleService,
+    ScheduleSpec,
     ViewerTicket,
+    WebhookChanges,
+    WebhookInfo,
+    WebhookSecret,
+    WebhookService,
+    WebhookSpec,
 )
 from rapa.core.robot import SLUG_PATTERN, Manifest
 
@@ -55,7 +71,10 @@ if TYPE_CHECKING:
     from rapa.ui.auth import UiSession
 
 __all__ = [
+    "BATCHES_OFF",
+    "SCHEDULES_OFF",
     "SESSIONS_OFF",
+    "WEBHOOKS_OFF",
     "Backend",
     "BackendError",
     "BackendUnavailable",
@@ -139,9 +158,68 @@ class Backend(Protocol):
 
     async def create_draft(self, session_id: UUID, choices: DraftChoices) -> RobotVersionInfo: ...
 
+    # -- publicar: agendas, webhooks e lotes ----------------------------------------
+
+    async def list_schedules(self) -> list[ScheduleInfo]: ...
+
+    async def get_schedule(self, schedule_id: UUID) -> ScheduleInfo | None: ...
+
+    async def create_schedule(self, spec: ScheduleSpec) -> ScheduleInfo: ...
+
+    async def update_schedule(
+        self, schedule_id: UUID, changes: ScheduleChanges
+    ) -> ScheduleInfo: ...
+
+    async def delete_schedule(self, schedule_id: UUID) -> None: ...
+
+    async def list_occurrences(
+        self, schedule_id: UUID, limit: int = 50
+    ) -> list[ScheduleOccurrence]: ...
+
+    async def list_webhooks(self, robot_id: UUID) -> list[WebhookInfo]: ...
+
+    async def create_webhook(self, robot_id: UUID, spec: WebhookSpec) -> WebhookSecret: ...
+
+    async def update_webhook(
+        self, robot_id: UUID, webhook_id: UUID, changes: WebhookChanges
+    ) -> WebhookInfo: ...
+
+    async def rotate_webhook(self, robot_id: UUID, webhook_id: UUID) -> WebhookSecret: ...
+
+    async def delete_webhook(self, robot_id: UUID, webhook_id: UUID) -> None: ...
+
+    async def preview_batch(
+        self,
+        robot_id: UUID,
+        file_name: str,
+        data: bytes,
+        columns: dict[str, str] | None = None,
+    ) -> BatchPreview: ...
+
+    async def create_batch(
+        self,
+        robot_id: UUID,
+        file_name: str,
+        data: bytes,
+        columns: dict[str, str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> BatchInfo: ...
+
+    async def list_batches(self, limit: int = 50) -> list[BatchInfo]: ...
+
+    async def get_batch(self, batch_id: UUID) -> BatchInfo | None: ...
+
+    async def list_batch_rows(self, batch_id: UUID) -> list[BatchRow]: ...
+
+    async def batch_results(self, batch_id: UUID, format: BatchFormat) -> BatchFile: ...
+
 
 #: Mensagem quando este servidor não oferece a gravação de demonstrações.
 SESSIONS_OFF = "a gravação de demonstrações não está disponível neste servidor"
+#: Mensagens quando este servidor não oferece agendas, webhooks ou lotes.
+SCHEDULES_OFF = "as agendas não estão disponíveis neste servidor"
+WEBHOOKS_OFF = "os webhooks não estão disponíveis neste servidor"
+BATCHES_OFF = "os lotes por planilha não estão disponíveis neste servidor"
 
 
 # ---------------------------------------------------------------------------
@@ -236,12 +314,18 @@ class ContractsBackend:
         principal: Principal,
         *,
         sessions: RecordingService | None = None,
+        schedules: ScheduleService | None = None,
+        webhooks: WebhookService | None = None,
+        batches: BatchService | None = None,
     ) -> None:
         self._catalog = catalog
         self._runs = runs
         self._admin = admin
         self._principal = principal
         self._sessions = sessions
+        self._schedules = schedules
+        self._webhooks = webhooks
+        self._batches = batches
 
     def __repr__(self) -> str:
         return f"ContractsBackend(subject={self._principal.subject!r})"
@@ -323,6 +407,97 @@ class ContractsBackend:
     async def create_draft(self, session_id: UUID, choices: DraftChoices) -> RobotVersionInfo:
         return await self._recording().create_draft(self._principal, session_id, choices)
 
+    # -- publicar --------------------------------------------------------------------
+
+    def _schedule_service(self) -> ScheduleService:
+        if self._schedules is None:
+            raise BackendUnavailable(SCHEDULES_OFF)
+        return self._schedules
+
+    def _webhook_service(self) -> WebhookService:
+        if self._webhooks is None:
+            raise BackendUnavailable(WEBHOOKS_OFF)
+        return self._webhooks
+
+    def _batch_service(self) -> BatchService:
+        if self._batches is None:
+            raise BackendUnavailable(BATCHES_OFF)
+        return self._batches
+
+    async def list_schedules(self) -> list[ScheduleInfo]:
+        return await self._schedule_service().list_schedules(self._principal)
+
+    async def get_schedule(self, schedule_id: UUID) -> ScheduleInfo | None:
+        return await self._schedule_service().get_schedule(self._principal, schedule_id)
+
+    async def create_schedule(self, spec: ScheduleSpec) -> ScheduleInfo:
+        return await self._schedule_service().create_schedule(self._principal, spec)
+
+    async def update_schedule(self, schedule_id: UUID, changes: ScheduleChanges) -> ScheduleInfo:
+        return await self._schedule_service().update_schedule(self._principal, schedule_id, changes)
+
+    async def delete_schedule(self, schedule_id: UUID) -> None:
+        await self._schedule_service().delete_schedule(self._principal, schedule_id)
+
+    async def list_occurrences(
+        self, schedule_id: UUID, limit: int = 50
+    ) -> list[ScheduleOccurrence]:
+        return await self._schedule_service().list_occurrences(self._principal, schedule_id, limit)
+
+    async def list_webhooks(self, robot_id: UUID) -> list[WebhookInfo]:
+        return await self._webhook_service().list_webhooks(self._principal, robot_id)
+
+    async def create_webhook(self, robot_id: UUID, spec: WebhookSpec) -> WebhookSecret:
+        return await self._webhook_service().create_webhook(self._principal, robot_id, spec)
+
+    async def update_webhook(
+        self, robot_id: UUID, webhook_id: UUID, changes: WebhookChanges
+    ) -> WebhookInfo:
+        return await self._webhook_service().update_webhook(
+            self._principal, robot_id, webhook_id, changes
+        )
+
+    async def rotate_webhook(self, robot_id: UUID, webhook_id: UUID) -> WebhookSecret:
+        return await self._webhook_service().rotate_secret(self._principal, robot_id, webhook_id)
+
+    async def delete_webhook(self, robot_id: UUID, webhook_id: UUID) -> None:
+        await self._webhook_service().delete_webhook(self._principal, robot_id, webhook_id)
+
+    async def preview_batch(
+        self,
+        robot_id: UUID,
+        file_name: str,
+        data: bytes,
+        columns: dict[str, str] | None = None,
+    ) -> BatchPreview:
+        return await self._batch_service().preview_batch(
+            self._principal, robot_id, file_name, data, columns
+        )
+
+    async def create_batch(
+        self,
+        robot_id: UUID,
+        file_name: str,
+        data: bytes,
+        columns: dict[str, str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> BatchInfo:
+        return await self._batch_service().create_batch(
+            self._principal, robot_id, file_name, data, columns, idempotency_key
+        )
+
+    async def list_batches(self, limit: int = 50) -> list[BatchInfo]:
+        return await self._batch_service().list_batches(self._principal, limit)
+
+    async def get_batch(self, batch_id: UUID) -> BatchInfo | None:
+        return await self._batch_service().get_batch(self._principal, batch_id)
+
+    async def list_batch_rows(self, batch_id: UUID) -> list[BatchRow]:
+        return await self._batch_service().list_batch_rows(self._principal, batch_id)
+
+    async def batch_results(self, batch_id: UUID, format: BatchFormat) -> BatchFile:
+        return await self._batch_service().batch_results(self._principal, batch_id, format)
+
 
 class _Platform(RobotCatalog, RunService, RobotAdmin, Protocol):
     """Um objeto que segue os três contratos (como a plataforma em memória)."""
@@ -338,21 +513,48 @@ class ContractsBackendFactory:
         admin: RobotAdmin,
         *,
         sessions: RecordingService | None = None,
+        schedules: ScheduleService | None = None,
+        webhooks: WebhookService | None = None,
+        batches: BatchService | None = None,
     ) -> None:
         self._catalog = catalog
         self._runs = runs
         self._admin = admin
         self._sessions = sessions
+        self._schedules = schedules
+        self._webhooks = webhooks
+        self._batches = batches
 
     @classmethod
     def from_platform(
-        cls, platform: _Platform, *, sessions: RecordingService | None = None
+        cls,
+        platform: _Platform,
+        *,
+        sessions: RecordingService | None = None,
+        schedules: ScheduleService | None = None,
+        webhooks: WebhookService | None = None,
+        batches: BatchService | None = None,
     ) -> ContractsBackendFactory:
-        return cls(platform, platform, platform, sessions=sessions)
+        return cls(
+            platform,
+            platform,
+            platform,
+            sessions=sessions,
+            schedules=schedules,
+            webhooks=webhooks,
+            batches=batches,
+        )
 
     def __call__(self, session: UiSession) -> ContractsBackend:
         return ContractsBackend(
-            self._catalog, self._runs, self._admin, session.principal, sessions=self._sessions
+            self._catalog,
+            self._runs,
+            self._admin,
+            session.principal,
+            sessions=self._sessions,
+            schedules=self._schedules,
+            webhooks=self._webhooks,
+            batches=self._batches,
         )
 
 
@@ -371,6 +573,16 @@ _SESSION: TypeAdapter[RecordingSessionInfo] = TypeAdapter(RecordingSessionInfo)
 _SESSIONS: TypeAdapter[list[RecordingSessionInfo]] = TypeAdapter(list[RecordingSessionInfo])
 _TICKET: TypeAdapter[ViewerTicket] = TypeAdapter(ViewerTicket)
 _PROPOSALS: TypeAdapter[GeneralizationProposals] = TypeAdapter(GeneralizationProposals)
+_SCHEDULE: TypeAdapter[ScheduleInfo] = TypeAdapter(ScheduleInfo)
+_SCHEDULES: TypeAdapter[list[ScheduleInfo]] = TypeAdapter(list[ScheduleInfo])
+_OCCURRENCES: TypeAdapter[list[ScheduleOccurrence]] = TypeAdapter(list[ScheduleOccurrence])
+_WEBHOOK: TypeAdapter[WebhookInfo] = TypeAdapter(WebhookInfo)
+_WEBHOOKS: TypeAdapter[list[WebhookInfo]] = TypeAdapter(list[WebhookInfo])
+_WEBHOOK_SECRET: TypeAdapter[WebhookSecret] = TypeAdapter(WebhookSecret)
+_PREVIEW: TypeAdapter[BatchPreview] = TypeAdapter(BatchPreview)
+_BATCH: TypeAdapter[BatchInfo] = TypeAdapter(BatchInfo)
+_BATCHES: TypeAdapter[list[BatchInfo]] = TypeAdapter(list[BatchInfo])
+_BATCH_ROWS: TypeAdapter[list[BatchRow]] = TypeAdapter(list[BatchRow])
 
 _MAX_MESSAGE = 500
 _MAX_DETAILS = 50
@@ -593,6 +805,184 @@ class RestBackend:
             json_body=choices.model_dump(mode="json"),
         )
         return self._parse(_VERSION, data)
+
+    # -- publicar --------------------------------------------------------------------
+
+    async def _raw(
+        self,
+        method: str,
+        path: str,
+        *,
+        data: Mapping[str, str] | None = None,
+        files: Mapping[str, tuple[str, bytes, str]] | None = None,
+        params: Mapping[str, str] | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> httpx2.Response:
+        """Pedido que envia um formulário multipart ou recebe um arquivo."""
+        request_headers = {"Authorization": f"Bearer {self._token}"}
+        request_headers.update(headers or {})
+        try:
+            response = await self._client.request(
+                method,
+                path,
+                data=dict(data) if data else None,
+                files=dict(files) if files else None,
+                params=dict(params) if params else None,
+                headers=request_headers,
+            )
+        except httpx2.TimeoutException:
+            raise BackendUnavailable(_UNAVAILABLE) from None
+        except httpx2.HTTPError as exc:
+            logger.warning("falha ao chamar a API do RaPA: %s", type(exc).__name__)
+            raise BackendUnavailable(_UNAVAILABLE) from None
+        if not response.is_success:
+            raise _api_error(response)
+        return response
+
+    async def list_schedules(self) -> list[ScheduleInfo]:
+        return self._parse(_SCHEDULES, await self._send("GET", "/v1/agendas"))
+
+    async def get_schedule(self, schedule_id: UUID) -> ScheduleInfo | None:
+        data = await self._send("GET", f"/v1/agendas/{schedule_id}", not_found_is_none=True)
+        return None if data is None else self._parse(_SCHEDULE, data)
+
+    async def create_schedule(self, spec: ScheduleSpec) -> ScheduleInfo:
+        body = {
+            "robo_id": str(spec.robot_id),
+            "titulo": spec.title,
+            "cron": spec.cron,
+            "fuso": spec.timezone,
+            "entradas": spec.inputs,
+            "ativa": spec.enabled,
+        }
+        return self._parse(_SCHEDULE, await self._send("POST", "/v1/agendas", json_body=body))
+
+    async def update_schedule(self, schedule_id: UUID, changes: ScheduleChanges) -> ScheduleInfo:
+        names = {
+            "title": "titulo",
+            "cron": "cron",
+            "timezone": "fuso",
+            "inputs": "entradas",
+            "enabled": "ativa",
+        }
+        body = {
+            names[key]: value
+            for key, value in changes.model_dump(mode="json").items()
+            if value is not None
+        }
+        data = await self._send("PATCH", f"/v1/agendas/{schedule_id}", json_body=body)
+        return self._parse(_SCHEDULE, data)
+
+    async def delete_schedule(self, schedule_id: UUID) -> None:
+        await self._raw("DELETE", f"/v1/agendas/{schedule_id}")
+
+    async def list_occurrences(
+        self, schedule_id: UUID, limit: int = 50
+    ) -> list[ScheduleOccurrence]:
+        data = await self._send(
+            "GET",
+            f"/v1/agendas/{schedule_id}/ocorrencias",
+            params={"limite": str(min(max(limit, 1), 200))},
+        )
+        return self._parse(_OCCURRENCES, data)
+
+    async def list_webhooks(self, robot_id: UUID) -> list[WebhookInfo]:
+        data = await self._send("GET", f"/v1/robos/{robot_id}/webhooks", not_found_is_none=True)
+        return [] if data is None else self._parse(_WEBHOOKS, data)
+
+    async def create_webhook(self, robot_id: UUID, spec: WebhookSpec) -> WebhookSecret:
+        body = {"titulo": spec.title, "por_minuto": spec.rate_per_minute, "ativo": spec.enabled}
+        data = await self._send("POST", f"/v1/robos/{robot_id}/webhooks", json_body=body)
+        return self._parse(_WEBHOOK_SECRET, data)
+
+    async def update_webhook(
+        self, robot_id: UUID, webhook_id: UUID, changes: WebhookChanges
+    ) -> WebhookInfo:
+        names = {"title": "titulo", "rate_per_minute": "por_minuto", "enabled": "ativo"}
+        body = {
+            names[key]: value
+            for key, value in changes.model_dump(mode="json").items()
+            if value is not None
+        }
+        data = await self._send(
+            "PATCH", f"/v1/robos/{robot_id}/webhooks/{webhook_id}", json_body=body
+        )
+        return self._parse(_WEBHOOK, data)
+
+    async def rotate_webhook(self, robot_id: UUID, webhook_id: UUID) -> WebhookSecret:
+        data = await self._send("POST", f"/v1/robos/{robot_id}/webhooks/{webhook_id}/trocar-chave")
+        return self._parse(_WEBHOOK_SECRET, data)
+
+    async def delete_webhook(self, robot_id: UUID, webhook_id: UUID) -> None:
+        await self._raw("DELETE", f"/v1/robos/{robot_id}/webhooks/{webhook_id}")
+
+    @staticmethod
+    def _batch_form(robot_id: UUID, columns: dict[str, str] | None) -> dict[str, str]:
+        form = {"robo_id": str(robot_id)}
+        if columns:
+            form["colunas"] = json.dumps(columns, ensure_ascii=False)
+        return form
+
+    async def preview_batch(
+        self,
+        robot_id: UUID,
+        file_name: str,
+        data: bytes,
+        columns: dict[str, str] | None = None,
+    ) -> BatchPreview:
+        response = await self._raw(
+            "POST",
+            "/v1/lotes/previa",
+            data=self._batch_form(robot_id, columns),
+            files={"arquivo": (file_name, data, "application/octet-stream")},
+        )
+        return self._parse(_PREVIEW, self._json(response))
+
+    async def create_batch(
+        self,
+        robot_id: UUID,
+        file_name: str,
+        data: bytes,
+        columns: dict[str, str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> BatchInfo:
+        response = await self._raw(
+            "POST",
+            "/v1/lotes",
+            data=self._batch_form(robot_id, columns),
+            files={"arquivo": (file_name, data, "application/octet-stream")},
+            headers={"Idempotency-Key": idempotency_key} if idempotency_key else None,
+        )
+        return self._parse(_BATCH, self._json(response))
+
+    async def list_batches(self, limit: int = 50) -> list[BatchInfo]:
+        data = await self._send("GET", "/v1/lotes", params={"limite": str(min(max(limit, 1), 100))})
+        return self._parse(_BATCHES, data)
+
+    async def get_batch(self, batch_id: UUID) -> BatchInfo | None:
+        data = await self._send("GET", f"/v1/lotes/{batch_id}", not_found_is_none=True)
+        return None if data is None else self._parse(_BATCH, data)
+
+    async def list_batch_rows(self, batch_id: UUID) -> list[BatchRow]:
+        return self._parse(_BATCH_ROWS, await self._send("GET", f"/v1/lotes/{batch_id}/linhas"))
+
+    async def batch_results(self, batch_id: UUID, format: BatchFormat) -> BatchFile:
+        response = await self._raw(
+            "GET", f"/v1/lotes/{batch_id}/resultado", params={"formato": format.value}
+        )
+        extension = "xlsx" if format is BatchFormat.XLSX else "csv"
+        return BatchFile(
+            file_name=f"lote-{str(batch_id)[:8]}-resultado.{extension}",
+            media_type=response.headers.get("content-type", "application/octet-stream"),
+            content=response.content,
+        )
+
+    @staticmethod
+    def _json(response: httpx2.Response) -> Any:
+        try:
+            return response.json()
+        except ValueError:
+            raise BackendUnavailable(_UNEXPECTED) from None
 
 
 class RestBackendFactory:

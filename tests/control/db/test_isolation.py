@@ -1,10 +1,11 @@
 """Isolamento entre empresas, provado como ``rapa_app`` (o papel da API e da interface).
 
 A empresa B não vê nada da A (robôs, versões, execuções, eventos, credenciais,
-auditoria, usuários), não consegue gravar com o company_id da A, e uma
-transação sem empresa não vê nada de ninguém.
+auditoria, usuários, sessões de gravação, agendas, webhooks e lotes), não consegue
+gravar com o company_id da A, e uma transação sem empresa não vê nada de ninguém.
 """
 
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
@@ -16,10 +17,27 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from rapa.control.db import Database
 from rapa.control.db.schema import TENANT_TABLES
-from rapa.control.services import PgPlatform, PgProvisioning, PgRunQueue
+from rapa.control.services import (
+    PgBatches,
+    PgPlatform,
+    PgProvisioning,
+    PgRunQueue,
+    PgSchedules,
+    PgWebhooks,
+    Scheduler,
+    WebhookKeys,
+)
 from rapa.control.services.sessions import PgSessionStore
+from rapa.control.services.webhooks import sign_delivery
 from rapa.control.sessions import SessionRecord
-from rapa.core.contracts import RecordingSessionStatus, RunTrigger
+from rapa.core.contracts import (
+    BatchFormat,
+    NotFound,
+    RecordingSessionStatus,
+    RunTrigger,
+    ScheduleSpec,
+    WebhookSpec,
+)
 from rapa.core.events import RunEventKind
 from rapa.core.ids import new_id
 from rapa.core.robot import CredentialRef
@@ -36,6 +54,8 @@ class World:
     a_robot: UUID
     a_run: UUID
     a_session: UUID
+    #: A agenda, o webhook e o lote da empresa A.
+    a_published: dict[str, UUID]
 
 
 async def _world(app_db: Database, dispatcher_db: Database, superuser: AsyncEngine) -> World:
@@ -67,9 +87,54 @@ async def _world(app_db: Database, dispatcher_db: Database, superuser: AsyncEngi
             [event(job.run_id, job.attempt, 0, RunEventKind.RUN_STARTED)],
         )
     sessions = {tenant.company_id: await _stopped_session(app_db, tenant) for tenant in (a, b)}
+    published = {}
+    for tenant in (a, b):
+        published[tenant.company_id] = await _publishing_rows(app_db, dispatcher_db, tenant)
     return World(
-        a=a, b=b, a_robot=a_version.robot_id, a_run=a_run.run_id, a_session=sessions[a.company_id]
+        a=a,
+        b=b,
+        a_robot=a_version.robot_id,
+        a_run=a_run.run_id,
+        a_session=sessions[a.company_id],
+        a_published=published[a.company_id],
     )
+
+
+async def _publishing_rows(
+    app_db: Database, dispatcher_db: Database, tenant: Tenant
+) -> dict[str, UUID]:
+    """Uma agenda com uma ocorrência, um webhook com uma entrega e um lote com uma linha."""
+    robot_id = next(
+        s.robot_id
+        for s in await PgPlatform(app_db).list_published(tenant.admin)
+        if s.slug == "emitir_protocolo"
+    )
+    schedule = await PgSchedules(app_db).create_schedule(
+        tenant.operator,
+        ScheduleSpec(robot_id=robot_id, title="Diária", cron="0 9 * * *", inputs=PROTOCOLO_INPUTS),
+    )
+    assert schedule.next_run_at is not None
+    await Scheduler(app_db, dispatcher_db).fire(
+        tenant.company_id, schedule.schedule_id, schedule.next_run_at
+    )
+    webhooks = PgWebhooks(app_db, WebhookKeys("chave-do-servidor-de-teste-com-32-caracteres"))
+    created = await webhooks.create_webhook(tenant.operator, robot_id, WebhookSpec(title="ERP"))
+    body = json.dumps(PROTOCOLO_INPUTS).encode()
+    stamp = str(int(datetime.now(UTC).timestamp()))
+    await webhooks.deliver(
+        created.webhook.webhook_id,
+        timestamp=stamp,
+        delivery_id="entrega-1",
+        signature=sign_delivery(created.secret, stamp, "entrega-1", body),
+        body=body,
+    )
+    sheet = b"Nome completo;CPF;UF\r\nMaria;529.982.247-25;SP\r\n"
+    batch = await PgBatches(app_db).create_batch(tenant.operator, robot_id, "lote.csv", sheet)
+    return {
+        "schedule": schedule.schedule_id,
+        "webhook": created.webhook.webhook_id,
+        "batch": batch.batch_id,
+    }
 
 
 async def _stopped_session(db: Database, tenant: Tenant) -> UUID:
@@ -150,6 +215,37 @@ async def test_company_b_sees_nothing_of_company_a(
         s.company_id == world.b.company_id for s in await platform.search(admin_b, "protocolo")
     )
 
+    # Agendas, webhooks e lotes da A: nem pelos serviços nem pelo SQL.
+    published = world.a_published
+    schedules = PgSchedules(app_db)
+    assert await schedules.get_schedule(admin_b, published["schedule"]) is None
+    assert all(s.company_id == world.b.company_id for s in await schedules.list_schedules(admin_b))
+    with pytest.raises(NotFound):
+        await schedules.list_occurrences(admin_b, published["schedule"])
+    webhooks = PgWebhooks(app_db, WebhookKeys("chave-do-servidor-de-teste-com-32-caracteres"))
+    assert await webhooks.get_webhook(admin_b, world.a_robot, published["webhook"]) is None
+    with pytest.raises(NotFound):
+        await webhooks.list_webhooks(admin_b, world.a_robot)
+    batches = PgBatches(app_db)
+    assert await batches.get_batch(admin_b, published["batch"]) is None
+    assert all(x.company_id == world.b.company_id for x in await batches.list_batches(admin_b))
+    with pytest.raises(NotFound):
+        await batches.batch_results(admin_b, published["batch"], BatchFormat.CSV)
+    async with app_db.tenant_session(world.b.company_id) as session:
+        for table, column, key in (
+            ("schedules", "id", "schedule"),
+            ("schedule_occurrences", "schedule_id", "schedule"),
+            ("webhooks", "id", "webhook"),
+            ("webhook_deliveries", "webhook_id", "webhook"),
+            ("batches", "id", "batch"),
+            ("batch_rows", "batch_id", "batch"),
+        ):
+            count = await session.scalar(
+                text(f"SELECT count(*) FROM {table} WHERE {column} = :id"),  # noqa: S608
+                {"id": published[key]},
+            )
+            assert count == 0, table
+
 
 async def test_writes_with_another_company_id_fail_with_check(
     app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine
@@ -187,6 +283,37 @@ async def test_writes_with_another_company_id_fail_with_check(
             "INSERT INTO recordings (company_id, id, session_id, created_by, recording) "
             "VALUES (:a, :new, :sessao, 'b', '{}')",
             {"sessao": world.a_session},
+        ),
+        "schedules": (
+            "INSERT INTO schedules (company_id, id, robot_id, title, cron, created_by, "
+            "updated_by) VALUES (:a, :new, :robo, 'x', '* * * * *', 'b', 'b')",
+            {"robo": world.a_robot},
+        ),
+        "schedule_occurrences": (
+            "INSERT INTO schedule_occurrences (company_id, schedule_id, scheduled_for, status, "
+            "reason) VALUES (:a, :agenda, now(), 'skipped', 'perdida')",
+            {"agenda": world.a_published["schedule"]},
+        ),
+        "webhooks": (
+            "INSERT INTO webhooks (company_id, id, robot_id, title, key_salt, created_by, "
+            "updated_by) VALUES (:a, :new, :robo, 'x', '\\x00'::bytea, 'b', 'b')",
+            {"robo": world.a_robot},
+        ),
+        "webhook_deliveries": (
+            "INSERT INTO webhook_deliveries (company_id, webhook_id, delivery_id, body_sha256, "
+            "run_id) VALUES (:a, :webhook, 'x', repeat('0', 64), :run)",
+            {"webhook": world.a_published["webhook"], "run": world.a_run},
+        ),
+        "batches": (
+            "INSERT INTO batches (company_id, id, robot_id, version_id, file_name, file_format, "
+            "file_sha256, total_rows, columns, created_by) VALUES (:a, :new, :robo, :new, 'x', "
+            "'csv', repeat('0', 64), 1, '{}', 'b')",
+            {"robo": world.a_robot},
+        ),
+        "batch_rows": (
+            "INSERT INTO batch_rows (company_id, batch_id, row_no, line_no, run_id) "
+            "VALUES (:a, :lote, 99, 2, :run)",
+            {"lote": world.a_published["batch"], "run": world.a_run},
         ),
     }
     for table, (statement, extra) in attempts.items():

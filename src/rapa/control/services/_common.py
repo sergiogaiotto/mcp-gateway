@@ -7,6 +7,7 @@ from sqlalchemy import RowMapping
 
 from rapa.control.db.session import Database
 from rapa.core.contracts import (
+    InvalidInput,
     Principal,
     RobotSummary,
     RobotVersionInfo,
@@ -21,6 +22,7 @@ __all__ = [
     "INTERACTIVE_PRIORITY",
     "PRIORITY_BY_TRIGGER",
     "PgService",
+    "clean_title",
     "now_utc",
     "run_status",
     "summary",
@@ -47,6 +49,14 @@ INTERACTIVE_PRIORITY = 0
 
 def now_utc() -> datetime:
     return datetime.now(UTC)
+
+
+def clean_title(text: str) -> str:
+    """O título com os brancos normalizados; um título só de brancos é recusado."""
+    cleaned = " ".join(text.split())
+    if not cleaned:
+        raise InvalidInput("título inválido", ["o título não pode ficar em branco"])
+    return cleaned
 
 
 class PgService:

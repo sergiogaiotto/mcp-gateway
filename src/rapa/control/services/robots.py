@@ -35,7 +35,14 @@ from rapa.core.contracts import (
 from rapa.core.ids import new_id
 from rapa.core.robot import Manifest
 
-__all__ = ["PgRobotAdmin", "PgRobotCatalog", "fold_text", "published_query"]
+__all__ = [
+    "PgRobotAdmin",
+    "PgRobotCatalog",
+    "company_published_query",
+    "fold_text",
+    "published_query",
+    "published_robot",
+]
 
 _VERSION_COLUMNS = (
     robot_versions.c.id,
@@ -63,7 +70,19 @@ def fold_text(text: str) -> str:
 
 def published_query(principal: Principal) -> Select[Any]:
     """Robôs publicados visíveis para o principal, com a versão atual."""
-    query = (
+    query = company_published_query(principal.company_id)
+    allowed = visible_areas(principal)
+    if allowed is not None:
+        query = query.where(robots.c.area_id.in_(allowed))
+    return query
+
+
+def company_published_query(company_id: UUID) -> Select[Any]:
+    """Robôs publicados da empresa, com a versão atual (sem filtrar pelas áreas de alguém).
+
+    Serve às agendas e aos webhooks, que rodam em nome da área do robô.
+    """
+    return (
         select(
             robots.c.id.label("robot_id"),
             robots.c.company_id,
@@ -84,15 +103,20 @@ def published_query(principal: Principal) -> Select[Any]:
             )
         )
         .where(
-            robots.c.company_id == principal.company_id,
+            robots.c.company_id == company_id,
             robots.c.status == RobotStatus.PUBLISHED.value,
             robot_versions.c.status == VersionStatus.PUBLISHED.value,
         )
     )
-    allowed = visible_areas(principal)
-    if allowed is not None:
-        query = query.where(robots.c.area_id.in_(allowed))
-    return query
+
+
+async def published_robot(
+    session: AsyncSession, company_id: UUID, robot_id: UUID
+) -> RowMapping | None:
+    """O robô publicado da empresa, com a versão atual (``manifest`` incluído), ou ``None``."""
+    query = company_published_query(company_id).where(robots.c.id == robot_id)
+    row: RowMapping | None = (await session.execute(query)).mappings().one_or_none()
+    return row
 
 
 class PgRobotAdmin(PgService):

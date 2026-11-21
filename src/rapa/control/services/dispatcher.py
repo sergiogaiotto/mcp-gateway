@@ -23,8 +23,9 @@ certo ou até o prazo da execução (mais uma folga). Enquanto isso, o recolhedo
 deste despachante não devolve a execução à fila. Erros inesperados (pool de
 conexões esgotado, por exemplo) não derrubam o laço nem a renovação.
 
-Cada etapa do laço (criar partições de eventos, recolher concessões vencidas e
-pegar execuções) tem a sua própria proteção: um erro persistente numa delas não
+Cada etapa do laço (criar partições de eventos, recolher concessões vencidas,
+disparar as agendas vencidas, quando há um agendador, e pegar execuções) tem a
+sua própria proteção: um erro persistente numa delas não
 impede as outras. A etapa de manutenção que falha é repetida com espera
 crescente, e :attr:`Dispatcher.healthy` fica falso quando alguma etapa falha sem
 parar há ``unhealthy_after_s`` ou mais.
@@ -35,7 +36,7 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Protocol
 from uuid import UUID
 
 from sqlalchemy.exc import DataError, DBAPIError, IntegrityError
@@ -45,7 +46,7 @@ from rapa.control.services.queue import PgRunQueue, StaleAttempt
 from rapa.core.contracts import InvalidInput, RunMode, RunnerJob, RunState
 from rapa.core.robot import Effect
 
-__all__ = ["Dispatcher", "Launcher", "WorkerNotStarted", "failure_result"]
+__all__ = ["Dispatcher", "Launcher", "Ticker", "WorkerNotStarted", "failure_result"]
 
 logger = logging.getLogger("rapa.control.dispatcher")
 
@@ -60,8 +61,17 @@ _MAINTENANCE_RETRY_MAX_S = 60.0
 _STEPS = {
     "partitions": "criação das partições de eventos",
     "reap": "recolhimento das concessões vencidas",
+    "schedules": "disparo das agendas",
     "claim": "despacho de execuções",
 }
+
+
+class Ticker(Protocol):
+    """O agendador (:class:`rapa.control.services.schedules.Scheduler`), visto do laço."""
+
+    async def tick(self, now: datetime | None = None) -> int:
+        """Põe na fila as ocorrências vencidas; devolve quantas execuções entraram."""
+        ...
 
 
 class WorkerNotStarted(Exception):
@@ -137,11 +147,17 @@ class Dispatcher:
         finish_retry_s: float = 0.2,
         finish_grace_s: float = 300.0,
         unhealthy_after_s: float = 60.0,
+        scheduler: Ticker | None = None,
+        schedule_interval: float = 5.0,
         clock: Callable[[], datetime] = now_utc,
     ) -> None:
         """``finish_retry_s`` é a primeira espera entre tentativas de gravar o
         resultado (dobra a cada falha, até 5 s); ``finish_grace_s`` é quanto
         tempo além do prazo da execução o despachante insiste em gravá-lo.
+
+        Com ``scheduler``, a manutenção também dispara as agendas vencidas a cada
+        ``schedule_interval`` segundos (a etapa ``"schedules"``), antes de pegar
+        execuções: o que entrou na fila já é despachado na mesma volta.
 
         Uma etapa da manutenção que falha é repetida depois de ``poll_interval``,
         espera que dobra a cada falha seguida, até 60 s. ``unhealthy_after_s`` é
@@ -163,6 +179,8 @@ class Dispatcher:
         self.finish_retry_s = finish_retry_s
         self.finish_grace_s = finish_grace_s
         self.unhealthy_after_s = unhealthy_after_s
+        self.scheduler = scheduler
+        self.schedule_interval = schedule_interval
         self.clock = clock
         self._tasks: dict[asyncio.Task[None], RunnerJob] = {}
         self._steps = {name: _StepState() for name in _STEPS}
@@ -296,6 +314,13 @@ class Dispatcher:
                         len(report.indeterminate),
                         len(report.failed),
                     )
+        if self.scheduler is not None and self._due("schedules", now, self.schedule_interval):
+            try:
+                await self.scheduler.tick(now)
+            except Exception as exc:  # banco fora, erro inesperado: tenta de novo depois
+                self._failed("schedules", now, exc, backoff=True)
+            else:
+                self._succeeded("schedules", now)
 
     async def run_once(self) -> int:
         """Pega execuções até encher a concorrência; devolve quantas lançou."""

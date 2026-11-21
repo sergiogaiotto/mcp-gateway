@@ -25,6 +25,7 @@ from rapa.core.contracts import (
     NotFound,
     QuotaExceeded,
     ServiceUnavailable,
+    SignatureInvalid,
 )
 
 __all__ = [
@@ -47,6 +48,7 @@ _STATUS: tuple[tuple[type[ContractError], int], ...] = (
     (InvalidInput, 422),
     (QuotaExceeded, 429),
     (ServiceUnavailable, 503),
+    (SignatureInvalid, 401),
 )
 
 _HTTP_CODES = {

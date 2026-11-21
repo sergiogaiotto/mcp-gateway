@@ -10,7 +10,7 @@ com a mesma forma canônica do banco.
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -25,6 +25,7 @@ __all__ = [
     "GENESIS_HASH",
     "ChainReport",
     "append",
+    "append_many",
     "canonical_row",
     "payload_digest",
     "row_hash",
@@ -61,6 +62,32 @@ async def append(
             target=target,
             payload_digest=payload_digest(payload),
         )
+    )
+
+
+async def append_many(
+    session: AsyncSession,
+    *,
+    company_id: UUID,
+    actor: str,
+    action: str,
+    entries: Sequence[Mapping[str, Any]],
+) -> None:
+    """Inclui várias linhas de uma vez (cada uma com ``target`` e ``payload``), em ordem."""
+    if not entries:
+        return
+    await session.execute(
+        insert(audit_log),
+        [
+            {
+                "company_id": company_id,
+                "actor": actor[:255],
+                "action": action,
+                "target": entry["target"],
+                "payload_digest": payload_digest(entry["payload"]),
+            }
+            for entry in entries
+        ],
     )
 
 

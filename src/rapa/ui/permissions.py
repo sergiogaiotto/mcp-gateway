@@ -7,10 +7,12 @@ verdade continua no plano de controle, que confere tudo de novo.
 from collections.abc import Iterable
 from uuid import UUID
 
-from rapa.core.contracts import Principal, RobotVersionInfo, Role, VersionStatus
+from rapa.core.contracts import Principal, RobotVersionInfo, Role, VersionStatus, can_automate
 
 __all__ = [
     "RUN_ROLES",
+    "can_automate",
+    "can_automate_anywhere",
     "can_create",
     "can_create_anywhere",
     "can_publish",
@@ -48,6 +50,13 @@ def creator_areas(principal: Principal, known_areas: Iterable[UUID] = ()) -> lis
 def can_record(principal: Principal) -> bool:
     """Se a pessoa pode gravar uma demonstração em alguma área (o papel de criação)."""
     return can_create_anywhere(principal) or bool(creator_areas(principal))
+
+
+def can_automate_anywhere(principal: Principal) -> bool:
+    """Se a pessoa pode criar agendas, webhooks ou lotes em alguma área."""
+    return can_automate(principal, None) or any(
+        can_automate(principal, area) for area in principal.area_roles
+    )
 
 
 def can_validate(principal: Principal, area_id: UUID) -> bool:

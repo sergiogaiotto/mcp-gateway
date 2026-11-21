@@ -24,6 +24,7 @@ import tempfile
 from collections.abc import AsyncIterator, Coroutine, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -33,6 +34,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from rapa.control.api.publishing import PublishingServices
 from rapa.control.auth import (
     Authenticator,
     AuthError,
@@ -50,9 +52,20 @@ from rapa.control.launcher import (
     SecretSource,
     StaticSecretSource,
 )
-from rapa.control.services import Dispatcher, PgPlatform, PgPrincipalResolver, PgRunQueue
+from rapa.control.services import (
+    Dispatcher,
+    PgBatches,
+    PgPlatform,
+    PgPrincipalResolver,
+    PgRunQueue,
+    PgSchedules,
+    PgWebhooks,
+    Scheduler,
+    WebhookKeys,
+)
 from rapa.control.services.queue import DEFAULT_MAX_DURATION
 from rapa.control.services.sessions import PgSessionStore
+from rapa.control.services.sheets import SheetLimits
 from rapa.control.sessions import (
     GeneralizationAssistant,
     HubAssistant,
@@ -67,6 +80,8 @@ __all__ = [
     "AuthenticatorLoginResolver",
     "DispatcherSupervisor",
     "ServerSettings",
+    "build_publishing",
+    "build_scheduler",
     "build_sessions",
     "create_server_app",
     "dispatcher_pool_size",
@@ -148,6 +163,15 @@ class ServerSettings(BaseModel):
     llm_model: str | None = None
     llm_api_key: str | None = Field(default=None, repr=False)
     llm_capabilities_file: Path | None = None
+    #: Chave do servidor de que se deriva a chave de cada webhook; sem ela, não há webhooks.
+    webhook_key: str | None = Field(default=None, min_length=32, repr=False)
+    #: Até quantos segundos depois do horário uma ocorrência de agenda ainda roda.
+    schedule_catch_up_s: float = Field(default=600.0, ge=0, le=7 * 86_400)
+    #: De quantos em quantos segundos o despachante procura agendas vencidas.
+    schedule_interval_s: float = Field(default=5.0, ge=0, le=3600)
+    #: Linhas e tamanho máximos da planilha de um lote.
+    batch_max_rows: int = Field(default=1000, ge=1, le=100_000)
+    batch_max_bytes: int = Field(default=5 * 1024 * 1024, ge=1024, le=100 * 1024 * 1024)
 
     @model_validator(mode="after")
     def _check(self) -> ServerSettings:
@@ -213,7 +237,15 @@ class ServerSettings(BaseModel):
         - hub de LLM para as propostas da revisão: ``RAPA_LLM_BASE_URL``,
           ``RAPA_LLM_MODEL``, ``RAPA_LLM_API_KEY`` e ``RAPA_LLM_CAPACIDADES`` (a
           matriz gravada por ``python -m rapa.llm.probe --out``). Sem o hub, a revisão
-          mostra só as sugestões das regras, com um aviso.
+          mostra só as sugestões das regras, com um aviso;
+        - publicar: ``RAPA_CHAVE_WEBHOOKS`` (pelo menos 32 caracteres; a chave de cada
+          webhook é derivada dela com o sal do webhook, e trocá-la invalida as chaves de
+          todos; sem ela, os webhooks respondem 503), ``RAPA_AGENDA_TOLERANCIA_S`` (até
+          quantos segundos depois do horário uma ocorrência de agenda ainda roda; depois
+          disso, fica registrada como perdida; padrão 600), ``RAPA_AGENDA_INTERVALO_S``
+          (de quantos em quantos segundos o despachante procura agendas vencidas; padrão
+          5), ``RAPA_LOTE_MAX_LINHAS`` (padrão 1000) e ``RAPA_LOTE_MAX_BYTES`` (tamanho
+          máximo da planilha de um lote; padrão 5 MiB).
         """
         env = os.environ if env is None else env
         data: dict[str, Any] = {
@@ -241,12 +273,17 @@ class ServerSettings(BaseModel):
             "llm_model": env.get("RAPA_LLM_MODEL") or None,
             "llm_api_key": env.get("RAPA_LLM_API_KEY") or None,
             "llm_capabilities_file": _path(env, "RAPA_LLM_CAPACIDADES"),
+            "webhook_key": env.get("RAPA_CHAVE_WEBHOOKS") or None,
         }
         for key, name, kind in (
             ("sessions_per_company", "RAPA_SESSOES_POR_EMPRESA", int),
             ("sessions_max", "RAPA_SESSOES_MAX", int),
             ("session_idle_s", "RAPA_SESSAO_OCIOSA_S", float),
             ("session_max_s", "RAPA_SESSAO_MAX_S", float),
+            ("schedule_catch_up_s", "RAPA_AGENDA_TOLERANCIA_S", float),
+            ("schedule_interval_s", "RAPA_AGENDA_INTERVALO_S", float),
+            ("batch_max_rows", "RAPA_LOTE_MAX_LINHAS", int),
+            ("batch_max_bytes", "RAPA_LOTE_MAX_BYTES", int),
         ):
             if raw := env.get(name, "").strip():
                 data[key] = kind(raw)
@@ -357,6 +394,7 @@ def _mount_ui(
     platform: PgPlatform,
     authenticator: Authenticator,
     sessions: RecordingSessions | None = None,
+    publishing: PublishingServices | None = None,
 ) -> None:
     from rapa.ui.app import create_ui
     from rapa.ui.auth import DevLogin, DevProfile, OidcLogin, OidcSettings, UiAuth
@@ -392,7 +430,13 @@ def _mount_ui(
         raise ValueError("a interface precisa do login OIDC (RAPA_OIDC_*) ou do modo RAPA_DEV")
     create_ui(
         app,
-        backend_factory=ContractsBackendFactory.from_platform(platform, sessions=sessions),
+        backend_factory=ContractsBackendFactory.from_platform(
+            platform,
+            sessions=sessions,
+            schedules=publishing.schedules if publishing else None,
+            webhooks=publishing.webhooks if publishing else None,
+            batches=publishing.batches if publishing else None,
+        ),
         # A interface age direto nos serviços, então a sessão confere de novo no banco
         # (conta ativa e papéis), como a API faz a cada pedido.
         auth=UiAuth(
@@ -611,6 +655,29 @@ def build_dispatcher(settings: ServerSettings, db: Database) -> Dispatcher:
     )
 
 
+def build_publishing(settings: ServerSettings, db: Database) -> PublishingServices:
+    """Agendas, webhooks (só com ``RAPA_CHAVE_WEBHOOKS``) e lotes sobre o banco da aplicação."""
+    webhooks = PgWebhooks(db, WebhookKeys(settings.webhook_key)) if settings.webhook_key else None
+    return PublishingServices(
+        schedules=PgSchedules(db),
+        webhooks=webhooks,
+        receiver=webhooks,
+        batches=PgBatches(
+            db,
+            limits=SheetLimits(
+                max_bytes=settings.batch_max_bytes, max_rows=settings.batch_max_rows
+            ),
+        ),
+        batch_max_bytes=settings.batch_max_bytes,
+    )
+
+
+def build_scheduler(settings: ServerSettings, db: Database, dispatcher_db: Database) -> Scheduler:
+    """O agendador do despachante: acha as agendas pelo banco do despachante e cria as
+    execuções pelo da aplicação, fixado na empresa de cada agenda."""
+    return Scheduler(db, dispatcher_db, catch_up=timedelta(seconds=settings.schedule_catch_up_s))
+
+
 def _assistant(settings: ServerSettings) -> GeneralizationAssistant | None:
     if not (settings.llm_base_url and settings.llm_model):
         return None
@@ -718,6 +785,7 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
         if settings.http and settings.sessions
         else (None, None)
     )
+    publishing = build_publishing(settings, db)
     if verifier is not None:
         app = create_http_app(
             catalog=platform,
@@ -734,6 +802,7 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
                 rate_limit_per_s=settings.rate_limit_per_s,
             ),
             sessions=sessions,
+            publishing=publishing,
         )
     else:
         app = FastAPI(title="RaPA (despachante)", docs_url=None, redoc_url=None, openapi_url=None)
@@ -743,16 +812,29 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
             return {"estado": "ok"}
 
     dispatcher = build_dispatcher(settings, dispatcher_db) if dispatcher_db else None
+    if isinstance(dispatcher, Dispatcher) and dispatcher_db is not None:
+        if dispatcher.scheduler is None:
+            # As agendas vencidas viram execuções numa etapa do mesmo laço.
+            dispatcher.scheduler = build_scheduler(settings, db, dispatcher_db)
+            dispatcher.schedule_interval = settings.schedule_interval_s
     supervisor = DispatcherSupervisor(dispatcher) if dispatcher else None
     if supervisor is not None:
         app.add_middleware(_DispatcherHealth, supervisor=supervisor)
     app.state.dispatcher = dispatcher
     app.state.dispatcher_supervisor = supervisor
     app.state.sessions = sessions
+    app.state.publishing = publishing
     if settings.http and settings.ui:
         # Antes de envolver o lifespan: o NiceGUI (ui.run_with) envolve o que encontrar
         # com a subida e o encerramento dele, e esse conjunto fica dentro do nosso.
-        _mount_ui(app, settings, platform, Authenticator(verifier, resolver), sessions)  # type: ignore[arg-type]
+        _mount_ui(
+            app,
+            settings,
+            platform,
+            Authenticator(verifier, resolver),  # type: ignore[arg-type]
+            sessions,
+            publishing,
+        )
     inner = app.router.lifespan_context
     started = False
 

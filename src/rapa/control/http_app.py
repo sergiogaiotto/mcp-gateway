@@ -7,7 +7,7 @@ escolhe as implementações (PostgreSQL em produção, memória nos testes).
 import importlib.metadata
 import logging
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -20,6 +20,7 @@ from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from rapa.control.api.errors import error_response, install_error_handlers, log_unexpected
+from rapa.control.api.publishing import PublishingServices
 from rapa.control.api.ratelimit import RateLimiter
 from rapa.control.api.routes import ApiServices, create_api_router
 from rapa.control.api.sessions import live_origins
@@ -36,6 +37,8 @@ __all__ = ["BodySizeLimitMiddleware", "CatchAllMiddleware", "HttpSettings", "cre
 logger = logging.getLogger(__name__)
 
 _METADATA_PATH = "/.well-known/oauth-protected-resource"
+#: Folga do limite do corpo para os campos e separadores do multipart de um lote.
+_MULTIPART_SLACK = 64 * 1024
 
 
 def _version() -> str:
@@ -76,11 +79,18 @@ class HttpSettings(BaseModel):
 
 
 class BodySizeLimitMiddleware:
-    """Recusa com 413 corpos maiores que o limite, antes de qualquer leitura pela aplicação."""
+    """Recusa com 413 corpos maiores que o limite, antes de qualquer leitura pela aplicação.
 
-    def __init__(self, app: ASGIApp, max_body_bytes: int) -> None:
+    ``path_limits`` dá um limite próprio a caminhos exatos (o envio da planilha de um
+    lote, por exemplo, que passa do limite comum).
+    """
+
+    def __init__(
+        self, app: ASGIApp, max_body_bytes: int, path_limits: Mapping[str, int] | None = None
+    ) -> None:
         self.app = app
         self.max_body_bytes = max_body_bytes
+        self.path_limits = dict(path_limits or {})
 
     @staticmethod
     async def _too_large(scope: Scope, receive: Receive, send: Send) -> None:
@@ -93,10 +103,11 @@ class BodySizeLimitMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+        limit = self.path_limits.get(str(scope.get("path", "")), self.max_body_bytes)
         declared = Headers(scope=scope).get("content-length")
         if declared is not None:
             try:
-                too_large = int(declared) > self.max_body_bytes
+                too_large = int(declared) > limit
             except ValueError:
                 too_large = False
             if too_large:
@@ -113,7 +124,7 @@ class BodySizeLimitMiddleware:
                 pending.append(message)
                 break
             body.extend(message.get("body", b""))
-            if len(body) > self.max_body_bytes:
+            if len(body) > limit:
                 await self._too_large(scope, receive, send)
                 return
             if not message.get("more_body", False):
@@ -170,13 +181,16 @@ def create_http_app(
     resolver: PrincipalResolver,
     settings: HttpSettings | None = None,
     sessions: RecordingSessions | None = None,
+    publishing: PublishingServices | None = None,
 ) -> FastAPI:
     """Monta a aplicação FastAPI com REST, MCP, saúde e as proteções comuns.
 
     ``sessions`` liga as sessões de gravação (``/v1/sessoes`` e a visão ao vivo);
-    elas não entram no MCP, que só executa robôs publicados.
+    elas não entram no MCP, que só executa robôs publicados. ``publishing`` liga
+    as agendas, os webhooks e os lotes por planilha (também fora do MCP).
     """
     settings = settings or HttpSettings()
+    publishing = publishing or PublishingServices()
     if isinstance(verifier, StaticTokenVerifier) and not settings.allow_static_tokens:
         raise ValueError(
             "tokens fixos só valem em desenvolvimento; ligue allow_static_tokens explicitamente"
@@ -232,6 +246,7 @@ def create_http_app(
         public_url=public_url,
         sessions=sessions,
         live_origins=live_origins(public_url, settings.live_allowed_origins),
+        publishing=publishing,
     )
     app.include_router(create_api_router(services))
     app.router.routes.append(Route("/mcp", endpoint=gateway, include_in_schema=False))
@@ -262,6 +277,12 @@ def create_http_app(
             allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
             expose_headers=["Location", "Retry-After"],
         )
-    app.add_middleware(BodySizeLimitMiddleware, max_body_bytes=settings.max_body_bytes)
+    # A planilha de um lote pode passar do limite comum (com folga para o multipart).
+    batch_limit = max(settings.max_body_bytes, publishing.batch_max_bytes + _MULTIPART_SLACK)
+    app.add_middleware(
+        BodySizeLimitMiddleware,
+        max_body_bytes=settings.max_body_bytes,
+        path_limits={"/v1/lotes": batch_limit, "/v1/lotes/previa": batch_limit},
+    )
     app.add_middleware(CatchAllMiddleware)
     return app

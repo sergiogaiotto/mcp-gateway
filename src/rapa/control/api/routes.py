@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from rapa.control.api.errors import error_response
 from rapa.control.api.openapi_robots import build_robots_openapi
+from rapa.control.api.publishing import PublishingServices, add_publishing_routes
 from rapa.control.api.ratelimit import RateLimiter
 from rapa.control.api.sessions import add_session_routes
 from rapa.control.auth import Authenticator
@@ -88,6 +89,8 @@ class ApiServices:
     sessions: RecordingSessions | None = None
     #: Origens da interface aceitas no websocket da visão ao vivo (vazio: não confere).
     live_origins: frozenset[str] = frozenset()
+    #: Agendas, webhooks e lotes; o que faltar responde 503.
+    publishing: PublishingServices = field(default_factory=PublishingServices)
 
 
 def check_idempotency_key(key: str | None) -> str | None:
@@ -259,6 +262,10 @@ def create_api_router(services: ApiServices) -> APIRouter:
     add_session_routes(
         router, services.sessions, current_principal, allowed_origins=services.live_origins
     )
+
+    # -- publicar: agendas, webhooks e lotes ----------------------------------------
+
+    add_publishing_routes(router, services.publishing, current_principal, check_idempotency_key)
 
     # -- OpenAPI dos robôs --------------------------------------------------
 
