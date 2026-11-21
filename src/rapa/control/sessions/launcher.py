@@ -2,8 +2,11 @@
 
 Um lançador põe de pé o hospedeiro de uma sessão (:mod:`rapa.session.host`) e
 devolve onde falar com ele (``ws://...``) e o token do canal. O protocolo é pequeno
-de propósito (``start``, ``stop`` e ``is_alive``): na Fase 1 um lançador de pods do
-Kubernetes toma o lugar do local, sem mudar o resto.
+de propósito (``start``, ``stop``, ``terminate`` e ``is_alive``): na Fase 1 um
+lançador de pods do Kubernetes toma o lugar do local, sem mudar o resto. ``stop``
+vem depois do ``parar`` e espera o hospedeiro sair sozinho (até 15 s);
+``terminate`` encerra na hora um hospedeiro que ninguém mandou parar (o prazo, o
+navegador perdido, o fim do serviço), sem fazer ninguém esperar.
 
 :class:`LocalSessionLauncher`, para a Fase 0 e o desenvolvimento:
 
@@ -15,7 +18,10 @@ Kubernetes toma o lugar do local, sem mudar o resto.
 - espera a linha ``{"pronto": true, "porta": N}`` e devolve o endereço local;
 - guarda o token só em memória; o banco nunca o vê;
 - garante o prazo máximo: se o hospedeiro passar dele (com folga), recebe SIGTERM
-  e depois SIGKILL.
+  e depois SIGKILL;
+- cria uma pasta só da sessão para o perfil do navegador e a apaga quando o
+  processo sai, mesmo num SIGKILL (o Chromium que ainda escreve nela recebe SIGKILL
+  antes).
 
 O token e o endereço ficam neste processo: com várias réplicas da API, a sessão
 só é controlada pela réplica que a abriu (o lançador de pods resolve isso).
@@ -27,8 +33,10 @@ import json
 import logging
 import os
 import secrets
+import shutil
 import signal
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -48,6 +56,9 @@ __all__ = [
 logger = logging.getLogger("rapa.control.sessions")
 
 _TOKEN_BYTES = 32
+_PROFILE_PREFIX = "rapa-sessao-"
+#: Espera pelo hospedeiro que recebeu "parar" (ele devolve a gravação e sai sozinho).
+_STOP_WAIT_S = 15.0
 
 
 class SessionNotStarted(RuntimeError):
@@ -80,7 +91,13 @@ class SessionLauncher(Protocol):
 
     async def start(self, job: SessionJob) -> SessionEndpoint: ...
 
-    async def stop(self, session_id: UUID) -> None: ...
+    async def stop(self, session_id: UUID) -> None:
+        """Depois do ``parar``: espera o hospedeiro sair sozinho (e força se ele demorar)."""
+        ...
+
+    async def terminate(self, session_id: UUID) -> None:
+        """Encerra já um hospedeiro que não recebeu ``parar`` (SIGTERM, depois SIGKILL)."""
+        ...
 
     async def is_alive(self, session_id: UUID) -> bool: ...
 
@@ -106,6 +123,8 @@ class LocalSessionSettings:
 class _Host:
     process: asyncio.subprocess.Process
     endpoint: SessionEndpoint
+    #: Pasta só desta sessão, com o perfil dentro; apagada quando o hospedeiro sai, mesmo morto.
+    profiles: Path | None = None
     watcher: asyncio.Task[None] | None = None
 
 
@@ -128,6 +147,18 @@ class LocalSessionLauncher:
             raise SessionNotStarted("esta sessão já tem um navegador")
         settings = self.settings
         token = secrets.token_urlsafe(_TOKEN_BYTES)
+        if settings.profile_dir is not None:
+            await asyncio.to_thread(
+                settings.profile_dir.mkdir, parents=True, exist_ok=True, mode=0o700
+            )
+        # Uma pasta só desta sessão, com o perfil dentro: um SIGKILL (o prazo de encerramento,
+        # a falta de memória) não deixa o hospedeiro apagar o perfil (os cookies do portal),
+        # então o lançador apaga esta pasta quando o processo sai, de qualquer jeito.
+        profiles = Path(
+            await asyncio.to_thread(
+                tempfile.mkdtemp, prefix=_PROFILE_PREFIX, dir=settings.profile_dir
+            )
+        )
         config = {
             "token": token,
             "start_url": job.start_url,
@@ -139,40 +170,40 @@ class LocalSessionLauncher:
             "height": job.height,
             "idle_timeout_s": job.idle_timeout_s,
             "max_duration_s": job.max_duration_s,
-            "profile_parent": str(settings.profile_dir) if settings.profile_dir else None,
+            "profile_parent": str(profiles),
         }
-        if settings.profile_dir is not None:
-            await asyncio.to_thread(
-                settings.profile_dir.mkdir, parents=True, exist_ok=True, mode=0o700
-            )
+        process: asyncio.subprocess.Process | None = None
         try:
-            process = await asyncio.create_subprocess_exec(
-                settings.python,
-                "-m",
-                "rapa.session.host",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=child_env(),
-                start_new_session=True,
-            )
-        except OSError as exc:
-            logger.error("o hospedeiro da sessão não iniciou: %s", type(exc).__name__)
-            raise SessionNotStarted("não foi possível abrir o navegador da gravação") from None
-        try:
-            port = await asyncio.wait_for(
-                self._handshake(process, config), timeout=settings.start_timeout_s
-            )
-        except BaseException as exc:
-            await self._kill(process)
-            if isinstance(exc, asyncio.CancelledError):
-                raise
-            logger.error("o hospedeiro da sessão não ficou pronto: %s", type(exc).__name__)
-            raise SessionNotStarted("o navegador da gravação não abriu a tempo") from None
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    settings.python,
+                    "-m",
+                    "rapa.session.host",
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=child_env(),
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                logger.error("o hospedeiro da sessão não iniciou: %s", type(exc).__name__)
+                raise SessionNotStarted("não foi possível abrir o navegador da gravação") from None
+            try:
+                port = await asyncio.wait_for(
+                    self._handshake(process, config), timeout=settings.start_timeout_s
+                )
+            except Exception as exc:
+                logger.error("o hospedeiro da sessão não ficou pronto: %s", type(exc).__name__)
+                raise SessionNotStarted("o navegador da gravação não abriu a tempo") from None
+        except BaseException:
+            if process is not None:
+                await self._kill(process)
+            await _remove_profiles(profiles)
+            raise
         endpoint = SessionEndpoint(
             url=f"ws://{_url_host(settings.listen_host)}:{port}/", token=token
         )
-        host = _Host(process=process, endpoint=endpoint)
+        host = _Host(process=process, endpoint=endpoint, profiles=profiles)
         self._hosts[job.session_id] = host
         host.watcher = asyncio.get_running_loop().create_task(
             self._watch(job, host), name=f"sessao-{job.session_id}"
@@ -213,6 +244,8 @@ class LocalSessionLauncher:
             for task in drains:
                 task.cancel()
             await asyncio.gather(*drains, return_exceptions=True)
+            if host.profiles is not None and process.returncode is not None:
+                await _remove_profiles(host.profiles)
 
     async def stop(self, session_id: UUID) -> None:
         host = self._hosts.pop(session_id, None)
@@ -220,25 +253,30 @@ class LocalSessionLauncher:
             return
         try:
             # Depois do "parar" o hospedeiro sai sozinho; dá um tempo antes de forçar.
-            await asyncio.wait_for(asyncio.shield(host.process.wait()), timeout=15)
+            await asyncio.wait_for(asyncio.shield(host.process.wait()), timeout=_STOP_WAIT_S)
         except TimeoutError:
             await self._kill(host.process)
-        if host.watcher is not None:
-            host.watcher.cancel()
-            await asyncio.gather(host.watcher, return_exceptions=True)
+        await _finish(host)
+
+    async def terminate(self, session_id: UUID) -> None:
+        host = self._hosts.pop(session_id, None)
+        if host is None:
+            return
+        # Sem "parar", ninguém espera a gravação: SIGTERM já (o hospedeiro fecha o navegador
+        # e apaga o perfil) e SIGKILL depois de ``kill_grace_s``.
+        await self._kill(host.process)
+        await _finish(host)
 
     async def is_alive(self, session_id: UUID) -> bool:
         host = self._hosts.get(session_id)
         return host is not None and host.process.returncode is None
 
     async def aclose(self) -> None:
-        """Encerra todos os hospedeiros (no fim do serviço)."""
-        for session_id in list(self._hosts):
-            host = self._hosts.pop(session_id)
-            await self._kill(host.process)
-            if host.watcher is not None:
-                host.watcher.cancel()
-                await asyncio.gather(host.watcher, return_exceptions=True)
+        """Encerra todos os hospedeiros ao mesmo tempo (no fim do serviço)."""
+        await asyncio.gather(
+            *(self.terminate(session_id) for session_id in list(self._hosts)),
+            return_exceptions=True,
+        )
 
     async def _kill(self, process: asyncio.subprocess.Process) -> None:
         if process.returncode is not None:
@@ -251,6 +289,47 @@ class LocalSessionLauncher:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
             await process.wait()
+
+
+async def _finish(host: _Host) -> None:
+    """Espera a vigia, que apaga a pasta da sessão depois que o processo saiu."""
+    if host.watcher is not None:
+        await asyncio.gather(host.watcher, return_exceptions=True)
+
+
+async def _remove_profiles(path: Path, *, attempts: int = 20) -> None:
+    """Apaga a pasta da sessão, mesmo com o Chromium ainda de pé.
+
+    O Chromium roda noutro grupo de processos e, quando o hospedeiro morre, ainda
+    escreve no perfil por um instante antes de perceber: os que ficaram com o perfil
+    desta sessão na linha de comando recebem SIGKILL, e a pasta é apagada de novo
+    até sumir.
+    """
+    for _ in range(attempts):
+        await asyncio.to_thread(_kill_strays, path)
+        await asyncio.to_thread(shutil.rmtree, path, True)
+        if not await asyncio.to_thread(path.exists):
+            return
+        await asyncio.sleep(0.5)
+    logger.warning("a pasta do perfil de uma sessão não pôde ser apagada")
+
+
+def _kill_strays(path: Path) -> None:
+    """SIGKILL nos processos com ``--user-data-dir`` dentro de ``path`` (Linux, por /proc)."""
+    marker = f"--user-data-dir={path}{os.sep}".encode()
+    proc = Path("/proc")
+    if not proc.is_dir():  # pragma: no cover - fora do Linux, o Chromium sai sozinho
+        return
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if marker in cmdline:
+            with contextlib.suppress(OSError):
+                os.kill(int(entry.name), signal.SIGKILL)
 
 
 async def _drain(stream: asyncio.StreamReader) -> None:

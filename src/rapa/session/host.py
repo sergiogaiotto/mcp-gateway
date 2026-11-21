@@ -22,15 +22,23 @@ O hospedeiro:
    intermediários descartados sob pressão, :class:`rapa.session.protocol.FrameSender`),
    o endereço e o título da página;
 4. recebe mouse, roda, teclado (o texto pelo ``Input.insertText``, para acentos e
-   teclas mortas), tamanho, navegação (só http e https) e respostas a diálogos;
+   teclas mortas; dos atalhos, só os de edição, :func:`rapa.session.keys.key_commands`),
+   tamanho, navegação (só http e https) e respostas a diálogos;
 5. no ``parar``, para o gravador e devolve a gravação (já limpa de segredos pelo
    gravador) e encerra;
 6. encerra sozinho depois de ``idle_timeout_s`` sem entrada (10 min) ou de
    ``max_duration_s`` (60 min), num SIGTERM ou num erro.
 
-Em qualquer saída, o navegador fecha e a pasta do perfil é apagada. O hospedeiro
-nunca grava quadros nem segredos em disco ou no log: o log só leva mensagens
-fixas e nomes de tipos de erro.
+O navegador nunca sai da web: toda conexão passa pela guarda da saída
+(:mod:`rapa.session.egress`, que recusa a própria máquina, o link-local e o
+metadata da nuvem), o QUIC fica desligado e o WebRTC só usa o que passa pelo
+proxy; uma aba com página interna do Chromium (``chrome://``, ``file://``,
+``view-source:``) fecha sem aparecer para a pessoa.
+
+Em qualquer saída, o navegador fecha e a pasta do perfil é apagada (se o
+hospedeiro morrer sem poder apagá-la, o lançador apaga). O hospedeiro nunca grava
+quadros nem segredos em disco ou no log: o log só leva mensagens fixas e nomes de
+tipos de erro.
 """
 
 import asyncio
@@ -48,6 +56,7 @@ from collections.abc import Callable, Coroutine
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from playwright.async_api import (
     BrowserContext,
@@ -65,6 +74,7 @@ from websockets.http11 import Request, Response
 
 from rapa.recorder.recorder import Recorder, RecorderError, redact_url
 from rapa.runner.browser import LOCALE, TIMEZONE, resolve_executable
+from rapa.session.egress import BROWSER_NETWORK_ARGS, EgressGuard
 from rapa.session.keys import MouseState, key_commands, text_commands, wheel_commands
 from rapa.session.protocol import (
     MAX_CLIENT_MESSAGE,
@@ -99,6 +109,14 @@ NAVIGATION_TIMEOUT_S = 30.0
 #: Entradas que esperam o navegador; acima disso, os movimentos do mouse são descartados.
 _INPUT_QUEUE = 512
 _PROFILE_PREFIX = "rapa-sessao-"
+#: Esquemas que a aba da pessoa pode mostrar; o resto (file:, chrome:, view-source:...) fecha.
+_WEB_SCHEMES = frozenset({"http", "https", "about", "blob", "data", "chrome-error"})
+#: Intervalo mínimo entre dois avisos de endereço interno recusado.
+_REFUSAL_WARNING_S = 10.0
+_REFUSED_TEXT = (
+    "O navegador da gravação não abre endereços internos do servidor (a própria máquina e o "
+    "metadata da nuvem). Use o endereço público do portal."
+)
 
 
 class EndReason(StrEnum):
@@ -165,6 +183,7 @@ class SessionHost:
         self._started = 0.0
         self._last_input = 0.0
         self._warning: str | None = None
+        self._last_refusal = float("-inf")
         self._stopping = False
         #: Pasta do perfil (apagada no fim); exposta para os testes conferirem.
         self.profile_dir: Path | None = None
@@ -202,18 +221,37 @@ class SessionHost:
     async def _run(self, ready: Callable[[int], None]) -> EndReason:
         if self._ended is None or self.profile_dir is None:  # pragma: no cover - só por run()
             raise RuntimeError("a sessão não foi iniciada por run()")
+        egress = EgressGuard.from_browser_args(self.config.browser_args, on_refused=self._refused)
+        egress_port = await egress.start()
+        try:
+            return await self._run_browser(ready, egress_port, self.profile_dir, self._ended)
+        finally:
+            await egress.close()
+
+    async def _run_browser(
+        self,
+        ready: Callable[[int], None],
+        egress_port: int,
+        profile_dir: Path,
+        ended: asyncio.Future[EndReason],
+    ) -> EndReason:
         config = self.config
         async with async_playwright() as playwright:
             context = await playwright.chromium.launch_persistent_context(
-                str(self.profile_dir / "perfil"),
+                str(profile_dir / "perfil"),
                 executable_path=resolve_executable(config.chromium),
                 headless=True,
-                args=list(config.browser_args),
+                # Os do operador primeiro: os que tiram o UDP do caminho não são desfeitos.
+                args=[*config.browser_args, *BROWSER_NETWORK_ARGS],
                 viewport={"width": config.width, "height": config.height},
                 locale=LOCALE,
                 timezone_id=TIMEZONE,
                 accept_downloads=True,
-                downloads_path=str(self.profile_dir / "downloads"),
+                downloads_path=str(profile_dir / "downloads"),
+                # Toda conexão TCP do navegador (também os saltos de um redirecionamento,
+                # iframes, workers e websockets; o Playwright põe <-loopback>) passa pela
+                # guarda da saída (rapa.session.egress).
+                proxy={"server": f"socks5://127.0.0.1:{egress_port}"},
             )
             self._context = context
             try:
@@ -239,7 +277,7 @@ class SessionHost:
                     ready(self.port)
                     self._spawn(lambda: self._navigate(config.start_url, first=True))
                     self._spawn(self._watchdog)
-                    reason = await self._ended
+                    reason = await ended
                     await self._say_goodbye(reason)
             finally:
                 self._stopping = True
@@ -293,8 +331,16 @@ class SessionHost:
         page.on("framenavigated", self._on_navigated)
         page.on("load", self._on_load)
 
+    @staticmethod
+    def _is_web(page: Page) -> bool:
+        return urlsplit(page.url).scheme in _WEB_SCHEMES
+
     def _on_page(self, page: Page) -> None:
-        # Uma aba nova (um link com target=_blank) passa a ser a que a pessoa vê.
+        # Uma aba nova (um link com target=_blank) passa a ser a que a pessoa vê; uma página
+        # interna do Chromium (chrome://, file://) nunca: fecha sem aparecer.
+        if not self._is_web(page):
+            self._spawn(page.close)
+            return
         self._register(page)
         self._spawn(lambda: self._activate(page))
 
@@ -316,7 +362,7 @@ class SessionHost:
             await self._activate(page)
 
     async def _activate(self, page: Page) -> None:
-        if self._stopping or page.is_closed() or self._context is None:
+        if self._stopping or page.is_closed() or self._context is None or not self._is_web(page):
             return
         old = self._cdp
         self._cdp, self._casting, self._screen = None, False, None
@@ -340,6 +386,13 @@ class SessionHost:
             await self._send_page_info()
 
     def _on_navigated(self, frame: Frame) -> None:
+        page = frame.page
+        if frame == page.main_frame and not self._is_web(page):
+            if page is self._page:
+                # Nenhum quadro dela sai; ao fechar, a aba anterior volta a ser a da pessoa.
+                self._cdp, self._casting = None, False
+            self._spawn(page.close)
+            return
         if self._page is not None and frame == self._page.main_frame:
             self._spawn(self._send_page_info)
 
@@ -349,7 +402,7 @@ class SessionHost:
 
     async def _send_page_info(self) -> None:
         page, client = self._page, self._client
-        if page is None or client is None:
+        if page is None or client is None or not self._is_web(page):
             return
         url = page.url
         shown = redact_url(url, set()) if url.startswith(("http://", "https://")) else url
@@ -370,6 +423,14 @@ class SessionHost:
             await self._warn("Não foi possível abrir o endereço. Confira e tente de novo.")
             if first:
                 self._warning = "O endereço inicial não abriu. Digite outro endereço."
+
+    def _refused(self, _host: str) -> None:
+        """A guarda da saída recusou uma conexão: avisa a pessoa (no máximo a cada 10 s)."""
+        now = self._clock()
+        if now - self._last_refusal < _REFUSAL_WARNING_S:
+            return
+        self._last_refusal = now
+        self._spawn(lambda: self._warn(_REFUSED_TEXT))
 
     async def _warn(self, text: str) -> None:
         client = self._client

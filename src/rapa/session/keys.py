@@ -157,11 +157,34 @@ def text_commands(message: TextMessage) -> list[Command]:
     return [("Input.insertText", {"text": text})]
 
 
+#: Atalhos de caractere que chegam ao navegador da nuvem: só os de edição (Ctrl ou Meta, sem
+#: Alt). Os outros são comandos do próprio Chromium (Ctrl+T, Ctrl+N, Ctrl+H, Ctrl+J...) que
+#: abrem páginas internas (chrome://), e da caixa da nova aba se chega a file:// da máquina.
+_EDIT_SHORTCUTS = frozenset("acvxyz")
+#: Teclas especiais que o Chromium trata como comando do navegador (com qualquer Alt ou Meta,
+#: Shift+Esc, Ctrl+Shift+Delete e as teclas de função, menos F5).
+_BROWSER_KEYS = frozenset({f"F{n}" for n in range(1, 13)} - {"F5"})
+
+
+def _browser_command(message: KeyMessage) -> bool:
+    modifiers = message.modificadores
+    if modifiers & (ALT | META):
+        # Alt+setas (voltar e avançar) ficam; Alt+Home abre a página inicial (chrome://).
+        return not (modifiers == ALT and message.tecla in {"ArrowLeft", "ArrowRight"})
+    if message.tecla in _BROWSER_KEYS:
+        return True
+    if message.tecla == "Escape" and modifiers & SHIFT:
+        return True
+    return message.tecla == "Delete" and modifiers & (CTRL | SHIFT) == CTRL | SHIFT
+
+
 def key_commands(message: KeyMessage) -> list[Command]:
     """Tecla especial ou atalho. Teclas de caractere sem Ctrl, Alt ou Meta chegam como ``texto``."""
     modifiers = message.modificadores
     special = _SPECIAL.get(message.tecla)
     if special is not None:
+        if _browser_command(message):
+            return []
         if message.acao == "descer":
             kind = "keyDown" if special.text is not None else "rawKeyDown"
             return [_key_event(kind, special, modifiers, repeat=message.repetida)]
@@ -169,6 +192,13 @@ def key_commands(message: KeyMessage) -> list[Command]:
     found = _us_key(message.tecla) if message.tecla != " " else None
     if found is None or not modifiers & (CTRL | ALT | META):
         # Um caractere sem atalho viria como texto; o resto não tem tradução segura.
+        return []
+    letter = message.tecla.lower()
+    if (
+        modifiers & ALT
+        or letter not in _EDIT_SHORTCUTS
+        or (modifiers & SHIFT and letter not in "vz")
+    ):
         return []
     key, _ = found
     # Atalho (Ctrl+A, Ctrl+Z...): a tecla sem texto, para o navegador tratar o comando.

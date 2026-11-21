@@ -35,6 +35,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -190,7 +191,9 @@ class RecordingSessions:
             area_id=area_id,
             owner=principal.subject,
             title=title,
-            start_url=url,
+            # Só o hospedeiro recebe o endereço inteiro: a consulta e o fragmento podem ter um
+            # token ou uma senha (o gravador os mascara), então nunca vão para o banco.
+            start_url=urlunsplit((*urlsplit(url)[:3], "", "")),
             status=RecordingSessionStatus.STARTING,
             created_at=now,
             expires_at=now + timedelta(seconds=limits.max_duration_s),
