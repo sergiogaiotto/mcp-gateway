@@ -112,9 +112,10 @@ class SessionStore(Protocol):
 
     async def list_live(self, company_id: UUID) -> list[SessionRecord]: ...
 
-    async def reserve_in_use(self, *, now: datetime) -> int:
+    async def reserve_in_use(self, *, now: datetime) -> int | None:
         """Navegadores da reserva interativa em uso na plataforma: as sessões abertas (de
-        todas as empresas) e as execuções interativas (validações) rodando."""
+        todas as empresas) e as execuções interativas (validações) rodando; None se este
+        armazenamento não enxerga a plataforma inteira."""
         ...
 
     async def touch(
@@ -123,8 +124,9 @@ class SessionStore(Protocol):
         """Renova ``seen_at`` das sessões abertas que este processo segura."""
         ...
 
-    async def list_stale(self, *, before: datetime) -> list[tuple[UUID, UUID]]:
-        """Sessões abertas (empresa, sessão), de qualquer empresa, sem renovação desde ``before``."""
+    async def list_stale(self, *, before: datetime) -> list[tuple[UUID, UUID]] | None:
+        """Sessões abertas (empresa, sessão), de qualquer empresa, sem renovação desde
+        ``before``; None se este armazenamento não enxerga a plataforma inteira."""
         ...
 
     async def set_status(
@@ -233,7 +235,7 @@ class MemorySessionStore:
             if s.company_id == company_id and s.status in LIVE_STATUSES
         ]
 
-    async def reserve_in_use(self, *, now: datetime) -> int:
+    async def reserve_in_use(self, *, now: datetime) -> int | None:
         live = [
             s for s in self.sessions.values() if s.status in LIVE_STATUSES and s.expires_at > now
         ]
@@ -251,7 +253,7 @@ class MemorySessionStore:
             ):
                 self.sessions[company_id, session_id] = replace(record, seen_at=at)
 
-    async def list_stale(self, *, before: datetime) -> list[tuple[UUID, UUID]]:
+    async def list_stale(self, *, before: datetime) -> list[tuple[UUID, UUID]] | None:
         return [
             (s.company_id, s.session_id)
             for s in self.sessions.values()

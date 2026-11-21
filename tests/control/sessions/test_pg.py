@@ -10,10 +10,11 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from rapa.control.db import Database
-from rapa.control.services import PgPlatform, verify_chain
+from rapa.control.services import PgPlatform, PgRunQueue, verify_chain
 from rapa.control.services.queue import _loads
 from rapa.control.services.sessions import PgSessionStore
 from rapa.control.sessions import LiveRelay, RecordingSessions, SessionLimits, SessionRecord
+from rapa.control.sessions.service import STALE_AFTER
 from rapa.core.contracts import (
     DraftChoices,
     QuotaExceeded,
@@ -21,7 +22,7 @@ from rapa.core.contracts import (
     StepNameChoice,
 )
 from rapa.core.ids import new_id
-from tests.control.db.support import Tenant, make_tenant, reset_queue
+from tests.control.db.support import Tenant, make_tenant, notas, publish, reset_queue
 from tests.control.sessions.support import DEMO_PASSWORD, FakeLauncher
 
 pytestmark = pytest.mark.database
@@ -248,3 +249,130 @@ async def test_queue_counts_live_sessions_in_the_interactive_reserve(
         end_reason="ociosa",
     )
     assert await interactive() == 1
+
+
+async def test_guard_keeps_drafts_and_robot_links_honest(
+    app_db: Database, superuser_engine: AsyncEngine
+) -> None:
+    await reset_queue(superuser_engine, total_slots=30)
+    tenant = await make_tenant(app_db, "Trava do rascunho")
+    launcher = FakeLauncher()
+    service = RecordingSessions(
+        PgSessionStore(app_db),
+        launcher,
+        PgPlatform(app_db),
+        limits=SessionLimits(per_company=3),
+        relay=LiveRelay(stop_timeout_s=10),
+    )
+    creator, area = tenant.creator, tenant.area_id
+    choices = DraftChoices(
+        name="cadastro_gravado", title="Cadastro gravado", description="Cadastra uma pessoa."
+    )
+    try:
+        drafted = await service.create_session(creator, area, URL)
+        await service.stop_session(creator, drafted.session_id)
+        first = await service.create_draft(creator, drafted.session_id, choices)
+        # Criar o rascunho de novo faz uma versão nova do mesmo robô: a versão avança.
+        second = await service.create_draft(creator, drafted.session_id, choices)
+        assert second.robot_id == first.robot_id and second.version_no == first.version_no + 1
+        stopped = await service.create_session(creator, area, URL)
+        await service.stop_session(creator, stopped.session_id)
+        live = await service.create_session(creator, area, URL)
+        params = {"robot": first.robot_id, "old": first.version_no}
+        refused = [
+            # Um rascunho não volta a ser só uma sessão parada.
+            (drafted, "UPDATE recording_sessions SET status = 'stopped' WHERE id = :id", "23514"),
+            # A versão de um mesmo robô só avança, e precisa existir.
+            (drafted, "UPDATE recording_sessions SET version_no = :old WHERE id = :id", "23514"),
+            (drafted, "UPDATE recording_sessions SET version_no = 99 WHERE id = :id", "23503"),
+            # O robô só muda ao criar um rascunho de uma sessão parada.
+            (
+                stopped,
+                "UPDATE recording_sessions SET robot_id = :robot, version_no = :old WHERE id = :id",
+                "23514",
+            ),
+            (
+                live,
+                "UPDATE recording_sessions SET status = 'drafted', robot_id = :robot,"
+                " version_no = :old WHERE id = :id",
+                "23514",
+            ),
+            # O processo que abriu a sessão nunca muda.
+            (live, "UPDATE recording_sessions SET instance_id = 'outro' WHERE id = :id", "23514"),
+        ]
+        for session, statement, sqlstate in refused:
+            with pytest.raises(DBAPIError) as caught:
+                async with superuser_engine.begin() as conn:
+                    await conn.execute(text(statement), {**params, "id": session.session_id})
+            assert getattr(caught.value.orig, "sqlstate", None) == sqlstate, statement
+        # A aplicação renova a sessão aberta, mas não troca o processo dela.
+        async with app_db.tenant_session(tenant.company_id) as session:
+            await session.execute(
+                text("UPDATE recording_sessions SET seen_at = now() WHERE id = :id"),
+                {"id": live.session_id},
+            )
+        with pytest.raises(DBAPIError) as caught:
+            async with app_db.tenant_session(tenant.company_id) as session:
+                await session.execute(
+                    text("UPDATE recording_sessions SET instance_id = 'outro' WHERE id = :id"),
+                    {"id": live.session_id},
+                )
+        assert getattr(caught.value.orig, "sqlstate", None) == "42501"
+    finally:
+        await service.aclose()
+        await launcher.aclose()
+
+
+async def test_reserve_in_use_heartbeat_and_sessions_nobody_holds(
+    app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine
+) -> None:
+    await reset_queue(superuser_engine, total_slots=10)
+    async with superuser_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE recording_sessions SET status = 'expired', stopped_at = now() "
+                "WHERE status IN ('starting', 'active')"
+            )
+        )
+    platform = PgPlatform(app_db)
+    tenant = await make_tenant(app_db, "Quem segura")
+    # Sem o papel do despachante, a API não enxerga as outras empresas.
+    alone = PgSessionStore(app_db)
+    assert await alone.reserve_in_use(now=datetime.now(UTC)) is None
+    assert await alone.list_stale(before=datetime.now(UTC)) is None
+    store = PgSessionStore(app_db, fleet=dispatcher_db)
+    now = datetime.now(UTC)
+    held = _record(tenant, instance_id="api-1", seen_at=now)
+    orphan = _record(tenant, instance_id="api-0", seen_at=now - timedelta(minutes=10))
+    for record in (held, orphan):
+        await store.insert(record, company_limit=5)
+    assert await store.reserve_in_use(now=now) == 2
+    key_held, key_orphan = (
+        (tenant.company_id, held.session_id),
+        (tenant.company_id, orphan.session_id),
+    )
+    stale = await store.list_stale(before=now - STALE_AFTER)
+    assert key_orphan in stale and key_held not in stale
+    # Só o processo que segura a sessão a renova.
+    await store.touch(tenant.company_id, [orphan.session_id], instance_id="api-1", at=now)
+    assert key_orphan in await store.list_stale(before=now - STALE_AFTER)
+    later = now + timedelta(minutes=5)
+    await store.touch(tenant.company_id, [held.session_id], instance_id="api-1", at=later)
+    assert key_held not in await store.list_stale(before=later - STALE_AFTER)
+    assert (await store.get(*key_held)).seen_at == later  # type: ignore[union-attr]
+    # Uma validação rodando ocupa a mesma reserva (na fila, ainda não).
+    for record in (held, orphan):
+        await store.set_status(
+            tenant.company_id,
+            record.session_id,
+            expected={RecordingSessionStatus.ACTIVE},
+            status=RecordingSessionStatus.EXPIRED,
+            end_reason="perdida",
+        )
+    await publish(platform, tenant, notas())
+    robot = await platform.get_published(tenant.creator, "baixar_notas")
+    assert robot is not None
+    await platform.start_validation(tenant.creator, robot.robot_id, robot.version_no, {})
+    assert await store.reserve_in_use(now=now) == 0
+    assert await PgRunQueue(dispatcher_db).claim_next() is not None
+    assert await store.reserve_in_use(now=now) == 1

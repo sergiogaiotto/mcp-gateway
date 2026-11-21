@@ -18,6 +18,7 @@ from uuid import UUID
 from sqlalchemy import RowMapping, Select, func, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from rapa.control.db import Database
 from rapa.control.db.schema import areas, platform_settings, recording_sessions, recordings, runs
 from rapa.control.services import audit
 from rapa.control.services._common import INTERACTIVE_PRIORITY, PgService
@@ -74,7 +75,18 @@ def _record(row: RowMapping) -> SessionRecord:
 
 
 class PgSessionStore(PgService):
-    """Armazenamento das sessões de gravação (:class:`rapa.control.sessions.store.SessionStore`)."""
+    """Armazenamento das sessões de gravação (:class:`rapa.control.sessions.store.SessionStore`).
+
+    ``fleet`` é o banco com o papel do despachante (``BYPASSRLS``, só leitura da
+    situação), para as duas leituras que cruzam empresas: as vagas da reserva em uso
+    e as sessões que nenhum processo segura. Sem ele (a API sem o despachante no
+    mesmo processo), essas leituras devolvem None e o serviço conta só as sessões
+    deste processo.
+    """
+
+    def __init__(self, db: Database, *, fleet: Database | None = None) -> None:
+        super().__init__(db)
+        self.fleet = fleet
 
     async def area_exists(self, company_id: UUID, area_id: UUID) -> bool:
         async with self.db.tenant_session(company_id) as session:
@@ -183,9 +195,11 @@ class PgSessionStore(PgService):
             rows = (await session.execute(query)).mappings().all()
         return [_record(row) for row in rows]
 
-    async def reserve_in_use(self, *, now: datetime) -> int:
+    async def reserve_in_use(self, *, now: datetime) -> int | None:
+        if self.fleet is None:
+            return None
         # Pelo papel do despachante: conta todas as empresas, sem ver nada além da situação.
-        async with self.db.dispatcher_session() as session:
+        async with self.fleet.dispatcher_session() as session:
             sessions = await session.scalar(
                 select(func.count(recording_sessions.c.company_id)).where(
                     recording_sessions.c.status.in_(_LIVE),
@@ -217,8 +231,10 @@ class PgSessionStore(PgService):
                 .values(seen_at=at)
             )
 
-    async def list_stale(self, *, before: datetime) -> list[tuple[UUID, UUID]]:
-        async with self.db.dispatcher_session() as session:
+    async def list_stale(self, *, before: datetime) -> list[tuple[UUID, UUID]] | None:
+        if self.fleet is None:
+            return None
+        async with self.fleet.dispatcher_session() as session:
             rows = (
                 await session.execute(
                     select(recording_sessions.c.company_id, recording_sessions.c.id)

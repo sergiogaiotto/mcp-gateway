@@ -17,6 +17,7 @@ from rapa.control.sessions import (
     SessionLimits,
     TicketBook,
 )
+from rapa.control.sessions.service import company_cap
 from rapa.core.contracts import (
     Conflict,
     DraftChoices,
@@ -127,22 +128,54 @@ async def test_tickets_are_single_use_short_lived_and_per_session(world: Session
 
 
 async def test_company_and_global_caps() -> None:
-    world = build_world(limits=SessionLimits(per_company=2, global_max=3))
+    world = build_world(limits=SessionLimits(per_company=3, global_max=4))
     service, p = world.service, world.people
     try:
+        # Uma empresa nunca passa da metade das vagas da plataforma (4 // 2 = 2 < 3).
         await service.create_session(p["criadora"], world.area_a, URL)
         await service.create_session(p["colega"], world.area_a, URL)
         with pytest.raises(QuotaExceeded, match="sua empresa já tem 2"):
             await service.create_session(p["vizinha"], world.other_area_a, URL)
         await service.create_session(p["outra"], world.area_b, URL)
-        # A empresa B ainda tem vaga, mas a plataforma não.
+        # Uma validação rodando ocupa a mesma reserva: a empresa B ainda tem vaga, a plataforma não.
+        world.store.interactive_runs = 1
         world.people["outra2"] = p["outra"].model_copy(update={"subject": "outro@b"})
-        with pytest.raises(QuotaExceeded, match="vagas de gravação da plataforma"):
+        with pytest.raises(QuotaExceeded, match="vagas de gravação e de teste da plataforma"):
             await service.create_session(world.people["outra2"], world.area_b, URL)
+        # A validação acabou: a vaga volta.
+        world.store.interactive_runs = 0
+        second_b = await service.create_session(world.people["outra2"], world.area_b, URL)
         # Uma sessão que termina sozinha libera a vaga.
+        world.store.interactive_runs = 1
         [first, *_] = await service.list_sessions(p["criadora"])
         await world.launcher.hosts[first.session_id].end("ociosa")
-        await service.create_session(world.people["outra2"], world.area_b, URL)
+        await service.stop_session(world.people["outra2"], second_b.session_id)
+        await service.create_session(p["vizinha"], world.other_area_a, URL)
+    finally:
+        await service.aclose()
+        await world.launcher.aclose()
+
+
+@pytest.mark.parametrize(
+    ("per_company", "platform", "expected"),
+    [(2, 3, 1), (2, 4, 2), (2, 30, 2), (5, 1, 1), (5, 2, 1), (5, 10, 5)],
+)
+def test_one_company_never_takes_more_than_half_of_the_platform(
+    per_company: int, platform: int, expected: int
+) -> None:
+    assert company_cap(per_company, platform) == expected
+
+
+async def test_default_caps_leave_room_for_other_companies() -> None:
+    # A reserva padrão (3 vagas com 30 navegadores): uma empresa fica com uma, as outras
+    # ainda gravam.
+    world = build_world(reserve=3)
+    service, p = world.service, world.people
+    try:
+        await service.create_session(p["criadora"], world.area_a, URL)
+        with pytest.raises(QuotaExceeded, match="sua empresa já tem 1 gravação aberta"):
+            await service.create_session(p["colega"], world.area_a, URL)
+        await service.create_session(p["outra"], world.area_b, URL)
     finally:
         await service.aclose()
         await world.launcher.aclose()

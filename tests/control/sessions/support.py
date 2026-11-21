@@ -150,6 +150,9 @@ class FakeLauncher:
     hosts: dict[UUID, FakeHost] = field(default_factory=dict)
     jobs: list[SessionJob] = field(default_factory=list)
     fail: bool = False
+    #: Sessões encerradas depois do "parar" (stop) e sem ele (terminate).
+    stopped: list[UUID] = field(default_factory=list)
+    terminated: list[UUID] = field(default_factory=list)
 
     async def start(self, job: SessionJob) -> SessionEndpoint:
         if self.fail:
@@ -161,6 +164,13 @@ class FakeLauncher:
         return SessionEndpoint(url=host.url, token=host.token)
 
     async def stop(self, session_id: UUID) -> None:
+        self.stopped.append(session_id)
+        host = self.hosts.get(session_id)
+        if host is not None:
+            await host.close()
+
+    async def terminate(self, session_id: UUID) -> None:
+        self.terminated.append(session_id)
         host = self.hosts.get(session_id)
         if host is not None:
             await host.close()
@@ -196,7 +206,7 @@ def build_world(
     assistant: Any = None,
     tickets: TicketBook | None = None,
     recording: Recording | None = None,
-    reserve: int | None = 3,
+    reserve: int | None = 4,
 ) -> SessionsWorld:
     platform = MemoryPlatform()
     company_a, area_a, other_area_a = new_id(), new_id(), new_id()
