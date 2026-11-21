@@ -1084,8 +1084,9 @@ def _typed_value_matches(
     digits = _NOT_DIGIT.sub("", text)
     if not digits:
         return False
-    if _negative(text) != _negative(value):
+    if _negative(text) != _negative(value) or _NO_CENTS.search(value):
         # O sinal de menos que o texto tem precisa ficar, e o que ele não tem não aparece.
+        # "10,-", "kr 10,-", "CHF 10.–": sem centavos (positivo) ou com o sinal no fim?
         return False
     decimal = _decimal_parts(text, typed=True)
     if decimal is not None:
@@ -1104,14 +1105,41 @@ def _typed_value_matches(
         text.strip().lstrip("-").isdigit()
         and bool(mark)
         and _ZERO_FRACTION.fullmatch(fraction) is not None
+        and _ZERO_WHOLE.fullmatch(whole) is not None
         and _NOT_DIGIT.sub("", whole) == digits
     )
 
 
 #: Do primeiro ao último dígito de um texto.
 _DIGIT_SPAN = re.compile(r"[0-9](?:.*[0-9])?", re.DOTALL)
-#: O sinal de menos: o hífen, o sinal de menos (U+2212) e o traço (U+2013).
-_MINUS_SIGNS = ("-", "\u2212", "\u2013")
+#: O sinal de menos: o hífen, o sinal de menos (U+2212), os traços e as outras formas do
+#: hífen e do sinal de menos (sem quebra, de largura total, sobrescrito, subscrito).
+_MINUS_SIGNS = (
+    "-",
+    "\u2212",
+    "\u2013",
+    "\u2010",
+    "\u2011",
+    "\u2012",
+    "\u2014",
+    "\u2015",
+    "\ufe58",
+    "\ufe63",
+    "\uff0d",
+    "\u2796",
+    "\u02d7",
+    "\u207b",
+    "\u208b",
+    "\u1806",
+)
+#: Antes das casas zeradas, só o sinal, um símbolo de moeda e os separadores de milhar
+#: (nunca letras: "D 10.00", "Débito 10,00 €", "elfu 1.00").
+_ZERO_WHOLE = re.compile(
+    r"[\s\-\u2212\u2013]*(?:R\$|US\$|\$|€|£|CHF|BRL|USD|EUR)?[\s\-\u2212\u2013]*[0-9][0-9.\s'\u2019]*"
+)
+#: O traço logo depois de um separador decimal, no fim ("10,-", "CHF 10.–"): o preço sem
+#: centavos (positivo) ou o sinal de menos depois do número? Na dúvida, não vale.
+_NO_CENTS = re.compile(r"[0-9]\s*[.,]\s*[-\u2212\u2013\u2014][^0-9]*\Z")
 #: Uma ou duas casas decimais zeradas, com brancos e, no máximo, um "%", "€" ou "$" depois
 #: (nunca letras, parênteses ou um sinal: "10,00 mil", "(10,00)", "10,00-", "10,00 D").
 _ZERO_FRACTION = re.compile(r"\s*0{1,2}\s*(?:%|€|\$)?\s*")
