@@ -1641,6 +1641,7 @@ control = [
     { name = "pyjwt", extra = ["crypto"] },
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "uvicorn" },
+    { name = "websockets" },
 ]
 fixtures = [
     { name = "fastapi" },
@@ -1653,6 +1654,7 @@ llm = [
 ]
 runner = [
     { name = "playwright" },
+    { name = "websockets" },
 ]
 ui = [
     { name = "authlib" },
@@ -1689,6 +1691,8 @@ requires-dist = [
     { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'control'", specifier = ">=2.1.9,<2.2" },
     { name = "uvicorn", marker = "extra == 'control'", specifier = ">=0.54" },
     { name = "uvicorn", marker = "extra == 'fixtures'", specifier = ">=0.54" },
+    { name = "websockets", marker = "extra == 'control'", specifier = ">=17.4,<18" },
+    { name = "websockets", marker = "extra == 'runner'", specifier = ">=17.4,<18" },
 ]
 provides-extras = ["runner", "llm", "control", "ui", "fixtures"]
 

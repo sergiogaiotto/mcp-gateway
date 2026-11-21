@@ -57,10 +57,10 @@ def _objects(pg: PgDatabase, database: str) -> tuple[int, int]:
     return int(tables[0]), int(functions[0])
 
 
-def _app_can_read_runs(pg: PgDatabase, database: str) -> bool:
+def _app_can_read_runs(pg: PgDatabase, database: str, table: str = "runs") -> bool:
     with pg.server.connect(database) as conn:
         row = conn.execute(
-            "SELECT has_table_privilege(%s, 'runs', 'SELECT')", (pg.roles.app,)
+            "SELECT has_table_privilege(%s, %s, 'SELECT')", (pg.roles.app, table)
         ).fetchone()
     return bool(row and row[0])
 
@@ -88,6 +88,7 @@ def test_grants_skip_missing_roles_and_cli_reapplies(pg_database: PgDatabase) ->
         # Papéis que ainda não existem: a migração passa e só avisa.
         upgrade(url, roles=RoleNames(app="papel_que_nao_existe", dispatcher="outro_inexistente"))
         assert not _app_can_read_runs(pg_database, name)
+        assert not _app_can_read_runs(pg_database, name, "recording_sessions")
         assert (
             main(
                 [
@@ -103,6 +104,9 @@ def test_grants_skip_missing_roles_and_cli_reapplies(pg_database: PgDatabase) ->
             == 0
         )
         assert _app_can_read_runs(pg_database, name)
+        # As permissões das tabelas das sessões de gravação (revisão 0003) também.
+        assert _app_can_read_runs(pg_database, name, "recording_sessions")
+        assert _app_can_read_runs(pg_database, name, "recordings")
 
 
 def test_offline_sql_is_generated(pg_database: PgDatabase) -> None:

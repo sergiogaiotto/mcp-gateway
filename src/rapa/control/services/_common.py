@@ -29,8 +29,8 @@ __all__ = [
 ]
 
 #: Menor número = maior prioridade: interativo, depois MCP, API e interface,
-#: depois agenda e webhook, depois lote. Só o interativo (a validação e, no
-#: futuro, gravação e controle ao vivo) usa a reserva e fica fora da cota da
+#: depois agenda e webhook, depois lote. Só o interativo (a validação; as sessões
+#: de gravação também ocupam a reserva, contadas à parte) usa a reserva e fica fora da cota da
 #: empresa; o botão "Executar" da interface roda em produção e conta na cota,
 #: senão uma empresa poderia tomar todas as vagas das outras.
 PRIORITY_BY_TRIGGER: dict[RunTrigger, int] = {

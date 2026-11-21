@@ -142,11 +142,10 @@ async def test_start_run_from_generated_form(world: World) -> None:
         await user.should_see("protocolo: PRT-2026-0001")
 
 
-async def test_live_view_placeholder_and_unknown_run(world: World) -> None:
+async def test_old_live_view_address_leads_to_gravar_and_unknown_run(world: World) -> None:
     async with world.user() as user:
         await login(user, "operador", "/ao-vivo")
-        await user.should_see(marker="ao-vivo")
-        await user.should_see("Esta tela chega numa próxima fase.")
+        await user.should_see(marker="sem-permissao-gravar", retries=50)
         await user.open("/execucoes/nao-e-um-numero")
         await user.should_see("Execução não encontrada.")
 

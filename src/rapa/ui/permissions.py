@@ -14,6 +14,7 @@ __all__ = [
     "can_create",
     "can_create_anywhere",
     "can_publish",
+    "can_record",
     "can_run",
     "can_validate",
     "creator_areas",
@@ -42,6 +43,11 @@ def creator_areas(principal: Principal, known_areas: Iterable[UUID] = ()) -> lis
     """Áreas onde o principal pode criar versões, entre as dele e as conhecidas."""
     candidates = dict.fromkeys([*principal.area_roles, *known_areas])
     return [area for area in candidates if can_create(principal, area)]
+
+
+def can_record(principal: Principal) -> bool:
+    """Se a pessoa pode gravar uma demonstração em alguma área (o papel de criação)."""
+    return can_create_anywhere(principal) or bool(creator_areas(principal))
 
 
 def can_validate(principal: Principal, area_id: UUID) -> bool:

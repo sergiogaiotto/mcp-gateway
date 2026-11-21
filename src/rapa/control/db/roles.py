@@ -31,13 +31,27 @@ rapa.control.db.migrate --url ... --somente-permissoes``.
 
 As partições de ``run_events`` não recebem permissões: o acesso é sempre pela
 tabela-mãe, e cada partição também tem isolamento por linha.
+
+As tabelas das sessões de gravação (revisão 0003) têm um bloco próprio
+(:func:`session_grants_sql`), que só concede quando as tabelas existem: assim
+``--somente-permissoes`` funciona em qualquer revisão. A aplicação lê e inclui
+sessões e gravações, e só muda a situação de uma sessão (e a renova enquanto está
+aberta); nunca apaga nada. O despachante só lê a situação das sessões, para contar
+as abertas na reserva de vagas interativas e achar as que nenhum processo segura.
 """
 
 import os
 import re
 from dataclasses import dataclass
 
-__all__ = ["DEFAULT_APP_ROLE", "DEFAULT_DISPATCHER_ROLE", "RoleNames", "grants_sql"]
+__all__ = [
+    "DEFAULT_APP_ROLE",
+    "DEFAULT_DISPATCHER_ROLE",
+    "RoleNames",
+    "all_grants_sql",
+    "grants_sql",
+    "session_grants_sql",
+]
 
 DEFAULT_APP_ROLE = "rapa_app"
 DEFAULT_DISPATCHER_ROLE = "rapa_dispatcher"
@@ -92,14 +106,33 @@ GRANT EXECUTE ON FUNCTION rapa_ensure_event_partitions(integer) TO {role};
 """
 
 
-def _block(role: str, grants: str) -> str:
+_SESSION_APP_GRANTS = """
+GRANT SELECT, INSERT ON recording_sessions, recordings TO {role};
+GRANT UPDATE (status, end_reason, robot_id, version_no, started_at, stopped_at, seen_at)
+    ON recording_sessions TO {role};
+"""
+
+_SESSION_DISPATCHER_GRANTS = """
+GRANT SELECT (company_id, id, status, expires_at, seen_at) ON recording_sessions TO {role};
+"""
+
+_SESSION_TABLES = ("recording_sessions", "recordings")
+
+
+def _block(role: str, grants: str, *, tables: tuple[str, ...] = ()) -> str:
     body = grants.format(role=f'"{role}"').strip()
+    condition = f"EXISTS (SELECT FROM pg_roles WHERE rolname = '{role}')"
+    missing = "papel % não existe; permissões não concedidas"
+    for table in tables:
+        condition += f" AND to_regclass('public.{table}') IS NOT NULL"
+    if tables:
+        missing = "papel % ou tabelas das sessões ausentes; permissões não concedidas"
     return (
         "DO $grants$\nBEGIN\n"
-        f"    IF EXISTS (SELECT FROM pg_roles WHERE rolname = '{role}') THEN\n"
+        f"    IF {condition} THEN\n"
         + "\n".join(f"        {line}" for line in body.splitlines())
         + "\n    ELSE\n"
-        f"        RAISE NOTICE 'papel % não existe; permissões não concedidas', '{role}';\n"
+        f"        RAISE NOTICE '{missing}', '{role}';\n"
         "    END IF;\nEND\n$grants$"
     )
 
@@ -111,3 +144,16 @@ def grants_sql(roles: RoleNames) -> list[str]:
     depois de criá-los completa as permissões.
     """
     return [_block(roles.app, _APP_GRANTS), _block(roles.dispatcher, _DISPATCHER_GRANTS)]
+
+
+def session_grants_sql(roles: RoleNames) -> list[str]:
+    """Permissões das tabelas das sessões de gravação (revisão 0003), se elas existirem."""
+    return [
+        _block(roles.app, _SESSION_APP_GRANTS, tables=_SESSION_TABLES),
+        _block(roles.dispatcher, _SESSION_DISPATCHER_GRANTS, tables=_SESSION_TABLES),
+    ]
+
+
+def all_grants_sql(roles: RoleNames) -> list[str]:
+    """Todas as permissões, das tabelas que existirem na revisão atual do banco."""
+    return [*grants_sql(roles), *session_grants_sql(roles)]

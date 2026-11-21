@@ -4,7 +4,8 @@ Lógica pura (sem banco), usada por :func:`rapa.control.services.queue.claim_nex
 dentro da transação que pega a execução.
 
 - **Reserva interativa:** ``ceil(total × razão)`` vagas ficam para execuções
-  interativas (gravação, controle ao vivo e testes; hoje, a validação). Elas
+  interativas (gravação, controle ao vivo e testes: a validação e as sessões de
+  gravação, que contam como interativas em uso enquanto estão abertas). Elas
   usam a reserva primeiro e não contam na cota da empresa. Com a reserva
   cheia, um interativo só usa uma vaga geral que nenhuma outra empresa precise
   para atender a própria garantia com o que tem na fila: interativos de uma

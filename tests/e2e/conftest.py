@@ -56,6 +56,7 @@ async def platform_app(
         artifacts_dir=tmp_path / "artefatos",
         chromium=chromium_path,
         browser_args=(HOST_RESOLVER_ARG,),
+        sessions_dir=tmp_path / "sessoes",
     )
     # O lifespan (gateway MCP e despachante) roda dentro do teste: o SDK do MCP
     # exige abrir e fechar o grupo de tarefas na mesma tarefa.

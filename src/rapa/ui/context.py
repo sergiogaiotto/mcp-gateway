@@ -31,6 +31,9 @@ class UiSettings:
     poll_interval_s: float = 2.0
     #: Tempo máximo para montar uma página (chamadas à API incluídas).
     page_timeout_s: float = 20.0
+    #: Endereço base do websocket da visão ao vivo (``wss://api.exemplo``); sem ele, o
+    #: navegador usa o mesmo endereço da interface (a API e a interface no mesmo domínio).
+    live_ws_base: str | None = None
     #: Nomes legíveis das áreas e empresas (só para exibição).
     area_labels: Mapping[UUID, str] = field(default_factory=dict)
     company_labels: Mapping[UUID, str] = field(default_factory=dict)

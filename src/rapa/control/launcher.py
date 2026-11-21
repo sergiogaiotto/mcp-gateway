@@ -56,6 +56,7 @@ __all__ = [
     "NoSecrets",
     "SecretSource",
     "StaticSecretSource",
+    "child_env",
 ]
 
 logger = logging.getLogger("rapa.control.launcher")
@@ -239,12 +240,21 @@ class _EventTail:
         return out
 
 
-def _worker_env() -> dict[str, str]:
+def child_env() -> dict[str, str]:
+    """Ambiente mínimo de um processo filho (executor ou sessão de gravação).
+
+    Só o que o Python, o Playwright e as fontes precisam: nada do plano de controle
+    (URL do banco, chaves, tokens) passa para o filho.
+    """
     return {
         key: value
         for key, value in os.environ.items()
         if key in _ENV_ALLOWED or key.startswith(_ENV_PREFIXES)
     }
+
+
+def _worker_env() -> dict[str, str]:
+    return child_env()
 
 
 def _write_private(path: Path, text: str) -> None:
