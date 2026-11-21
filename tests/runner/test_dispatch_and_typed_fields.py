@@ -1694,6 +1694,36 @@ _NAMED_SLOTS: dict[str, tuple[str, ...]] = {
         "s.querySelector('.nm img').alt='Excluir Item '+i;",
         "s.querySelector('.nm').id='nm'+k;s.querySelector('.b').setAttribute('aria-labelledby','nm'+k);",
     ),
+    # O nome no title de um elemento de dentro cujo texto é aria-hidden.
+    "titulo_glifo": (
+        "<button type='button' class='b'><span class='t'><span aria-hidden='true'>&times;</span>"
+        "</span></button>",
+        "b.querySelector('.t').title='Excluir Item '+i;",
+    ),
+    # O aria-labelledby do botão aponta para um elemento com o nome no aria-label.
+    "lb_aria": (
+        "<button type='button' class='b'>X</button><span class='nm'></span>",
+        "s.querySelector('.nm').setAttribute('aria-label','Excluir Item '+i);",
+        "s.querySelector('.nm').id='nm'+k;s.querySelector('.b').setAttribute('aria-labelledby','nm'+k);",
+    ),
+    # O aria-labelledby do botão aponta para um elemento com o nome no title.
+    "lb_titulo": (
+        "<button type='button' class='b'>X</button><span class='nm'></span>",
+        "s.querySelector('.nm').title='Excluir Item '+i;",
+        "s.querySelector('.nm').id='nm'+k;s.querySelector('.b').setAttribute('aria-labelledby','nm'+k);",
+    ),
+    # O aria-labelledby do <svg> de dentro aponta para um elemento com o nome no aria-label.
+    "svg_lb_aria": (
+        f"<button type='button' class='b'>{_SVG_IMG}</button><span class='nm'></span>",
+        "s.querySelector('.nm').setAttribute('aria-label','Excluir Item '+i);",
+        "s.querySelector('.nm').id='nm'+k;s.querySelector('svg').setAttribute('aria-labelledby','nm'+k);",
+    ),
+    # Parte do nome no valor de um campo dentro do botão.
+    "valor_campo": (
+        "<button type='button' class='b'>Excluir <input class='v' readonly size='8' tabindex='-1'>"
+        "</button>",
+        "b.querySelector('.v').value='Item '+i;",
+    ),
     # O item 55 em diante tem o nome no title do botão; os de antes, no <svg> de dentro.
     "titulo_para_dentro": (
         f"<button type='button' class='b'>{_ICON}{_SVG_IMG}</button>",
@@ -1750,6 +1780,11 @@ def _named_list(mode: str, event: str) -> str:
         ("labelledby_alt", "pointerdown"),
         ("titulo_para_dentro", "pointerover"),
         ("titulo_para_dentro", "mouseover"),
+        ("titulo_glifo", "pointerover"),
+        ("lb_aria", "pointerdown"),
+        ("lb_titulo", "pointerover"),
+        ("svg_lb_aria", "pointerover"),
+        ("valor_campo", "pointerdown"),
     ],
 )
 async def test_a_recycled_icon_button_never_deletes_another_item(
@@ -1758,9 +1793,10 @@ async def test_a_recycled_icon_button_never_deletes_another_item(
     # Botões de ícone que a página reaproveita para outro item com o mouse chegando ou
     # apertando: o aria-label que chega com outro valor que não o title da chegada, o title
     # que passa pelo nome do outro item antes de a dica tirá-lo, o alt da imagem (também no
-    # elemento do aria-labelledby), o nome do <svg> de dentro (no aria-label ou no
-    # aria-labelledby dele) e o title de um ícone ou de uma imagem sem alt contam no rótulo que
-    # o vigia confere. O title que sai junto com um nome de dentro que chega não é uma dica.
+    # elemento do aria-labelledby, com o aria-label e o title dele), o nome do <svg> de dentro
+    # (no aria-label ou no aria-labelledby dele), o title de um ícone, de uma imagem sem alt ou
+    # de um elemento cujo texto é aria-hidden e o valor de um campo de dentro contam no rótulo
+    # que o vigia confere. O title que sai junto com um nome de dentro que chega não é uma dica.
     srv.app = _api_app(srv, {"/p": _named_list(mode, event)})
     manifest = _manifest(
         [_nav(srv.base, "/p"), _click("excluir", "Excluir Item 57", effect="write")]
@@ -1816,6 +1852,60 @@ async def test_a_box_already_as_it_should_be_redrawn_before_the_guard_never_mark
     }
     outcome = await _run(run_robot, _manifest([_nav(srv.base, "/p"), step]))
     assert shifted
+    _wrote(outcome, srv, RunState.FAILED, "")
+    assert outcome.result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+
+
+_LABEL_SLOTS = {
+    # O nome no title de um ícone dentro do <label>.
+    "titulo_icone": (
+        f"<label class='lb'><input type='checkbox' class='b'>{_SQUARE}</label>",
+        "s.querySelector('i').title='Aprovar Item '+i;",
+    ),
+    # Parte do nome no valor de um campo dentro do <label>.
+    "valor_campo": (
+        "<label class='lb'><input type='checkbox' class='b'> Aprovar "
+        "<input class='v' readonly size='8' tabindex='-1'></label>",
+        "s.querySelector('.v').value='Item '+i;",
+    ),
+}
+
+
+@pytest.mark.parametrize("event", ["pointerover", "pointerdown"])
+@pytest.mark.parametrize("mode", sorted(_LABEL_SLOTS))
+async def test_a_recycled_box_named_inside_its_label_never_marks_another_item(
+    run_robot: RobotRunner, srv: _Server, mode: str, event: str
+) -> None:
+    # Caixas de uma lista posicional cujo nome vem de dentro do <label> (o title de um ícone,
+    # o valor de um campo): a página reaproveita os nós para outros itens com o mouse
+    # chegando ou apertando, e o rótulo que o vigia confere lê o <label> como o nome.
+    slot, draw = _LABEL_SLOTS[mode]
+    page = _page(
+        "<div id='lista'>"
+        + f"<div class='slot' style='height:40px'>{slot}</div>" * 10
+        + "</div><script>let offset=50;const slots=[...document.querySelectorAll('.slot')];"
+        "const draw=()=>slots.forEach((s,k)=>{const i=offset+k;const b=s.querySelector('.b');"
+        f"b.dataset.i=i;{draw};b.checked=false}});"
+        "slots.forEach((s)=>{s.querySelector('.b').onchange=function(){"
+        "fetch('/api',{method:'POST',body:'MARCA:Item '+this.dataset.i+'='+this.checked+';'})}});"
+        "draw();let feito=false;"
+        f"addEventListener('{event}',(e)=>{{if(feito||!e.isTrusted||!e.target.closest||"
+        "!e.target.closest('.slot'))return;feito=true;offset-=5;draw()},true);</script>"
+    )
+    srv.app = _api_app(srv, {"/p": page})
+    step = {
+        "kind": "check",
+        "id": "aprovar",
+        "title": "Marcar Aprovar Item 57",
+        "effect": "write",
+        "timeout_ms": 4_000,
+        "checked": True,
+        "target": _target(
+            "caixa Aprovar Item 57",
+            {"by": "role", "value": "checkbox", "name": "Aprovar Item 57", "exact": True},
+        ),
+    }
+    outcome = await _run(run_robot, _manifest([_nav(srv.base, "/p"), step]))
     _wrote(outcome, srv, RunState.FAILED, "")
     assert outcome.result.error_code == ErrorCode.ELEMENTO_AMBIGUO
 
@@ -1893,6 +1983,66 @@ async def test_a_target_with_display_contents_and_fields_elsewhere_is_clicked(
     save = _click("salvar", "Salvar", effect="write", role=role, timeout=4_000)
     outcome = await _run(run_robot, _manifest([_nav(srv.base, "/host"), cep, save]))
     _wrote(outcome, srv, RunState.SUCCEEDED, "S;")
+
+
+def _contents_link_app(srv: _Server, link: str, head: str = "", *, ms: int = 1500) -> App:
+    """O link num iframe de um modal centralizado por uma transformação, onde o Playwright não
+    confere o que está por cima do alvo. A página de cima cobre a parte da esquerda do iframe
+    (onde fica o texto do link) com um "Desfazer" que grava, por ``ms`` ms (para sempre se
+    ``ms`` é 0)."""
+    form = _page(f"<div style='margin:20px'>{link}</div>", head)
+    hide = f"setTimeout(()=>o.remove(),{ms});" if ms else ""
+    host = _page(
+        "<div style='position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:3;"
+        "background:#fff'><iframe id='f' src='/form' "
+        "style='width:600px;height:160px;border:0;display:block'></iframe></div>"
+        "<script>const f=document.getElementById('f').getBoundingClientRect();"
+        "const o=document.createElement('button');o.type='button';o.textContent='Desfazer';"
+        "o.style.cssText='position:fixed;z-index:50;left:'+f.left+'px;top:'+f.top+'px;width:'+"
+        "(f.width*0.45)+'px;height:'+f.height+'px';"
+        "o.onclick=()=>fetch('/api',{method:'POST',body:'DESFAZ;'});document.body.appendChild(o);"
+        f"{hide}</script>"
+    )
+    return _api_app(srv, {"/host": host, "/form": form})
+
+
+_SAVE_LINK = f"href='#' style='display:contents' onclick=\"{_SAVE_S};return false\""
+_FAR = "<span style='display:inline-block;margin-left:300px;padding:6px;border:1px solid'>ir</span>"
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        f"<a {_SAVE_LINK}>Salvar agora {_FAR}</a>",
+        f"<a {_SAVE_LINK}><span style='display:contents'></span>Salvar agora {_FAR}</a>",
+    ],
+    ids=["texto_primeiro", "vazio_e_texto"],
+)
+async def test_a_contents_link_whose_text_is_covered_waits_for_the_page_over_it(
+    run_robot: RobotRunner, srv: _Server, link: str
+) -> None:
+    # O link com display: contents começa com texto, que a página de cima cobre por 1,5 s; o
+    # filho dele, à direita, está livre. O Playwright clica no meio do primeiro pedaço do
+    # link (o texto): a espera confere esse pedaço, e não o do filho.
+    srv.app = _contents_link_app(srv, link)
+    save = _click("salvar", "Salvar agora ir", effect="write", role="link", timeout=6_000)
+    save["target"]["frames"] = ["#f"]
+    outcome = await _run(run_robot, _manifest([_nav(srv.base, "/host"), save]))
+    _wrote(outcome, srv, RunState.SUCCEEDED, "S;")
+
+
+async def test_a_contents_link_with_generated_content_is_never_clicked_blind(
+    run_robot: RobotRunner, srv: _Server
+) -> None:
+    # O ::before do link com display: contents vem antes dos filhos e não tem caixa que se
+    # leia: a espera não sabe onde o clique cai e não o deixa ir para o "Desfazer".
+    style = "<style>.p::before{content:'IC ';display:inline-block;padding:6px}</style>"
+    link = f"<a class='p' {_SAVE_LINK}>{_FAR.replace('>ir<', '>Salvar agora ir<')}</a>"
+    srv.app = _contents_link_app(srv, link, style, ms=0)
+    save = _click("salvar", "IC Salvar agora ir", effect="write", role="link", timeout=4_000)
+    save["target"]["frames"] = ["#f"]
+    outcome = await _run(run_robot, _manifest([_nav(srv.base, "/host"), save]))
+    _wrote(outcome, srv, RunState.FAILED, "")
 
 
 async def test_a_drawer_inside_a_shifted_modal_iframe_never_gives_the_click_to_the_page_over_it(

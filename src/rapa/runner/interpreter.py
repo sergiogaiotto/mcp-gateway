@@ -757,9 +757,10 @@ Object.defineProperty(window, key, {
 # executor lê depois de agir. O ouvinte do vigia é o que :data:`_GUARD_HOOK_JS` pôs no
 # documento antes dos scripts dele (senão, um posto agora, depois dos que a página já pôs na
 # janela). Num clique ou numa marcação, o rótulo do alvo (``aria-label``, ``title``, o texto
-# de ``aria-labelledby`` e dos ``<label>`` dele, ``data-testid``, o texto do HTML com o ``alt``
-# das imagens e os nomes dos elementos de dentro: o ``aria-label`` de um ``<svg>``, o texto do
-# ``aria-labelledby`` deles e, sem outro nome, o ``title`` de um ícone) também
+# de ``aria-labelledby``, com o ``aria-label`` e o ``title`` do elemento dele, e dos ``<label>``
+# dele, ``data-testid``, o texto do HTML com o ``alt`` das imagens e o valor dos campos de
+# dentro, e os nomes dos elementos de dentro: o ``aria-label`` de um ``<svg>``, o nome do
+# ``aria-labelledby`` deles e, sem um nem outro, o ``title`` de um ícone) também
 # precisa ser o da hora em que o vigia foi posto: uma lista virtual que reaproveita o nó para
 # outro item enquanto o Playwright rola até ele troca o rótulo. Vale também o rótulo que os
 # ouvintes da página para a chegada do mouse ao alvo puseram (``pointerover`` e ``mouseover``,
@@ -845,16 +846,39 @@ const typedHold = () => (typed || []).every(([node, value]) => fieldValue(node) 
 const armedAt = view.performance.now();
 const prompt = () => late === null || view.performance.now() - armedAt <= late;
 // O rótulo do alvo num clique ou numa marcação (uma lista virtual que reaproveita o nó).
+// O elemento do aria-labelledby vale com o aria-label, o title e os nomes de dentro dele (sem
+// seguir outro aria-labelledby, como o nome também não segue). Uma vez por id em cada leitura
+// do rótulo: muitos elementos de dentro podem apontar para o mesmo.
+const memo = new Map();
+const refName = (id) => {
+  const node = target.getRootNode().getElementById?.(id) ?? null;
+  if (!node) return '';
+  const sub = [];
+  const text = normalize(nameText(node, sub, false));
+  return [node.getAttribute('aria-label') ?? '', node.getAttribute('title') ?? '', text, ...sub]
+    .join(' ');
+};
 const named = (ids) => (ids ?? '').split(/\s+/).filter(Boolean)
-  .map((id) => target.getRootNode().getElementById?.(id) ?? null)
-  .map((node) => (node ? normalize(nameText(node, null)) : '')).join(' ');
+  .map((id) => {
+    if (!memo.has(id)) memo.set(id, refName(id));
+    return memo.get(id);
+  }).join(' ');
+// O valor de um campo embutido (o nome também o usa).
+const embedded = (node) => {
+  if (node instanceof HTMLSelectElement) return [...node.selectedOptions].map((o) => o.text).join(' ');
+  if (node instanceof HTMLTextAreaElement) return node.value;
+  if (node instanceof HTMLInputElement && !buttons.has(node.type) && node.type !== 'image') return node.value;
+  return null;
+};
 // O texto do nome também vem do alt (<img>, <area>, <input type=image>), também no elemento
 // do aria-labelledby.
 const inner = [];
-// Os nomes de dentro (into): o aria-label, o texto do aria-labelledby e, sem outro nome,
-// o title de um elemento de dentro (o <i title> de um ícone, o <img title> sem alt); o
-// aria-label de um <svg role=img> de dentro.
-const nameText = (node, into = inner) => {
+// Os nomes de dentro (into): o aria-label de um elemento de dentro (o <svg role=img>), o nome
+// do aria-labelledby dele e, sem um nem outro, o title dele (o <i title> de um ícone, o
+// <img title> sem alt, o title de um texto aria-hidden). O valor de um campo de dentro entra
+// no texto. Sem ``follow``, o aria-labelledby de dentro não é seguido (no elemento de um
+// aria-labelledby, como o nome também não segue).
+const nameText = (node, into = inner, follow = true) => {
   if (node.nodeType === 1 && skipped.has(node.nodeName)) return '';
   if (node instanceof HTMLInputElement && buttons.has(node.type)) return node.value;
   if ((node instanceof HTMLInputElement && node.type === 'image') || node instanceof HTMLImageElement
@@ -866,34 +890,38 @@ const nameText = (node, into = inner) => {
     if (child.nodeType === 3) text += child.nodeValue ?? '';
     else if (child.nodeType === 1) {
       const own = child.getAttribute('aria-label');
-      const refs = child.getAttribute('aria-labelledby');
-      const sub = nameText(child, into);
-      if (into !== null) {
-        if (own) into.push(own);
-        if (refs) into.push(named(refs));
-        const tip = child.getAttribute('title');
-        if (tip && !own && !refs && !normalize(sub)) into.push(tip);
-      }
+      const refs = follow ? child.getAttribute('aria-labelledby') : null;
+      const sub = embedded(child) ?? nameText(child, into, follow);
+      if (own) into.push(own);
+      if (refs) into.push(named(refs));
+      // O title de um elemento de dentro, também com texto (o texto pode ser aria-hidden).
+      const tip = child.getAttribute('title');
+      if (tip && !own && !refs) into.push(tip);
       text += sub;
     }
   }
-  if (node.shadowRoot) text += nameText(node.shadowRoot, into);
+  if (node.shadowRoot) text += nameText(node.shadowRoot, into, follow);
   return text;
+};
+const labelText = (node) => {
+  const sub = [];
+  return [normalize(nameText(node, sub)), ...sub].join(' ');
 };
 const parts = () => {
   inner.length = 0;
+  memo.clear();
   const text = normalize(nameText(target));
   return [target.getAttribute('aria-label') ?? '', target.getAttribute('title') ?? '',
     named(target.getAttribute('aria-labelledby')),
-    [...(target.labels ?? [])].map((node) => normalize(htmlText(node))).join(' '),
+    [...(target.labels ?? [])].map(labelText).join(' '),
     target.getAttribute('data-testid') ?? '', text, inner.join(' ')];
 };
 const label = () => JSON.stringify(parts());
 // Só a dica mudou: o title que sai ou chega, o aria-label que chega igual ao title da chegada
 // (o Bootstrap 5), os nomes de dentro que chegam com o title e o aria-label iguais; o resto,
-// igual. Os valores por que o title e o aria-label do alvo passaram
-// desde o vigia também contam: um nó reaproveitado nos ouvintes da chegada, antes de uma dica
-// que tira o title (o jQuery UI), passa pelo title do outro item.
+// igual. Os valores por que o title e o aria-label do alvo passaram desde o vigia também
+// contam: um nó reaproveitado nos ouvintes da chegada, antes de uma dica que tira o title (o
+// jQuery UI), passa pelo title do outro item.
 const seen = [];
 const keep = (records) => {
   for (const record of records) seen.push([record.attributeName, record.oldValue ?? '']);
@@ -1021,13 +1049,29 @@ if (!want.matches('input, textarea, select') && !want.isContentEditable) {
 }
 let view = element.ownerDocument.defaultView;
 let box = null;
-// Um elemento com display: contents não tem caixa: valem as dos filhos (onde o clique cai).
+// Um elemento com display: contents não tem caixa: valem as dos filhos, também as do texto e
+// as do shadow root ou dos nós de um <slot>, na ordem em que são desenhados (o Playwright
+// clica no meio da primeira). O ::before dele vem antes delas e não tem retângulo que se leia:
+// com ele, não dá para dizer onde o clique cai.
+let unsure = false;
 const boxes = (node) => {
   const own = [...node.getClientRects()];
   if (own.length || view.getComputedStyle(node).display !== 'contents') return own;
-  return [...node.children].flatMap(boxes);
+  const before = view.getComputedStyle(node, '::before').content;
+  if (before && before !== 'none' && before !== 'normal') unsure = true;
+  const kids = node.shadowRoot ? node.shadowRoot.childNodes
+    : node.localName === 'slot' && node.assignedNodes().length ? node.assignedNodes() : node.childNodes;
+  return [...kids].flatMap((child) => {
+    if (child.nodeType === 1) return boxes(child);
+    if (child.nodeType !== 3) return [];
+    const range = node.ownerDocument.createRange();
+    range.selectNodeContents(child);
+    return [...range.getClientRects()];
+  });
 };
-for (const rect of boxes(element)) {
+const drawn = boxes(element);
+if (unsure) return false;
+for (const rect of drawn) {
   const left = Math.max(rect.left, 0);
   const top = Math.max(rect.top, 0);
   const right = Math.min(rect.right, view.innerWidth);
