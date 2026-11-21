@@ -896,6 +896,8 @@ const nameText = (node, into = inner, follow = true) => {
   const kids = node instanceof HTMLSlotElement && node.assignedNodes().length
     ? node.assignedNodes() : node.childNodes;
   for (const child of kids) {
+    // O nó posto num <slot> de um shadow root aberto é lido pelo slot (uma vez só).
+    if (node.shadowRoot && child.assignedSlot) continue;
     if (child.nodeType === 3) text += child.nodeValue ?? '';
     else if (child.nodeType === 1) {
       const own = child.getAttribute('aria-label');
@@ -1147,7 +1149,11 @@ for (;;) {
   const outer = frame.ownerDocument.defaultView;
   for (let node = frame; node && node.nodeType === 1;
       node = node.parentElement ?? node.parentNode?.host ?? null) {
-    if (!flat(outer.getComputedStyle(node))) return null;
+    const own = outer.getComputedStyle(node);
+    if (!flat(own)) return null;
+    // Com CSS zoom em volta do iframe, o Playwright erra o ponto do clique (põe as caixas sem o
+    // zoom): ele pode cair fora do iframe, na página de cima. Conta como coberto.
+    if ((parseFloat(own.zoom) || 1) !== 1) return false;
   }
   const rect = frame.getBoundingClientRect();
   const style = outer.getComputedStyle(frame);
