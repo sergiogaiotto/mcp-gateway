@@ -757,14 +757,16 @@ Object.defineProperty(window, key, {
 # executor lê depois de agir. O ouvinte do vigia é o que :data:`_GUARD_HOOK_JS` pôs no
 # documento antes dos scripts dele (senão, um posto agora, depois dos que a página já pôs na
 # janela). Num clique ou numa marcação, o rótulo do alvo (``aria-label``, ``title``, o texto
-# de ``aria-labelledby`` e dos ``<label>`` dele, ``data-testid`` e o texto do HTML) também
+# de ``aria-labelledby`` e dos ``<label>`` dele, ``data-testid``, o texto do HTML com o ``alt``
+# das imagens e o ``aria-label`` dos elementos de dentro, como o de um ``<svg>``) também
 # precisa ser o da hora em que o vigia foi posto: uma lista virtual que reaproveita o nó para
 # outro item enquanto o Playwright rola até ele troca o rótulo. Vale também o rótulo que os
 # ouvintes da página para a chegada do mouse ao alvo puseram (``pointerover`` e ``mouseover``,
 # que o vigia vê antes deles; o rótulo é lido de novo no ``pointermove`` e no ``mousemove``,
-# depois deles), se ele era o da hora do vigia quando o mouse chegou e se só a dica mudou (o
-# ``title`` que sai ou chega, o ``aria-label`` que chega; o texto, os ``<label>``, o
-# ``aria-labelledby`` e o ``data-testid`` iguais). Depois do primeiro evento de um clique ou
+# depois deles), se ele era o da hora do vigia quando o mouse chegou e se só a dica mudou: o
+# ``title`` que sai ou chega e o ``aria-label`` que chega igual ao ``title`` da chegada, sem
+# que um ou outro tenha passado por outro valor desde o vigia; o texto, os ``<label>``, o
+# ``aria-labelledby``, o ``data-testid`` e os nomes de dentro iguais. Depois do primeiro evento de um clique ou
 # de uma marcação, e até o ``click``, o vigia confere de novo, em cada evento do navegador, o
 # endereço, a linha e o rótulo (os ouvintes da página já receberam os eventos de antes e podem
 # tê-los mudado); se mudaram, ele cancela esse evento e os seguintes (``meio``). Um clique
@@ -844,15 +846,61 @@ const prompt = () => late === null || view.performance.now() - armedAt <= late;
 const named = (ids) => (ids ?? '').split(/\s+/).filter(Boolean)
   .map((id) => target.getRootNode().getElementById?.(id) ?? null)
   .map((node) => (node ? normalize(htmlText(node)) : '')).join(' ');
-const parts = () => [target.getAttribute('aria-label') ?? '', target.getAttribute('title') ?? '',
-  named(target.getAttribute('aria-labelledby')),
-  [...(target.labels ?? [])].map((node) => normalize(htmlText(node))).join(' '),
-  target.getAttribute('data-testid') ?? '', normalize(htmlText(target))];
+// O texto do nome também vem do alt (<img>, <area>, <input type=image>) e do aria-label de
+// um elemento de dentro (o <svg role=img aria-label>).
+const inner = [];
+const nameText = (node) => {
+  if (node.nodeType === 1 && skipped.has(node.nodeName)) return '';
+  if (node instanceof HTMLInputElement && buttons.has(node.type)) return node.value;
+  if ((node instanceof HTMLInputElement && node.type === 'image') || node instanceof HTMLImageElement
+      || node instanceof HTMLAreaElement) {
+    return node.getAttribute('alt') ?? '';
+  }
+  let text = '';
+  for (let child = node.firstChild; child; child = child.nextSibling) {
+    if (child.nodeType === 3) text += child.nodeValue ?? '';
+    else if (child.nodeType === 1) {
+      const own = child.getAttribute('aria-label');
+      if (own) inner.push(own);
+      text += nameText(child);
+    }
+  }
+  if (node.shadowRoot) text += nameText(node.shadowRoot);
+  return text;
+};
+const parts = () => {
+  inner.length = 0;
+  const text = normalize(nameText(target));
+  return [target.getAttribute('aria-label') ?? '', target.getAttribute('title') ?? '',
+    named(target.getAttribute('aria-labelledby')),
+    [...(target.labels ?? [])].map((node) => normalize(htmlText(node))).join(' '),
+    target.getAttribute('data-testid') ?? '', text, inner.join(' ')];
+};
 const label = () => JSON.stringify(parts());
-// Só a dica mudou: o title que sai ou chega, o aria-label que chega; o resto, igual.
-const tooltipOnly = (h, a) => (a[0] === h[0] || h[0] === '')
+// Só a dica mudou: o title que sai ou chega, o aria-label que chega igual ao title da chegada
+// (o Bootstrap 5); o resto, igual. Os valores por que o title e o aria-label do alvo passaram
+// desde o vigia também contam: um nó reaproveitado nos ouvintes da chegada, antes de uma dica
+// que tira o title (o jQuery UI), passa pelo title do outro item.
+const seen = [];
+const keep = (records) => {
+  for (const record of records) seen.push([record.attributeName, record.oldValue ?? '']);
+};
+const watch = (kind === 'clique' || kind === 'marca') && typeof MutationObserver === 'function'
+  ? new MutationObserver(keep) : null;
+if (watch !== null) {
+  watch.observe(target, {attributes: true, attributeOldValue: true,
+    attributeFilter: ['title', 'aria-label']});
+}
+const drain = () => {
+  if (watch !== null) keep(watch.takeRecords());
+};
+const passed = (name, ...allowed) => seen.every(([n, v]) => n !== name || allowed.includes(v));
+const tooltipOnly = (h, a) => (drain(), true)
+  && (a[0] === h[0] || (h[0] === '' && a[0] === h[1]))
+  && passed('aria-label', h[0], '') && passed('title', h[1], '')
   && (a[1] === h[1] || a[1] === '' || h[1] === '')
-  && a[2] === h[2] && a[3] === h[3] && a[4] === h[4] && a[5] === h[5];
+  && a[2] === h[2] && a[3] === h[3] && a[4] === h[4] && a[5] === h[5]
+  && (a[6] === h[6] || h[6] === '');
 const armedLabel = kind === 'clique' || kind === 'marca' ? label() : null;
 // O rótulo quando o mouse chega ao alvo, antes dos ouvintes da página, e logo depois dos
 // ouvintes dela para a chegada: a mudança que a chegada do mouse fez só vale se for a de
@@ -876,6 +924,7 @@ const hook = view[Symbol.for('rapa.vigia')] ?? null;
 let state = 'armado';
 let reason = 'alvo';
 const off = () => {
+  if (watch !== null) watch.disconnect();
   if (hook !== null) hook.clear(listener);
   else for (const type of types) view.removeEventListener(type, listener, true);
 };
@@ -947,9 +996,11 @@ return {
 # deslocado ou em escala por uma transformação, dele ou de um elemento em volta dele, também
 # através de shadow roots; a caixa do elemento vai junto, cortada pela janela de cada
 # documento, e o ponto é o centro dela). O texto de um botão que vem de um ``<slot>`` sobe
-# pelo slot. Fora da janela ou num documento de outra origem acima, não dá para saber: vale
-# ``true`` (o vigia confere a demora do primeiro evento). Num iframe girado, inclinado, espelhado ou em
-# perspectiva, o ponto de dentro não se traduz pela caixa: vale ``null``.
+# pelo slot. Fora da janela do documento dele ou de um documento de cima (uma gaveta que
+# ainda entra), ainda não dá para clicar: vale ``false``. Num documento de outra origem acima,
+# não dá para saber: vale ``true`` (o vigia confere a demora do primeiro evento). Num iframe
+# girado, inclinado, espelhado ou em perspectiva, o ponto de dentro não se traduz pela caixa:
+# vale ``null``.
 _UNCOVERED_JS = r"""(element) => {
 let want = element;
 if (!want.matches('input, textarea, select') && !want.isContentEditable) {
@@ -967,7 +1018,7 @@ for (const rect of element.getClientRects()) {
     break;
   }
 }
-if (box === null) return true;
+if (box === null) return false;
 let x = (box[0] + box[2]) / 2;
 let y = (box[1] + box[3]) / 2;
 const up = (node) => node.parentNode ?? node.host ?? null;
@@ -4108,12 +4159,14 @@ class Interpreter:
         )
         ctx.held = _held(typed)
         await self._arm_guard(step, ctx, target, page, typed, frame)
-        if points:
+        if points or await self._points_at(step, ctx.element):
             # A página pode ter reaproveitado o nó para outro item depois de ele ser preso (a
             # lista virtual que redesenha no quadro seguinte à rolagem da espera, o feed que
             # põe um item no topo): com o vigia já posto, o elemento preso ainda precisa ser
             # o único do localizador. O que a página redesenha antes do vigia falha aqui; o
-            # que ela redesenha depois troca o rótulo que o vigia guardou.
+            # que ela redesenha depois troca o rótulo que o vigia guardou. Numa marcação, se a
+            # caixa já estava como devia, a pergunta é feita de novo: o nó reaproveitado pode
+            # mostrar um item no outro estado, e a marcação clicaria nele.
             await self._still_the_only_one(step, ctx, target)
         return act
 

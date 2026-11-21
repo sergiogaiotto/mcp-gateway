@@ -1640,6 +1640,176 @@ async def test_a_button_past_the_edge_of_a_shifted_modal_iframe_is_clicked(
     assert time.monotonic() - started < 5.5
 
 
+_GIF = "data:image/gif;base64,R0lGODlhAQABAIAAAP8AADAAACwAAAAAAQABAAACAkQBADs="
+_ICON = "<span aria-hidden='true'>X</span>"
+# Como cada nó da lista mostra o nome do item (``b`` é o botão, ``i`` o item).
+_NAMED_SLOTS = {
+    # O item 55 em diante tem o nome no title; os de antes, no aria-label, sem title.
+    "aria_chega": (
+        f"<button type='button' class='b'>{_ICON}</button>",
+        "if(i>=55){b.title='Excluir Item '+i;b.removeAttribute('aria-label')}"
+        "else{b.setAttribute('aria-label','Excluir Item '+i);b.removeAttribute('title')}",
+    ),
+    # O nome no title, e uma dica delegada que tira o title na chegada (como o jQuery UI).
+    "dica_jq": (f"<button type='button' class='b'>{_ICON}</button>", "b.title='Excluir Item '+i;"),
+    # O nome no alt da imagem de dentro.
+    "img_alt": (
+        f"<button type='button' class='b'><img width='16' height='16' alt='' src='{_GIF}'></button>",
+        "b.querySelector('img').alt='Excluir Item '+i;",
+    ),
+    # Um botão de imagem.
+    "input_image": (
+        f"<input type='image' class='b' width='16' height='16' alt='' src='{_GIF}'>",
+        "b.alt='Excluir Item '+i;",
+    ),
+    # O nome no aria-label de um <svg role=img> de dentro.
+    "svg_aria": (
+        "<button type='button' class='b'><svg role='img' aria-label='' width='16' height='16'>"
+        "<rect width='16' height='16'></rect></svg></button>",
+        "b.querySelector('svg').setAttribute('aria-label','Excluir Item '+i);",
+    ),
+}
+
+
+def _named_list(mode: str, event: str) -> str:
+    """Uma lista posicional de 10 nós (itens 50 a 59) cujo nome vem de ``mode``. No primeiro
+    ``event`` do navegador num deles, um ouvinte da página na janela põe a lista 5 itens para
+    trás. O nó clicado manda o item que mostra."""
+    slot, draw = _NAMED_SLOTS[mode]
+    tooltip = (
+        "document.addEventListener('mouseover',(e)=>{const t=e.target.closest&&"
+        "e.target.closest('[title]');if(t){t.dataset.t=t.title;t.removeAttribute('title')}});"
+        if mode == "dica_jq"
+        else ""
+    )
+    return _page(
+        "<div id='lista'>"
+        + f"<div class='slot' style='height:40px'>{slot}</div>" * 10
+        + "</div><script>let offset=50;const slots=[...document.querySelectorAll('.slot')];"
+        "const draw=()=>slots.forEach((s,k)=>{const i=offset+k;const b=s.querySelector('.b');"
+        f"b.dataset.i=i;{draw}}});"
+        "slots.forEach((s)=>s.querySelector('.b').addEventListener('click',function(e){"
+        "e.preventDefault();fetch('/api',{method:'POST',body:'DEL:Item '+this.dataset.i+';'})}));"
+        "draw();let feito=false;"
+        f"addEventListener('{event}',(e)=>{{if(feito||!e.isTrusted||!e.target.closest||"
+        "!e.target.closest('.b'))return;feito=true;offset-=5;draw()},true);" + tooltip + "</script>"
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "event"),
+    [
+        ("aria_chega", "pointerover"),
+        ("aria_chega", "pointermove"),
+        ("dica_jq", "pointerover"),
+        ("dica_jq", "mouseover"),
+        ("img_alt", "pointerover"),
+        ("img_alt", "pointerdown"),
+        ("input_image", "mousedown"),
+        ("svg_aria", "pointerover"),
+        ("svg_aria", "mouseup"),
+    ],
+)
+async def test_a_recycled_icon_button_never_deletes_another_item(
+    run_robot: RobotRunner, srv: _Server, mode: str, event: str
+) -> None:
+    # Botões de ícone que a página reaproveita para outro item com o mouse chegando ou
+    # apertando: o aria-label que chega com outro valor que não o title da chegada, o title
+    # que passa pelo nome do outro item antes de a dica tirá-lo, o alt da imagem e o nome do
+    # <svg> de dentro contam no rótulo que o vigia confere.
+    srv.app = _api_app(srv, {"/p": _named_list(mode, event)})
+    manifest = _manifest(
+        [_nav(srv.base, "/p"), _click("excluir", "Excluir Item 57", effect="write")]
+    )
+    outcome = await _run(run_robot, manifest)
+    _wrote(outcome, srv, RunState.FAILED, "")
+    assert outcome.result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+
+
+@pytest.mark.parametrize(("item", "checked"), [(57, True), (58, False)])
+async def test_a_box_already_as_it_should_be_redrawn_before_the_guard_never_marks_another_item(
+    run_robot: RobotRunner, srv: _Server, monkeypatch: pytest.MonkeyPatch, item: int, checked: bool
+) -> None:
+    # A caixa do item já está como o passo pede, mas a página reaproveita o nó para um item no
+    # outro estado logo antes de o vigia ser posto (um feed ao vivo): a conferência do elemento
+    # único com o vigia posto lê de novo se a marcação vai clicar.
+    page = _page(
+        "<div id='lista'>"
+        + "<div class='slot'><label><input type='checkbox' class='b'> <span class='nome'></span>"
+        "</label></div>"
+        * 10
+        + "</div><script>let offset=50;const state={};for(let i=0;i<100;i++)state[i]=i%2===1;"
+        "const slots=[...document.querySelectorAll('.slot')];"
+        "const draw=()=>slots.forEach((s,k)=>{const i=offset+k;const b=s.querySelector('.b');"
+        "b.dataset.i=i;s.querySelector('.nome').textContent='Aprovar Item '+i;b.checked=state[i]});"
+        "slots.forEach((s)=>{const b=s.querySelector('.b');b.onchange=function(){"
+        "const i=+this.dataset.i;state[i]=this.checked;"
+        "fetch('/api',{method:'POST',body:'MARCA:Item '+i+'='+this.checked+';'})}});draw();"
+        "window.desloca=()=>{offset-=5;draw()};</script>"
+    )
+    srv.app = _api_app(srv, {"/p": page})
+    original = Interpreter._arm_guard
+    shifted: list[bool] = []
+
+    async def arm_after_a_shift(self: Interpreter, step: Any, *args: Any) -> None:
+        if not shifted:
+            shifted.append(True)
+            await self.page.evaluate("window.desloca()")
+        await original(self, step, *args)
+
+    monkeypatch.setattr(Interpreter, "_arm_guard", arm_after_a_shift)
+    step = {
+        "kind": "check",
+        "id": "aprovar",
+        "title": f"Marcar Aprovar Item {item}",
+        "effect": "write",
+        "timeout_ms": 4_000,
+        "checked": checked,
+        "target": _target(
+            f"caixa Aprovar Item {item}",
+            {"by": "label", "value": f"Aprovar Item {item}", "exact": True},
+        ),
+    }
+    outcome = await _run(run_robot, _manifest([_nav(srv.base, "/p"), step]))
+    assert shifted
+    _wrote(outcome, srv, RunState.FAILED, "")
+    assert outcome.result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+
+
+async def test_a_drawer_inside_a_shifted_modal_iframe_never_gives_the_click_to_the_page_over_it(
+    run_robot: RobotRunner, srv: _Server
+) -> None:
+    # A gaveta que entra pela direita fica dentro do iframe de um modal centralizado: o
+    # Salvar está fora da janela do próprio documento. "Abrir" pede à página de cima uma capa
+    # que cobre a tela por 1,5 s e move a gaveta 300 ms depois. Fora da janela, o alvo ainda
+    # não dá para clicar: a espera continua até a gaveta entrar e a capa sair.
+    form = _page(
+        "<button type='button' id='ab'>Abrir</button>"
+        "<div id='dr' style='position:fixed;right:0;top:60px;width:260px;height:120px;"
+        "transform:translateX(110%);transition:transform 700ms linear;background:#fff'>"
+        "<div style='padding:30px'><button type='button' style='width:90px;height:32px' "
+        f'onclick="{_SAVE_S}">Salvar</button></div></div>'
+        "<script>document.getElementById('ab').onclick=()=>{parent.capa();setTimeout(()=>{"
+        "document.getElementById('dr').style.transform='translateX(0)'},300)}</script>"
+    )
+    host = _page(
+        "<div style='position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:3;"
+        "background:#fff'><iframe id='f' src='/form' "
+        "style='width:400px;height:220px;border:0;display:block'></iframe></div>"
+        "<button id='desfaz' type='button' hidden style='position:fixed;inset:0;z-index:50' "
+        "onclick=\"fetch('/api',{method:'POST',body:'DESFAZ;'})\">Desfazer</button>"
+        "<script>window.capa=()=>{const d=document.getElementById('desfaz');d.hidden=false;"
+        "setTimeout(()=>{d.hidden=true},1500)}</script>"
+    )
+    srv.app = _api_app(srv, {"/host": host, "/form": form})
+    open_it = _click("gaveta", "Abrir", effect="read")
+    open_it["target"]["frames"] = ["#f"]
+    save = _click("salvar", "Salvar", effect="write", timeout=6_000)
+    save["target"]["frames"] = ["#f"]
+    outcome = await _run(run_robot, _manifest([_nav(srv.base, "/host"), open_it, save]))
+    _wrote(outcome, srv, RunState.SUCCEEDED, "S;")
+
+
 async def test_a_drawer_that_slides_in_never_gives_the_click_to_the_page_over_it(
     run_robot: RobotRunner, srv: _Server
 ) -> None:
