@@ -88,7 +88,7 @@ def test_host_rules_follow_chromium() -> None:
 
 def test_udp_is_kept_out_of_the_browser() -> None:
     assert "--disable-quic" in BROWSER_NETWORK_ARGS
-    assert "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in BROWSER_NETWORK_ARGS
+    assert "--webrtc-ip-handling-policy=disable_non_proxied_udp" in BROWSER_NETWORK_ARGS
 
 
 # -- o proxy de verdade --------------------------------------------------------------------

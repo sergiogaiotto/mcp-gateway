@@ -75,7 +75,7 @@ _CHUNK = 65536
 #: dos argumentos do operador, para não serem desfeitos por eles.
 BROWSER_NETWORK_ARGS = (
     "--disable-quic",
-    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
 )
 
 # Respostas SOCKS5 (RFC 1928).
