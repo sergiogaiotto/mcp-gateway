@@ -1642,8 +1642,11 @@ async def test_a_button_past_the_edge_of_a_shifted_modal_iframe_is_clicked(
 
 _GIF = "data:image/gif;base64,R0lGODlhAQABAIAAAP8AADAAACwAAAAAAQABAAACAkQBADs="
 _ICON = "<span aria-hidden='true'>X</span>"
-# Como cada nó da lista mostra o nome do item (``b`` é o botão, ``i`` o item).
-_NAMED_SLOTS = {
+_SQUARE = "<i style='display:inline-block;width:16px;height:16px;background:#c00'></i>"
+_SVG_IMG = "<svg role='img' width='16' height='16'><rect width='16' height='16'></rect></svg>"
+# Como cada nó da lista mostra o nome do item (``b`` é o botão, ``i`` o item, ``s`` a linha;
+# o terceiro valor, se há, prepara cada linha uma vez, com ``k`` a posição dela).
+_NAMED_SLOTS: dict[str, tuple[str, ...]] = {
     # O item 55 em diante tem o nome no title; os de antes, no aria-label, sem title.
     "aria_chega": (
         f"<button type='button' class='b'>{_ICON}</button>",
@@ -1668,6 +1671,36 @@ _NAMED_SLOTS = {
         "<rect width='16' height='16'></rect></svg></button>",
         "b.querySelector('svg').setAttribute('aria-label','Excluir Item '+i);",
     ),
+    # O nome no title de um ícone de dentro.
+    "titulo_icone": (
+        f"<button type='button' class='b'>{_SQUARE}</button>",
+        "b.querySelector('i').title='Excluir Item '+i;",
+    ),
+    # O nome no title de uma imagem sem alt.
+    "titulo_img": (
+        f"<button type='button' class='b'><img width='16' height='16' src='{_GIF}'></button>",
+        "b.querySelector('img').title='Excluir Item '+i;",
+    ),
+    # O nome no aria-labelledby do <svg> de dentro.
+    "svg_labelledby": (
+        f"<button type='button' class='b'>{_SVG_IMG}</button><span class='nm' hidden></span>",
+        "s.querySelector('.nm').textContent='Excluir Item '+i;",
+        "s.querySelector('.nm').id='nm'+k;s.querySelector('svg').setAttribute('aria-labelledby','nm'+k);",
+    ),
+    # O aria-labelledby do botão aponta para uma imagem com o nome no alt.
+    "labelledby_alt": (
+        "<button type='button' class='b'>X</button>"
+        f"<span class='nm'><img width='16' height='16' alt='' src='{_GIF}'></span>",
+        "s.querySelector('.nm img').alt='Excluir Item '+i;",
+        "s.querySelector('.nm').id='nm'+k;s.querySelector('.b').setAttribute('aria-labelledby','nm'+k);",
+    ),
+    # O item 55 em diante tem o nome no title do botão; os de antes, no <svg> de dentro.
+    "titulo_para_dentro": (
+        f"<button type='button' class='b'>{_ICON}{_SVG_IMG}</button>",
+        "const g=b.querySelector('svg');"
+        "if(i>=55){b.title='Excluir Item '+i;g.removeAttribute('aria-label')}"
+        "else{b.removeAttribute('title');g.setAttribute('aria-label','Excluir Item '+i)}",
+    ),
 }
 
 
@@ -1675,7 +1708,8 @@ def _named_list(mode: str, event: str) -> str:
     """Uma lista posicional de 10 nós (itens 50 a 59) cujo nome vem de ``mode``. No primeiro
     ``event`` do navegador num deles, um ouvinte da página na janela põe a lista 5 itens para
     trás. O nó clicado manda o item que mostra."""
-    slot, draw = _NAMED_SLOTS[mode]
+    slot, draw, *prepare = _NAMED_SLOTS[mode]
+    setup = f"slots.forEach((s,k)=>{{{prepare[0]}}});" if prepare else ""
     tooltip = (
         "document.addEventListener('mouseover',(e)=>{const t=e.target.closest&&"
         "e.target.closest('[title]');if(t){t.dataset.t=t.title;t.removeAttribute('title')}});"
@@ -1686,7 +1720,8 @@ def _named_list(mode: str, event: str) -> str:
         "<div id='lista'>"
         + f"<div class='slot' style='height:40px'>{slot}</div>" * 10
         + "</div><script>let offset=50;const slots=[...document.querySelectorAll('.slot')];"
-        "const draw=()=>slots.forEach((s,k)=>{const i=offset+k;const b=s.querySelector('.b');"
+        + setup
+        + "const draw=()=>slots.forEach((s,k)=>{const i=offset+k;const b=s.querySelector('.b');"
         f"b.dataset.i=i;{draw}}});"
         "slots.forEach((s)=>s.querySelector('.b').addEventListener('click',function(e){"
         "e.preventDefault();fetch('/api',{method:'POST',body:'DEL:Item '+this.dataset.i+';'})}));"
@@ -1708,6 +1743,13 @@ def _named_list(mode: str, event: str) -> str:
         ("input_image", "mousedown"),
         ("svg_aria", "pointerover"),
         ("svg_aria", "mouseup"),
+        ("titulo_icone", "pointerover"),
+        ("titulo_icone", "pointerdown"),
+        ("titulo_img", "mouseover"),
+        ("svg_labelledby", "pointerover"),
+        ("labelledby_alt", "pointerdown"),
+        ("titulo_para_dentro", "pointerover"),
+        ("titulo_para_dentro", "mouseover"),
     ],
 )
 async def test_a_recycled_icon_button_never_deletes_another_item(
@@ -1715,8 +1757,10 @@ async def test_a_recycled_icon_button_never_deletes_another_item(
 ) -> None:
     # Botões de ícone que a página reaproveita para outro item com o mouse chegando ou
     # apertando: o aria-label que chega com outro valor que não o title da chegada, o title
-    # que passa pelo nome do outro item antes de a dica tirá-lo, o alt da imagem e o nome do
-    # <svg> de dentro contam no rótulo que o vigia confere.
+    # que passa pelo nome do outro item antes de a dica tirá-lo, o alt da imagem (também no
+    # elemento do aria-labelledby), o nome do <svg> de dentro (no aria-label ou no
+    # aria-labelledby dele) e o title de um ícone ou de uma imagem sem alt contam no rótulo que
+    # o vigia confere. O title que sai junto com um nome de dentro que chega não é uma dica.
     srv.app = _api_app(srv, {"/p": _named_list(mode, event)})
     manifest = _manifest(
         [_nav(srv.base, "/p"), _click("excluir", "Excluir Item 57", effect="write")]
@@ -1774,6 +1818,81 @@ async def test_a_box_already_as_it_should_be_redrawn_before_the_guard_never_mark
     assert shifted
     _wrote(outcome, srv, RunState.FAILED, "")
     assert outcome.result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+
+
+@pytest.mark.parametrize(("checked", "on"), [(True, 53), (False, 57)])
+async def test_a_box_redrawn_before_its_state_is_read_is_never_reported_as_done(
+    run_robot: RobotRunner, srv: _Server, monkeypatch: pytest.MonkeyPatch, checked: bool, on: int
+) -> None:
+    # A página reaproveita o nó da caixa do item 57 para o item 53 logo depois de ele ser
+    # preso, antes de o executor ler o estado dela, e o 53 já está como o passo pede para o
+    # 57. Sem clique nenhum, o passo daria certo sem o item pedido: com o vigia posto, o
+    # elemento preso ainda precisa ser o único do localizador.
+    page = _page(
+        "<div id='lista'>"
+        + "<div class='slot'><label><input type='checkbox' class='b'> <span class='nome'></span>"
+        "</label></div>"
+        * 10
+        + f"</div><script>let offset=50;const state={{}};for(let i=0;i<100;i++)state[i]=i==={on};"
+        "const slots=[...document.querySelectorAll('.slot')];"
+        "const draw=()=>slots.forEach((s,k)=>{const i=offset+k;const b=s.querySelector('.b');"
+        "b.dataset.i=i;s.querySelector('.nome').textContent='Aprovar Item '+i;b.checked=state[i]});"
+        "slots.forEach((s)=>{const b=s.querySelector('.b');b.onchange=function(){"
+        "const i=+this.dataset.i;state[i]=this.checked;"
+        "fetch('/api',{method:'POST',body:'MARCA:Item '+i+'='+this.checked+';'})}});draw();"
+        "window.desloca=()=>{offset-=4;draw()};</script>"
+    )
+    srv.app = _api_app(srv, {"/p": page})
+    original = Interpreter._wait_ready
+    shifted: list[bool] = []
+
+    async def ready_after_a_shift(self: Interpreter, step: Any, *args: Any) -> None:
+        if step.id == "aprovar" and not shifted:
+            shifted.append(True)
+            await self.page.evaluate("window.desloca()")
+        await original(self, step, *args)
+
+    monkeypatch.setattr(Interpreter, "_wait_ready", ready_after_a_shift)
+    step = {
+        "kind": "check",
+        "id": "aprovar",
+        "title": "Marcar Aprovar Item 57",
+        "effect": "write",
+        "timeout_ms": 4_000,
+        "checked": checked,
+        "target": _target(
+            "caixa Aprovar Item 57", {"by": "label", "value": "Aprovar Item 57", "exact": True}
+        ),
+    }
+    outcome = await _run(run_robot, _manifest([_nav(srv.base, "/p"), step]))
+    assert shifted
+    _wrote(outcome, srv, RunState.FAILED, "")
+    assert outcome.result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+
+
+@pytest.mark.parametrize("role", ["link", "button"])
+async def test_a_target_with_display_contents_and_fields_elsewhere_is_clicked(
+    run_robot: RobotRunner, srv: _Server, role: str
+) -> None:
+    # Um link ou um botão com display: contents não tem caixa própria; o clique cai nos filhos
+    # dele. Com o CEP digitado num iframe, a espera pelo alvo livre usa as caixas dos filhos.
+    tag = "a href='#'" if role == "link" else "button type='button'"
+    end = "a" if role == "link" else "button"
+    host = _page(
+        "<iframe id='f' src='/form' style='width:300px;height:80px'></iframe>"
+        f"<div style='margin:20px'><{tag} style='display:contents' "
+        f'onclick="{_SAVE_S};return false">'
+        "<span style='display:inline-block;padding:8px;border:1px solid'>Salvar</span>"
+        f"</{end}></div>"
+    )
+    srv.app = _api_app(
+        srv, {"/host": host, "/form": _page("<label for='cep'>CEP</label><input id='cep'>")}
+    )
+    cep = _fill("digitar_cep", "CEP", "01001000")
+    cep["target"]["frames"] = ["#f"]
+    save = _click("salvar", "Salvar", effect="write", role=role, timeout=4_000)
+    outcome = await _run(run_robot, _manifest([_nav(srv.base, "/host"), cep, save]))
+    _wrote(outcome, srv, RunState.SUCCEEDED, "S;")
 
 
 async def test_a_drawer_inside_a_shifted_modal_iframe_never_gives_the_click_to_the_page_over_it(

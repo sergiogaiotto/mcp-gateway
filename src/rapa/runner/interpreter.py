@@ -758,7 +758,8 @@ Object.defineProperty(window, key, {
 # documento antes dos scripts dele (senão, um posto agora, depois dos que a página já pôs na
 # janela). Num clique ou numa marcação, o rótulo do alvo (``aria-label``, ``title``, o texto
 # de ``aria-labelledby`` e dos ``<label>`` dele, ``data-testid``, o texto do HTML com o ``alt``
-# das imagens e o ``aria-label`` dos elementos de dentro, como o de um ``<svg>``) também
+# das imagens e os nomes dos elementos de dentro: o ``aria-label`` de um ``<svg>``, o texto do
+# ``aria-labelledby`` deles e, sem outro nome, o ``title`` de um ícone) também
 # precisa ser o da hora em que o vigia foi posto: uma lista virtual que reaproveita o nó para
 # outro item enquanto o Playwright rola até ele troca o rótulo. Vale também o rótulo que os
 # ouvintes da página para a chegada do mouse ao alvo puseram (``pointerover`` e ``mouseover``,
@@ -766,8 +767,9 @@ Object.defineProperty(window, key, {
 # depois deles), se ele era o da hora do vigia quando o mouse chegou e se só a dica mudou: o
 # ``title`` que sai ou chega e o ``aria-label`` que chega igual ao ``title`` da chegada, sem
 # que um ou outro tenha passado por outro valor desde o vigia; o texto, os ``<label>``, o
-# ``aria-labelledby``, o ``data-testid`` e os nomes de dentro iguais. Depois do primeiro evento de um clique ou
-# de uma marcação, e até o ``click``, o vigia confere de novo, em cada evento do navegador, o
+# ``aria-labelledby`` e o ``data-testid`` iguais; os nomes de dentro iguais, ou chegando quando
+# o ``title`` e o ``aria-label`` não mudaram. Depois do primeiro evento de um clique ou de uma
+# marcação, e até o ``click``, o vigia confere de novo, em cada evento do navegador, o
 # endereço, a linha e o rótulo (os ouvintes da página já receberam os eventos de antes e podem
 # tê-los mudado); se mudaram, ele cancela esse evento e os seguintes (``meio``). Um clique
 # cujos eventos não chegaram à janela do alvo vale ``fora``.
@@ -845,11 +847,14 @@ const prompt = () => late === null || view.performance.now() - armedAt <= late;
 // O rótulo do alvo num clique ou numa marcação (uma lista virtual que reaproveita o nó).
 const named = (ids) => (ids ?? '').split(/\s+/).filter(Boolean)
   .map((id) => target.getRootNode().getElementById?.(id) ?? null)
-  .map((node) => (node ? normalize(htmlText(node)) : '')).join(' ');
-// O texto do nome também vem do alt (<img>, <area>, <input type=image>) e do aria-label de
-// um elemento de dentro (o <svg role=img aria-label>).
+  .map((node) => (node ? normalize(nameText(node, null)) : '')).join(' ');
+// O texto do nome também vem do alt (<img>, <area>, <input type=image>), também no elemento
+// do aria-labelledby.
 const inner = [];
-const nameText = (node) => {
+// Os nomes de dentro (into): o aria-label, o texto do aria-labelledby e, sem outro nome,
+// o title de um elemento de dentro (o <i title> de um ícone, o <img title> sem alt); o
+// aria-label de um <svg role=img> de dentro.
+const nameText = (node, into = inner) => {
   if (node.nodeType === 1 && skipped.has(node.nodeName)) return '';
   if (node instanceof HTMLInputElement && buttons.has(node.type)) return node.value;
   if ((node instanceof HTMLInputElement && node.type === 'image') || node instanceof HTMLImageElement
@@ -861,11 +866,18 @@ const nameText = (node) => {
     if (child.nodeType === 3) text += child.nodeValue ?? '';
     else if (child.nodeType === 1) {
       const own = child.getAttribute('aria-label');
-      if (own) inner.push(own);
-      text += nameText(child);
+      const refs = child.getAttribute('aria-labelledby');
+      const sub = nameText(child, into);
+      if (into !== null) {
+        if (own) into.push(own);
+        if (refs) into.push(named(refs));
+        const tip = child.getAttribute('title');
+        if (tip && !own && !refs && !normalize(sub)) into.push(tip);
+      }
+      text += sub;
     }
   }
-  if (node.shadowRoot) text += nameText(node.shadowRoot);
+  if (node.shadowRoot) text += nameText(node.shadowRoot, into);
   return text;
 };
 const parts = () => {
@@ -878,7 +890,8 @@ const parts = () => {
 };
 const label = () => JSON.stringify(parts());
 // Só a dica mudou: o title que sai ou chega, o aria-label que chega igual ao title da chegada
-// (o Bootstrap 5); o resto, igual. Os valores por que o title e o aria-label do alvo passaram
+// (o Bootstrap 5), os nomes de dentro que chegam com o title e o aria-label iguais; o resto,
+// igual. Os valores por que o title e o aria-label do alvo passaram
 // desde o vigia também contam: um nó reaproveitado nos ouvintes da chegada, antes de uma dica
 // que tira o title (o jQuery UI), passa pelo title do outro item.
 const seen = [];
@@ -900,7 +913,7 @@ const tooltipOnly = (h, a) => (drain(), true)
   && passed('aria-label', h[0], '') && passed('title', h[1], '')
   && (a[1] === h[1] || a[1] === '' || h[1] === '')
   && a[2] === h[2] && a[3] === h[3] && a[4] === h[4] && a[5] === h[5]
-  && (a[6] === h[6] || h[6] === '');
+  && (a[6] === h[6] || (h[6] === '' && a[0] === h[0] && a[1] === h[1]));
 const armedLabel = kind === 'clique' || kind === 'marca' ? label() : null;
 // O rótulo quando o mouse chega ao alvo, antes dos ouvintes da página, e logo depois dos
 // ouvintes dela para a chegada: a mudança que a chegada do mouse fez só vale se for a de
@@ -1008,7 +1021,13 @@ if (!want.matches('input, textarea, select') && !want.isContentEditable) {
 }
 let view = element.ownerDocument.defaultView;
 let box = null;
-for (const rect of element.getClientRects()) {
+// Um elemento com display: contents não tem caixa: valem as dos filhos (onde o clique cai).
+const boxes = (node) => {
+  const own = [...node.getClientRects()];
+  if (own.length || view.getComputedStyle(node).display !== 'contents') return own;
+  return [...node.children].flatMap(boxes);
+};
+for (const rect of boxes(element)) {
   const left = Math.max(rect.left, 0);
   const top = Math.max(rect.top, 0);
   const right = Math.min(rect.right, view.innerWidth);
@@ -4159,14 +4178,15 @@ class Interpreter:
         )
         ctx.held = _held(typed)
         await self._arm_guard(step, ctx, target, page, typed, frame)
-        if points or await self._points_at(step, ctx.element):
+        if points or isinstance(step, CheckStep):
             # A página pode ter reaproveitado o nó para outro item depois de ele ser preso (a
             # lista virtual que redesenha no quadro seguinte à rolagem da espera, o feed que
             # põe um item no topo): com o vigia já posto, o elemento preso ainda precisa ser
             # o único do localizador. O que a página redesenha antes do vigia falha aqui; o
-            # que ela redesenha depois troca o rótulo que o vigia guardou. Numa marcação, se a
-            # caixa já estava como devia, a pergunta é feita de novo: o nó reaproveitado pode
-            # mostrar um item no outro estado, e a marcação clicaria nele.
+            # que ela redesenha depois troca o rótulo que o vigia guardou. Numa marcação, também
+            # quando a caixa já estava como devia: o nó reaproveitado pode mostrar um item no
+            # outro estado (a marcação clicaria nele) ou outro item já como devia (o passo daria
+            # certo sem o item pedido).
             await self._still_the_only_one(step, ctx, target)
         return act
 
