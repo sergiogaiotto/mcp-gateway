@@ -64,12 +64,31 @@ _MAX_TICKET_MESSAGE = 512
 
 def live_origins(public_url: str | None, extra: Iterable[str] = ()) -> frozenset[str]:
     """Origens aceitas no websocket da visão ao vivo: a da URL pública e as informadas."""
-    origins = {o.strip().rstrip("/") for o in extra if o.strip()}
+    origins = {_origin(o.strip()) for o in extra if o.strip()}
     if public_url:
-        parts = urlsplit(public_url)
-        if parts.scheme and parts.netloc:
-            origins.add(f"{parts.scheme}://{parts.netloc}".lower())
-    return frozenset(o.lower() for o in origins)
+        origins.add(_origin(public_url))
+    return frozenset(o for o in origins if o)
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin(url: str) -> str:
+    """A origem como o navegador a manda: esquema e servidor, sem usuário nem a porta padrão."""
+    parts = urlsplit(url.rstrip("/"))
+    if not parts.scheme or not parts.hostname:
+        return ""
+    scheme = parts.scheme.lower()
+    host = parts.hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    try:
+        port = parts.port
+    except ValueError:
+        return ""
+    if port is None or port == _DEFAULT_PORTS.get(scheme):
+        return f"{scheme}://{host}"
+    return f"{scheme}://{host}:{port}"
 
 
 def _ticket_of(raw: str | None) -> str | None:
@@ -83,7 +102,8 @@ def _ticket_of(raw: str | None) -> str | None:
     if not isinstance(data, dict) or data.get("tipo") != "bilhete":
         return None
     ticket = data.get("bilhete")
-    return ticket if isinstance(ticket, str) and ticket else None
+    # O bilhete é ASCII (token_urlsafe): outro texto (um surrogate solto) nem é conferido.
+    return ticket if isinstance(ticket, str) and ticket and ticket.isascii() else None
 
 
 class CreateSessionBody(BaseModel):

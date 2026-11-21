@@ -313,3 +313,63 @@ async def test_page_dialogs_appear_inside_the_live_view_never_as_native_dialogs(
     [record] = store.sessions.values()
     assert record.status is RecordingSessionStatus.STOPPED
     assert list((tmp_path / "sessoes").iterdir()) == []
+
+
+@contextmanager
+def _confirm_site() -> Iterator[int]:
+    """Um site que pede confirmação para uma ação destrutiva e mostra a resposta."""
+    page = (
+        b"<html><head><title>Portal</title></head><body><p>Portal</p><script>"
+        b"setTimeout(() => { const r = confirm('Excluir todos os registros?');"
+        b" location.href = '/fim?r=' + r; }, 300);</script></body></html>"
+    )
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            body = page if self.path == "/" else b"<html><body>fim</body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield int(server.server_address[1])
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+async def test_enter_on_the_cancel_button_cancels_the_page_dialog(
+    chromium_path: str, tmp_path: Path
+) -> None:
+    with _confirm_site() as site, _serve(chromium_path, tmp_path / "sessoes") as (base_url, _):
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(
+                executable_path=chromium_path, args=[HOST_RESOLVER_ARG]
+            )
+            try:
+                page = await browser.new_page(viewport={"width": 1200, "height": 900})
+                page.set_default_timeout(20_000)
+                await page.goto(f"{base_url}/gravar")
+                await page.get_by_role("button", name="Entrar como Criadora").click()
+                await page.get_by_label("Endereço inicial").fill(f"http://conf.rapa.test:{site}/")
+                await page.get_by_role("button", name="Começar a gravar").click()
+                overlay = page.locator("#rapa-ao-vivo [data-rapa-dialogo=confirm]")
+                await expect(overlay).to_be_visible(timeout=30_000)
+                # Quem usa o teclado vai até "Cancelar" e aperta Enter: a página recebe "não".
+                await overlay.get_by_role("button", name="Cancelar").focus()
+                await page.keyboard.press("Enter")
+                await expect(page.get_by_label("Endereço da página")).to_have_value(
+                    f"http://conf.rapa.test:{site}/fim?r=false", timeout=15_000
+                )
+                await page.get_by_role("button", name="Parar e revisar").click()
+                await expect(page.get_by_text("Revisar:")).to_be_visible(timeout=30_000)
+            finally:
+                await browser.close()

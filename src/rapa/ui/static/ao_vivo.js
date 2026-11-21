@@ -271,7 +271,8 @@
     box.addEventListener("keydown", function (e) {
       // As teclas do diálogo ficam aqui: nada vai para o navegador da gravação.
       e.stopPropagation();
-      if (e.key === "Enter") { e.preventDefault(); answer(true); }
+      // Enter num botão com foco é o clique dele (Cancelar cancela); no campo, é o OK.
+      if (e.key === "Enter" && e.target.tagName !== "BUTTON") { e.preventDefault(); answer(true); }
       else if (e.key === "Escape") { e.preventDefault(); answer(kind === "alert"); }
     });
     this.dialogBox = box;

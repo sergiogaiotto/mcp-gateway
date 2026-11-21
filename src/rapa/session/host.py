@@ -47,6 +47,7 @@ import contextlib
 import hmac
 import json
 import logging
+import os
 import shutil
 import signal
 import sys
@@ -116,6 +117,20 @@ _WEB_SCHEMES = frozenset({"http", "https", "about", "blob", "data", "chrome-erro
 _REFUSAL_WINDOW_S = 3.0
 #: Intervalo mínimo entre dois avisos de endereço interno recusado.
 _REFUSAL_WARNING_S = 10.0
+#: Os argumentos do operador que decidem por onde o navegador sai valem para o executor
+#: (``RAPA_ARGS_NAVEGADOR`` é o mesmo), nunca para a sessão: o Chromium obedece ao último
+#: ``--proxy-server`` e ao último ``--proxy-bypass-list`` (que desfaz o ``<-loopback>``), e
+#: ``--no-proxy-server`` vence os dois; qualquer um deles tiraria a guarda do caminho.
+_PROXY_SWITCHES = frozenset(
+    {"proxy-server", "no-proxy-server", "proxy-pac-url", "proxy-auto-detect", "proxy-bypass-list"}
+)
+
+
+def _session_args(args: tuple[str, ...]) -> list[str]:
+    """Os argumentos do operador sem os que mudam o proxy do navegador."""
+    return [a for a in args if a.split("=", 1)[0].lstrip("-") not in _PROXY_SWITCHES]
+
+
 _REFUSED_TEXT = (
     "O navegador da gravação não abre endereços internos do servidor (a própria máquina e o "
     "metadata da nuvem). Use o endereço público do portal."
@@ -189,6 +204,8 @@ class SessionHost:
         self._last_refusal = float("-inf")
         self._last_refusal_warning = float("-inf")
         self._stopping = False
+        #: O processo que abriu este (a API, pelo lançador): se ele morrer, a sessão acaba.
+        self._parent = os.getppid()
         #: Pasta do perfil (apagada no fim); exposta para os testes conferirem.
         self.profile_dir: Path | None = None
         self.port: int | None = None
@@ -246,7 +263,7 @@ class SessionHost:
                 executable_path=resolve_executable(config.chromium),
                 headless=True,
                 # Os do operador primeiro: os que tiram o UDP do caminho não são desfeitos.
-                args=[*config.browser_args, *BROWSER_NETWORK_ARGS],
+                args=[*_session_args(config.browser_args), *BROWSER_NETWORK_ARGS],
                 viewport={"width": config.width, "height": config.height},
                 locale=LOCALE,
                 timezone_id=TIMEZONE,
@@ -305,6 +322,11 @@ class SessionHost:
             return
         config = self.config
         while not self._ended.done():
+            if os.getppid() != self._parent:
+                # A API que abriu a sessão caiu: ninguém mais tem o token, e o banco já vai
+                # dar a sessão por encerrada; o navegador e o perfil não ficam para trás.
+                self.finish(EndReason.SIGNAL)
+                return
             now = self._clock()
             if now - self._last_input >= config.idle_timeout_s:
                 self.finish(EndReason.IDLE)

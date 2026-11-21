@@ -32,7 +32,7 @@ async def running_host(
         token=token,
         start_url=start_url,
         chromium=chromium,
-        browser_args=(HOST_RESOLVER_ARG,),
+        browser_args=overrides.pop("browser_args", (HOST_RESOLVER_ARG,)),
         width=1024,
         height=700,
         profile_parent=str(tmp_path),

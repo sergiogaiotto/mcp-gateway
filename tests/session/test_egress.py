@@ -2,10 +2,12 @@
 
 import asyncio
 import contextlib
+import itertools
 import socket
 import struct
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import pytest
 
@@ -289,3 +291,39 @@ async def test_connections_are_bounded_and_closed_with_the_guard() -> None:
             assert await _closed(reader)
             writer.close()
         assert guard.active == 0
+
+
+def _own_addresses() -> list[str]:
+    """Endereços IPv4 desta máquina fora do loopback (o IP do pod ou da máquina da API)."""
+    found: list[str] = []
+    with contextlib.suppress(OSError):
+        lines = Path("/proc/net/fib_trie").read_text().splitlines()
+        for before, line in itertools.pairwise(lines):
+            address = before.strip().removeprefix("|-- ")
+            if "/32 host LOCAL" in line and not address.startswith("127."):
+                found.append(address)
+    return sorted(set(found))
+
+
+def test_the_machines_own_addresses_are_blocked() -> None:
+    own = _own_addresses()
+    if not own:
+        pytest.skip("esta máquina não tem endereço fora do loopback")
+    # A API num contêiner escuta em 0.0.0.0: o endereço da própria máquina chega nela.
+    assert all(blocked_address(address) for address in own)
+    assert internal_host(own[0])
+    # Um endereço vizinho, de outra máquina da mesma rede, continua aberto (intranet).
+    assert not blocked_address("10.255.255.254")
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["::127.0.0.1", "64:ff9b::7f00:1", "2002:7f00:1::", "64:ff9b::a9fe:a9fe", "::ffff:0.0.0.1"],
+)
+def test_an_ipv6_form_of_a_blocked_ipv4_is_blocked(address: str) -> None:
+    # O IPv4 dentro do IPv6 (compatível, NAT64, 6to4 ou mapeado) vale como o próprio IPv4.
+    assert blocked_address(address)
+
+
+def test_an_ipv6_form_of_a_public_ipv4_is_not_blocked() -> None:
+    assert not blocked_address("64:ff9b::808:808")

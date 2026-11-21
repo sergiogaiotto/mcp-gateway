@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import http.server
+import os
 import socket
 import threading
 from collections.abc import Iterator
@@ -12,8 +13,8 @@ from pathlib import Path
 import pytest
 from playwright.async_api import Locator
 
-from rapa.fixtures.server import RunningPortal
-from rapa.session.host import SessionHost
+from rapa.fixtures.server import HOST_RESOLVER_ARG, RunningPortal
+from rapa.session.host import EndReason, SessionHost
 from tests.session.test_host_browser import live, running_host
 
 pytestmark = pytest.mark.browser
@@ -253,3 +254,87 @@ async def test_webrtc_sends_no_udp_outside_the_proxy(
             assert received == 0
     finally:
         udp.close()
+
+
+@contextmanager
+def server_on_every_interface() -> Iterator[int]:
+    """Um serviço como a API num pod: escuta em 0.0.0.0, também no endereço da máquina."""
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            data = f"<html><head><title>{MARK}</title></head><body>{MARK}</body></html>".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield int(server.server_address[1])
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+async def test_the_machines_own_address_is_out_of_reach(
+    chromium_path: str, portal_v1: RunningPortal, tmp_path: Path
+) -> None:
+    from tests.session.test_egress import _own_addresses
+
+    own = _own_addresses()
+    if not own:
+        pytest.skip("esta máquina não tem endereço fora do loopback")
+    with server_on_every_interface() as port:
+        async with (
+            running_host(chromium_path, f"{portal_v1.base_url}/", tmp_path) as (host, token, _),
+            live(host, token) as client,
+        ):
+            await client.page("/")
+            await client.send(tipo="navegar", url=f"http://{own[0]}:{port}/")
+            await asyncio.sleep(3)
+            assert MARK not in await _titles(host)
+            assert not [e for e in client.of("pagina") if e.get("titulo") == MARK]
+
+
+@pytest.mark.parametrize(
+    "operator_arg", ["--no-proxy-server", "--proxy-server=direct://", "--proxy-bypass-list=*"]
+)
+async def test_operator_proxy_switches_never_take_the_guard_out(
+    chromium_path: str, portal_v1: RunningPortal, tmp_path: Path, operator_arg: str
+) -> None:
+    # RAPA_ARGS_NAVEGADOR também vale para o executor, que pode precisar de um proxy.
+    with internal_server() as port:
+        async with (
+            running_host(
+                chromium_path,
+                f"{portal_v1.base_url}/",
+                tmp_path,
+                browser_args=(HOST_RESOLVER_ARG, operator_arg),
+            ) as (host, token, _),
+            live(host, token) as client,
+        ):
+            await client.page("/")
+            await client.send(tipo="navegar", url=f"http://127.0.0.1:{port}/")
+            await asyncio.sleep(3)
+            assert MARK not in await _titles(host)
+            assert not [e for e in client.of("pagina") if e.get("titulo") == MARK]
+
+
+async def test_the_session_ends_when_the_process_that_opened_it_dies(
+    chromium_path: str, portal_v1: RunningPortal, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import rapa.session.host as host_module
+
+    async with running_host(chromium_path, f"{portal_v1.base_url}/", tmp_path) as (_, _, task):
+        parent = os.getppid()
+        # A API caiu: o hospedeiro passa a ser filho de outro processo (o init).
+        monkeypatch.setattr(host_module.os, "getppid", lambda: parent + 1)
+        reason = await asyncio.wait_for(asyncio.shield(task), timeout=15)
+        assert reason is EndReason.SIGNAL
+    assert not await asyncio.to_thread(lambda: list(tmp_path.iterdir()))

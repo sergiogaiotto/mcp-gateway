@@ -415,6 +415,14 @@ class RecordingSessions:
             return current or record
         return updated
 
+    async def _release(self, session_id: UUID) -> None:
+        """Solta o navegador de uma sessão que o banco já dá por encerrada."""
+        self._live.pop(session_id, None)
+        self.tickets.revoke(session_id)
+        await self.relay.forget(session_id)
+        with contextlib.suppress(Exception):
+            await self.launcher.terminate(session_id)
+
     async def _host_ended(self, session_id: UUID, reason: str) -> None:
         """O hospedeiro avisou o fim (sem atividade, prazo, sinal) ou a ligação caiu."""
         company_id = self._live.get(session_id)
@@ -459,7 +467,14 @@ class RecordingSessions:
         for session_id, company_id in list(self._live.items()):
             record = await self.store.get(company_id, session_id)
             if record is None:
-                self._live.pop(session_id, None)
+                # Ainda sendo incluída (``create_session`` a tira de ``_live`` se falhar):
+                # tirá-la aqui faria a própria varredura encerrá-la depois de STALE_AFTER.
+                continue
+            if record.status not in LIVE_STATUSES and session_id not in self._ending:
+                # Encerrada no banco por outro caminho (outra réplica a achou sem dono): o
+                # navegador dela não fica de pé aqui.
+                await self._release(session_id)
+                ended += 1
                 continue
             refreshed = await self._refresh(record)
             if refreshed.status not in LIVE_STATUSES:
@@ -544,6 +559,11 @@ class RecordingSessions:
         if record.status not in LIVE_STATUSES:
             raise Conflict("a sessão de gravação já terminou")
         if not self.relay.knows(session_id):
+            if record.instance_id != self.instance_id:
+                # Outra réplica viva segura o navegador (a sessão que ninguém segura já foi
+                # encerrada por ``_owned``): só ela para a sessão; encerrar aqui deixaria o
+                # navegador de pé lá e a vaga livre no banco.
+                raise Conflict("a sessão de gravação está aberta em outro servidor; tente de novo")
             await self._end(record, RecordingSessionStatus.EXPIRED, "perdida")
             raise Conflict("a sessão de gravação não está aberta neste servidor; grave de novo")
         try:

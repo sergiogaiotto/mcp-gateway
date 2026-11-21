@@ -347,3 +347,23 @@ def test_live_origins_come_from_the_public_url_and_the_extra_list() -> None:
         "https://api.exemplo",
         "https://ui.exemplo",
     }
+
+
+async def test_a_ticket_that_is_not_ascii_closes_like_any_bad_ticket(
+    http: tuple[SessionsWorld, str, httpx2.AsyncClient],
+) -> None:
+    world, base, client = http
+    sid = (await _create(client, area_id=str(world.area_a)))["session_id"]
+    ws = await connect(base.replace("http://", "ws://") + f"/v1/sessoes/{sid}/ao-vivo")
+    await ws.send('{"tipo": "bilhete", "bilhete": "\\ud800"}')
+    assert await _refused(ws) == 1008
+
+
+def test_live_origins_drop_the_default_port_and_the_user() -> None:
+    # O navegador nunca manda a porta padrão nem o usuário na origem.
+    assert live_origins("https://ana@rapa.exemplo.gov.br:443/app") == frozenset(
+        {"https://rapa.exemplo.gov.br"}
+    )
+    assert live_origins("http://rapa.local:8080/", ["HTTPS://UI.Exemplo:443"]) == frozenset(
+        {"http://rapa.local:8080", "https://ui.exemplo"}
+    )

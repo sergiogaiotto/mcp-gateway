@@ -4,9 +4,11 @@ Com o armazenamento em memória e o hospedeiro falso (sem navegador).
 """
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID
 
 import pytest
@@ -14,7 +16,15 @@ import pytest
 from rapa.control.sessions import RecordingSessions, SessionLimits
 from rapa.control.sessions.relay import LiveRelay
 from rapa.control.sessions.service import STALE_AFTER
-from rapa.core.contracts import InvalidInput, NotFound, Principal, RecordingSessionStatus, Role
+from rapa.core.contracts import (
+    Conflict,
+    InvalidInput,
+    NotFound,
+    Principal,
+    QuotaExceeded,
+    RecordingSessionStatus,
+    Role,
+)
 from rapa.core.ids import new_id
 from tests.control.sessions.support import FakeLauncher, QueueViewer, SessionsWorld, build_world
 
@@ -306,3 +316,85 @@ async def test_the_viewer_replaced_gets_nothing_after_replacement(world: Session
     assert len(first.frames) == frames_before
     second.inbox.put_nowait(None)
     await asyncio.gather(w1, w2, return_exceptions=True)
+
+
+_LIVE = (RecordingSessionStatus.ACTIVE, RecordingSessionStatus.STARTING)
+
+
+async def _agree(world: SessionsWorld, session_id: UUID) -> None:
+    """O banco e o navegador concordam: aberta com navegador, ou encerrada sem ele."""
+    stored = world.store.sessions[world.company_a, session_id]
+    assert (stored.status in _LIVE) == await world.launcher.is_alive(session_id), stored.status
+
+
+async def test_stop_on_another_replica_never_leaves_the_browser_running() -> None:
+    world = build_world(limits=SessionLimits(per_company=1))
+    p = world.people["criadora"]
+    replica = _other_process(world, Clock(), FakeLauncher())
+    try:
+        held = await world.service.create_session(p, world.area_a, URL)
+        # O "parar" chega à réplica que não tem o navegador (o balanceador escolheu).
+        with pytest.raises(Conflict):
+            await replica.stop_session(p, held.session_id)
+        await world.service.sweep()
+        await _agree(world, held.session_id)
+        # E a vaga da empresa não abre enquanto o navegador dela está de pé.
+        for _ in range(3):
+            with contextlib.suppress(QuotaExceeded, Conflict):
+                info = await world.service.create_session(p, world.area_a, URL)
+                with contextlib.suppress(Conflict):
+                    await replica.stop_session(p, info.session_id)
+        assert len([h for h in world.launcher.hosts.values() if h.alive]) == 1
+    finally:
+        await replica.aclose()
+        await world.service.aclose()
+        await world.launcher.aclose()
+
+
+async def test_a_session_another_replica_expired_loses_its_browser() -> None:
+    # Esta réplica ficou sem renovar (o banco fora do ar, um relógio atrasado) e outra a
+    # encerrou no banco: o navegador sai também, na próxima varredura.
+    world = build_world()
+    clock = Clock()
+    world.service._clock = clock
+    replica = _other_process(world, clock, FakeLauncher())
+    try:
+        held = await world.service.create_session(world.people["criadora"], world.area_a, URL)
+        clock.now += STALE_AFTER + timedelta(seconds=1)
+        assert await replica.sweep() == 1
+        await world.service.sweep()
+        await _agree(world, held.session_id)
+        assert held.session_id not in world.service._live
+        assert world.launcher.terminated == [held.session_id]
+    finally:
+        await replica.aclose()
+        await world.service.aclose()
+        await world.launcher.aclose()
+
+
+async def test_a_sweep_during_the_insert_never_loses_the_new_session() -> None:
+    world = build_world()
+    clock = Clock()
+    world.service._clock = clock
+    insert = world.store.insert
+
+    async def slow_insert(record: Any, *, company_limit: int) -> None:
+        await asyncio.sleep(0.2)  # o INSERT no PostgreSQL, sob a trava da empresa
+        await insert(record, company_limit=company_limit)
+
+    world.store.insert = slow_insert  # type: ignore[method-assign]
+    try:
+        creating = asyncio.create_task(
+            world.service.create_session(world.people["criadora"], world.area_a, URL)
+        )
+        await asyncio.sleep(0.05)
+        await world.service.sweep()  # a varredura periódica cai no meio do INSERT
+        info = await creating
+        for _ in range(10):  # a demonstração continua, uma varredura a cada 15 s
+            clock.now += timedelta(seconds=15)
+            await world.service.sweep()
+        stored = world.store.sessions[world.company_a, info.session_id]
+        assert stored.status is RecordingSessionStatus.ACTIVE, stored.end_reason
+    finally:
+        await world.service.aclose()
+        await world.launcher.aclose()

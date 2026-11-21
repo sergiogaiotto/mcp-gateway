@@ -75,6 +75,8 @@ HANDSHAKE_TIMEOUT_S = 10.0
 RESOLVE_TIMEOUT_S = 10.0
 #: Prazo para abrir a conexão com o destino conferido.
 CONNECT_TIMEOUT_S = 30.0
+#: Prazo do outro sentido depois que um lado da conexão fechou.
+HALF_CLOSE_S = 60.0
 _CHUNK = 65536
 
 #: Argumentos do Chromium que tiram o UDP do caminho (o proxy só leva TCP). Vêm depois
@@ -131,13 +133,55 @@ def blocked_address(address: str) -> bool:
         ip = ipaddress.ip_address(address.split("%", 1)[0])
     except ValueError:
         return True
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
+    if isinstance(ip, ipaddress.IPv6Address):
+        embedded = _embedded_ipv4(ip)
+        if embedded is not None:
+            # O IPv4 dentro do IPv6 (mapeado, compatível, NAT64 ou 6to4) vale como ele.
+            ip = embedded
     if isinstance(ip, ipaddress.IPv4Address) and ip in _THIS_NETWORK:
         return True
     if any(ip in network for network in _METADATA_NETWORKS):
         return True
-    return ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast
+    if ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast:
+        return True
+    return _assigned_here(ip)
+
+
+_IPV4_COMPATIBLE = ipaddress.ip_network("::/96")
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+
+
+def _embedded_ipv4(ip: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+    """O IPv4 que um IPv6 carrega: mapeado (::ffff:a.b.c.d), compatível (::a.b.c.d), NAT64
+    (64:ff9b::a.b.c.d) ou 6to4 (2002:aabb:ccdd::). ``::`` e ``::1`` ficam como IPv6."""
+    if ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    if ip.sixtofour is not None:
+        return ip.sixtofour
+    if ip in _NAT64 or (ip in _IPV4_COMPATIBLE and int(ip) > 1):
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return None
+
+
+def _assigned_here(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """O endereço é de uma interface desta máquina (o IP do pod ou da máquina da API)?
+
+    Um serviço que escuta em ``0.0.0.0`` (a API num contêiner) responde também no
+    endereço da própria máquina, fora do loopback. Só um endereço local aceita
+    ``bind``; com ``ip_nonlocal_bind`` ligado, todos aceitam e a guarda recusa tudo
+    (falha fechada).
+    """
+    family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
+    try:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+    except OSError:
+        return False
+    with sock:
+        try:
+            sock.bind((str(ip), 0))
+        except OSError:
+            return False
+    return True
 
 
 def _is_localhost(name: str) -> bool:
@@ -416,8 +460,15 @@ async def _splice(
     try:
         pending: set[asyncio.Future[bool]] = set(tasks)
         while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            if any(task.cancelled() or task.exception() or not task.result() for task in done):
+            # Depois que um lado fechou, o outro tem um prazo: um destino que nunca responde
+            # nem fecha não segura a vaga da guarda para sempre.
+            grace = None if len(pending) == len(tasks) else HALF_CLOSE_S
+            done, pending = await asyncio.wait(
+                pending, timeout=grace, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done or any(
+                task.cancelled() or task.exception() or not task.result() for task in done
+            ):
                 break
     finally:
         for task in tasks:
