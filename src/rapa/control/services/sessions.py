@@ -1,6 +1,8 @@
 """Sessões de gravação e gravações no PostgreSQL (:class:`PgSessionStore`).
 
-Tudo roda em transações fixadas na empresa (isolamento por linha). A contagem
+Tudo roda em transações fixadas na empresa (isolamento por linha), menos as
+leituras que cruzam empresas (as vagas da reserva em uso e as sessões que nenhum
+processo segura), que usam o papel do despachante e só veem a situação. A contagem
 das sessões abertas da empresa e a inclusão da nova rodam sob uma trava
 consultiva da empresa, então duas aberturas ao mesmo tempo não passam juntas do
 limite. Guardar a gravação, marcar a sessão como parada e auditar ficam na mesma
@@ -16,12 +18,12 @@ from uuid import UUID
 from sqlalchemy import RowMapping, Select, func, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from rapa.control.db.schema import areas, platform_settings, recording_sessions, recordings
+from rapa.control.db.schema import areas, platform_settings, recording_sessions, recordings, runs
 from rapa.control.services import audit
-from rapa.control.services._common import PgService
+from rapa.control.services._common import INTERACTIVE_PRIORITY, PgService
 from rapa.control.services.admission import Capacity
 from rapa.control.sessions.store import LIVE_STATUSES, SessionRecord, company_limit_error
-from rapa.core.contracts import Conflict, RecordingSessionStatus
+from rapa.core.contracts import Conflict, RecordingSessionStatus, RunState
 from rapa.core.ids import new_id
 
 __all__ = ["PgSessionStore"]
@@ -30,6 +32,10 @@ __all__ = ["PgSessionStore"]
 SESSION_LOCK_KEY = 7104
 
 _LIVE = [s.value for s in LIVE_STATUSES]
+#: Execuções que ocupam um navegador (como o despachante conta).
+_RUNNING_RUNS = [RunState.RUNNING.value, RunState.AWAITING_HUMAN.value]
+#: Sessões sem dono encerradas por varredura, no máximo.
+_STALE_BATCH = 200
 
 
 def _query() -> Select[Any]:
@@ -62,6 +68,8 @@ def _record(row: RowMapping) -> SessionRecord:
         robot_id=row["robot_id"],
         version_no=row["version_no"],
         recording_id=row["recording_id"],
+        instance_id=row["instance_id"],
+        seen_at=row["seen_at"],
     )
 
 
@@ -133,8 +141,10 @@ class PgSessionStore(PgService):
                     title=record.title,
                     start_url=record.start_url,
                     status=record.status.value,
+                    instance_id=record.instance_id,
                     created_at=record.created_at,
                     expires_at=record.expires_at,
+                    seen_at=record.last_seen,
                 )
             )
             await audit.append(
@@ -172,6 +182,54 @@ class PgSessionStore(PgService):
         async with self.db.tenant_session(company_id) as session:
             rows = (await session.execute(query)).mappings().all()
         return [_record(row) for row in rows]
+
+    async def reserve_in_use(self, *, now: datetime) -> int:
+        # Pelo papel do despachante: conta todas as empresas, sem ver nada além da situação.
+        async with self.db.dispatcher_session() as session:
+            sessions = await session.scalar(
+                select(func.count(recording_sessions.c.company_id)).where(
+                    recording_sessions.c.status.in_(_LIVE),
+                    recording_sessions.c.expires_at > now,
+                )
+            )
+            validations = await session.scalar(
+                select(func.count(runs.c.id)).where(
+                    runs.c.priority == INTERACTIVE_PRIORITY,
+                    runs.c.state.in_(_RUNNING_RUNS),
+                )
+            )
+        return int(sessions or 0) + int(validations or 0)
+
+    async def touch(
+        self, company_id: UUID, session_ids: Collection[UUID], *, instance_id: str, at: datetime
+    ) -> None:
+        if not session_ids:
+            return
+        async with self.db.tenant_session(company_id) as session:
+            await session.execute(
+                update(recording_sessions)
+                .where(
+                    recording_sessions.c.company_id == company_id,
+                    recording_sessions.c.id.in_(list(session_ids)),
+                    recording_sessions.c.status.in_(_LIVE),
+                    recording_sessions.c.instance_id == instance_id,
+                )
+                .values(seen_at=at)
+            )
+
+    async def list_stale(self, *, before: datetime) -> list[tuple[UUID, UUID]]:
+        async with self.db.dispatcher_session() as session:
+            rows = (
+                await session.execute(
+                    select(recording_sessions.c.company_id, recording_sessions.c.id)
+                    .where(
+                        recording_sessions.c.status.in_(_LIVE),
+                        recording_sessions.c.seen_at < before,
+                    )
+                    .limit(_STALE_BATCH)
+                )
+            ).all()
+        return [(row[0], row[1]) for row in rows]
 
     async def set_status(
         self,

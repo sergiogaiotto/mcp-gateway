@@ -35,9 +35,9 @@ tabela-mãe, e cada partição também tem isolamento por linha.
 As tabelas das sessões de gravação (revisão 0003) têm um bloco próprio
 (:func:`session_grants_sql`), que só concede quando as tabelas existem: assim
 ``--somente-permissoes`` funciona em qualquer revisão. A aplicação lê e inclui
-sessões e gravações, e só muda a situação de uma sessão; nunca apaga nada. O
-despachante só lê a situação das sessões, para contar as abertas na reserva de
-vagas interativas.
+sessões e gravações, e só muda a situação de uma sessão (e a renova enquanto está
+aberta); nunca apaga nada. O despachante só lê a situação das sessões, para contar
+as abertas na reserva de vagas interativas e achar as que nenhum processo segura.
 """
 
 import os
@@ -108,12 +108,12 @@ GRANT EXECUTE ON FUNCTION rapa_ensure_event_partitions(integer) TO {role};
 
 _SESSION_APP_GRANTS = """
 GRANT SELECT, INSERT ON recording_sessions, recordings TO {role};
-GRANT UPDATE (status, end_reason, robot_id, version_no, started_at, stopped_at)
+GRANT UPDATE (status, end_reason, robot_id, version_no, started_at, stopped_at, seen_at)
     ON recording_sessions TO {role};
 """
 
 _SESSION_DISPATCHER_GRANTS = """
-GRANT SELECT (company_id, status, expires_at) ON recording_sessions TO {role};
+GRANT SELECT (company_id, id, status, expires_at, seen_at) ON recording_sessions TO {role};
 """
 
 _SESSION_TABLES = ("recording_sessions", "recordings")

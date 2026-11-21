@@ -8,15 +8,22 @@ Uma sessão de gravação é o navegador na nuvem em que a pessoa demonstra a ta
 isolamento por linha (ENABLE e FORCE) com a política de sempre.
 
 - ``recording_sessions``: área, dona (o ``subject`` de quem abriu), endereço
-  inicial, situação, prazos e, depois da revisão, o robô e a versão do rascunho.
-  O token do canal de controle e os bilhetes da visão ao vivo nunca vêm para cá.
-  Uma trava impede trocar a empresa, a área, a dona, o endereço e os prazos, e
-  tirar uma sessão encerrada (sem atividade, prazo, falha) dessa situação.
+  inicial (sem a consulta nem o fragmento, que podem ter um token), situação,
+  prazos e, depois da revisão, o robô e a versão do rascunho. O processo da API
+  que segura o navegador fica em ``instance_id`` e renova ``seen_at`` enquanto a
+  sessão está aberta: uma sessão aberta que ninguém renova há alguns minutos (a
+  API caiu) é encerrada por qualquer processo. O token do canal de controle e os
+  bilhetes da visão ao vivo nunca vêm para cá. Uma trava impede trocar a empresa,
+  a área, a dona, o endereço, o processo e os prazos; tirar uma sessão encerrada
+  (sem atividade, prazo, falha) dessa situação; voltar de parada para aberta ou de
+  rascunho para parada; e mudar o robô e a versão fora da criação de um rascunho
+  (a versão de um mesmo robô só avança, e precisa existir).
 - ``recordings``: a gravação da demonstração (o JSON do gravador, que já sai
   sem segredos), uma por sessão, imutável.
 
-O despachante só lê a situação das sessões (``company_id``, ``status`` e
-``expires_at``), para contar as abertas na reserva de vagas interativas.
+O despachante só lê a situação das sessões (``company_id``, ``id``, ``status``,
+``expires_at`` e ``seen_at``), para contar as abertas na reserva de vagas
+interativas e achar as que nenhum processo segura mais.
 """
 
 from collections.abc import Sequence
@@ -61,15 +68,19 @@ def upgrade() -> None:
             end_reason text CHECK (end_reason IS NULL OR end_reason ~ '^[a-z_]{{1,40}}$'),
             robot_id uuid,
             version_no integer CHECK (version_no >= 1),
+            instance_id text NOT NULL DEFAULT '' CHECK (length(instance_id) <= 100),
             created_at timestamptz NOT NULL DEFAULT now(),
             started_at timestamptz,
             stopped_at timestamptz,
             expires_at timestamptz NOT NULL,
+            seen_at timestamptz NOT NULL DEFAULT now(),
             PRIMARY KEY (company_id, id),
             FOREIGN KEY (company_id, area_id) REFERENCES areas (company_id, id),
             FOREIGN KEY (company_id, robot_id) REFERENCES robots (company_id, id),
+            FOREIGN KEY (robot_id, version_no) REFERENCES robot_versions (robot_id, version_no),
             CHECK (expires_at > created_at),
-            CHECK (status <> 'drafted' OR (robot_id IS NOT NULL AND version_no IS NOT NULL))
+            CHECK (status <> 'drafted' OR (robot_id IS NOT NULL AND version_no IS NOT NULL)),
+            CHECK (status = 'drafted' OR (robot_id IS NULL AND version_no IS NULL))
         )
         """,
         """
@@ -117,11 +128,12 @@ def upgrade() -> None:
                 OR NEW.area_id IS DISTINCT FROM OLD.area_id
                 OR NEW.owner IS DISTINCT FROM OLD.owner
                 OR NEW.start_url IS DISTINCT FROM OLD.start_url
+                OR NEW.instance_id IS DISTINCT FROM OLD.instance_id
                 OR NEW.created_at IS DISTINCT FROM OLD.created_at
                 OR NEW.expires_at IS DISTINCT FROM OLD.expires_at
             THEN
                 RAISE EXCEPTION USING ERRCODE = 'check_violation',
-                    MESSAGE = 'a sessão de gravação não pode trocar de empresa, área, dona, endereço ou prazo';
+                    MESSAGE = 'a sessão de gravação não pode trocar de empresa, área, dona, endereço, processo ou prazo';
             END IF;
             IF OLD.status IN ('expired', 'failed') AND NEW.status IS DISTINCT FROM OLD.status THEN
                 RAISE EXCEPTION USING ERRCODE = 'check_violation',
@@ -130,6 +142,20 @@ def upgrade() -> None:
             IF OLD.status IN ('stopped', 'drafted') AND NEW.status NOT IN ('stopped', 'drafted') THEN
                 RAISE EXCEPTION USING ERRCODE = 'check_violation',
                     MESSAGE = 'uma sessão de gravação parada não volta a gravar';
+            END IF;
+            IF OLD.status = 'drafted' AND NEW.status <> 'drafted' THEN
+                RAISE EXCEPTION USING ERRCODE = 'check_violation',
+                    MESSAGE = 'uma sessão de gravação com rascunho não volta a ser só parada';
+            END IF;
+            IF (NEW.robot_id, NEW.version_no) IS DISTINCT FROM (OLD.robot_id, OLD.version_no) THEN
+                IF NOT (NEW.status = 'drafted' AND OLD.status IN ('stopped', 'drafted')) THEN
+                    RAISE EXCEPTION USING ERRCODE = 'check_violation',
+                        MESSAGE = 'o robô de uma sessão de gravação só muda ao criar um rascunho';
+                END IF;
+                IF NEW.robot_id = OLD.robot_id AND NEW.version_no <= OLD.version_no THEN
+                    RAISE EXCEPTION USING ERRCODE = 'check_violation',
+                        MESSAGE = 'a versão do rascunho de uma sessão de gravação só avança';
+                END IF;
             END IF;
             RETURN NEW;
         END

@@ -55,6 +55,14 @@ class SessionRecord:
     robot_id: UUID | None = None
     version_no: int | None = None
     recording_id: UUID | None = None
+    #: O processo da API que segura o navegador ("" se nenhum disse).
+    instance_id: str = ""
+    #: Última vez que esse processo confirmou a sessão (None: na criação).
+    seen_at: datetime | None = None
+
+    @property
+    def last_seen(self) -> datetime:
+        return self.seen_at or self.created_at
 
     def info(self) -> RecordingSessionInfo:
         return RecordingSessionInfo(
@@ -103,6 +111,21 @@ class SessionStore(Protocol):
         ...
 
     async def list_live(self, company_id: UUID) -> list[SessionRecord]: ...
+
+    async def reserve_in_use(self, *, now: datetime) -> int:
+        """Navegadores da reserva interativa em uso na plataforma: as sessões abertas (de
+        todas as empresas) e as execuções interativas (validações) rodando."""
+        ...
+
+    async def touch(
+        self, company_id: UUID, session_ids: Collection[UUID], *, instance_id: str, at: datetime
+    ) -> None:
+        """Renova ``seen_at`` das sessões abertas que este processo segura."""
+        ...
+
+    async def list_stale(self, *, before: datetime) -> list[tuple[UUID, UUID]]:
+        """Sessões abertas (empresa, sessão), de qualquer empresa, sem renovação desde ``before``."""
+        ...
 
     async def set_status(
         self,
@@ -160,6 +183,8 @@ class MemorySessionStore:
     """Sessões e gravações em memória, com as mesmas regras do PostgreSQL."""
 
     reserve: int | None = 3
+    #: Execuções interativas (validações) rodando na reserva, para os testes.
+    interactive_runs: int = 0
     areas: set[tuple[UUID, UUID]] = field(default_factory=set)
     sessions: dict[tuple[UUID, UUID], SessionRecord] = field(default_factory=dict)
     recordings: dict[tuple[UUID, UUID], tuple[UUID, dict[str, Any]]] = field(default_factory=dict)
@@ -184,7 +209,9 @@ class MemorySessionStore:
         ]
         if len(live) >= company_limit:
             raise company_limit_error(company_limit)
-        self.sessions[record.company_id, record.session_id] = record
+        self.sessions[record.company_id, record.session_id] = replace(
+            record, seen_at=record.last_seen
+        )
         self._audit(record.company_id, record.owner, "gravacao.sessao_criada", record)
 
     def _audit(self, company_id: UUID, actor: str, action: str, record: SessionRecord) -> None:
@@ -204,6 +231,31 @@ class MemorySessionStore:
             s
             for s in self.sessions.values()
             if s.company_id == company_id and s.status in LIVE_STATUSES
+        ]
+
+    async def reserve_in_use(self, *, now: datetime) -> int:
+        live = [
+            s for s in self.sessions.values() if s.status in LIVE_STATUSES and s.expires_at > now
+        ]
+        return len(live) + self.interactive_runs
+
+    async def touch(
+        self, company_id: UUID, session_ids: Collection[UUID], *, instance_id: str, at: datetime
+    ) -> None:
+        for session_id in session_ids:
+            record = self.sessions.get((company_id, session_id))
+            if (
+                record is not None
+                and record.status in LIVE_STATUSES
+                and record.instance_id == instance_id
+            ):
+                self.sessions[company_id, session_id] = replace(record, seen_at=at)
+
+    async def list_stale(self, *, before: datetime) -> list[tuple[UUID, UUID]]:
+        return [
+            (s.company_id, s.session_id)
+            for s in self.sessions.values()
+            if s.status in LIVE_STATUSES and s.last_seen < before
         ]
 
     async def set_status(

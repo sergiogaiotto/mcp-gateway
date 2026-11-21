@@ -250,10 +250,12 @@ recording_sessions = Table(
     Column("end_reason", Text, nullable=True),
     Column("robot_id", Uuid, nullable=True),
     Column("version_no", Integer, nullable=True),
+    Column("instance_id", Text, nullable=False, server_default=""),
     _ts("created_at", nullable=False, server_default=True),
     _ts("started_at"),
     _ts("stopped_at"),
     _ts("expires_at", nullable=False),
+    _ts("seen_at", nullable=False, server_default=True),
 )
 
 recordings = Table(
