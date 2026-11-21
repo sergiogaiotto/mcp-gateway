@@ -25,7 +25,7 @@ from .support import PROTOCOL_ROWS, World, build_world, csv_bytes, protocol_shee
 pytestmark = [pytest.mark.database, pytest.mark.usefixtures("no_error_logs")]
 
 
-def _user(world: World) -> AbstractAsyncContextManager[User]:
+def _user(world: World, **settings: Any) -> AbstractAsyncContextManager[User]:
     people = {
         "operador": world.a.operator,
         "leitora": world.a.viewer,
@@ -50,7 +50,7 @@ def _user(world: World) -> AbstractAsyncContextManager[User]:
                 batches=world.batches,
             ),
             auth=auth,
-            settings=UiSettings(poll_interval_s=0.05),
+            settings=UiSettings(**{"poll_interval_s": 0.05, **settings}),
         )
 
     return simulate(build)
@@ -183,7 +183,7 @@ async def test_batch_upload_preview_confirm_progress_and_download(world: World) 
         user.find(marker="baixar-csv").click()
         response = await user.download.next(timeout=5)
         text = response.content.decode("utf-8-sig")
-        assert text.splitlines()[0].startswith("linha;execucao;situacao")
+        assert text.splitlines()[0].startswith('"linha";"execucao";"situacao"')
         assert text.count("Na fila") == 3
         await logout(user)
         # Quem só lê acompanha, mas não cria; outra empresa não vê o lote.
@@ -195,3 +195,14 @@ async def test_batch_upload_preview_confirm_progress_and_download(world: World) 
         await user.should_see("Lote não encontrado.", retries=50)
     assert batch.total == 3
     assert isinstance(batch.batch_id, UUID)
+
+
+async def test_batch_upload_accepts_the_batch_size_limit(world: World) -> None:
+    # A tela recusa no navegador o que passa do limite dos lotes, e só isso (o servidor
+    # aceita o mesmo tamanho no envio dela; veja o teste do limite do corpo na API).
+    async with _user(world, batch_max_bytes=2 * 1024 * 1024) as user:
+        await login(user, "operador", "/lotes")
+        await user.should_see(marker="novo-lote", retries=50)
+        [element] = list(user.find(marker="arquivo-lote").elements)
+        assert element.props["max-file-size"] == 2 * 1024 * 1024
+        await user.should_see("de até 2048 KiB")

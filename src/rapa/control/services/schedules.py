@@ -14,18 +14,29 @@ Regras:
   (``America/Sao_Paulo`` por padrão), sempre a partir de um instante, de forma
   determinística. Desligar a agenda apaga ``next_run_at``; ligar de novo conta a
   partir de agora (o que passou com ela desligada não roda). Remover só arquiva.
+- **Quantas.** Uma empresa tem no máximo ``max_enabled_per_company`` agendas ligadas
+  (``RAPA_AGENDAS_POR_EMPRESA``, 200 por padrão), contadas sob uma trava da
+  empresa ao criar ou ligar: acima disso, conflito (409). As desligadas não contam.
 
 O :class:`Scheduler` roda dentro do laço do despachante (uma etapa da manutenção,
 :class:`rapa.control.services.dispatcher.Dispatcher`). A cada volta, ele pede ao
-banco do despachante as agendas vencidas (só os identificadores) e trata cada uma
-numa transação fixada na empresa dela, pelo papel da aplicação:
+banco do despachante as agendas vencidas (só os identificadores), revezando as
+empresas (a mais atrasada de cada uma, depois a segunda de cada uma...: uma
+empresa com muitas agendas vencidas não deixa as das outras para depois da
+tolerância), e trata cada uma numa transação fixada na empresa dela, pelo papel
+da aplicação. Uma volta dura no máximo ``max_tick_s`` (meio segundo por padrão),
+para não atrasar o despacho das execuções, que vem logo depois no mesmo laço; o
+que sobrar fica para a volta seguinte, que então não espera o intervalo
+(:attr:`Scheduler.behind`). Para cada agenda:
 
 1. trava a linha da agenda (``FOR UPDATE SKIP LOCKED``): outro despachante que
    chegue junto pula a agenda, e o que chegar depois vê ``next_run_at`` já adiante;
-2. junta as ocorrências vencidas desde ``next_run_at``. As que passaram da
-   tolerância (``catch_up``, ``RAPA_AGENDA_TOLERANCIA_S``) são ignoradas como
-   ``perdida`` (o serviço estava fora do ar); das que estão dentro dela, só a mais
-   nova roda, e as anteriores ficam como ``substituida``;
+2. junta as ocorrências vencidas desde ``next_run_at``. Se ``next_run_at`` passou
+   da tolerância (``catch_up``, ``RAPA_AGENDA_TOLERANCIA_S``: o serviço estava fora
+   do ar), tudo o que passou dela vira **um** registro ``perdida`` (no horário da
+   primeira, com a primeira e a última na auditoria), sem uma linha por
+   ocorrência, e a conta recomeça em agora menos a tolerância; das que estão
+   dentro dela, só a mais nova roda, e as anteriores ficam como ``substituida``;
 3. a que roda vira uma execução com origem ``schedule`` (prioridade de agenda,
    abaixo do interativo, do MCP e do REST), a chave de idempotência
    ``<agenda>:<horário>`` no escopo ``agenda`` e a ocorrência registrada na mesma
@@ -45,6 +56,7 @@ como para qualquer execução.
 """
 
 import logging
+import time
 from collections import Counter
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -85,6 +97,8 @@ from rapa.core.robot import Manifest
 
 __all__ = [
     "DEFAULT_CATCH_UP",
+    "DEFAULT_MAX_ENABLED_PER_COMPANY",
+    "DEFAULT_TICK_BUDGET_S",
     "SCHEDULE_ACTOR",
     "SCHEDULE_SCOPE",
     "PgSchedules",
@@ -100,8 +114,14 @@ DEFAULT_CATCH_UP = timedelta(minutes=10)
 SCHEDULE_SCOPE = "agenda"
 #: Quem aparece na auditoria das ocorrências ignoradas.
 SCHEDULE_ACTOR = "agendador"
+#: Tempo máximo de uma volta do agendador, em segundos (o que sobrar vai para a próxima).
+DEFAULT_TICK_BUDGET_S = 0.5
+#: Agendas ligadas, no máximo, por empresa (``RAPA_AGENDAS_POR_EMPRESA``).
+DEFAULT_MAX_ENABLED_PER_COMPANY = 200
 #: Quantas ocorrências vencidas de uma agenda são tratadas por volta.
 _MAX_DUE = 500
+#: Classe da trava (``pg_advisory_xact_lock``) que conta as agendas ligadas da empresa.
+_SCHEDULE_LOCK_CLASS = 7105
 _UNFINISHED = (RunState.QUEUED.value, RunState.RUNNING.value, RunState.AWAITING_HUMAN.value)
 #: A ocorrência já tinha sido tratada (nada a registrar de novo).
 _ALREADY_HANDLED = "ja_tratada"
@@ -169,8 +189,18 @@ _published = published_robot
 class PgSchedules(PgService):
     """Agendas no PostgreSQL (:class:`rapa.core.contracts.ScheduleService`)."""
 
-    def __init__(self, db: Database, *, clock: Callable[[], datetime] = now_utc) -> None:
+    def __init__(
+        self,
+        db: Database,
+        *,
+        max_enabled_per_company: int = DEFAULT_MAX_ENABLED_PER_COMPANY,
+        clock: Callable[[], datetime] = now_utc,
+    ) -> None:
+        """``max_enabled_per_company`` é quantas agendas ligadas uma empresa pode ter."""
+        if max_enabled_per_company < 1:
+            raise ValueError("o limite de agendas por empresa precisa ser positivo")
         super().__init__(db)
+        self.max_enabled_per_company = max_enabled_per_company
         self.clock = clock
 
     async def _robot(
@@ -217,6 +247,27 @@ class PgSchedules(PgService):
         if errors:
             raise InvalidInput("entradas inválidas", errors)
 
+    async def _check_room(self, session: AsyncSession, company_id: UUID) -> None:
+        """Confere, sob a trava da empresa, se ela ainda pode ligar mais uma agenda."""
+        await session.execute(
+            select(func.pg_advisory_xact_lock(_SCHEDULE_LOCK_CLASS, func.hashtext(str(company_id))))
+        )
+        enabled = await session.scalar(
+            select(func.count())
+            .select_from(schedules)
+            .where(
+                schedules.c.company_id == company_id,
+                schedules.c.enabled.is_(True),
+                schedules.c.archived_at.is_(None),
+            )
+        )
+        limit = self.max_enabled_per_company
+        if int(enabled or 0) >= limit:
+            raise Conflict(
+                f"sua empresa já tem {limit} agendas ligadas, o limite; "
+                "desligue ou remova uma antes de ligar outra"
+            )
+
     async def list_schedules(self, principal: Principal) -> list[ScheduleInfo]:
         query = (
             _select()
@@ -252,6 +303,8 @@ class PgSchedules(PgService):
             if published is None:
                 raise Conflict("o robô precisa estar publicado para ganhar uma agenda")
             self._check_inputs(published, spec.inputs)
+            if spec.enabled:
+                await self._check_room(session, company_id)
             await session.execute(
                 insert(schedules).values(
                     company_id=company_id,
@@ -300,6 +353,8 @@ class PgSchedules(PgService):
                 if published is None:
                     raise Conflict("o robô precisa estar publicado para a agenda rodar")
                 self._check_inputs(published, inputs)
+            if enabled and not row["enabled"]:
+                await self._check_room(session, company_id)
             timing = changes.cron is not None or changes.timezone is not None
             next_run: datetime | None = row["next_run_at"]
             if not enabled:
@@ -410,30 +465,58 @@ class Scheduler:
         *,
         catch_up: timedelta = DEFAULT_CATCH_UP,
         batch_size: int = 100,
+        max_tick_s: float = DEFAULT_TICK_BUDGET_S,
         clock: Callable[[], datetime] = now_utc,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
+        """``max_tick_s`` é o tempo máximo de uma volta (:meth:`tick`): passado ele,
+        a volta para depois da agenda atual e :attr:`behind` fica verdadeiro."""
         if catch_up < timedelta(0):
             raise ValueError("a tolerância das agendas não pode ser negativa")
         if batch_size < 1:
             raise ValueError("o agendador precisa tratar pelo menos uma agenda por volta")
+        if max_tick_s <= 0:
+            raise ValueError("o tempo máximo de uma volta do agendador precisa ser positivo")
         self.app_db = app_db
         self.dispatcher_db = dispatcher_db
         self.catch_up = catch_up
         self.batch_size = batch_size
+        self.max_tick_s = max_tick_s
         self.clock = clock
+        self.monotonic = monotonic
+        #: A última volta deixou agendas vencidas para trás (parou pelo tempo ou
+        #: encheu ``batch_size``): a próxima não precisa esperar o intervalo.
+        self.behind = False
 
     async def due(self, now: datetime) -> list[tuple[UUID, UUID]]:
-        """As agendas vencidas (empresa e identificador), das mais atrasadas às mais novas."""
+        """As agendas vencidas (empresa e identificador), uma empresa de cada vez.
+
+        A volta reveza as empresas: primeiro a agenda mais atrasada de cada uma,
+        depois a segunda de cada uma, e assim por diante. Uma empresa com milhares
+        de agendas vencidas nunca deixa as das outras para depois da tolerância.
+        """
+        turn = (
+            func.row_number()
+            .over(
+                partition_by=schedules.c.company_id,
+                order_by=(schedules.c.next_run_at, schedules.c.id),
+            )
+            .label("turn")
+        )
+        ranked = (
+            select(schedules.c.company_id, schedules.c.id, schedules.c.next_run_at, turn)
+            .where(
+                schedules.c.enabled.is_(True),
+                schedules.c.archived_at.is_(None),
+                schedules.c.next_run_at <= now,
+            )
+            .subquery()
+        )
         async with self.dispatcher_db.dispatcher_session() as session:
             rows = (
                 await session.execute(
-                    select(schedules.c.company_id, schedules.c.id)
-                    .where(
-                        schedules.c.enabled.is_(True),
-                        schedules.c.archived_at.is_(None),
-                        schedules.c.next_run_at <= now,
-                    )
-                    .order_by(schedules.c.next_run_at)
+                    select(ranked.c.company_id, ranked.c.id)
+                    .order_by(ranked.c.turn, ranked.c.next_run_at, ranked.c.id)
                     .limit(self.batch_size)
                 )
             ).all()
@@ -442,25 +525,50 @@ class Scheduler:
     async def tick(self, now: datetime | None = None) -> int:
         """Trata as agendas vencidas; devolve quantas execuções entraram na fila.
 
+        A volta dura no máximo ``max_tick_s`` (mais o disparo em andamento): o
+        despachante a roda no mesmo laço em que pega as execuções, e uma volta longa
+        atrasaria o despacho de todas as empresas. O que sobrar fica para a próxima
+        volta, com :attr:`behind` verdadeiro.
+
         Uma agenda que falha por um erro inesperado (o banco, por exemplo) não
         impede as outras; o primeiro erro é levantado no fim, para a saúde do
         despachante acusar.
         """
         now = now or self.clock()
+        started = self.monotonic()
         enqueued = 0
+        handled = 0
+        out_of_time = False
         failure: Exception | None = None
-        for company_id, schedule_id in await self.due(now):
+        found = await self.due(now)
+        for index, (company_id, schedule_id) in enumerate(found):
+            if index and self.monotonic() - started >= self.max_tick_s:
+                out_of_time = True
+                break
             try:
-                enqueued += await self.fire(company_id, schedule_id, now)
+                created = await self._fire(company_id, schedule_id, now)
             except Exception as exc:  # um erro numa agenda não para as outras
                 logger.error("falha ao disparar uma agenda: %s", type(exc).__name__)
                 failure = failure or exc
+                continue
+            if created is not None:
+                handled += 1
+                enqueued += created
+        # Uma volta cheia em que outro despachante já tinha travado tudo não conta
+        # como atraso: a próxima espera o intervalo, sem girar à toa.
+        self.behind = failure is None and (
+            out_of_time or (len(found) >= self.batch_size and handled > 0)
+        )
         if failure is not None:
             raise failure
         return enqueued
 
     async def fire(self, company_id: UUID, schedule_id: UUID, now: datetime) -> int:
         """Trata as ocorrências vencidas de uma agenda; devolve 1 se uma virou execução."""
+        return await self._fire(company_id, schedule_id, now) or 0
+
+    async def _fire(self, company_id: UUID, schedule_id: UUID, now: datetime) -> int | None:
+        """Como :meth:`fire`, mas ``None`` quando a agenda não estava mais para tratar."""
         async with self.app_db.tenant_session(company_id) as session:
             row = (
                 (
@@ -480,31 +588,42 @@ class Scheduler:
                 .one_or_none()
             )
             if row is None:
-                return 0  # outro despachante já está nela, ou já foi tratada
+                return None  # outro despachante já está nela, ou já foi tratada
             try:
                 cron, zone = CronExpression.parse(row["cron"]), load_zone(row["timezone"])
             except CronError:
                 await self._disable(session, row, "agenda_invalida")
                 return 0
             first: datetime = row["next_run_at"]
-            due = [first, *cron.occurrences(first, now, zone, limit=_MAX_DUE - 1)]
-            truncated = len(due) >= _MAX_DUE
-            recent = [at for at in due if now - at <= self.catch_up]
-            skipped: list[tuple[datetime, str]] = [
-                (at, SkipReason.MISSED) for at in due if now - at > self.catch_up
-            ]
+            horizon = now - self.catch_up
+            skipped: list[tuple[datetime, str]] = []
+            missed: tuple[datetime, datetime] | None = None
+            if first < horizon:
+                # O serviço ficou fora do ar: tudo o que passou da tolerância vira um
+                # registro só (a primeira ocorrência, com a primeira e a última na
+                # auditoria), e as ocorrências contam de novo a partir de agora menos
+                # a tolerância, sem percorrer uma a uma as que se perderam.
+                last_missed = max(first, cron.previous_before(horizon, zone) or first)
+                missed = (first, last_missed)
+                skipped.append((first, SkipReason.MISSED))
+                recent = list(cron.occurrences(last_missed, now, zone, limit=_MAX_DUE))
+                handled = last_missed
+            else:
+                recent = [first, *cron.occurrences(first, now, zone, limit=_MAX_DUE - 1)]
+                handled = first
+            truncated = len(recent) >= _MAX_DUE
             skipped += [(at, SkipReason.SUPERSEDED) for at in recent[:-1]]
             created = 0
             if recent:
-                chosen = recent[-1]
+                chosen = handled = recent[-1]
                 reason = await self._enqueue(session, row, chosen)
                 if reason is None:
                     created = 1
                 elif reason != _ALREADY_HANDLED:
                     skipped.append((chosen, reason))
-            await self._record_skipped(session, row, skipped)
-            following = cron.next_after(due[-1] if truncated else max(now, due[-1]), zone)
-            values: dict[str, Any] = {"next_run_at": following, "last_occurrence_at": due[-1]}
+            await self._record_skipped(session, row, skipped, missed)
+            following = cron.next_after(handled if truncated else max(now, handled), zone)
+            values: dict[str, Any] = {"next_run_at": following, "last_occurrence_at": handled}
             if following is None:
                 values["enabled"] = False
             await session.execute(
@@ -583,8 +702,12 @@ class Scheduler:
 
     @staticmethod
     async def _record_skipped(
-        session: AsyncSession, row: RowMapping, skipped: list[tuple[datetime, str]]
+        session: AsyncSession,
+        row: RowMapping,
+        skipped: list[tuple[datetime, str]],
+        missed: tuple[datetime, datetime] | None = None,
     ) -> None:
+        """Registra as ignoradas; ``missed`` é o trecho perdido (a primeira e a última)."""
         if not skipped:
             return
         await session.execute(
@@ -604,18 +727,24 @@ class Scheduler:
             .on_conflict_do_nothing()
         )
         reasons = Counter(reason for _, reason in skipped)
-        moments = sorted(at for at, _ in skipped)
+        moments = sorted([at for at, _ in skipped] + ([missed[1]] if missed else []))
+        payload: dict[str, Any] = {
+            "motivos": dict(sorted(reasons.items())),
+            "primeira": moments[0].isoformat(),
+            "ultima": moments[-1].isoformat(),
+        }
+        if missed is not None:
+            payload["perdidas"] = {
+                "primeira": missed[0].isoformat(),
+                "ultima": missed[1].isoformat(),
+            }
         await audit.append(
             session,
             company_id=row["company_id"],
             actor=SCHEDULE_ACTOR,
             action="agenda.ocorrencias_ignoradas",
             target=f"agenda:{row['id']}",
-            payload={
-                "motivos": dict(sorted(reasons.items())),
-                "primeira": moments[0].isoformat(),
-                "ultima": moments[-1].isoformat(),
-            },
+            payload=payload,
         )
 
     @staticmethod

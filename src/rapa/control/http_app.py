@@ -6,8 +6,9 @@ escolhe as implementações (PostgreSQL em produção, memória nos testes).
 
 import importlib.metadata
 import logging
+import re
 from collections import deque
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -32,13 +33,22 @@ from rapa.core.contracts import RobotAdmin, RobotCatalog, RunService
 if TYPE_CHECKING:
     from rapa.control.sessions.service import RecordingSessions
 
-__all__ = ["BodySizeLimitMiddleware", "CatchAllMiddleware", "HttpSettings", "create_http_app"]
+__all__ = [
+    "UI_UPLOAD_PATH",
+    "BodySizeLimitMiddleware",
+    "CatchAllMiddleware",
+    "HttpSettings",
+    "create_http_app",
+]
 
 logger = logging.getLogger(__name__)
 
 _METADATA_PATH = "/.well-known/oauth-protected-resource"
 #: Folga do limite do corpo para os campos e separadores do multipart de um lote.
 _MULTIPART_SLACK = 64 * 1024
+#: Envio de arquivo da interface (o ``ui.upload`` do NiceGUI, montado na mesma
+#: aplicação): é por ele que a tela Lotes manda a planilha.
+UI_UPLOAD_PATH = r"/_nicegui/client/[^/]+/upload/[0-9]+"
 
 
 def _version() -> str:
@@ -82,15 +92,30 @@ class BodySizeLimitMiddleware:
     """Recusa com 413 corpos maiores que o limite, antes de qualquer leitura pela aplicação.
 
     ``path_limits`` dá um limite próprio a caminhos exatos (o envio da planilha de um
-    lote, por exemplo, que passa do limite comum).
+    lote, por exemplo, que passa do limite comum); ``path_patterns``, a caminhos que
+    casam por inteiro com uma expressão regular (o envio de arquivo da interface,
+    que tem os identificadores da página e do elemento no caminho).
     """
 
     def __init__(
-        self, app: ASGIApp, max_body_bytes: int, path_limits: Mapping[str, int] | None = None
+        self,
+        app: ASGIApp,
+        max_body_bytes: int,
+        path_limits: Mapping[str, int] | None = None,
+        path_patterns: Sequence[tuple[str, int]] = (),
     ) -> None:
         self.app = app
         self.max_body_bytes = max_body_bytes
         self.path_limits = dict(path_limits or {})
+        self.path_patterns = [(re.compile(pattern), limit) for pattern, limit in path_patterns]
+
+    def _limit(self, path: str) -> int:
+        if (limit := self.path_limits.get(path)) is not None:
+            return limit
+        for pattern, pattern_limit in self.path_patterns:
+            if pattern.fullmatch(path):
+                return pattern_limit
+        return self.max_body_bytes
 
     @staticmethod
     async def _too_large(scope: Scope, receive: Receive, send: Send) -> None:
@@ -103,7 +128,7 @@ class BodySizeLimitMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        limit = self.path_limits.get(str(scope.get("path", "")), self.max_body_bytes)
+        limit = self._limit(str(scope.get("path", "")))
         declared = Headers(scope=scope).get("content-length")
         if declared is not None:
             try:
@@ -277,12 +302,14 @@ def create_http_app(
             allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
             expose_headers=["Location", "Retry-After"],
         )
-    # A planilha de um lote pode passar do limite comum (com folga para o multipart).
+    # A planilha de um lote pode passar do limite comum (com folga para o multipart),
+    # pelo REST e pelo envio de arquivo da interface (a tela Lotes).
     batch_limit = max(settings.max_body_bytes, publishing.batch_max_bytes + _MULTIPART_SLACK)
     app.add_middleware(
         BodySizeLimitMiddleware,
         max_body_bytes=settings.max_body_bytes,
         path_limits={"/v1/lotes": batch_limit, "/v1/lotes/previa": batch_limit},
+        path_patterns=[(UI_UPLOAD_PATH, batch_limit)],
     )
     app.add_middleware(CatchAllMiddleware)
     return app

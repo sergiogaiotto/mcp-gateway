@@ -29,6 +29,11 @@ sua própria proteção: um erro persistente numa delas não
 impede as outras. A etapa de manutenção que falha é repetida com espera
 crescente, e :attr:`Dispatcher.healthy` fica falso quando alguma etapa falha sem
 parar há ``unhealthy_after_s`` ou mais.
+
+O disparo das agendas fica no mesmo laço, antes de pegar execuções, mas com tempo
+limitado por volta (``Scheduler.max_tick_s``): muitas agendas vencidas atrasam o
+despacho no máximo esse tanto. Quando o agendador fica para trás, a volta seguinte
+começa sem esperar ``poll_interval``, e o despacho roda entre uma volta e outra.
 """
 
 import asyncio
@@ -69,8 +74,17 @@ _STEPS = {
 class Ticker(Protocol):
     """O agendador (:class:`rapa.control.services.schedules.Scheduler`), visto do laço."""
 
+    @property
+    def behind(self) -> bool:
+        """A última volta deixou agendas vencidas para trás (a próxima vem sem esperar)."""
+        ...
+
     async def tick(self, now: datetime | None = None) -> int:
-        """Põe na fila as ocorrências vencidas; devolve quantas execuções entraram."""
+        """Põe na fila as ocorrências vencidas; devolve quantas execuções entraram.
+
+        Cada volta precisa ser curta (o despacho vem logo depois, no mesmo laço):
+        o que não couber fica para a próxima, com :attr:`behind` verdadeiro.
+        """
         ...
 
 
@@ -157,7 +171,10 @@ class Dispatcher:
 
         Com ``scheduler``, a manutenção também dispara as agendas vencidas a cada
         ``schedule_interval`` segundos (a etapa ``"schedules"``), antes de pegar
-        execuções: o que entrou na fila já é despachado na mesma volta.
+        execuções: o que entrou na fila já é despachado na mesma volta. Cada volta
+        do agendador tem tempo limitado; quando ele fica para trás
+        (``scheduler.behind``), a volta seguinte do laço vem sem esperar o intervalo,
+        e o despacho continua rodando entre uma e outra.
 
         Uma etapa da manutenção que falha é repetida depois de ``poll_interval``,
         espera que dobra a cada falha seguida, até 60 s. ``unhealthy_after_s`` é
@@ -187,6 +204,8 @@ class Dispatcher:
         self._wakeup = asyncio.Event()
         #: Início da volta atual do laço (None antes de começar ou depois de parar).
         self._loop_started: datetime | None = None
+        #: O agendador ficou para trás na última volta: a próxima não espera.
+        self._schedules_behind = False
 
     @property
     def in_flight(self) -> int:
@@ -314,13 +333,17 @@ class Dispatcher:
                         len(report.indeterminate),
                         len(report.failed),
                     )
-        if self.scheduler is not None and self._due("schedules", now, self.schedule_interval):
+        if self.scheduler is not None and (
+            self._schedules_behind or self._due("schedules", now, self.schedule_interval)
+        ):
+            self._schedules_behind = False
             try:
                 await self.scheduler.tick(now)
             except Exception as exc:  # banco fora, erro inesperado: tenta de novo depois
                 self._failed("schedules", now, exc, backoff=True)
             else:
                 self._succeeded("schedules", now)
+                self._schedules_behind = bool(self.scheduler.behind)
 
     async def run_once(self) -> int:
         """Pega execuções até encher a concorrência; devolve quantas lançou."""
@@ -374,6 +397,11 @@ class Dispatcher:
             # A espera entre as voltas não conta como volta presa.
             self._loop_started = None
             self._wakeup.clear()
+            if self._schedules_behind:
+                # Agendas vencidas ficaram para trás: a próxima volta vem já (o
+                # despacho acima rodou entre as duas), só dando a vez às execuções.
+                await asyncio.sleep(0)
+                continue
             waiters = [
                 asyncio.ensure_future(stop.wait()),
                 asyncio.ensure_future(self._wakeup.wait()),

@@ -842,7 +842,10 @@ class WebhookService(Protocol):
 
 
 class WebhookReceiver(Protocol):
-    """A entrega de um webhook, sem token: autenticada só pela assinatura."""
+    """A entrega de um webhook, sem token: autenticada só pela assinatura.
+
+    ``client`` é o endereço de origem da requisição, para os limites de quem erra.
+    """
 
     async def deliver(
         self,
@@ -852,6 +855,7 @@ class WebhookReceiver(Protocol):
         delivery_id: str | None,
         signature: str | None,
         body: bytes,
+        client: str | None = None,
     ) -> WebhookDelivery: ...
 
 

@@ -116,6 +116,7 @@ def test_publishing_configuration(tmp_path: Path) -> None:
     assert defaults.webhook_key is None
     assert (defaults.schedule_catch_up_s, defaults.schedule_interval_s) == (600.0, 5.0)
     assert (defaults.batch_max_rows, defaults.batch_max_bytes) == (1000, 5 * 1024 * 1024)
+    assert (defaults.schedules_per_company, defaults.webhook_lookups_per_s) == (200, 200.0)
     key = "chave-dos-webhooks-que-nunca-aparece-em-lugar-nenhum"
     settings = ServerSettings.from_env(
         {
@@ -125,15 +126,20 @@ def test_publishing_configuration(tmp_path: Path) -> None:
             "RAPA_AGENDA_INTERVALO_S": "1",
             "RAPA_LOTE_MAX_LINHAS": "50",
             "RAPA_LOTE_MAX_BYTES": "65536",
+            "RAPA_AGENDAS_POR_EMPRESA": "30",
+            "RAPA_WEBHOOKS_POR_SEGUNDO": "50",
         }
     )
     assert settings.webhook_key == key and key not in repr(settings)
     assert (settings.schedule_catch_up_s, settings.schedule_interval_s) == (120.0, 1.0)
     assert (settings.batch_max_rows, settings.batch_max_bytes) == (50, 65536)
+    assert (settings.schedules_per_company, settings.webhook_lookups_per_s) == (30, 50.0)
     for env, field in (
         ({"RAPA_CHAVE_WEBHOOKS": "curta"}, "webhook_key"),
         ({"RAPA_LOTE_MAX_LINHAS": "0"}, "batch_max_rows"),
         ({"RAPA_AGENDA_TOLERANCIA_S": "-1"}, "schedule_catch_up_s"),
+        ({"RAPA_AGENDAS_POR_EMPRESA": "0"}, "schedules_per_company"),
+        ({"RAPA_WEBHOOKS_POR_SEGUNDO": "0"}, "webhook_lookups_per_s"),
     ):
         with pytest.raises(ValueError, match=field):
             ServerSettings.from_env({**base, **env})
@@ -146,6 +152,21 @@ def test_publishing_configuration(tmp_path: Path) -> None:
     publishing = app.state.publishing
     assert publishing.webhooks is publishing.receiver is not None
     assert publishing.batches is not None and publishing.batch_max_bytes == 5 * 1024 * 1024
+    # Os limites novos chegam aos serviços.
+    app = create_server_app(
+        ServerSettings.from_env(
+            {
+                **base,
+                "RAPA_UI": "0",
+                "RAPA_CHAVE_WEBHOOKS": key,
+                "RAPA_AGENDAS_POR_EMPRESA": "30",
+                "RAPA_WEBHOOKS_POR_SEGUNDO": "50",
+            }
+        )
+    )
+    publishing = app.state.publishing
+    assert publishing.schedules.max_enabled_per_company == 30
+    assert publishing.webhooks.gate.lookups_per_s == 50.0
 
 
 def test_dispatcher_gets_the_scheduler(tmp_path: Path) -> None:

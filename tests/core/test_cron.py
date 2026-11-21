@@ -1,6 +1,7 @@
 """Expressões cron: leitura, recusas e as ocorrências nos fusos (com e sem horário de verão)."""
 
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 
 import pytest
 
@@ -94,6 +95,14 @@ def test_macros(macro: str, same_as: str) -> None:
         "0 0 31 2 *",
         "0 0 30,31 2 *",
         "x" * 201,
+        # Só dígitos ASCII: "²" passa no isdigit() e o int() dele levantava ValueError.
+        "² * * * *",
+        "*/² * * * *",
+        "1-² * * * *",
+        "0 ¹ * * *",
+        "٣ * * * *",
+        "*/٣ * * * *",
+        "０ * * * *",
     ],
 )
 def test_invalid_expressions_are_refused_in_portuguese(text: str) -> None:
@@ -217,3 +226,65 @@ def test_deterministic_for_the_same_reference() -> None:
     cron = CronExpression.parse("17 */3 * * *")
     reference = utc(2026, 7, 9, 10, 11, 12)
     assert {cron.next_after(reference, SAO_PAULO) for _ in range(20)} == {utc(2026, 7, 9, 12, 17)}
+
+
+# -- a ocorrência anterior (a recuperação depois de o serviço ficar fora do ar) ------------
+
+
+def _transitions(zone: object, year: int) -> list[datetime]:
+    """Os instantes (UTC) em que o relógio do fuso muda, no ano."""
+    found: list[datetime] = []
+    moment = utc(year, 1, 1)
+    offset = moment.astimezone(zone).utcoffset()  # type: ignore[arg-type]
+    while moment.year == year:
+        moment += timedelta(hours=1)
+        current = moment.astimezone(zone).utcoffset()  # type: ignore[arg-type]
+        if current != offset:
+            found.append(moment)
+        offset = current
+    return found
+
+
+@pytest.mark.parametrize(
+    ("zone_name", "year"),
+    [
+        ("America/Sao_Paulo", 2018),
+        ("America/New_York", 2026),
+        ("Australia/Lord_Howe", 2026),
+        ("Antarctica/Troll", 2026),
+        ("America/Havana", 2026),
+    ],
+)
+def test_previous_before_mirrors_next_after_across_clock_changes(zone_name: str, year: int) -> None:
+    # Perto de cada mudança do relógio, a anterior a um instante é sempre a última da
+    # cadeia de next_after antes dele, com as mesmas regras do horário de verão.
+    zone = load_zone(zone_name)
+    for text in ("*/7 * * * *", "30 0 * * *", "15,45 1,2 * * *", "59 23 * * *", "0 2 * * *"):
+        cron = CronExpression.parse(text)
+        for change in _transitions(zone, year):
+            chain = list(
+                cron.occurrences(
+                    change - timedelta(days=2), change + timedelta(days=2), zone, limit=2000
+                )
+            )
+            assert len(chain) >= 2, (text, change)
+            probe = chain[0] + timedelta(seconds=1)
+            while probe <= chain[-1]:
+                expected = max(at for at in chain if at < probe)
+                assert cron.previous_before(probe, zone) == expected, (text, zone_name, probe)
+                probe += timedelta(minutes=11, seconds=13)
+            for before, at in pairwise(chain):
+                assert cron.previous_before(at, zone) == before, (text, zone_name, at)
+
+
+def test_previous_before_is_strict_and_needs_a_zone() -> None:
+    cron = CronExpression.parse("0 9 * * 1-5")
+    friday_nine = utc(2026, 11, 20, 12)  # 9h em São Paulo
+    assert cron.previous_before(friday_nine, SAO_PAULO) == utc(2026, 11, 19, 12)
+    assert cron.previous_before(friday_nine + timedelta(seconds=1), SAO_PAULO) == friday_nine
+    # De segunda de manhã, a anterior é a de sexta.
+    assert cron.previous_before(utc(2026, 11, 23, 11), SAO_PAULO) == friday_nine
+    with pytest.raises(ValueError):
+        cron.previous_before(datetime(2026, 1, 1), SAO_PAULO)
+    yearly = CronExpression.parse("0 0 29 2 *")
+    assert yearly.previous_before(utc(2026, 11, 21), SAO_PAULO) == utc(2024, 2, 29, 3)

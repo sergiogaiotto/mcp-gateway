@@ -34,6 +34,9 @@ class UiSettings:
     #: Endereço base do websocket da visão ao vivo (``wss://api.exemplo``); sem ele, o
     #: navegador usa o mesmo endereço da interface (a API e a interface no mesmo domínio).
     live_ws_base: str | None = None
+    #: Tamanho máximo da planilha de um lote, em bytes (o ``RAPA_LOTE_MAX_BYTES`` do
+    #: servidor; o envio pela tela recusa antes um arquivo maior).
+    batch_max_bytes: int = 5 * 1024 * 1024
     #: Nomes legíveis das áreas e empresas (só para exibição).
     area_labels: Mapping[UUID, str] = field(default_factory=dict)
     company_labels: Mapping[UUID, str] = field(default_factory=dict)

@@ -306,7 +306,7 @@ def _show_secret(box: ui.column, created: WebhookSecret) -> None:
         ui.label(
             "O corpo é um objeto JSON com as entradas do robô. Mande os cabeçalhos "
             "X-RaPA-Timestamp (segundos desde 1970), X-RaPA-Delivery (identificador único da "
-            "entrega) e X-RaPA-Signature (sha256= e o HMAC-SHA256, com a chave, de "
+            "entrega, sem ponto) e X-RaPA-Signature (sha256= e o HMAC-SHA256, com a chave, de "
             "<timestamp>.<delivery>.<corpo>). A mesma entrega de novo devolve a mesma execução."
         ).classes("text-caption")
 
@@ -491,9 +491,11 @@ class NewBatch:
             if not self.by_id:
                 ui.label("Nenhum robô publicado nas áreas que você opera.").mark("sem-robos")
                 return
+            limit_kib = self.viewer.ctx.settings.batch_max_bytes // 1024
             ui.label(
-                "Envie uma planilha .xlsx (só com valores, sem fórmulas) ou .csv. A primeira "
-                "linha tem os títulos das colunas: o nome técnico ou o título de cada entrada."
+                "Envie uma planilha .xlsx (só com valores, sem fórmulas) ou .csv, de até "
+                f"{limit_kib} KiB. A primeira linha tem os títulos das colunas: o nome técnico "
+                "ou o título de cada entrada."
             ).classes("text-caption")
             self.robot_select = (
                 ui.select(
@@ -505,11 +507,19 @@ class NewBatch:
                 .classes("w-96")
                 .mark("robo-lote")
             )
+            # O servidor aceita no envio da tela o mesmo tamanho do REST; um arquivo
+            # maior é recusado já no navegador, com o aviso.
             ui.upload(
                 label="Planilha (.xlsx ou .csv)",
                 auto_upload=True,
                 max_files=1,
+                max_file_size=self.viewer.ctx.settings.batch_max_bytes,
                 on_upload=self._uploaded,
+                on_rejected=lambda: ui.notify(
+                    f"O arquivo passa do limite de {limit_kib} KiB; divida a planilha em lotes "
+                    "menores.",
+                    type="negative",
+                ),
             ).props('accept=".xlsx,.csv"').classes("w-96").mark("arquivo-lote")
             self.preview_box = ui.column().classes("w-full").mark("area-previa")
 

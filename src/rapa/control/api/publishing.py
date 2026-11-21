@@ -6,7 +6,10 @@ token e é autenticada só pela assinatura (:mod:`rapa.control.services.webhooks
 com o limite por webhook. Ela responde 202 com a execução (a mesma para a mesma
 entrega), 401 para qualquer problema de assinatura (sem dizer qual), 409 para
 webhook desligado, robô não publicado ou entrega repetida com outro corpo, 422
-para entradas inválidas e 429 acima do limite.
+para entradas inválidas e 429 acima do limite do webhook, para um endereço de
+origem com recusas demais ou com leituras demais no processo (os dois últimos
+antes de qualquer consulta ao banco; veja
+:class:`rapa.control.services.webhooks.WebhookGate`).
 
 A chave de um webhook só aparece na resposta da criação e da troca de chave, com
 ``Cache-Control: no-store``. O resultado de um lote sai como arquivo (CSV ou xlsx).
@@ -350,6 +353,7 @@ def add_publishing_routes(
             delivery_id=delivery_id,
             signature=signature,
             body=await request.body(),
+            client=request.client.host if request.client else None,
         )
         response.headers["Location"] = f"/v1/execucoes/{delivery.run_id}"
         return delivery

@@ -13,7 +13,7 @@ from rapa.control.db import Database
 from rapa.control.db.schema import TENANT_TABLES
 from rapa.control.services import PgWebhooks, WebhookKeys, verify_chain
 from rapa.control.services._common import PRIORITY_BY_TRIGGER
-from rapa.control.services.webhooks import sign_delivery
+from rapa.control.services.webhooks import WebhookGate, WebhookLimiter, sign_delivery
 from rapa.core.contracts import (
     Conflict,
     Forbidden,
@@ -352,3 +352,158 @@ def test_signature_format_is_documented() -> None:
     assert "chave" not in repr(WebhookKeys(SERVER_KEY)) and SERVER_KEY not in repr(
         WebhookKeys(SERVER_KEY)
     )
+
+
+def _counting(world: World, gate: WebhookGate) -> tuple[PgWebhooks, list[object]]:
+    """Os webhooks da empresa A com a porta dada, contando as leituras no banco."""
+    hooks = PgWebhooks(
+        world.webhooks.db,
+        WebhookKeys(SERVER_KEY),
+        limiter=WebhookLimiter(clock=world.clock.monotonic),
+        gate=gate,
+        clock=world.clock,
+    )
+    lookups: list[object] = []
+    original = hooks._lookup
+
+    async def counting(webhook_id: Any) -> Any:
+        lookups.append(webhook_id)
+        return await original(webhook_id)
+
+    hooks._lookup = counting  # type: ignore[method-assign]
+    return hooks, lookups
+
+
+async def _outcome(hooks: PgWebhooks, webhook_id: Any, args: dict[str, Any], client: str) -> int:
+    try:
+        await hooks.deliver(webhook_id, **args, client=client)
+    except SignatureInvalid:
+        return 401
+    except QuotaExceeded:
+        return 429
+    return 202
+
+
+async def test_unknown_ids_and_refusing_clients_are_answered_before_the_database(
+    app_db: Database, superuser_engine: AsyncEngine
+) -> None:
+    world = await _world(app_db, superuser_engine)
+    hook, secret = await _create(world)
+    gate = WebhookGate(lookups_per_s=1000, failures_per_minute=5, clock=world.clock.monotonic)
+    hooks, lookups = _counting(world, gate)
+    now = world.clock.now
+    attacker, partner = "203.0.113.7", "198.51.100.1"
+    args = signed(secret, BODY, "e-1", at=now)
+    # O mesmo identificador desconhecido, de novo e de novo: só o primeiro vai ao banco.
+    unknown = new_id()
+    assert [await _outcome(hooks, unknown, args, attacker) for _ in range(10)] == [401] * 10
+    assert len(lookups) == 1
+    # Identificadores sempre novos: cada recusa gasta uma ficha do endereço; sem fichas,
+    # 429 sem ir ao banco.
+    outcomes = [await _outcome(hooks, new_id(), args, attacker) for _ in range(10)]
+    assert outcomes == [401] * 4 + [429] * 6
+    assert len(lookups) == 5
+    # Os outros clientes seguem entregando, e a entrega certa não gasta ficha nenhuma.
+    for n in range(8):
+        good = signed(secret, BODY, f"p-{n}", at=now)
+        assert await _outcome(hooks, hook.webhook_id, good, partner) == 202
+    # Uma assinatura errada ou um horário velho também contam como recusa do cliente.
+    wrong = signed("errada" * 7, BODY, "p-9", at=now)
+    stale = signed(secret, BODY, "p-9", at=now - timedelta(seconds=301))
+    assert await _outcome(hooks, hook.webhook_id, wrong, "192.0.2.5") == 401
+    assert await _outcome(hooks, hook.webhook_id, stale, "192.0.2.5") == 401
+    for _ in range(3):
+        await _outcome(hooks, hook.webhook_id, wrong, "192.0.2.5")
+    assert (
+        await _outcome(hooks, hook.webhook_id, signed(secret, BODY, "p-9", at=now), "192.0.2.5")
+        == 429
+    )
+    # O endereço que errou demais espera a ficha voltar (5 por minuto: uma a cada 12 s).
+    world.clock.mono += 12
+    assert (
+        await _outcome(hooks, hook.webhook_id, signed(secret, BODY, "p-9", at=now), "192.0.2.5")
+        == 202
+    )
+    assert len(await runs_of(superuser_engine, "webhook", world.a.company_id)) == 9
+
+
+async def test_lookups_of_the_process_are_limited_before_the_database(
+    app_db: Database, superuser_engine: AsyncEngine
+) -> None:
+    world = await _world(app_db, superuser_engine)
+    hook, secret = await _create(world)
+    hooks, lookups = _counting(world, WebhookGate(lookups_per_s=1, clock=world.clock.monotonic))
+    now = world.clock.now
+    outcomes = [
+        await _outcome(
+            hooks, hook.webhook_id, signed(secret, BODY, f"e-{n}", at=now), f"10.0.0.{n}"
+        )
+        for n in range(4)
+    ]
+    # Folga de duas leituras; depois, 429 para todos, sem ir ao banco.
+    assert outcomes == [202, 202, 429, 429] and len(lookups) == 2
+    with pytest.raises(QuotaExceeded) as caught:
+        await hooks.deliver(hook.webhook_id, **signed(secret, BODY, "e-9", at=now))
+    assert caught.value.retry_after_s == 1
+    world.clock.mono += 1
+    assert await _outcome(hooks, hook.webhook_id, signed(secret, BODY, "e-9", at=now), "x") == 202
+
+
+async def test_removed_webhook_is_remembered_as_unknown(
+    app_db: Database, superuser_engine: AsyncEngine
+) -> None:
+    world = await _world(app_db, superuser_engine)
+    hook, secret = await _create(world)
+    hooks, lookups = _counting(world, WebhookGate(clock=world.clock.monotonic))
+    now = world.clock.now
+    assert await _outcome(hooks, hook.webhook_id, signed(secret, BODY, "e-1", at=now), "x") == 202
+    await world.webhooks.delete_webhook(
+        world.a.operator, world.robots_a["emitir_protocolo"], hook.webhook_id
+    )
+    for n in range(5):
+        args = signed(secret, BODY, f"e-{n + 2}", at=now)
+        assert await _outcome(hooks, hook.webhook_id, args, "x") == 401
+    assert len(lookups) == 2  # a entrega boa e a primeira depois da remoção
+
+
+@pytest.mark.parametrize("delivery", ["e-1.a", "a.b.c", "."])
+async def test_delivery_ids_with_a_dot_are_refused(
+    app_db: Database, superuser_engine: AsyncEngine, delivery: str
+) -> None:
+    world = await _world(app_db, superuser_engine)
+    hook, secret = await _create(world)
+    stamp = str(int(world.clock.now.timestamp()))
+    # Uma entrega legítima de "e-1" com o corpo 'a.{...}' assina "<ts>.e-1.a.{...}": com
+    # um ponto no identificador, a mesma assinatura serviria para "e-1.a" com o corpo
+    # '{...}', que é um objeto JSON válido (outra execução, sem a chave).
+    head, _, rest = delivery.partition(".")
+    captured = sign_delivery(secret, stamp, head or "x", rest.encode() + b"." + BODY)
+    with pytest.raises(SignatureInvalid):
+        await world.webhooks.deliver(
+            hook.webhook_id,
+            timestamp=stamp,
+            delivery_id=delivery,
+            signature=captured,
+            body=BODY,
+        )
+    assert await runs_of(superuser_engine, "webhook", world.a.company_id) == []
+
+
+async def test_database_refuses_delivery_ids_with_a_dot(
+    app_db: Database, superuser_engine: AsyncEngine
+) -> None:
+    world = await _world(app_db, superuser_engine)
+    hook, secret = await _create(world)
+    delivery = await world.webhooks.deliver(
+        hook.webhook_id, **signed(secret, BODY, "e-1", at=world.clock.now)
+    )
+    with pytest.raises(DBAPIError) as caught:
+        async with superuser_engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO webhook_deliveries (company_id, webhook_id, delivery_id, "
+                    "body_sha256, run_id) VALUES (:c, :w, 'e.2', repeat('0', 64), :r)"
+                ),
+                {"c": world.a.company_id, "w": hook.webhook_id, "r": delivery.run_id},
+            )
+    assert getattr(caught.value.orig, "sqlstate", None) == "23514"

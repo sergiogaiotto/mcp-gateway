@@ -17,8 +17,9 @@ Seis tabelas, todas com a empresa liderando as chaves e isolamento por linha
   (``RAPA_CHAVE_WEBHOOKS``) com o sal aleatório de cada webhook. Trocar a chave é
   trocar o sal.
 - ``webhook_deliveries``: cada entrega aceita, única por webhook e identificador
-  da entrega (a proteção contra repetição), com o resumo do corpo e a execução.
-  Só aceita inclusões.
+  da entrega (a proteção contra repetição; ASCII visível sem o ponto, que separa
+  os campos da mensagem assinada), com o resumo do corpo e a execução. Só aceita
+  inclusões.
 - ``batches`` e ``batch_rows``: o lote (o robô e a versão, o arquivo pelo resumo,
   nunca o conteúdo) e uma linha por execução. Só aceitam inclusões.
 
@@ -142,7 +143,9 @@ def _tables() -> list[str]:
         CREATE TABLE webhook_deliveries (
             company_id uuid NOT NULL REFERENCES companies (id),
             webhook_id uuid NOT NULL,
-            delivery_id text NOT NULL CHECK (delivery_id ~ '^[!-~]{1,200}$'),
+            -- ASCII visível sem o ponto, que separa os campos da mensagem assinada.
+            delivery_id text NOT NULL
+                CHECK (delivery_id ~ '^[!-~]{1,200}$' AND strpos(delivery_id, '.') = 0),
             body_sha256 text NOT NULL CHECK (body_sha256 ~ '^[0-9a-f]{64}$'),
             run_id uuid NOT NULL,
             received_at timestamptz NOT NULL DEFAULT now(),

@@ -16,13 +16,16 @@ chaves de todos os webhooks, que precisam ser trocadas.
 
 - ``X-RaPA-Timestamp``: o instante, em segundos desde 1970 (UTC);
 - ``X-RaPA-Delivery``: o identificador da entrega (1 a 200 caracteres ASCII
-  visíveis), único por webhook;
+  visíveis, sem ponto), único por webhook;
 - ``X-RaPA-Signature``: ``sha256=`` e o HMAC-SHA256 em hexadecimal, com a chave
   (o texto inteiro, em UTF-8), de ``<timestamp>.<delivery>.<corpo>`` (veja
   :func:`sign_delivery`).
 
 O identificador da entrega entra na assinatura: sem ele, quem copiasse uma
-entrega válida poderia repeti-la com outro identificador. A conferência usa
+entrega válida poderia repeti-la com outro identificador. O horário só tem
+dígitos e o identificador não tem ponto, então a mensagem assinada só se separa
+de um jeito (um ponto no identificador deixaria mover a fronteira dele com o
+corpo sem mudar a assinatura). A conferência usa
 comparação em tempo constante. Webhook desconhecido ou removido, assinatura que
 não confere e horário a mais de 5 minutos do relógio do servidor têm a mesma
 resposta (401), que não diz qual foi o caso.
@@ -35,7 +38,10 @@ entregas iguais ao mesmo tempo nunca criam duas execuções.
 
 **Limite.** Cada webhook aceita até ``rate_per_minute`` entregas por minuto
 (contadas depois da assinatura, por processo; com várias réplicas, o limite é a
-soma). Acima disso, 429 com ``Retry-After``.
+soma). Acima disso, 429 com ``Retry-After``. Antes de ler o webhook no banco, a
+entrega passa por :class:`WebhookGate`: um identificador que não existia há
+pouco é recusado (401) sem ir ao banco, um endereço de origem com recusas demais
+e o processo com leituras demais por segundo recebem 429.
 
 A execução nasce com origem ``webhook`` (prioridade de agenda e webhook) em nome
 de ``webhook:<id>``. Nada é repetido sozinho: uma entrega recusada não cria
@@ -89,12 +95,16 @@ from rapa.core.ids import new_id
 from rapa.core.robot import Manifest
 
 __all__ = [
+    "DEFAULT_FAILURES_PER_MINUTE",
+    "DEFAULT_LOOKUPS_PER_S",
+    "DEFAULT_UNKNOWN_TTL_S",
     "DELIVERY_HEADER",
     "MAX_CLOCK_SKEW_S",
     "SIGNATURE_HEADER",
     "TIMESTAMP_HEADER",
     "WEBHOOK_SCOPE",
     "PgWebhooks",
+    "WebhookGate",
     "WebhookKeys",
     "WebhookLimiter",
     "sign_delivery",
@@ -111,12 +121,21 @@ WEBHOOK_SCOPE = "webhook"
 #: Tamanho mínimo da chave do servidor (``RAPA_CHAVE_WEBHOOKS``).
 MIN_SERVER_KEY = 32
 
-_DELIVERY_ID = re.compile(r"^[\x21-\x7e]{1,200}$")
+#: Leituras de webhook por segundo, neste processo, de todas as entregas juntas.
+DEFAULT_LOOKUPS_PER_S = 200.0
+#: Entregas recusadas na assinatura, por minuto, de um mesmo endereço de origem.
+DEFAULT_FAILURES_PER_MINUTE = 60
+#: Por quanto tempo um webhook que não existe é respondido sem ir ao banco.
+DEFAULT_UNKNOWN_TTL_S = 60.0
+
+#: ASCII visível sem o ponto: o ponto separa os campos da mensagem assinada.
+_DELIVERY_ID = re.compile(r"^[\x21-\x2d\x2f-\x7e]{1,200}$")
 _SIGNATURE = re.compile(r"^sha256=([0-9a-f]{64})$")
 _TIMESTAMP = re.compile(r"^[0-9]{1,12}$")
 _SECRET_PREFIX = "whsec_"  # noqa: S105 - o prefixo da chave, não uma chave
 _DERIVATION_LABEL = b"rapa/webhook/v1\x00"
 _REJECTED = "assinatura inválida, horário fora da tolerância ou webhook desconhecido"
+_TOO_MANY = "entregas demais agora; tente de novo em {wait} s"
 
 
 def webhook_path(webhook_id: UUID) -> str:
@@ -125,7 +144,17 @@ def webhook_path(webhook_id: UUID) -> str:
 
 
 def sign_delivery(secret: str, timestamp: str, delivery_id: str, body: bytes) -> str:
-    """O valor de ``X-RaPA-Signature`` para uma entrega (o que o outro sistema calcula)."""
+    """O valor de ``X-RaPA-Signature`` para uma entrega (o que o outro sistema calcula).
+
+    O horário só tem dígitos e o identificador não tem ponto: a mensagem
+    ``<timestamp>.<delivery>.<corpo>`` se separa de um jeito só. Um horário ou um
+    identificador fora do formato levanta :class:`ValueError`.
+    """
+    if not _TIMESTAMP.fullmatch(timestamp) or not _DELIVERY_ID.fullmatch(delivery_id):
+        raise ValueError(
+            "horário (só dígitos) ou identificador da entrega (1 a 200 caracteres ASCII "
+            "visíveis, sem ponto) fora do formato"
+        )
     message = timestamp.encode() + b"." + delivery_id.encode() + b"." + body
     return "sha256=" + hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
 
@@ -161,6 +190,122 @@ class _Bucket:
     updated: float
 
 
+def _refill(bucket: _Bucket, now: float, rate: float, burst: float) -> None:
+    elapsed = max(0.0, now - bucket.updated)
+    bucket.tokens = min(burst, bucket.tokens + elapsed * rate)
+    bucket.updated = now
+
+
+def _wait_s(bucket: _Bucket, rate: float) -> int:
+    return max(1, math.ceil((1.0 - bucket.tokens) / rate))
+
+
+class WebhookGate:
+    """O que a entrega confere antes de ler o webhook no banco (em memória, por processo).
+
+    A entrega chega sem token, então qualquer um pode chamá-la com um identificador
+    qualquer; cada leitura do webhook custa uma transação do pool que as outras
+    rotas de todas as empresas usam. Por isso, antes de ler:
+
+    - **Desconhecidos.** Um identificador que o banco disse não existir (ou estar
+      removido) fica ``unknown_ttl_s`` segundos numa lista curta: nesse tempo, a
+      resposta é 401 direto, sem ir ao banco. A lista guarda até ``max_keys``.
+    - **Por cliente.** Cada endereço de origem tem um balde de fichas gasto pelas
+      entregas recusadas na assinatura (webhook desconhecido, assinatura errada,
+      horário fora da tolerância): ``failures_per_minute`` por minuto, com a
+      mesma folga. Sem fichas, 429 sem ir ao banco. As entregas certas não gastam
+      nada: um sistema que entrega muito não é limitado aqui.
+    - **No processo.** Um balde de ``lookups_per_s`` leituras por segundo (folga de
+      ``2 * lookups_per_s``) para todas as entregas juntas; sem fichas, 429.
+
+    O endereço de origem é o que o servidor HTTP vê: atrás de um proxy, configure-o
+    para repassar o do cliente (``FORWARDED_ALLOW_IPS`` do uvicorn), senão todos os
+    clientes dividem o mesmo balde.
+    """
+
+    def __init__(
+        self,
+        *,
+        lookups_per_s: float = DEFAULT_LOOKUPS_PER_S,
+        failures_per_minute: int = DEFAULT_FAILURES_PER_MINUTE,
+        unknown_ttl_s: float = DEFAULT_UNKNOWN_TTL_S,
+        max_keys: int = 10_000,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if lookups_per_s <= 0 or failures_per_minute < 1 or unknown_ttl_s < 0 or max_keys < 1:
+            raise ValueError("os limites da entrega dos webhooks precisam ser positivos")
+        self.lookups_per_s = lookups_per_s
+        self.failures_per_minute = failures_per_minute
+        self._lookup_rate = lookups_per_s
+        self._lookup_burst = max(1.0, 2.0 * lookups_per_s)
+        self._failure_rate = failures_per_minute / 60.0
+        self._failure_burst = float(failures_per_minute)
+        self._unknown_ttl = unknown_ttl_s
+        self._max_keys = max_keys
+        self._clock = clock
+        self._lookups = _Bucket(tokens=self._lookup_burst, updated=clock())
+        self._failures: OrderedDict[str, _Bucket] = OrderedDict()
+        self._unknown: OrderedDict[UUID, float] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def known_unknown(self, webhook_id: UUID) -> bool:
+        """Se o banco disse há pouco que este webhook não existe."""
+        now = self._clock()
+        with self._lock:
+            expires = self._unknown.get(webhook_id)
+            if expires is None:
+                return False
+            if now >= expires:
+                del self._unknown[webhook_id]
+                return False
+            return True
+
+    def remember_unknown(self, webhook_id: UUID) -> None:
+        """Guarda o identificador que não existe (ou foi removido) por ``unknown_ttl_s``."""
+        if self._unknown_ttl <= 0:
+            return
+        now = self._clock()
+        with self._lock:
+            self._unknown[webhook_id] = now + self._unknown_ttl
+            self._unknown.move_to_end(webhook_id)
+            while len(self._unknown) > self._max_keys:
+                self._unknown.popitem(last=False)
+
+    def admit(self, client: str | None) -> None:
+        """Libera uma leitura do webhook no banco ou levanta :class:`QuotaExceeded`."""
+        key = client or "?"
+        now = self._clock()
+        with self._lock:
+            failures = self._failures.get(key)
+            if failures is not None:
+                _refill(failures, now, self._failure_rate, self._failure_burst)
+                self._failures.move_to_end(key)
+                if failures.tokens < 1.0:
+                    wait = _wait_s(failures, self._failure_rate)
+                    raise QuotaExceeded(_TOO_MANY.format(wait=wait), retry_after_s=wait)
+            _refill(self._lookups, now, self._lookup_rate, self._lookup_burst)
+            if self._lookups.tokens < 1.0:
+                wait = _wait_s(self._lookups, self._lookup_rate)
+                raise QuotaExceeded(_TOO_MANY.format(wait=wait), retry_after_s=wait)
+            self._lookups.tokens -= 1.0
+
+    def failed(self, client: str | None) -> None:
+        """Gasta uma ficha do cliente por uma entrega recusada na assinatura."""
+        key = client or "?"
+        now = self._clock()
+        with self._lock:
+            bucket = self._failures.get(key)
+            if bucket is None:
+                bucket = _Bucket(tokens=self._failure_burst, updated=now)
+                self._failures[key] = bucket
+                while len(self._failures) > self._max_keys:
+                    self._failures.popitem(last=False)
+            else:
+                _refill(bucket, now, self._failure_rate, self._failure_burst)
+                self._failures.move_to_end(key)
+            bucket.tokens = max(0.0, bucket.tokens - 1.0)
+
+
 class WebhookLimiter:
     """Balde de fichas por webhook, com o limite por minuto de cada um (em memória)."""
 
@@ -183,14 +328,12 @@ class WebhookLimiter:
                 while len(self._buckets) > self._max_keys:
                     self._buckets.popitem(last=False)
             else:
-                elapsed = max(0.0, now - bucket.updated)
-                bucket.tokens = min(burst, bucket.tokens + elapsed * rate)
-                bucket.updated = now
+                _refill(bucket, now, rate, burst)
                 self._buckets.move_to_end(webhook_id)
             if bucket.tokens >= 1.0:
                 bucket.tokens -= 1.0
                 return
-            wait = max(1, math.ceil((1.0 - bucket.tokens) / rate))
+            wait = _wait_s(bucket, rate)
         raise QuotaExceeded(
             f"limite de entregas deste webhook excedido; tente de novo em {wait} s",
             retry_after_s=wait,
@@ -274,11 +417,13 @@ class PgWebhooks(PgService):
         keys: WebhookKeys,
         *,
         limiter: WebhookLimiter | None = None,
+        gate: WebhookGate | None = None,
         clock: Callable[[], datetime] = now_utc,
     ) -> None:
         super().__init__(db)
         self.keys = keys
         self.limiter = limiter or WebhookLimiter()
+        self.gate = gate or WebhookGate()
         self.clock = clock
 
     def __repr__(self) -> str:
@@ -528,17 +673,29 @@ class PgWebhooks(PgService):
         delivery_id: str | None,
         signature: str | None,
         body: bytes,
+        client: str | None = None,
     ) -> WebhookDelivery:
-        """Confere a assinatura e põe a execução na fila (ou devolve a da mesma entrega)."""
+        """Confere a assinatura e põe a execução na fila (ou devolve a da mesma entrega).
+
+        ``client`` é o endereço de origem (para o limite de recusas por cliente de
+        :class:`WebhookGate`).
+        """
         now = self.clock()
         if delivery_id is None or not _DELIVERY_ID.fullmatch(delivery_id):
             raise SignatureInvalid(_REJECTED)
         match = _SIGNATURE.fullmatch(signature or "")
         if match is None or timestamp is None or not _TIMESTAMP.fullmatch(timestamp):
             raise SignatureInvalid(_REJECTED)
+        # Antes do banco: o desconhecido de há pouco é recusado direto, e as leituras
+        # têm limite (por cliente que erra e no processo).
+        if self.gate.known_unknown(webhook_id):
+            raise SignatureInvalid(_REJECTED)
+        self.gate.admit(client)
         hook = await self._lookup(webhook_id)
-        if hook is not None and hook["archived_at"] is not None:
-            hook = None  # removido: como se não existisse
+        if hook is None or hook["archived_at"] is not None:
+            # Removido é como se não existisse (e não volta: a trava não desarquiva).
+            self.gate.remember_unknown(webhook_id)
+            hook = None
         reference = "sha256=" + "0" * 64
         if hook is not None:
             secret = self.keys.derive(
@@ -548,8 +705,13 @@ class PgWebhooks(PgService):
         # Sem webhook, compara com um valor qualquer: o tempo da resposta não diz se ele existe.
         valid = hmac.compare_digest(reference, f"sha256={match.group(1)}")
         if hook is None or not valid:
+            self.gate.failed(client)
             raise SignatureInvalid(_REJECTED)
-        _parse_timestamp(timestamp, now)
+        try:
+            _parse_timestamp(timestamp, now)
+        except SignatureInvalid:
+            self.gate.failed(client)
+            raise
         if not hook["enabled"]:
             raise Conflict("o webhook está desligado")
         self.limiter.check(webhook_id, int(hook["rate_per_minute"]))

@@ -100,11 +100,16 @@ _FIELDS = (
 )
 
 
+def _is_ascii_number(text: str) -> bool:
+    return text.isascii() and text.isdigit()
+
+
 def _number(text: str, field: _Field) -> int:
     lowered = text.lower()
     if field.names is not None and lowered in field.names:
         return field.names[lowered]
-    if not text.isdigit() or len(text) > 2:
+    # Só os dígitos ASCII: ``isdigit`` também aceita "²" e "٣", que o cron não conhece.
+    if not _is_ascii_number(text) or len(text) > 2:
         raise CronError(f"{field.name}: valor inválido")
     value = int(text)
     if not field.low <= value <= field.high:
@@ -120,7 +125,7 @@ def _parse_field(text: str, field: _Field) -> frozenset[int]:
         base, slash, step_text = item.partition("/")
         step = 1
         if slash:
-            if not step_text.isdigit() or len(step_text) > 2 or int(step_text) < 1:
+            if not _is_ascii_number(step_text) or len(step_text) > 2 or int(step_text) < 1:
                 raise CronError(f"{field.name}: o passo depois da barra precisa ser de 1 a 99")
             step = int(step_text)
         if base == "*":
@@ -259,6 +264,40 @@ class CronExpression:
                         continue
                     instant = _resolve(naive, zone)
                     if instant > after_utc:
+                        return instant
+        return None
+
+    def previous_before(self, before: datetime, zone: ZoneInfo) -> datetime | None:
+        """A última ocorrência estritamente antes de ``before``, em UTC.
+
+        É o espelho de :meth:`next_after`, com as mesmas regras do horário de verão: o
+        instante de um horário local nunca diminui quando o horário cresce, então a
+        busca de trás para a frente para no primeiro que cabe. ``before`` precisa ter
+        fuso. Devolve ``None`` se não houver ocorrência nos 50 anos anteriores.
+        """
+        if before.tzinfo is None:
+            raise ValueError("o instante de referência precisa ter fuso horário")
+        before_utc = before.astimezone(UTC)
+        local = before_utc.astimezone(zone)
+        ceiling = local.replace(tzinfo=None)
+        if local.fold:
+            # Na segunda passagem de um horário repetido, os horários locais até o fim
+            # da repetição rodam na primeira passagem, que é antes de ``before``.
+            first_pass = local.replace(fold=0).utcoffset() or timedelta(0)
+            ceiling += first_pass - (local.utcoffset() or timedelta(0))
+        start = ceiling.date()
+        for offset in range(_HORIZON_DAYS):
+            day = start - timedelta(days=offset)
+            if not self.matches_day(day):
+                continue
+            for hour in reversed(self.hours):
+                for minute in reversed(self.minutes):
+                    naive = datetime(day.year, day.month, day.day, hour, minute)
+                    # Um horário local depois do teto nunca é antes de ``before``.
+                    if naive > ceiling:
+                        continue
+                    instant = _resolve(naive, zone)
+                    if instant < before_utc:
                         return instant
         return None
 

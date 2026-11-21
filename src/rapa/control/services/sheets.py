@@ -16,7 +16,15 @@ Lógica pura, sem banco, usada por :class:`rapa.control.services.batches.PgBatch
   descompactado, passa do limite (bomba de zip).
 - A primeira linha tem os títulos das colunas; linhas totalmente vazias são
   puladas. "Linha" nas mensagens é a linha da planilha (a dos títulos é a 1).
-- Limites: tamanho do arquivo, linhas (``SheetLimits``) e colunas.
+- Limites (``SheetLimits``): tamanho do arquivo, linhas e colunas, e também o que
+  a leitura produz, sem confiar no que o arquivo declara: a ``<dimension>`` da aba
+  é ignorada, cada linha para uma coluna depois do limite, a leitura para depois
+  de ``max_rows`` mais ``max_blank_lines`` linhas (vazias ou não, também no CSV) e
+  só as linhas com algo ficam na memória. No xlsx, no máximo 64 abas (cada uma
+  num arquivo, nenhuma de gráfico), e cada parte que o ``openpyxl`` monta inteira (estilos, pasta de
+  trabalho, relações, propriedades, abas de gráfico) tem até ``max_part_bytes``
+  descompactada; só as abas e os textos compartilhados, que ele lê aos poucos,
+  podem ser maiores, dentro do total de ``max_unzipped_bytes``.
 
 **Colunas e entradas.** Cada coluna vai para a entrada do robô com o mesmo nome
 técnico ou o mesmo título (sem diferença de maiúsculas, acentos, espaços e
@@ -36,9 +44,12 @@ repetem os valores.
 
 **Resultado.** Uma linha por linha do lote: o número da linha da planilha, a
 execução, a situação, os horários, **só as saídas que o robô declara** e o erro.
-As entradas não vão para o arquivo (podem ser sensíveis). Um texto que começa
-com ``=``, ``+``, ``-``, ``@``, tabulação ou retorno ganha um apóstrofo no CSV, e
-no xlsx toda célula de texto é gravada como texto: nada vira fórmula.
+As entradas não vão para o arquivo (podem ser sensíveis). No CSV, todo campo vai
+entre aspas, e um ``=``, ``+``, ``-``, ``@``, tabulação ou retorno no começo do
+campo ou logo depois de um separador (``;``, ``,``, tabulação ou quebra de linha)
+ganha um apóstrofo antes: nem um Excel que separa as colunas por vírgula abre
+uma célula que comece com fórmula. No xlsx, toda célula de texto é gravada como
+texto (nada vira fórmula), sem os caracteres de controle que o XML não aceita.
 """
 
 import csv
@@ -84,8 +95,13 @@ MAX_ROW_ERRORS_SHOWN = 200
 SAMPLE_ROWS = 5
 
 _ZIP_MAGIC = b"PK\x03\x04"
+#: Quantas abas, no máximo, o xlsx pode ter (o openpyxl abre todas).
+_MAX_SHEETS = 64
 _ALLOWED_EXTENSIONS = {".csv": BatchFormat.CSV, ".xlsx": BatchFormat.XLSX}
 _FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+#: Um começo de fórmula logo depois de um separador de campo ou de linha (de qualquer
+#: Excel: ``;``, ``,`` ou tabulação), onde outro programa pode começar uma célula.
+_FORMULA_AFTER_SEPARATOR = re.compile(r"(?<=[;,\t\r\n])(?=[=+\-@\t\r])")
 _TRUE = {"sim", "s", "verdadeiro", "v", "true", "t", "1", "x", "yes", "y"}
 _FALSE = {"nao", "não", "n", "falso", "f", "false", "0", "no"}
 _DATE_BR = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})$")
@@ -113,6 +129,12 @@ class SheetLimits:
     max_columns: int = 100
     #: Tamanho máximo do xlsx descompactado (contra bomba de zip).
     max_unzipped_bytes: int = 64 * 1024 * 1024
+    #: Tamanho máximo, descompactado, de cada parte que o openpyxl monta inteira na
+    #: memória (estilos, pasta de trabalho, relações...): só a aba e os textos
+    #: compartilhados são lidos aos poucos.
+    max_part_bytes: int = 1024 * 1024
+    #: Quantas linhas vazias (no meio ou no fim) a planilha pode ter além das ``max_rows``.
+    max_blank_lines: int = 10_000
 
     def __post_init__(self) -> None:
         if self.max_bytes < 1 or self.max_rows < 1 or self.max_columns < 1:
@@ -227,15 +249,80 @@ def _read_csv(data: bytes, limits: SheetLimits) -> Sheet:
     filled = 0
     try:
         for record, cells in enumerate(reader, start=1):
-            raw.append((record, list(cells)))
-            # Só contam as linhas com algo: as vazias do fim não pesam.
-            if record > 1 and any(cell.strip() for cell in cells):
+            if record > limits.max_rows + limits.max_blank_lines + 1:
+                raise _refuse(f"o lote passa do limite de {limits.max_rows} linhas")
+            # Só contam (e só ficam guardadas) as linhas com algo, além da dos títulos.
+            if record == 1:
+                raw.append((record, list(cells)))
+            elif any(cell.strip() for cell in cells):
+                raw.append((record, list(cells)))
                 filled += 1
                 if filled > limits.max_rows:
                     raise _refuse(f"o lote passa do limite de {limits.max_rows} linhas")
     except csv.Error:
         raise _refuse("o arquivo .csv está mal formado (aspas sem fechar?)") from None
     return _finish(BatchFormat.CSV, raw, limits)
+
+
+def _check_parts(data: bytes, sizes: Mapping[str, int], limits: SheetLimits) -> None:
+    """Só as abas e os textos compartilhados, que o openpyxl lê aos poucos, podem ser grandes.
+
+    As outras partes (o manifesto, a pasta de trabalho, as relações, os estilos, as
+    propriedades, as abas de gráfico...) ele monta inteiras na memória, e um arquivo
+    pequeno e repetitivo vira gigabytes: cada uma fica em ``max_part_bytes``. As
+    abas e os textos são os que o próprio openpyxl vai ler aos poucos, achados do
+    mesmo jeito que ele acha (manifesto e relações da pasta de trabalho).
+    """
+    from openpyxl.packaging.manifest import Manifest as Package
+    from openpyxl.packaging.relationship import get_rels_path
+    from openpyxl.reader.excel import _find_workbook_part
+    from openpyxl.reader.workbook import WorkbookParser
+    from openpyxl.xml.constants import (
+        ARC_CONTENT_TYPES,
+        ARC_CORE,
+        ARC_CUSTOM,
+        ARC_ROOT_RELS,
+        ARC_STYLE,
+        SHARED_STRINGS,
+    )
+    from openpyxl.xml.functions import fromstring
+
+    too_big = _refuse("a planilha descompactada é grande demais")
+
+    def small(name: str) -> None:
+        if sizes.get(name, 0) > limits.max_part_bytes:
+            raise too_big
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            small(ARC_CONTENT_TYPES)
+            package = Package.from_tree(fromstring(archive.read(ARC_CONTENT_TYPES)))
+            workbook = _find_workbook_part(package).PartName[1:]
+            small(workbook)
+            small(get_rels_path(workbook))
+            parser = WorkbookParser(archive, workbook, keep_links=False)
+            parser.parse()
+            sheets = [rel for _, rel in parser.find_sheets()]
+            strings = package.find(SHARED_STRINGS)
+    except InvalidInput:
+        raise
+    except Exception:  # o openpyxl levanta vários tipos para arquivos ruins
+        raise _refuse("não foi possível ler o arquivo .xlsx") from None
+    targets = [rel.target for rel in sheets]
+    if len(targets) > _MAX_SHEETS or len(set(targets)) != len(targets):
+        raise _refuse(f"a planilha precisa ter até {_MAX_SHEETS} abas, cada uma num arquivo")
+    # Uma aba de gráfico o openpyxl monta inteira, com os desenhos, os gráficos e as
+    # imagens dela (pelo mesmo critério que ele usa para reconhecê-la).
+    if any("chartsheet" in rel.Type for rel in sheets):
+        raise _refuse("a planilha tem abas de gráfico; deixe só as abas com os dados")
+    streamed = {rel.target for rel in sheets if "chartsheet" not in rel.Type}
+    streamed -= {rel.target for rel in sheets if "chartsheet" in rel.Type}
+    if strings is not None:
+        streamed.add(strings.PartName[1:])
+    streamed -= {ARC_CONTENT_TYPES, ARC_ROOT_RELS, ARC_STYLE, ARC_CORE, ARC_CUSTOM, workbook}
+    for name, size in sizes.items():
+        if size > limits.max_part_bytes and (name not in streamed or name.endswith(".rels")):
+            raise too_big
 
 
 def _read_xlsx(data: bytes, limits: SheetLimits) -> Sheet:
@@ -248,6 +335,7 @@ def _read_xlsx(data: bytes, limits: SheetLimits) -> Sheet:
         raise _refuse("a planilha descompactada é grande demais")
     if any(member.filename.lower().endswith("vbaproject.bin") for member in members):
         raise _refuse("planilhas com macros não são aceitas; salve como .xlsx sem macros")
+    _check_parts(data, {member.filename: member.file_size for member in members}, limits)
     import openpyxl  # só aqui: a leitura de CSV não precisa dele
 
     try:
@@ -260,9 +348,15 @@ def _read_xlsx(data: bytes, limits: SheetLimits) -> Sheet:
         if not workbook.worksheets:
             raise _refuse("a planilha não tem nenhuma aba")
         sheet = workbook.worksheets[0]
+        # A <dimension> do arquivo não decide quantas células são lidas, e cada linha
+        # para numa coluna além do limite (a que tiver título lá é recusada depois).
+        sheet.reset_dimensions()
+        max_lines = limits.max_rows + limits.max_blank_lines + 1
         raw: list[tuple[int, list[Any]]] = []
         filled = 0
-        for line, cells in enumerate(sheet.iter_rows(), start=1):
+        for line, cells in enumerate(sheet.iter_rows(max_col=limits.max_columns + 1), start=1):
+            if line > max_lines:
+                raise _refuse(f"o lote passa do limite de {limits.max_rows} linhas")
             values: list[Any] = []
             for cell in cells:
                 kind = getattr(cell, "data_type", None)
@@ -274,8 +368,10 @@ def _read_xlsx(data: bytes, limits: SheetLimits) -> Sheet:
                 if kind == "e":
                     raise _refuse(f"a planilha tem uma célula com erro na linha {line}")
                 values.append(getattr(cell, "value", None))
-            raw.append((line, values))
-            if line > 1 and any(not _is_empty(value) for value in values):
+            if line == 1:
+                raw.append((line, values))
+            elif any(not _is_empty(value) for value in values):
+                raw.append((line, values))
                 filled += 1
                 if filled > limits.max_rows:
                     raise _refuse(f"o lote passa do limite de {limits.max_rows} linhas")
@@ -509,7 +605,8 @@ def _cell_text(value: Any) -> str:
 
 
 def _csv_safe(text: str) -> str:
-    """Um texto que o Excel nunca lê como fórmula."""
+    """Um texto que o Excel nunca lê como fórmula, com qualquer separador de colunas."""
+    text = _FORMULA_AFTER_SEPARATOR.sub("'", text)
     return "'" + text if text.startswith(_FORMULA_START) else text
 
 
@@ -545,13 +642,15 @@ def render_results(
         )
     if format is BatchFormat.CSV:
         buffer = io.StringIO(newline="")
-        writer = csv.writer(buffer, delimiter=";", lineterminator="\r\n")
+        # Tudo entre aspas: um separador dentro de um campo nunca abre outra coluna.
+        writer = csv.writer(buffer, delimiter=";", lineterminator="\r\n", quoting=csv.QUOTE_ALL)
         writer.writerow(headers)
         for line in table:
             writer.writerow([_csv_safe(cell) for cell in line])
         # Com BOM: o Excel em português abre o UTF-8 com os acentos certos.
         return buffer.getvalue().encode("utf-8-sig")
     import openpyxl
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
     workbook = openpyxl.Workbook(write_only=False)
     sheet = workbook.active
@@ -559,7 +658,8 @@ def render_results(
     for line_no, line in enumerate([headers, *table], start=1):
         for column_no, text in enumerate(line, start=1):
             cell = sheet.cell(row=line_no, column=column_no)
-            cell.value = text
+            # O XML do xlsx não aceita alguns caracteres de controle (o openpyxl recusaria).
+            cell.value = ILLEGAL_CHARACTERS_RE.sub("", text)
             cell.data_type = "s"  # texto, nunca fórmula
     buffer_bytes = io.BytesIO()
     workbook.save(buffer_bytes)

@@ -66,6 +66,7 @@ from rapa.control.services import (
 from rapa.control.services.queue import DEFAULT_MAX_DURATION
 from rapa.control.services.sessions import PgSessionStore
 from rapa.control.services.sheets import SheetLimits
+from rapa.control.services.webhooks import WebhookGate
 from rapa.control.sessions import (
     GeneralizationAssistant,
     HubAssistant,
@@ -169,6 +170,11 @@ class ServerSettings(BaseModel):
     schedule_catch_up_s: float = Field(default=600.0, ge=0, le=7 * 86_400)
     #: De quantos em quantos segundos o despachante procura agendas vencidas.
     schedule_interval_s: float = Field(default=5.0, ge=0, le=3600)
+    #: Agendas ligadas, no máximo, por empresa.
+    schedules_per_company: int = Field(default=200, ge=1, le=100_000)
+    #: Leituras de webhook por segundo, neste processo, de todas as entregas juntas
+    #: (antes de conferir a assinatura; acima disso, 429 sem ir ao banco).
+    webhook_lookups_per_s: float = Field(default=200.0, gt=0, le=100_000)
     #: Linhas e tamanho máximos da planilha de um lote.
     batch_max_rows: int = Field(default=1000, ge=1, le=100_000)
     batch_max_bytes: int = Field(default=5 * 1024 * 1024, ge=1024, le=100 * 1024 * 1024)
@@ -244,8 +250,14 @@ class ServerSettings(BaseModel):
           quantos segundos depois do horário uma ocorrência de agenda ainda roda; depois
           disso, fica registrada como perdida; padrão 600), ``RAPA_AGENDA_INTERVALO_S``
           (de quantos em quantos segundos o despachante procura agendas vencidas; padrão
-          5), ``RAPA_LOTE_MAX_LINHAS`` (padrão 1000) e ``RAPA_LOTE_MAX_BYTES`` (tamanho
-          máximo da planilha de um lote; padrão 5 MiB).
+          5), ``RAPA_AGENDAS_POR_EMPRESA`` (agendas ligadas, no máximo, por empresa;
+          padrão 200), ``RAPA_WEBHOOKS_POR_SEGUNDO`` (leituras de webhook por segundo
+          neste processo, de todas as entregas juntas, antes de conferir a assinatura;
+          acima disso, 429 sem ir ao banco; padrão 200; o limite de recusas é por
+          endereço de origem, então atrás de um proxy o uvicorn precisa de
+          ``FORWARDED_ALLOW_IPS`` para ver o do cliente), ``RAPA_LOTE_MAX_LINHAS`` (padrão
+          1000) e ``RAPA_LOTE_MAX_BYTES`` (tamanho máximo da planilha de um lote, pelo
+          REST e pela tela Lotes; padrão 5 MiB).
         """
         env = os.environ if env is None else env
         data: dict[str, Any] = {
@@ -282,6 +294,8 @@ class ServerSettings(BaseModel):
             ("session_max_s", "RAPA_SESSAO_MAX_S", float),
             ("schedule_catch_up_s", "RAPA_AGENDA_TOLERANCIA_S", float),
             ("schedule_interval_s", "RAPA_AGENDA_INTERVALO_S", float),
+            ("schedules_per_company", "RAPA_AGENDAS_POR_EMPRESA", int),
+            ("webhook_lookups_per_s", "RAPA_WEBHOOKS_POR_SEGUNDO", float),
             ("batch_max_rows", "RAPA_LOTE_MAX_LINHAS", int),
             ("batch_max_bytes", "RAPA_LOTE_MAX_BYTES", int),
         ):
@@ -399,6 +413,7 @@ def _mount_ui(
     from rapa.ui.app import create_ui
     from rapa.ui.auth import DevLogin, DevProfile, OidcLogin, OidcSettings, UiAuth
     from rapa.ui.backend import ContractsBackendFactory
+    from rapa.ui.context import UiSettings
 
     dev_login = None
     if settings.dev and settings.dev_tokens_file is not None:
@@ -445,6 +460,8 @@ def _mount_ui(
             cookie_secure=settings.cookie_secure,
             principals=authenticator.resolver,
         ),
+        # O envio da tela Lotes aceita o mesmo tamanho de planilha que o REST.
+        settings=UiSettings(batch_max_bytes=settings.batch_max_bytes),
     )
 
 
@@ -657,9 +674,17 @@ def build_dispatcher(settings: ServerSettings, db: Database) -> Dispatcher:
 
 def build_publishing(settings: ServerSettings, db: Database) -> PublishingServices:
     """Agendas, webhooks (só com ``RAPA_CHAVE_WEBHOOKS``) e lotes sobre o banco da aplicação."""
-    webhooks = PgWebhooks(db, WebhookKeys(settings.webhook_key)) if settings.webhook_key else None
+    webhooks = (
+        PgWebhooks(
+            db,
+            WebhookKeys(settings.webhook_key),
+            gate=WebhookGate(lookups_per_s=settings.webhook_lookups_per_s),
+        )
+        if settings.webhook_key
+        else None
+    )
     return PublishingServices(
-        schedules=PgSchedules(db),
+        schedules=PgSchedules(db, max_enabled_per_company=settings.schedules_per_company),
         webhooks=webhooks,
         receiver=webhooks,
         batches=PgBatches(

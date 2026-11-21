@@ -288,6 +288,20 @@ def test_conversion_errors_are_per_row(column: str, value: str, message: str) ->
     assert value not in repr(error.errors)
 
 
+def test_xlsx_with_a_chart_sheet_is_refused() -> None:
+    # O openpyxl monta inteira cada aba de gráfico (com os desenhos e os gráficos).
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    for row in (("Nome completo", "CPF", "UF"), PROTOCOL_ROWS[0]):
+        sheet.append(list(row))
+    workbook.create_chartsheet("Gráfico")
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    with pytest.raises(InvalidInput) as caught:
+        read_sheet("a.xlsx", buffer.getvalue(), LIMITS)
+    assert "abas de gráfico" in caught.value.message
+
+
 # -- resultado --------------------------------------------------------------------------
 
 
@@ -352,6 +366,56 @@ def test_xlsx_result_stores_every_value_as_text() -> None:
     formula = sheet.cell(row=2, column=6)
     assert formula.value == '=HYPERLINK("http://mal")' and formula.data_type == "s"
     assert all(cell.data_type != "f" for row in sheet.iter_rows() for cell in row)
+
+
+_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+@pytest.mark.parametrize("separator", [";", ",", "\t"])
+def test_csv_result_has_no_formula_with_any_list_separator(separator: str) -> None:
+    # Um Excel que separa por vírgula (en-US) leria "x,=cmd..." como uma célula "=cmd...".
+    nasty = "x,=cmd|' /C calc'!A0;+1\t@SUM(A1)\n-2,\t=3"
+    row = BatchRow(
+        row_no=1,
+        line=2,
+        run_id=new_id(),
+        state=RunState.FAILED,
+        outputs={"protocolo": nasty},
+        error_code="falha",
+        error_message=nasty,
+    )
+    content = render_results([row], protocolo().outputs, BatchFormat.CSV).decode("utf-8-sig")
+    # Todo campo vai entre aspas.
+    assert content.startswith('"linha";"execucao";"situacao"')
+    # Lido com o separador de qualquer Excel (com ou sem respeitar as aspas), nenhuma célula
+    # começa com um gatilho de fórmula.
+    for quoting in (csv.QUOTE_MINIMAL, csv.QUOTE_NONE):
+        reader = csv.reader(
+            io.StringIO(content), delimiter=separator, quoting=quoting, escapechar="\\"
+        )
+        for line in reader:
+            for cell in line:
+                for piece in cell.replace("\r", "\n").split("\n"):
+                    assert not piece.lstrip('"').startswith(_TRIGGERS), (separator, cell)
+    # Lido como foi escrito, o texto só ganhou apóstrofos antes dos gatilhos.
+    table = list(csv.reader(io.StringIO(content), delimiter=";"))
+    assert table[1][5].replace("'", "") == nasty.replace("'", "")
+    assert table[1][7].startswith("x,'=cmd")
+
+
+def test_xlsx_result_drops_control_characters_xml_refuses() -> None:
+    row = BatchRow(
+        row_no=1,
+        line=2,
+        run_id=new_id(),
+        state=RunState.SUCCEEDED,
+        outputs={"protocolo": "PRT\x07-1\x00\x1b"},
+        error_message="sem\x0bfim",
+    )
+    content = render_results([row], protocolo().outputs, BatchFormat.XLSX)
+    sheet = openpyxl.load_workbook(io.BytesIO(content)).active
+    assert sheet.cell(row=2, column=6).value == "PRT-1"
+    assert sheet.cell(row=2, column=8).value == "semfim"
 
 
 def test_list_outputs_become_json_text() -> None:

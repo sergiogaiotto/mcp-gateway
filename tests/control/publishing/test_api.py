@@ -17,11 +17,20 @@ from rapa.control.api.publishing import PublishingServices
 from rapa.control.auth import StaticTokenVerifier
 from rapa.control.db import Database
 from rapa.control.http_app import HttpSettings, create_http_app
-from rapa.control.services.webhooks import sign_delivery
+from rapa.control.services import PgWebhooks, WebhookKeys
+from rapa.control.services.webhooks import WebhookGate, sign_delivery
 from tests.control.api.support import DictResolver, asgi_client, auth
 from tests.control.db.support import PROTOCOLO_INPUTS
 
-from .support import PROTOCOL_ROWS, World, build_world, csv_bytes, protocol_sheet, runs_of
+from .support import (
+    PROTOCOL_ROWS,
+    SERVER_KEY,
+    World,
+    build_world,
+    csv_bytes,
+    protocol_sheet,
+    runs_of,
+)
 
 pytestmark = pytest.mark.database
 
@@ -243,6 +252,39 @@ async def test_webhook_delivery_without_token(api: Api) -> None:
     assert len(await runs_of_api(api)) == 1
 
 
+async def test_webhook_delivery_refusals_per_client_get_429_before_the_database(
+    api: Api,
+) -> None:
+    world = api.world
+    gated = PgWebhooks(
+        world.webhooks.db,
+        WebhookKeys(SERVER_KEY),
+        gate=WebhookGate(failures_per_minute=2, clock=world.clock.monotonic),
+        clock=world.clock,
+    )
+    app = _app(world, PublishingServices(receiver=gated))
+    hook, secret = await _webhook(api)
+    url = f"/v1/webhooks/{hook['webhook_id']}"
+    body = json.dumps(PROTOCOLO_INPUTS).encode()
+    now = world.clock.now.timestamp()
+    async with asgi_client(app) as client:
+        statuses = [
+            (
+                await client.post(
+                    url, content=body, headers=_delivery_headers("x" * 40, body, f"p-{n}", now)
+                )
+            ).status_code
+            for n in range(3)
+        ]
+        assert statuses == [401, 401, 429]
+        limited = await client.post(
+            url, content=body, headers=_delivery_headers(secret, body, "p-9", now)
+        )
+    # O endereço que errou demais espera, mesmo com a assinatura certa.
+    assert limited.status_code == 429 and int(limited.headers["retry-after"]) == 30
+    assert limited.json()["erro"] == "limite_excedido"
+
+
 async def runs_of_api(api: Api) -> list[dict[str, Any]]:
     response = await api.client.get("/v1/execucoes", headers=_who("operator"))
     return [run for run in response.json() if run["trigger"] == "webhook"]
@@ -412,3 +454,13 @@ async def test_batch_upload_has_its_own_size_limit(api: Api) -> None:
         "/v1/lotes/previa", headers=_who("operator"), **_form(api, huge)
     )
     assert too_big.status_code == 413
+    # O envio de arquivo da interface (o da tela Lotes, pelo NiceGUI montado na mesma
+    # aplicação) tem o mesmo limite dos lotes; aqui a interface não está montada (404).
+    ui_upload = "/_nicegui/client/4f1c2a/upload/12"
+    files = {"files": {"arquivo": ("lote.csv", data, "text/csv")}}
+    assert (await api.client.post(ui_upload, **files)).status_code == 404
+    huge_files = {"files": {"arquivo": ("lote.csv", huge, "text/csv")}}
+    assert (await api.client.post(ui_upload, **huge_files)).status_code == 413
+    # Só esse caminho: outro do NiceGUI continua com o limite comum.
+    other = "/_nicegui/client/4f1c2a/outro/12"
+    assert (await api.client.post(other, **files)).status_code == 413
