@@ -148,6 +148,13 @@ class ElementDescriptor(_Model):
     is_password: bool = False
     is_one_time_code: bool = False
     is_username: bool = False
+    #: O campo foi senha nesta página e deixou de ser: a senha que a pessoa mostrou com
+    #: o "olho" (o ``type=password`` ou a máscara por CSS que a página tirou, ou o input
+    #: que entrou no lugar de uma senha). O valor nunca sai, o campo conta como a senha
+    #: da página e só vira a senha do cofre se também tiver a marca de senha. Só é
+    #: escrita quando é verdade: a gravação sem senha mostrada é a mesma das versões
+    #: anteriores, que a leem sem conhecer o campo (``extra="forbid"``).
+    was_password: bool = Field(default=False, exclude_if=lambda value: not value)
     sensitive: bool = False
     #: O ``aria-label`` ou o texto do ``aria-labelledby`` do campo fala em senha (o
     #: script olha os dois, mesmo quando o nome acessível vem só de um deles).

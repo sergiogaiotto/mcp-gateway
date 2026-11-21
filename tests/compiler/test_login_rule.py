@@ -33,6 +33,7 @@ from tests.compiler.builders import (
     button,
     checkbox,
     element,
+    link,
     otp,
     password,
     select_box,
@@ -321,6 +322,494 @@ def test_a_transaction_code_never_makes_a_login(
     assert usernames_in(result) == []
 
 
+@pytest.mark.parametrize("order", ["senha_antes", "senha_depois"])
+def test_a_password_the_person_revealed_counts_as_the_password_of_the_page(order: str) -> None:
+    # R1 e R2 (segunda camada): o script marca o campo que já foi senha na página
+    # (was_password: a senha que a pessoa mostrou com o "olho"). Ele nunca é credencial
+    # nem o usuário, e conta como a senha da página: o usuário e o valor de outro
+    # <form>, antes ou depois dele, saem da gravação e viram entradas.
+    revealed = textbox("Palavra-passe", id="p", form=LOGIN_FORM, sensitive=True, was_password=True)
+    rec = RecordingBuilder()
+    rec.navigate("/acesso")
+    if order == "senha_antes":
+        rec.fill(revealed, None)
+    rec.fill(textbox("Usuário", id="usuario", form=None), "ana.souza")
+    rec.fill(textbox("Valor", id="valor", form=PIX_FORM), "1250,00")
+    if order == "senha_depois":
+        rec.fill(revealed, None)
+    rec.click(button("Entrar", id="ok", form=LOGIN_FORM))
+    rec.request("POST", "/api/acesso", "fetch")
+    recording = rec.build()
+    found = secret_page_inputs(recording.events)
+    assert [e.value for e in found.usernames] == ["ana.souza"]
+    assert [e.value for e in found.others] == ["1250,00"]
+    assert analyze_logins(recording.events).logins == ()
+    result = compile_(recording)
+    assert fill_value(result, "digitar_palavra_passe") == an_input("palavra_passe")
+    assert fill_value(result, "digitar_usuario") == an_input("usuario")
+    assert fill_value(result, "digitar_valor") == an_input("valor")
+    assert result.manifest.credentials == []
+    assert "ana.souza" not in result.manifest.model_dump_json()
+
+
+AMBIGUOUS_CODES = [
+    otp("Código de segurança do pedido", id="c", form=None),
+    otp("Código do pedido", id="c", name_attr="codigo", form=None),
+    otp("Código", id="codigo", form=None),
+    otp("Informe", id="c", name_attr="codigo_seguranca", form=None),
+    # O código de uma operação, também com um sinal claro: nunca o código do cofre.
+    otp("Código de verificação do cartão", id="c", form=None),
+    otp("Token da transação", id="c", form=None, autocomplete="one-time-code"),
+]
+
+
+@pytest.mark.parametrize(
+    "code",
+    AMBIGUOUS_CODES,
+    ids=["codigo_de_seguranca", "name_codigo", "id_codigo", "name", "cartao", "transacao"],
+)
+def test_an_ambiguous_code_is_never_the_vault_code_without_a_confirmed_login(
+    code: ElementDescriptor,
+) -> None:
+    # R3: o campo só é código de uso único por um sinal ambíguo ("código de segurança",
+    # que também é o CVV ou o código de um pedido, ou o nome "codigo" sozinho). O valor
+    # continua fora da gravação, mas, sem um login confirmado, o robô o pede numa
+    # entrada: nunca digita o código do cofre no lugar do que a pessoa digitou.
+    rec = RecordingBuilder()
+    rec.navigate("/pedidos")
+    rec.fill(code, None)
+    rec.click(button("Buscar", id="b"))
+    rec.request("GET", "/api/pedidos", "fetch")
+    result = compile_(rec.build())
+    (value,) = (s.value for s in result.manifest.steps if isinstance(s, FillStep))
+    assert isinstance(value, TextValue) and value.template.startswith("{{ inputs.")
+    assert result.manifest.credentials == []
+
+
+@pytest.mark.parametrize("after_login", [True, False], ids=["depois_do_login", "sozinho"])
+@pytest.mark.parametrize("label", ["Confirmar", "Entrar"])
+def test_an_ambiguous_code_in_a_confirmed_login_is_the_vault_code(
+    label: str, after_login: bool
+) -> None:
+    # R3: o mesmo campo ambíguo (name="codigo", rótulo "Código") no <form> só com o código
+    # e o botão de login só é o código do cofre depois de um login confirmado com senha
+    # (a página do segundo fator). Sozinho, o mesmo <form> pode ser o código de um pedido
+    # ou de um convite ("Continuar"): vira uma entrada.
+    code = otp("Código", id="c", name_attr="codigo")
+    rec = RecordingBuilder()
+    if after_login:
+        rec.navigate("/login")
+        rec.fill(textbox("Usuário", id="usuario", form=LOGIN_FORM), "ana.souza")
+        rec.fill(password(), None)
+        rec.click_to(button("Entrar", id="en", form=LOGIN_FORM), "/login/codigo", method="POST")
+    else:
+        rec.navigate("/login/codigo")
+    rec.fill(code, None)
+    rec.click(button(label, id="ok", form=OTP_FORM))
+    rec.request("POST", "/login/codigo")
+    result = compile_(rec.build())
+    click = [s for s in result.manifest.steps if isinstance(s, ClickStep)][-1]
+    assert click.effect is Effect.READ
+    if after_login:
+        assert fill_value(result, "digitar_codigo") == SecretValue(
+            credential="portal_otp", field="totp"
+        )
+    else:
+        assert fill_value(result, "digitar_codigo") == an_input("codigo")
+
+
+def test_an_ambiguous_code_beside_a_password_without_a_login_is_an_input() -> None:
+    # R3: usuário, senha e o código ambíguo, com um envio que não é login ("OK"): o
+    # código vira uma entrada, como o usuário; só a senha continua a do cofre.
+    rec = RecordingBuilder()
+    rec.navigate("/login")
+    rec.fill(script_username("Usuário", id="usuario", form=LOGIN_FORM), None)
+    rec.fill(password(id="senha"), None)
+    rec.fill(otp("Código", id="c", name_attr="codigo", form=LOGIN_FORM), None)
+    rec.click(button("OK", id="ok", form=LOGIN_FORM))
+    rec.request("POST", "/login")
+    result = compile_(rec.build())
+    assert fill_value(result, "digitar_codigo") == an_input("codigo")
+    assert fill_value(result, "digitar_usuario") == an_input("usuario")
+    assert fill_value(result, "digitar_senha") == PASSWORD
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        otp("Código de verificação", id="c"),
+        otp("Código de autenticação", id="c"),
+        otp("Código", id="c", autocomplete="one-time-code"),
+        otp("Informe", id="c", name_attr="codigo_otp"),
+        otp("Código SMS", id="c"),
+    ],
+    ids=["verificacao", "autenticacao", "autocomplete", "name_otp", "sms"],
+)
+def test_a_code_with_a_clear_signal_stays_the_vault_code(code: ElementDescriptor) -> None:
+    # Um sinal claro de código de uso único (autocomplete=one-time-code, "código de
+    # verificação" ou "de autenticação", "otp", "sms") continua o código do cofre mesmo
+    # sem um login confirmado, como antes (o código que confirma uma operação depois do
+    # login). O "token" sozinho deixou de ser um sinal claro (o teste seguinte).
+    rec = RecordingBuilder()
+    rec.navigate("/pedidos")
+    rec.fill(code, None)
+    rec.click(button("Buscar", id="b"))
+    rec.request("GET", "/api/pedidos", "fetch")
+    result = compile_(rec.build())
+    (value,) = (s.value for s in result.manifest.steps if isinstance(s, FillStep))
+    assert value == SecretValue(credential="portal_otp", field="totp")
+
+
+#: Códigos que não dizem com clareza ser de uso único: o código de acesso (que em alguns
+#: portais é um código fixo; marcado com True) e o token de uma API (pelo rótulo, pelo
+#: nome ou pelo id), que só o login confirmado com senha liga ao cofre.
+STATIC_CODES = [
+    pytest.param(
+        otp("Código de acesso", id="c", name_attr="acesso", form=LOGIN_FORM),
+        True,
+        id="codigo_de_acesso",
+    ),
+    pytest.param(
+        otp("Informe", id="c", name_attr="codigo_acesso", form=LOGIN_FORM),
+        True,
+        id="name_codigo_acesso",
+    ),
+    pytest.param(otp("Token", id="c", form=LOGIN_FORM), False, id="token"),
+    pytest.param(
+        otp("Token de API", id="c", name_attr="api", form=LOGIN_FORM), False, id="token_de_api"
+    ),
+    pytest.param(otp("Informe", id="token", form=LOGIN_FORM), False, id="id_token"),
+]
+
+
+@pytest.mark.parametrize("in_login", [False, True], ids=["fora_do_login", "no_login"])
+@pytest.mark.parametrize(("code", "access_code"), STATIC_CODES)
+def test_an_access_code_or_a_bare_token_is_the_vault_code_only_in_a_confirmed_login(
+    code: ElementDescriptor, access_code: bool, in_login: bool
+) -> None:
+    # "Código de acesso" (também um código fixo, em alguns portais) e "token" sozinho (o
+    # token de uma API, no rótulo, no nome ou no id) não dizem com clareza que o código
+    # é de uso único: continuam sigilosos, mas fora de um login confirmado o robô pede o
+    # valor numa entrada; antes, ele digitava o código do cofre no lugar do que a
+    # pessoa digitou. No login confirmado com senha, o token continua o código do cofre.
+    # O código de acesso, não: num login com o usuário, o código de acesso e a senha (o
+    # e-CAC), ele é um código fixo que a pessoa guarda, nunca o código de uso único do
+    # cofre (o robô digitaria um TOTP onde a pessoa digitou o código fixo). Ele vira uma
+    # entrada também no login confirmado; o usuário e a senha continuam os do cofre.
+    rec = RecordingBuilder()
+    if in_login:
+        rec.navigate("/login")
+        rec.fill(textbox("Usuário", id="usuario", form=LOGIN_FORM), "ana.souza")
+        rec.fill(password(), None)
+        rec.fill(code, None)
+        rec.click_to(button("Entrar", id="en", form=LOGIN_FORM), "/inicio", method="POST")
+    else:
+        rec.navigate("/configuracoes")
+        rec.fill(code, None)
+        rec.click(button("Salvar", id="b"))
+        rec.request("POST", "/api/configuracoes", "fetch")
+    result = compile_(rec.build())
+    (value,) = (
+        s.value
+        for s in result.manifest.steps
+        if isinstance(s, FillStep) and s.id not in ("digitar_usuario", "digitar_senha")
+    )
+    if in_login and not access_code:
+        assert value == SecretValue(credential="portal_otp", field="totp")
+        assert fill_value(result, "digitar_usuario") == USERNAME
+    elif in_login:
+        assert isinstance(value, TextValue) and value.template.startswith("{{ inputs.")
+        assert fill_value(result, "digitar_usuario") == USERNAME
+        assert fill_value(result, "digitar_senha") == PASSWORD
+        assert [c.kind.value for c in result.manifest.credentials] == ["password"]
+        assert any("código fixo" in w for w in result.warnings)
+    else:
+        assert isinstance(value, TextValue) and value.template.startswith("{{ inputs.")
+        assert result.manifest.credentials == []
+        assert any("não diz isso com clareza" in w for w in result.warnings)
+
+
+#: O campo de uma página de Pix, depois do valor.
+PIX_CODE_FORM = FormInfo(action=f"{BASE}/pix", method="post", has_password=True, text_fields=1)
+
+
+@pytest.mark.parametrize(
+    ("label", "name_attr", "expected"),
+    [
+        ("Token", "token", "entrada"),
+        ("Código de verificação", "cv", "codigo"),
+        ("Token da transação", "tk", "entrada"),
+        ("Senha", "token", "senha"),
+    ],
+    ids=["token", "codigo_de_verificacao", "token_da_transacao", "rotulo_de_senha"],
+)
+def test_a_code_in_a_password_field_is_never_the_vault_password(
+    label: str, name_attr: str, expected: str
+) -> None:
+    # Um código de uso único num campo type=password ("Token", "Código de verificação",
+    # "Token da transação"): antes, a marca de senha vinha primeiro e o robô digitava a
+    # senha do login no campo do código. Agora ele segue as regras do código: o código
+    # do cofre com um sinal claro, uma entrada sem ele ou numa operação. O campo cujo
+    # rótulo fala em senha continua a senha, mesmo com name="token".
+    code = password(label, id="c", name_attr=name_attr, is_one_time_code=True, form=PIX_CODE_FORM)
+    rec = RecordingBuilder()
+    rec.navigate("/pix")
+    rec.fill(textbox("Valor", id="valor", form=PIX_CODE_FORM), "10,00")
+    rec.fill(code, None)
+    rec.click(button("Confirmar", id="ok", form=PIX_CODE_FORM))
+    rec.request("POST", "/pix")
+    result = compile_(rec.build())
+    (value,) = (
+        s.value
+        for s in result.manifest.steps
+        if isinstance(s, FillStep) and s.id != "digitar_valor"
+    )
+    if expected == "senha":
+        assert value == PASSWORD
+    elif expected == "codigo":
+        assert value == SecretValue(credential="portal_otp", field="totp")
+    else:
+        assert isinstance(value, TextValue) and value.template.startswith("{{ inputs.")
+        assert result.manifest.credentials == []
+    assert step(result, "clicar_confirmar").effect is Effect.WRITE
+
+
+@pytest.mark.parametrize("button_label", ["Continuar", "Entrar", "Confirmar"])
+@pytest.mark.parametrize(
+    "label", ["Código do pedido", "Código do convite"], ids=["pedido", "convite"]
+)
+def test_a_code_only_form_without_a_password_login_never_types_the_vault_code(
+    label: str, button_label: str
+) -> None:
+    # O <form> só com um código ambíguo (name="codigo") e um botão de login conta como
+    # login, mas sozinho pode ser o código de um pedido ou de um convite: antes, o robô
+    # digitava o código do cofre no lugar do que a pessoa digitou. O código ambíguo só
+    # vira o do cofre num login com senha, ou depois de um (o teste anterior, na página
+    # do segundo fator); aqui, vira uma entrada, com aviso.
+    rec = RecordingBuilder()
+    rec.navigate("/acompanhar")
+    rec.fill(otp(label, id="c", name_attr="codigo"), None)
+    rec.click(button(button_label, id="ok", form=OTP_FORM))
+    rec.request("POST", "/codigo")
+    result = compile_(rec.build())
+    (value,) = (s.value for s in result.manifest.steps if isinstance(s, FillStep))
+    assert isinstance(value, TextValue) and value.template.startswith("{{ inputs.")
+    assert result.manifest.credentials == []
+    assert any(label in w and "não diz isso com clareza" in w for w in result.warnings)
+
+
+# -- verificação da rodada G2: o código depois do login, o código de acesso e a senha nova --
+
+
+def _password_login(rec: RecordingBuilder, *, to: str = "/inicio") -> None:
+    """Login confirmado com o usuário, a senha e "Entrar" (POST que navega para ``to``)."""
+    rec.navigate("/login")
+    rec.fill(textbox("Usuário", id="usuario", form=LOGIN_FORM), "ana.souza")
+    rec.fill(password(), None)
+    rec.click_to(button("Entrar", id="en", form=LOGIN_FORM), to, method="POST")
+
+
+@pytest.mark.parametrize(
+    ("label", "variant"),
+    [
+        ("Código do pedido", "endereco_digitado"),
+        ("Código do pedido", "menu"),
+        ("Código do convite", "outro_site"),
+    ],
+    ids=["endereco_digitado", "menu", "outro_site"],
+)
+def test_an_order_or_invite_code_after_a_login_is_never_the_vault_code(
+    label: str, variant: str
+) -> None:
+    # Verificação da rodada G2: o <form> só com um código ambíguo (name="codigo") e um
+    # botão de login virava o código do cofre sempre que QUALQUER login com senha veio
+    # antes na gravação: o código de um pedido depois de digitar o endereço ou de passar
+    # pelo menu "Pedidos", e o código do convite de outro site (que ainda ganhava uma
+    # credencial nova, loja_otp). O robô digitaria um código do cofre onde a pessoa
+    # digitou o número do pedido. Agora só a página do código logo depois do login com
+    # senha (nenhuma ação da pessoa além do Tab, nenhum endereço digitado, a mesma aba)
+    # é o segundo fator; aqui, o código vira uma entrada, com aviso.
+    rec = RecordingBuilder()
+    _password_login(rec)
+    if variant == "endereco_digitado":
+        rec.navigate("/pedidos")
+    elif variant == "menu":
+        menu = rec.click(link("Pedidos", id="m"))
+        rec.request("GET", "/pedidos")
+        rec.navigate("/pedidos", cause=NavigationCause.CLICK, trigger=menu)
+    else:
+        rec.navigate("https://loja.exemplo.com.br/convite")
+    rec.fill(otp(label, id="c", name_attr="codigo"), None)
+    button_label = "Entrar" if variant == "outro_site" else "Continuar"
+    rec.click_to(button(button_label, id="ok", form=OTP_FORM), "/pedido", method="POST")
+    result = compile_(rec.build())
+    (value,) = (
+        s.value
+        for s in result.manifest.steps
+        if isinstance(s, FillStep) and s.id.startswith("digitar_codigo")
+    )
+    assert isinstance(value, TextValue) and value.template.startswith("{{ inputs.")
+    assert [(c.name, c.kind.value) for c in result.manifest.credentials] == [("portal", "password")]
+    assert fill_value(result, "digitar_usuario") == USERNAME
+    assert fill_value(result, "digitar_senha") == PASSWORD
+    assert any(label in w and "não diz isso com clareza" in w for w in result.warnings)
+
+
+@pytest.mark.parametrize("variant", ["token", "tab_antes", "token_em_password", "codigo"])
+def test_the_code_page_right_after_the_login_keeps_the_vault_code(variant: str) -> None:
+    # Verificação da rodada G2 (controle do teste anterior): a página do segundo fator,
+    # logo depois do login com senha, continua com o código do cofre: "Token" e
+    # "Confirmar" num <form> só com o código, também com um Tab antes do código (o Tab
+    # não é outra ação da pessoa), "Token" num type=password e o código ambíguo
+    # ("Código", name="codigo"). Sem a exceção do Tab, o código com o Tab antes virava
+    # uma entrada.
+    rec = RecordingBuilder()
+    _password_login(rec, to="/2fa")
+    if variant == "tab_antes":
+        rec.key("Tab")
+    if variant == "token_em_password":
+        code = password("Token", id="t", name_attr="token", is_one_time_code=True, form=OTP_FORM)
+    elif variant == "codigo":
+        code = otp("Código", id="t", name_attr="codigo")
+    else:
+        code = otp("Token", id="t")
+    rec.fill(code, None)
+    rec.click_to(button("Confirmar", id="ok", form=OTP_FORM), "/inicio", method="POST")
+    result = compile_(rec.build())
+    (value,) = (
+        s.value
+        for s in result.manifest.steps
+        if isinstance(s, FillStep) and s.id not in ("digitar_usuario", "digitar_senha")
+    )
+    assert value == SecretValue(credential="portal_otp", field="totp")
+    assert fill_value(result, "digitar_senha") == PASSWORD
+    assert step(result, "clicar_confirmar").effect is Effect.READ
+
+
+#: O login do e-CAC: o CPF, o código de acesso (fixo) e a senha num <form> só.
+ACCESS_FORM = FormInfo(
+    action=f"{BASE}/login", method="post", has_password=True, text_fields=2, has_one_time_code=True
+)
+
+
+@pytest.mark.parametrize("variant", ["e_cac", "sms_de_acesso"])
+def test_a_static_access_code_is_never_the_vault_code(variant: str) -> None:
+    # Verificação da rodada G2: o login com o CPF, o "Código de acesso" e a senha (o
+    # e-CAC) é um login confirmado com senha, e o código de acesso virava o código do
+    # cofre: o robô digitaria um TOTP onde a pessoa digitou o código fixo de acesso.
+    # Agora o código de acesso (rótulo, nome ou id) sem um sinal claro de código de uso
+    # único nunca é o código do cofre: vira uma entrada, com aviso; o CPF e a senha
+    # continuam os do cofre. Perda de disponibilidade aceita: o código do segundo fator
+    # que se chama "Código de acesso enviado por SMS", logo depois do login, também
+    # vira uma entrada.
+    rec = RecordingBuilder()
+    if variant == "e_cac":
+        rec.navigate("/login")
+        rec.fill(textbox("CPF", id="cpf", form=ACCESS_FORM), "12345678900")
+        rec.fill(
+            otp("Código de acesso", id="ca", name_attr="codigo_acesso", form=ACCESS_FORM), None
+        )
+        rec.fill(password(id="senha", form=ACCESS_FORM), None)
+        rec.click_to(button("Entrar", id="en", form=ACCESS_FORM), "/inicio", method="POST")
+        username = "digitar_cpf"
+    else:
+        _password_login(rec, to="/2fa")
+        rec.fill(otp("Código de acesso enviado por SMS", id="t", name_attr="acesso"), None)
+        rec.click_to(button("Entrar", id="ok", form=OTP_FORM), "/inicio", method="POST")
+        username = "digitar_usuario"
+    result = compile_(rec.build())
+    (value,) = (
+        s.value
+        for s in result.manifest.steps
+        if isinstance(s, FillStep) and s.id.startswith("digitar_codigo_de_acesso")
+    )
+    assert isinstance(value, TextValue) and value.template.startswith("{{ inputs.")
+    assert fill_value(result, username) == USERNAME
+    assert fill_value(result, "digitar_senha") == PASSWORD
+    assert [c.kind.value for c in result.manifest.credentials] == ["password"]
+    assert any("Código de acesso" in w and "código fixo" in w for w in result.warnings)
+    assert "12345678900" not in result.manifest.model_dump_json()
+
+
+#: O <form> da troca de senha (sem campo de texto).
+CHANGE_FORM = FormInfo(action=f"{BASE}/trocar", method="post", has_password=True, text_fields=0)
+SIGNUP_FORM = FormInfo(action=f"{BASE}/cadastro", method="post", has_password=True, text_fields=1)
+
+
+@pytest.mark.parametrize("variant", ["troca_de_senha", "cadastro"])
+def test_a_new_password_is_never_the_vault_password(variant: str) -> None:
+    # Verificação da rodada G2: o campo de senha nova (autocomplete=new-password: "Nova
+    # senha", "Confirme a nova senha", "Crie uma senha") virava a senha do cofre, e o
+    # robô digitaria a senha de AGORA onde a pessoa digitou uma senha nova. Agora a senha
+    # nova vira uma entrada, com um aviso que diz por quê; a senha atual
+    # (autocomplete=current-password) e a do login continuam as do cofre.
+    rec = RecordingBuilder()
+    if variant == "troca_de_senha":
+        _password_login(rec)
+        rec.navigate("/trocar-senha")
+        current = password(
+            "Senha atual", id="atual", form=CHANGE_FORM, autocomplete="current-password"
+        )
+        rec.fill(current, None)
+        for label, id_ in (("Nova senha", "nova"), ("Confirme a nova senha", "nova2")):
+            new = password(label, id=id_, form=CHANGE_FORM, autocomplete="new-password")
+            rec.fill(new, None)
+        rec.click_to(button("Salvar", id="s", form=CHANGE_FORM), "/ok", method="POST")
+        new_steps = {
+            "digitar_nova_senha": "nova_senha",
+            "digitar_confirme_a_nova_senha": "confirme_a_nova_senha",
+        }
+    else:
+        rec.navigate("/cadastro")
+        rec.fill(
+            textbox("E-mail", input_type="email", id="email", form=SIGNUP_FORM), "novo@exemplo.com"
+        )
+        new = password("Crie uma senha", id="nova", form=SIGNUP_FORM, autocomplete="new-password")
+        rec.fill(new, None)
+        rec.click_to(button("Continuar", id="ok", form=SIGNUP_FORM), "/ok", method="POST")
+        new_steps = {"digitar_crie_uma_senha": "crie_uma_senha"}
+    result = compile_(rec.build())
+    for step_id, name in new_steps.items():
+        assert fill_value(result, step_id) == an_input(name)
+    passwords = [
+        s.id
+        for s in result.manifest.steps
+        if isinstance(s, FillStep)
+        and isinstance(s.value, SecretValue)
+        and s.value.field == "password"
+    ]
+    if variant == "troca_de_senha":
+        assert passwords == ["digitar_senha", "digitar_senha_atual"]
+    else:
+        assert passwords == []
+    assert sum("pede uma senha nova" in w for w in result.warnings) == len(new_steps)
+
+
+@pytest.mark.parametrize("variant", ["sem_form", "validar"])
+def test_the_warning_of_a_code_after_a_login_says_what_happened(variant: str) -> None:
+    # Verificação da rodada G2: o "Token" logo depois de um login confirmado com senha,
+    # numa página que não é um login confirmado (a SPA sem <form>, o botão "Validar"),
+    # vira uma entrada. O aviso dizia que o código não veio depois de um login com
+    # senha, e veio: a pessoa que revisa o robô seria enganada. Agora ele diz que o
+    # código não foi o de um login confirmado com senha nem o da página do código logo
+    # depois de um.
+    rec = RecordingBuilder()
+    _password_login(rec, to="/2fa")
+    if variant == "sem_form":
+        rec.fill(otp("Token", id="t", form=None), None)
+        rec.click(button("Confirmar", id="ok"))
+        rec.request("POST", "/api/2fa", "fetch")
+    else:
+        rec.fill(otp("Token", id="t"), None)
+        rec.click_to(button("Validar", id="ok", form=OTP_FORM), "/inicio", method="POST")
+    result = compile_(rec.build())
+    assert fill_value(result, "digitar_token") == an_input("token")
+    (warning,) = (w for w in result.warnings if "“Token”" in w)
+    assert "não foi o código de um login confirmado com senha" in warning
+    assert "nem o da página do código logo depois de um" in warning
+    assert "nem veio depois de um" not in warning
+
+
 def test_a_login_after_a_write_keeps_the_username_out_of_the_robot() -> None:
     rec = RecordingBuilder()
     rec.navigate("/cadastro")
@@ -350,17 +839,43 @@ def test_a_username_marked_by_the_script_without_a_login_becomes_an_input() -> N
     assert step(result, "clicar_pagar_agora").effect is Effect.IRREVERSIBLE
 
 
-def test_a_page_declared_username_stays_the_username() -> None:
+@pytest.mark.parametrize("button_label", ["OK", "Entrar"])
+def test_a_page_declared_username_is_the_vault_username_only_in_a_confirmed_login(
+    button_label: str,
+) -> None:
+    # R4: a página declara o campo como usuário (autocomplete=username). Antes, ele virava
+    # o usuário do cofre mesmo com o envio "OK", que não é de login. Agora só o login
+    # confirmado o liga ao cofre; fora dele, vira uma entrada, como qualquer usuário.
     usuario = script_username("Usuário", id="usuario", autocomplete="username", form=LOGIN_FORM)
     rec = RecordingBuilder()
     rec.navigate("/login")
     rec.fill(usuario, None)
     rec.fill(password(id="senha"), None)
-    rec.click(button("OK", id="ok", form=LOGIN_FORM))
+    rec.click(button(button_label, id="ok", form=LOGIN_FORM))
     rec.request("POST", "/login")
     result = compile_(rec.build())
-    assert step(result, "clicar_ok").effect is Effect.WRITE
-    assert fill_value(result, "digitar_usuario") == USERNAME
+    if button_label == "OK":
+        assert step(result, "clicar_ok").effect is Effect.WRITE
+        assert fill_value(result, "digitar_usuario") == an_input("usuario")
+        assert usernames_in(result) == []
+    else:
+        assert step(result, "clicar_entrar").effect is Effect.READ
+        assert fill_value(result, "digitar_usuario") == USERNAME
+
+
+def test_a_page_declared_username_without_a_password_is_an_input() -> None:
+    # R4: a página de recuperar o acesso, sem senha: o script esconde o campo declarado
+    # (autocomplete=username), e o robô pede o valor numa entrada, nunca o do cofre.
+    usuario = script_username("Usuário", id="usuario", autocomplete="username", form=None)
+    rec = RecordingBuilder()
+    rec.navigate("/recuperar")
+    rec.fill(usuario, None)
+    rec.click(button("Enviar link", id="ok"))
+    rec.request("POST", "/api/recuperar", "fetch")
+    result = compile_(rec.build())
+    assert fill_value(result, "digitar_usuario") == an_input("usuario")
+    assert usernames_in(result) == []
+    assert result.manifest.credentials == []
 
 
 # -- o Enter só é login pelo clique implícito no botão do mesmo formulário ---------

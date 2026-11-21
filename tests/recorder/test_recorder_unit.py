@@ -1,10 +1,13 @@
 """Partes do gravador que não precisam de navegador."""
 
+import json
 from datetime import UTC, datetime
 from importlib import resources
 
 import pytest
 
+from rapa.compiler import lower
+from rapa.core.robot import FillStep, TextValue
 from rapa.recorder import (
     REDACTED,
     ClickEvent,
@@ -661,3 +664,78 @@ def test_the_name_of_a_signature_or_a_transaction_code_is_secret(name: str, secr
     # A assinatura eletrônica ou digital e o código de transação ou de segurança, no nome
     # do campo, o fazem sigiloso (nunca a senha do cofre); a assinatura de um plano, não.
     assert mentions_secret_name(name) is secret
+
+
+# -- compatibilidade: a marca da senha mostrada só é escrita quando é verdade ----------
+
+#: Gravação escrita por fd066bd, antes de ``was_password``: uma busca (navegação, o
+#: campo "Cliente", o clique em "Buscar" e a requisição), com todos os campos que
+#: aquela versão escreve.
+OLD_RECORDING = (
+    '{"version":1,"started_at":"2026-11-01T12:00:00Z","finished_at":"2026-11-01T12:01:00Z","events":['
+    '{"index":0,"t_ms":10.0,"page_id":0,"frame_url":null,"type":"navigation",'
+    '"url":"https://portal.exemplo.gov.br/busca","main_frame":true,"frame_path":null,"cause":"typed",'
+    '"trigger_index":null,"same_document":false},'
+    '{"index":1,"t_ms":200.0,"page_id":0,"frame_url":"https://portal.exemplo.gov.br/busca","type":"input",'
+    '"element":{"tag":"input","input_type":"text","role":"textbox","name":"Cliente","label":"Cliente",'
+    '"placeholder":null,"test_id":null,"name_attr":null,"id":"q","css":"#q","shadow_path":null,"serial":7,'
+    '"text":null,"title":null,"href":null,"autocomplete":null,"frame_path":[],"is_password":false,'
+    '"is_one_time_code":false,"is_username":false,"sensitive":false,"aria_mentions_password":false,'
+    '"row":null,"form":null,"counts":{"role_name":1,"label":1,"placeholder":null,"test_id":null,'
+    '"text":null,"id":1,"name_attr":null},"probe":null},'
+    '"value":"Maria","typed":"Maria","script_modified":false,"editing_since_ms":150.0},'
+    '{"index":2,"t_ms":300.0,"page_id":0,"frame_url":"https://portal.exemplo.gov.br/busca","type":"click",'
+    '"element":{"tag":"button","input_type":null,"role":"button","name":"Buscar","label":null,'
+    '"placeholder":null,"test_id":null,"name_attr":null,"id":"b","css":"#b","shadow_path":null,"serial":8,'
+    '"text":"Buscar","title":null,"href":null,"autocomplete":null,"frame_path":[],"is_password":false,'
+    '"is_one_time_code":false,"is_username":false,"sensitive":false,"aria_mentions_password":false,'
+    '"row":null,"form":null,"counts":{"role_name":1,"label":null,"placeholder":null,"test_id":null,'
+    '"text":1,"id":1,"name_attr":null},"probe":null},"detail":1},'
+    '{"index":3,"t_ms":320.0,"page_id":0,"frame_url":null,"type":"request","method":"GET",'
+    '"url":"https://portal.exemplo.gov.br/api/clientes","resource_type":"fetch","main_frame":true,'
+    '"is_navigation":false,"has_referer":false,"redirected":false}'
+    '],"other_hosts":[],"dropped_messages":0}'
+)
+
+
+def test_a_descriptor_without_a_revealed_password_is_written_without_the_mark() -> None:
+    # Compatibilidade: ``was_password`` só é escrito quando é verdade. O descritor de um
+    # campo que nunca foi senha sai só com os campos das versões anteriores, que leem a
+    # gravação sem conhecer a marca (os modelos delas recusam campos a mais): antes, toda
+    # gravação nova levava "was_password": false e falhava nelas.
+    before = set(ElementDescriptor.model_fields) - {"was_password"}
+    plain = ElementDescriptor(tag="input", input_type="text", css="#q", sensitive=True)
+    for dumped in (
+        plain.model_dump(),
+        plain.model_dump(mode="json"),
+        json.loads(plain.model_dump_json()),
+    ):
+        assert "was_password" not in dumped
+        assert set(dumped) <= before
+    revealed = ElementDescriptor(
+        tag="input", input_type="text", css="#p", sensitive=True, was_password=True
+    )
+    assert revealed.model_dump()["was_password"] is True
+    assert ElementDescriptor.model_validate_json(revealed.model_dump_json()).was_password
+    # Pela mensagem do script (que também só manda a marca quando é verdade), pela
+    # limpeza do gravador e pela gravação inteira.
+    recorder = Recorder(probe_locators=False, capture_text=False)
+    frame = _FakeFrame(_FakePage(), "https://portal.exemplo.gov.br/busca")
+    _send_input(recorder, frame, "Maria", label="Cliente", css="#q", id="q")
+    _send_click(recorder, frame, "Buscar", css="#b")
+    events = [recorder._scrub(event) for event in recorder._events]
+    recording = Recording(started_at=datetime.now(UTC), events=events)
+    assert "was_password" not in recording.model_dump_json()
+    assert "was_password" not in json.dumps(recording.model_dump(mode="json"))
+
+
+def test_a_recording_written_before_the_revealed_password_mark_still_loads() -> None:
+    # Compatibilidade: a gravação de fd066bd (sem ``was_password``) é lida, compilada e
+    # escrita de novo igual, campo por campo.
+    recording = Recording.model_validate_json(OLD_RECORDING)
+    field = next(e for e in recording.events if isinstance(e, InputEvent))
+    assert field.element.was_password is False
+    assert json.loads(recording.model_dump_json()) == json.loads(OLD_RECORDING)
+    result = lower(recording, name="robo_antigo", title="Robô antigo", description="Teste.")
+    (fill,) = (s for s in result.manifest.steps if isinstance(s, FillStep))
+    assert fill.value == TextValue(template="Maria")

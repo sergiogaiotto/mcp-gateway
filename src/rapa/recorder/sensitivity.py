@@ -54,6 +54,16 @@ fica fora da gravação. As regras:
   tirou ao guardar o campo para decidir depois vale como o valor. O campo que saiu
   antes do retrato é esquecido. As marcas de sigilo do campo só sobem até o valor
   sair, e só os retratos de depois de uma tecla contam (nunca o foco sozinho);
+- campo que já foi senha nesta página (``was_password``: a senha que a pessoa mostrou
+  com o "olho", antes do foco, no foco ou trocando o input): o valor sempre sai da
+  gravação, o campo conta como a senha da página (``is_secret_field``: os outros
+  campos saem, e o usuário digitado depois dela é o usuário) e nunca é o usuário;
+- código do cofre (``vault_code``): o código de uso único só vira o código do cofre
+  fora de um login confirmado com um sinal claro e fora de uma operação; o que só é
+  código por um sinal ambíguo ("código de segurança", "token" sozinho, o nome "codigo"
+  sozinho) só vira o código do cofre num login confirmado com senha (ou logo depois de
+  um: a página do segundo fator), e o de uma operação e o código de acesso
+  (``static_code``, que em alguns portais é um código fixo), nunca;
 - identidade do campo (``field_key``): aba, iframes, hospedeiros, seletor, id,
   nome e tudo o que a pessoa vê ou o compilador usa como localizador (etiqueta,
   tipo, papel, nome acessível, rótulo, placeholder, ``data-testid`` e a chave da
@@ -159,7 +169,9 @@ __all__ = [
     "same_element",
     "second_click",
     "secret_page_inputs",
+    "static_code",
     "username_by_signal",
+    "vault_code",
     "writes_in",
 ]
 
@@ -349,15 +361,16 @@ def username_by_signal(element: ElementDescriptor) -> bool:
     e-mail, ``type=email``, ou rótulo, atributo ``name``, id ou placeholder com uma
     palavra inteira de usuário. O texto da página (títulos, parágrafos) não conta.
     Não é o usuário o campo que o nome diz ser senha (``password_by_name``: é
-    ambíguo) nem o que fala de outra pessoa ou de um cadastro
-    (``names_another_party``). Igual a ``isUsernameField`` em ``capture.js``.
+    ambíguo), o que já foi senha (``was_password``: a senha mostrada com o "olho") nem
+    o que fala de outra pessoa ou de um cadastro (``names_another_party``). Igual a
+    ``isUsernameField`` em ``capture.js``.
     """
     input_type = element.input_type or ""
     if element.tag != "input" or input_type not in _USERNAME_TYPES:
         return False
     if is_password_field(element) or element.is_one_time_code or password_by_name(element):
         return False
-    if names_another_party(element):
+    if element.was_password or names_another_party(element):
         return False
     autocomplete = _autocomplete(element)
     if "username" in autocomplete or "email" in autocomplete or input_type == "email":
@@ -390,8 +403,13 @@ def password_by_name(element: ElementDescriptor) -> bool:
 
 
 def is_secret_field(element: ElementDescriptor) -> bool:
-    """Senha, código de uso único ou campo que o nome diz ser senha."""
-    return is_password_field(element) or element.is_one_time_code or password_by_name(element)
+    """Senha, código de uso único, campo que o nome diz ser senha ou que já foi senha."""
+    return (
+        is_password_field(element)
+        or element.is_one_time_code
+        or password_by_name(element)
+        or element.was_password
+    )
 
 
 def is_transaction_secret(element: ElementDescriptor) -> bool:
@@ -405,6 +423,90 @@ def is_transaction_secret(element: ElementDescriptor) -> bool:
         element.id,
     )
     return any(_TRANSACTION_WORDS.search(_plain(text)) for text in texts if text)
+
+
+#: Nome ou id (sem acentos nem separadores) que diz claramente código de uso único: os
+#: de ``OTP_NAMES`` em ``capture.js`` menos "codigo" sozinho e "codigoseguranca", que
+#: também são o código de um pedido ou o CVV, "codigoacesso", que também é um código
+#: fixo de acesso, e "token" sozinho, que também é o token de uma API.
+_CLEAR_CODE_NAMES = frozenset(
+    {
+        "otp",
+        "totp",
+        "mfa",
+        "2fa",
+        "tokenotp",
+        "codigootp",
+        "codigoverificacao",
+        "codverificacao",
+        "codigoautenticacao",
+        "codigosms",
+        "verificationcode",
+        "onetimecode",
+        "otpcode",
+        "authcode",
+        "smscode",
+        "mfacode",
+        "totpcode",
+    }
+)
+#: Rótulo (ou, sem ele, o placeholder) que diz claramente código de uso único: o
+#: ``OTP_LABEL`` de ``capture.js`` menos "código de segurança", "código de acesso" (um
+#: código fixo de acesso, em alguns portais) e "token" (o token de uma API, um token
+#: de acesso fixo).
+_CLEAR_CODE_LABEL = re.compile(
+    r"c[oó]digo\s+de\s+(?:verifica[cç][aã]o|autentica[cç][aã]o)|c[oó]digo\s+(?:otp|totp|sms)"
+    r"|autentica[cç][aã]o\s+em\s+duas|dois\s+fatores|\b2fa\b|one[-\s]?time|verification\s+code",
+    re.IGNORECASE,
+)
+
+
+def _squash(text: str | None) -> str:
+    """Minúsculas sem acentos e só letras e dígitos (como ``squash`` em ``capture.js``)."""
+    return re.sub(r"[^a-z0-9]", "", _strip_accents(" ".join((text or "").split()).lower()))
+
+
+def vault_code(element: ElementDescriptor) -> bool:
+    """O código de uso único que vira o código do cofre mesmo fora de um login confirmado.
+
+    Só com um sinal claro de código de uso único: ``autocomplete="one-time-code"``, um
+    nome ou id de código (otp, totp, codigo_verificacao, codigo_sms...) ou um rótulo (ou,
+    sem rótulo, o placeholder) que fala em código de verificação ou de autenticação,
+    código SMS ou OTP, dois fatores ou "one-time"; e nunca o campo de uma operação
+    (``is_transaction_secret``: o token da transação, o código de verificação do
+    cartão). O campo que só é código por um sinal ambíguo ("código de segurança", que
+    também é o CVV ou o código de um pedido; "código de acesso", que também é um código
+    fixo; "token" sozinho, no rótulo, no nome ou no id, que também é o token de uma API;
+    o nome ou o id "codigo" sozinho) continua sigiloso, mas só vira o código do cofre
+    num login confirmado com senha (ou logo depois de um); o código de acesso, nunca
+    (``static_code``): fora disso, o robô pede o valor numa entrada, nunca digita o
+    código do cofre no lugar do que a pessoa digitou.
+    """
+    if not element.is_one_time_code or is_transaction_secret(element):
+        return False
+    if "one-time-code" in _autocomplete(element):
+        return True
+    if _squash(element.name_attr) in _CLEAR_CODE_NAMES or _squash(element.id) in _CLEAR_CODE_NAMES:
+        return True
+    return _CLEAR_CODE_LABEL.search(element.label or element.placeholder or "") is not None
+
+
+_ACCESS_CODE_LABEL = re.compile(r"c[oó]digo\s+de\s+acesso", re.IGNORECASE)
+
+
+def static_code(element: ElementDescriptor) -> bool:
+    """O código que pode ser um código fixo de acesso ("Código de acesso"): nunca o do cofre.
+
+    Sem um sinal claro de código de uso único (``vault_code``), o rótulo ou o nome que
+    fala em código de acesso também é o código fixo de alguns portais (o CPF, o código de
+    acesso e a senha): o robô pede o valor numa entrada, mesmo num login confirmado.
+    """
+    if vault_code(element):
+        return False
+    names = (_squash(element.name_attr), _squash(element.id))
+    return "codigoacesso" in names or (
+        _ACCESS_CODE_LABEL.search(element.label or element.placeholder or "") is not None
+    )
 
 
 def in_shadow_root(element: ElementDescriptor) -> bool:

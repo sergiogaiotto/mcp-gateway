@@ -23,14 +23,22 @@ Regras principais:
   enquanto a pessoa editava o campo, depois de cada edição e depois do Tab que
   deixa o campo contam no efeito do passo, como num salvamento automático;
 - campo de senha → ``SecretValue(field="password")`` de uma credencial por
-  origem; código de uso único → ``SecretValue(field="totp")`` de outra
-  credencial;
+  origem (menos o código de uso único num ``type=password``, cujo rótulo não fala
+  em senha: ele segue as regras do código); código de uso único com um sinal claro
+  e fora de uma operação (``rapa.recorder.sensitivity.vault_code``) →
+  ``SecretValue(field="totp")`` de outra credencial; o código só por um sinal
+  ambíguo ("código de segurança", "token" sozinho, o nome "codigo" sozinho) só
+  vira o código do cofre num login confirmado com senha (ou num login confirmado
+  logo depois de um com senha: a página do segundo fator), e o de uma operação (o
+  token da transação) e o código de acesso (que em alguns portais é um código fixo),
+  nunca: fora disso, vira uma entrada obrigatória com aviso; a senha nova
+  (``autocomplete=new-password``) nunca é a senha do cofre e vira uma entrada;
 - usuário e envio do login pela regra de
   ``rapa.recorder.sensitivity.analyze_logins``: o envio só é leitura quando só
   credenciais de uma credencial foram preenchidas, o botão é de login e nada
   gravou antes no robô (a mesma conta do gravador, confirmada na classificação);
-  o campo que é o usuário pelo próprio campo vira o usuário do cofre só num login
-  confirmado (ou quando a página o declara no ``autocomplete``). No login em duas
+  o campo que é o usuário pelo próprio campo (também o que a página declara no
+  ``autocomplete``) vira o usuário do cofre só num login confirmado. No login em duas
   páginas o usuário também vira o do cofre, mas a ponte e o envio ficam com o
   efeito das requisições deles. Qualquer outro campo de texto de uma página com
   senha ou código, o usuário de um login não confirmado e o campo de um shadow
@@ -100,15 +108,17 @@ from rapa.recorder.sensitivity import (
     Login,
     analyze_logins,
     clickable,
-    declared_username,
     field_key,
     focus_only,
     is_password_like_text,
     looks_secret,
+    mentions_password,
     password_by_name,
     requests_while_editing,
     same_element,
     second_click,
+    static_code,
+    vault_code,
     writes_in,
 )
 
@@ -154,8 +164,9 @@ class _Draft:
     absorbed: list[int] = field(default_factory=list)
     #: Entrada criada para um valor que não fica no robô (``Lowering.secret_input``).
     secret_input: str | None = None
-    #: Usuário de login que espera a confirmação do envio (``Lowering.finish_logins``).
-    pending: bool = False
+    #: Credencial de login que espera a confirmação do envio (``Lowering.finish_logins``):
+    #: "username" (o usuário) ou "code" (o código que só é código por um sinal ambíguo).
+    pending: str | None = None
     #: Última entrada do campo (já sem o valor, se ele era sigiloso) e o endereço dela.
     source: InputEvent | None = None
     url: str = ""
@@ -206,6 +217,36 @@ def _login_warning(label: str, name: str) -> str:
         "regra do login (botão de login, só credenciais na página e nada gravado antes); "
         "não foi tratado como usuário do cofre, o valor digitado não entrou no robô e virou "
         f"a entrada {name}."
+    )
+
+
+def _code_warning(label: str, name: str) -> str:
+    """Aviso do campo que só é código de uso único por um sinal ambíguo, fora de um login."""
+    return (
+        f"O campo {quoted(label)} parecia um código de uso único, mas não diz isso com "
+        "clareza (pode ser o código de um pedido ou de uma operação) e não foi o código de um "
+        "login confirmado com senha, nem o da página do código logo depois de um; não foi "
+        "tratado como o código do cofre, o valor digitado não "
+        f"entrou no robô e virou a entrada {name}."
+    )
+
+
+def _static_code_warning(label: str, name: str) -> str:
+    """Aviso do código de acesso, que em alguns portais é um código fixo: nunca o do cofre."""
+    return (
+        f"O campo {quoted(label)} parecia um código de uso único, mas não diz isso com "
+        "clareza: o código de acesso, em alguns portais, é um código fixo, que a pessoa "
+        "guarda como uma senha; não foi tratado como o código do cofre (nem num login "
+        f"confirmado com senha), o valor digitado não entrou no robô e virou a entrada {name}."
+    )
+
+
+def _new_password_warning(label: str, name: str) -> str:
+    """Aviso do campo de senha nova (``autocomplete=new-password``): nunca a senha do cofre."""
+    return (
+        f"O campo {quoted(label)} pede uma senha nova (autocomplete=new-password), que nunca "
+        "é a senha do cofre; o valor digitado não entrou no robô e virou a entrada "
+        f"{name}."
     )
 
 
@@ -269,11 +310,14 @@ class _Lowering:
             if login.bridge is not None
         }
         self.cross_logins = [login for login in self.logins.logins if login.cross_document]
-        #: Entrada do usuário → envios dos logins de que ela faz parte.
+        #: Entrada do usuário (ou do código) → envios dos logins de que ela faz parte.
         self.username_submits: dict[int, set[int]] = {}
+        self.code_submits: dict[int, set[int]] = {}
         for login in self.logins.logins:
             for entry in login.username:
                 self.username_submits.setdefault(entry.index, set()).add(login.submit.index)
+            for entry in login.codes:
+                self.code_submits.setdefault(entry.index, set()).add(login.submit.index)
         user_actions = [e for e in self.events if e.type in USER_ACTION_TYPES]
         self.action_indices = [e.index for e in user_actions]
         self.next_action: dict[int, RecordingEvent | None] = {}
@@ -573,9 +617,11 @@ class _Lowering:
         element = event.element
         if element.sensitive or not is_password_like_text(element):
             return event
+        new_password = "new-password" in (element.autocomplete or "").lower().split()
         self.warn(
             f"O campo {quoted(element_label(element))} parece de senha, mas não é do tipo "
-            "senha; o valor gravado foi descartado e o robô digita a senha do cofre."
+            "senha; o valor gravado foi descartado e o robô "
+            + ("pede a senha nova numa entrada." if new_password else "digita a senha do cofre.")
         )
         hidden = element.model_copy(update={"is_password": True, "sensitive": True})
         return event.model_copy(
@@ -662,31 +708,38 @@ class _Lowering:
         label = element_label(element)
         title = f"Digitar {article(label)} {lower_first(clip_label(label))}"
         secret_input: str | None = None
-        pending = False
+        pending: str | None = None
         role = self.logins.roles.get(event.index)
         value: dict[str, Any]
-        if element.is_password:
+        # Um código de uso único num campo type=password ("Token", "Código de verificação")
+        # nunca é a senha do cofre: segue as regras do código (o rótulo que fala em senha,
+        # sim, continua a senha).
+        code_in_password = element.is_one_time_code and not any(
+            mentions_password(text) for text in (element.label, element.placeholder)
+        )
+        # A senha nova de um cadastro ou de uma troca de senha ("Nova senha", "Crie uma
+        # senha": autocomplete=new-password) nunca é a senha do cofre: o robô digitaria a
+        # senha de agora onde a pessoa digitou outra. Quem chama informa o valor.
+        new_password = "new-password" in (element.autocomplete or "").lower().split()
+        if element.is_password and not code_in_password and not new_password:
             value = {
                 "source": "secret",
                 "credential": self.credential(url, CredentialKind.PASSWORD),
                 "field": "password",
             }
-        elif element.is_one_time_code:
+        elif new_password:
+            value, secret_input = self.hidden_input(key, label, _new_password_warning)
+        elif element.is_one_time_code and vault_code(element):
             value = {
                 "source": "secret",
                 "credential": self.credential(url, CredentialKind.TOTP),
                 "field": "totp",
             }
-        elif declared_username(element) and (element.sensitive or role == "username"):
-            # A própria página declara o campo como usuário (autocomplete="username").
-            value = {
-                "source": "secret",
-                "credential": self.credential(url, CredentialKind.PASSWORD),
-                "field": "username",
-            }
-        elif role == "username":
-            # Depende do envio do login: ``finish_logins`` decide depois da classificação.
-            pending = True
+        elif element.is_one_time_code or role == "username":
+            # O usuário (também o que a página declara no autocomplete) e o código que só
+            # é código por um sinal ambíguo dependem do envio do login: ``finish_logins``
+            # decide depois da classificação.
+            pending = "code" if element.is_one_time_code else "username"
             value = {"source": "text", "template": ""}
         elif role == "other" or element.sensitive:
             # Campo de uma página com senha ou código (ou que o gravador escondeu) que
@@ -742,20 +795,51 @@ class _Lowering:
         )
 
     def finish_logins(self) -> None:
-        """Usuário dos logins, depois que a classificação confirmou os envios.
+        """Usuário e código ambíguo dos logins, depois que a classificação confirmou os envios.
 
-        Num login confirmado, o campo vira o usuário do cofre, com a credencial da
-        senha que vai com ele. Sem confirmação o cofre nunca é digitado nele: o valor,
-        que o gravador tira da gravação, vira uma entrada obrigatória com aviso.
+        Num login confirmado, o usuário vira o usuário do cofre, com a credencial da
+        senha que vai com ele, e o código que só é código por um sinal ambíguo vira o
+        código do cofre se esse login tem senha ou vem logo depois de um login confirmado
+        com senha (a página do segundo fator, ``right_after``): o ``<form>`` só com o
+        código e um botão de login, sozinho ou depois do menu, de um endereço digitado ou
+        de outro site, pode ser o código de um pedido ou de um convite. O código de acesso
+        (``static_code``), que em alguns portais é um código fixo, nunca vira o código do
+        cofre, nem num login confirmado com senha. Sem confirmação o cofre nunca é
+        digitado neles: o valor, que o gravador tira da gravação, vira uma entrada
+        obrigatória com aviso.
         """
         for draft in self.drafts:
             source = draft.source
-            if not draft.pending or source is None or draft.field_key is None:
+            if draft.pending is None or source is None or draft.field_key is None:
                 continue
-            submits = {s for i in draft.absorbed for s in self.username_submits.get(i, ())}
+            code = draft.pending == "code"
+            by_entry = self.code_submits if code else self.username_submits
+            submits = {s for i in draft.absorbed for s in by_entry.get(i, ())}
+            static = code and static_code(source.element)
+            if static:
+                submits = set()
             confirmed = sorted(submits & self.confirmed)
+            if code:
+                with_password = [
+                    s
+                    for s in self.confirmed
+                    if s in self.all_logins and self.all_logins[s].password
+                ]
+                confirmed = [
+                    s
+                    for s in confirmed
+                    if self.all_logins[s].password
+                    or any(self.right_after(p, self.all_logins[s]) for p in with_password)
+                ]
             secret_input: str | None = None
-            if confirmed:
+            if confirmed and code:
+                value: dict[str, Any] = {
+                    "source": "secret",
+                    "credential": self.credential(draft.url, CredentialKind.TOTP),
+                    "field": "totp",
+                }
+                draft.step.pop("sequential", None)
+            elif confirmed:
                 # A credencial da senha que vai com o usuário (mesma origem, em geral).
                 url = draft.url
                 for submit in confirmed:
@@ -766,7 +850,7 @@ class _Lowering:
                     if owner is not None and owner.url:
                         url = owner.url
                         break
-                value: dict[str, Any] = {
+                value = {
                     "source": "secret",
                     "credential": self.credential(url, CredentialKind.PASSWORD),
                     "field": "username",
@@ -774,10 +858,47 @@ class _Lowering:
                 draft.step.pop("sequential", None)
             else:
                 label = element_label(source.element)
-                value, secret_input = self.hidden_input(draft.field_key, label, _login_warning)
+                if static:
+                    warning = _static_code_warning
+                elif code:
+                    warning = _code_warning
+                else:
+                    warning = _login_warning
+                value, secret_input = self.hidden_input(draft.field_key, label, warning)
             draft.step["value"] = value
             draft.secret_input = secret_input
-            draft.pending = False
+            draft.pending = None
+
+    def right_after(self, password_submit: int, code_login: Login) -> bool:
+        """A página do código vem logo depois do login com senha (o segundo fator).
+
+        Nenhuma ação da pessoa (além do Tab) entre o envio do login com senha e o código,
+        nenhum endereço digitado e a mesma aba: o código de um pedido ou de um convite
+        depois de passar pelo menu (ou de abrir outro site) não é o código do cofre. A
+        página do segundo fator a que se chega por outro clique (escolher o SMS) também
+        não: o código vira uma entrada (perda de disponibilidade aceita).
+        """
+        if not code_login.codes or password_submit >= code_login.codes[0].index:
+            return False
+        first = code_login.codes[0]
+        submit = self.by_index.get(password_submit)
+        if submit is None or submit.page_id != first.page_id:
+            return False
+        for event in self.events:
+            if not password_submit < event.index < first.index:
+                continue
+            if event.type in USER_ACTION_TYPES and not (
+                isinstance(event, KeyEvent) and event.key == "Tab"
+            ):
+                return False
+            if (
+                isinstance(event, NavigationEvent)
+                and event.main_frame
+                and event.page_id == first.page_id
+                and event.cause is NavigationCause.TYPED
+            ):
+                return False
+        return True
 
     def on_select(self, event: SelectEvent) -> None:
         element = event.element
