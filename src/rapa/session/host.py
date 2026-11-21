@@ -111,6 +111,9 @@ _INPUT_QUEUE = 512
 _PROFILE_PREFIX = "rapa-sessao-"
 #: Esquemas que a aba da pessoa pode mostrar; o resto (file:, chrome:, view-source:...) fecha.
 _WEB_SCHEMES = frozenset({"http", "https", "about", "blob", "data", "chrome-error"})
+#: Uma página que falha até este tempo depois de uma conexão recusada pela guarda falhou
+#: por ela (o Chromium mostra só um erro de conexão).
+_REFUSAL_WINDOW_S = 3.0
 #: Intervalo mínimo entre dois avisos de endereço interno recusado.
 _REFUSAL_WARNING_S = 10.0
 _REFUSED_TEXT = (
@@ -184,6 +187,7 @@ class SessionHost:
         self._last_input = 0.0
         self._warning: str | None = None
         self._last_refusal = float("-inf")
+        self._last_refusal_warning = float("-inf")
         self._stopping = False
         #: Pasta do perfil (apagada no fim); exposta para os testes conferirem.
         self.profile_dir: Path | None = None
@@ -395,6 +399,9 @@ class SessionHost:
             self._spawn(page.close)
             return
         if self._page is not None and frame == self._page.main_frame:
+            if page.url.startswith("chrome-error:"):
+                # Um link, um redirecionamento ou o "navegar" para um endereço interno.
+                self._warn_refused()
             self._spawn(self._send_page_info)
 
     def _on_load(self, page: Page) -> None:
@@ -421,16 +428,26 @@ class SessionHost:
             await asyncio.wait_for(self._recorder.goto(page, url), timeout=NAVIGATION_TIMEOUT_S)
         except (PlaywrightError, TimeoutError) as exc:
             logger.info("a página pedida não abriu: %s", type(exc).__name__)
-            await self._warn("Não foi possível abrir o endereço. Confira e tente de novo.")
+            if self._refused_recently():
+                await self._warn(_REFUSED_TEXT)
+            else:
+                await self._warn("Não foi possível abrir o endereço. Confira e tente de novo.")
             if first:
                 self._warning = "O endereço inicial não abriu. Digite outro endereço."
 
     def _refused(self, _host: str) -> None:
-        """A guarda da saída recusou uma conexão: avisa a pessoa (no máximo a cada 10 s)."""
+        """A guarda da saída recusou uma conexão (de uma página ou do próprio Chromium)."""
+        self._last_refusal = self._clock()
+
+    def _refused_recently(self) -> bool:
+        return self._clock() - self._last_refusal < _REFUSAL_WINDOW_S
+
+    def _warn_refused(self) -> None:
+        """A página da pessoa falhou logo depois de uma recusa: diz por quê (no máximo a cada 10 s)."""
         now = self._clock()
-        if now - self._last_refusal < _REFUSAL_WARNING_S:
+        if not self._refused_recently() or now - self._last_refusal_warning < _REFUSAL_WARNING_S:
             return
-        self._last_refusal = now
+        self._last_refusal_warning = now
         self._spawn(lambda: self._warn(_REFUSED_TEXT))
 
     async def _warn(self, text: str) -> None:

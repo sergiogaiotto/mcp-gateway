@@ -94,8 +94,6 @@ async def test_navigation_never_reaches_the_control_plane_network(
             ):
                 await client.send(tipo="navegar", url=url)
                 await asyncio.sleep(1.2)
-            # A pessoa fica sabendo por que a página não abriu.
-            await client.event("aviso", mensagem=lambda text: "endereços internos" in str(text))
             # Um link da página (uma ação da pessoa), também.
             await client.send(tipo="navegar", url=f"{portal_v1.base_url}/")
             page = host.page
@@ -123,6 +121,8 @@ async def test_navigation_never_reaches_the_control_plane_network(
             assert MARK not in fetched
             assert MARK not in await _titles(host)
             assert not [e for e in client.of("pagina") if e.get("titulo") == MARK]
+            # A pessoa fica sabendo por que a página não abriu.
+            await client.event("aviso", mensagem=lambda text: "endereços internos" in str(text))
             # A sessão continua utilizável.
             await client.send(tipo="navegar", url=f"{portal_v1.base_url}/login")
             await client.page("/login")

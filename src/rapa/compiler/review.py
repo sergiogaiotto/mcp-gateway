@@ -6,7 +6,8 @@ entradas, de :func:`rapa.compiler.generalize_inputs`, e repetições, de
 linguagem propôs (:func:`rapa.llm.generalize.propose_edits`). Cada operação do
 modelo é conferida pelo código (:func:`rapa.core.edits.apply_edits`, uma a uma,
 sobre o robô compilado); as recusadas aparecem com o motivo e nunca viram proposta.
-Nenhuma proposta entra no robô sozinha.
+Nenhuma proposta entra no robô sozinha: o título e a descrição do formulário são os
+da compilação, e os do modelo aparecem à parte (``robot_info``).
 
 :func:`apply_choices` aplica só o que a pessoa confirmou: primeiro as repetições
 (que mudam a estrutura), depois as entradas, os nomes dos passos, os efeitos (que
@@ -32,6 +33,7 @@ from rapa.core.contracts import (
     RepetitionChoice,
     RepetitionField,
     RepetitionProposal,
+    RobotInfoProposal,
     StepNameProposal,
     StepOverview,
 )
@@ -151,7 +153,7 @@ def build_proposals(
     effects: dict[str, EffectProposal] = {}
     checks: dict[str, CheckProposal] = {}
     rejected: list[str] = []
-    title, description = manifest.title, manifest.description
+    robot_info: RobotInfoProposal | None = None
     for op in model_ops or ():
         reason = _accepted(compiled, op)
         if reason is not None:
@@ -190,8 +192,13 @@ def build_proposals(
             case AddTextPostcondition():
                 checks.setdefault(op.text, CheckProposal(text=op.text))
             case SetRobotInfo():
-                title = op.title or title
-                description = op.description or description
+                # Uma proposta à parte: o formulário fica com o título e a descrição compilados.
+                title = clip_label(op.title, 120) if op.title else None
+                if title == manifest.title:
+                    title = None
+                description = op.description if op.description != manifest.description else None
+                if title or description:
+                    robot_info = RobotInfoProposal(title=title, description=description)
             case _:
                 pass  # o alvo de um passo não muda pela revisão
     order = {step.id: n for n, (step, _) in enumerate(manifest.iter_steps())}
@@ -202,9 +209,10 @@ def build_proposals(
         session_id=session_id,
         recording_id=recording_id,
         name=manifest.name,
-        title=clip_label(title, 120),
-        description=description,
+        title=clip_label(manifest.title, 120),
+        description=manifest.description,
         steps=overview(manifest),
+        robot_info=robot_info,
         parameters=sorted(parameters.values(), key=lambda p: order.get(p.step_id, 0)),
         step_names=sorted(step_names.values(), key=lambda p: order.get(p.step_id, 0)),
         repetitions=[_repetition(c) for c in find_repetitions(manifest)],

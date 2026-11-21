@@ -9,6 +9,7 @@ navegador, do mesmo tamanho, que só mede a página.
 """
 
 import asyncio
+import http.server
 import socket
 import sys
 import threading
@@ -21,7 +22,7 @@ import pytest
 import uvicorn
 from fastapi import FastAPI
 from nicegui.testing.general import nicegui_reset_globals
-from playwright.async_api import Browser, Locator, Page, async_playwright, expect
+from playwright.async_api import Browser, Dialog, Locator, Page, async_playwright, expect
 
 from rapa.control.auth import StaticTokenVerifier
 from rapa.control.http_app import HttpSettings, create_http_app
@@ -74,13 +75,19 @@ def _serve(chromium: str, sessions_dir: Path) -> Iterator[tuple[str, MemorySessi
                 )
             )
             sessions = RecordingSessions(store, launcher, platform, relay=LiveRelay())
+            port = _free_port()
             app: FastAPI = create_http_app(
                 catalog=platform,
                 runs=platform,
                 admin=platform,
                 verifier=StaticTokenVerifier({"token-criadora": creator}),
                 resolver=DictResolver(),
-                settings=HttpSettings(allow_static_tokens=True, rate_limit_per_s=None),
+                # Com a URL pública, o websocket da visão ao vivo confere o Origin da interface.
+                settings=HttpSettings(
+                    allow_static_tokens=True,
+                    rate_limit_per_s=None,
+                    public_url=f"http://127.0.0.1:{port}",
+                ),
                 sessions=sessions,
             )
             create_ui(
@@ -92,7 +99,6 @@ def _serve(chromium: str, sessions_dir: Path) -> Iterator[tuple[str, MemorySessi
                 ),
                 settings=UiSettings(area_labels={area: "Fiscal"}),
             )
-            port = _free_port()
             server = uvicorn.Server(
                 uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
             )
@@ -221,4 +227,89 @@ async def test_live_view_in_a_real_browser_types_accents_and_secrets(
     for secret in (DEFAULT_USER, DEFAULT_PASSWORD, DEFAULT_TOTP_SECRET):
         assert secret not in text
     # O perfil do navegador da nuvem foi apagado no fim.
+    assert list((tmp_path / "sessoes").iterdir()) == []
+
+
+@contextmanager
+def _dialog_site() -> Iterator[int]:
+    """Um site que, ao abrir, pede uma senha num ``prompt`` (fingindo ser o RaPA)."""
+    page = (
+        "<html><head><title>Portal</title></head><body><p>Portal</p><script>"
+        "setTimeout(() => { const r = prompt('Sua sessão do RaPA expirou. Digite sua senha:',"
+        " 'padrão'); location.href = '/fim?resposta=' + encodeURIComponent(r === null ?"
+        " 'cancelado' : r); }, 300);</script></body></html>"
+    ).encode()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            body = page if self.path == "/" else b"<html><body>fim</body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield int(server.server_address[1])
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+async def test_page_dialogs_appear_inside_the_live_view_never_as_native_dialogs(
+    chromium_path: str, tmp_path: Path
+) -> None:
+    with (
+        _dialog_site() as site,
+        _serve(chromium_path, tmp_path / "sessoes") as (base_url, store),
+    ):
+        start = f"http://dialogo.rapa.test:{site}/"
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(
+                executable_path=chromium_path, args=[HOST_RESOLVER_ARG]
+            )
+            try:
+                page = await browser.new_page(viewport={"width": 1200, "height": 900})
+                page.set_default_timeout(20_000)
+                native: list[str] = []
+
+                async def refuse(dialog: Dialog) -> None:
+                    native.append(dialog.type)
+                    await dialog.dismiss()
+
+                page.on("dialog", refuse)
+                await page.goto(f"{base_url}/gravar")
+                await page.get_by_role("button", name="Entrar como Criadora").click()
+                await page.get_by_label("Endereço inicial").fill(start)
+                await page.get_by_role("button", name="Começar a gravar").click()
+                overlay = page.locator("#rapa-ao-vivo [data-rapa-dialogo=prompt]")
+                await expect(overlay).to_be_visible(timeout=30_000)
+                # O texto é da página, dito como da página, dentro da tela da gravação.
+                await expect(overlay).to_contain_text("não é do RaPA")
+                await expect(overlay.locator("[data-rapa-dialogo-texto]")).to_have_text(
+                    "Sua sessão do RaPA expirou. Digite sua senha:"
+                )
+                answer = overlay.get_by_label("Resposta para a página")
+                await expect(answer).to_have_value("padrão")
+                await answer.fill("resposta qualquer")
+                await overlay.get_by_role("button", name="OK").click()
+                await expect(overlay).to_have_count(0)
+                address = page.get_by_label("Endereço da página")
+                await expect(address).to_have_value(
+                    f"http://dialogo.rapa.test:{site}/fim?resposta=resposta%20qualquer",
+                    timeout=15_000,
+                )
+                assert native == []
+                await page.get_by_role("button", name="Parar e revisar").click()
+                await expect(page.get_by_text("Revisar:")).to_be_visible(timeout=30_000)
+            finally:
+                await browser.close()
+    [record] = store.sessions.values()
+    assert record.status is RecordingSessionStatus.STOPPED
     assert list((tmp_path / "sessoes").iterdir()) == []

@@ -127,6 +127,13 @@ class FakeHost:
         finally:
             self._client = None
 
+    async def emit(self, *events: dict[str, Any]) -> None:
+        """Manda eventos ao plano de controle, como a página do hospedeiro mudando."""
+        client = self._client
+        assert client is not None
+        for event in events:
+            await client.send(json.dumps(event))
+
     async def end(self, reason: str) -> None:
         """Termina sozinho (sem atividade, prazo), como o hospedeiro de verdade."""
         self.alive = False

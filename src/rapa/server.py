@@ -121,6 +121,8 @@ class ServerSettings(BaseModel):
     oidc_redirect_uri: str | None = None
     cookie_secure: bool = True
     mcp_allowed_origins: frozenset[str] = frozenset()
+    #: Origens da interface aceitas no websocket da visão ao vivo, além da de ``public_url``.
+    live_allowed_origins: tuple[str, ...] = ()
     rate_limit_per_s: float | None = Field(default=20.0, gt=0)
     concurrency: int = Field(default=4, ge=1, le=256)
     poll_interval_s: float = Field(default=1.0, gt=0)
@@ -198,12 +200,16 @@ class ServerSettings(BaseModel):
           (0 desliga) e ``RAPA_COOKIE_SEGURO``;
         - sessões de gravação (a demonstração no navegador da nuvem): ``RAPA_SESSOES``
           (1 ou 0; liga por padrão), ``RAPA_SESSOES_POR_EMPRESA`` (abertas ao mesmo tempo
-          por empresa; padrão 2), ``RAPA_SESSOES_MAX`` (abertas ao mesmo tempo neste
-          processo; padrão: o tamanho da reserva interativa, 10% das vagas),
+          por empresa; padrão 2, nunca mais que metade de ``RAPA_SESSOES_MAX``),
+          ``RAPA_SESSOES_MAX`` (vagas da plataforma para as gravações, contando as
+          validações rodando; padrão: o tamanho da reserva interativa, 10% das vagas),
           ``RAPA_SESSAO_OCIOSA_S`` (segundos sem entrada até encerrar; padrão 600),
-          ``RAPA_SESSAO_MAX_S`` (prazo máximo; padrão 3600) e ``RAPA_PASTA_SESSOES``
-          (onde ficam os perfis temporários dos navegadores, apagados no fim). Os
-          navegadores usam ``RAPA_CHROMIUM_PATH`` e ``RAPA_ARGS_NAVEGADOR``;
+          ``RAPA_SESSAO_MAX_S`` (prazo máximo; padrão 3600), ``RAPA_PASTA_SESSOES``
+          (onde ficam os perfis temporários dos navegadores, apagados no fim) e
+          ``RAPA_ORIGENS_AO_VIVO`` (separadas por vírgula: origens da interface aceitas
+          no websocket da visão ao vivo, além da de ``RAPA_PUBLIC_URL``). Os
+          navegadores usam ``RAPA_CHROMIUM_PATH`` (o Chromium completo: o
+          ``chrome-headless-shell`` ignora a política do WebRTC) e ``RAPA_ARGS_NAVEGADOR``;
         - hub de LLM para as propostas da revisão: ``RAPA_LLM_BASE_URL``,
           ``RAPA_LLM_MODEL``, ``RAPA_LLM_API_KEY`` e ``RAPA_LLM_CAPACIDADES`` (a
           matriz gravada por ``python -m rapa.llm.probe --out``). Sem o hub, a revisão
@@ -250,6 +256,8 @@ class ServerSettings(BaseModel):
             data["mcp_allowed_origins"] = frozenset(
                 o.strip() for o in origins.split(",") if o.strip()
             )
+        if live := env.get("RAPA_ORIGENS_AO_VIVO"):
+            data["live_allowed_origins"] = tuple(o.strip() for o in live.split(",") if o.strip())
         if (rate := env.get("RAPA_LIMITE_POR_SEGUNDO")) is not None:
             data["rate_limit_per_s"] = float(rate) or None
         if concurrency := env.get("RAPA_CONCORRENCIA"):
@@ -722,6 +730,7 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
                 authorization_servers=(settings.jwt_issuer,) if settings.jwt_issuer else (),
                 allow_static_tokens=settings.dev,
                 mcp_allowed_origins=settings.mcp_allowed_origins,
+                live_allowed_origins=settings.live_allowed_origins,
                 rate_limit_per_s=settings.rate_limit_per_s,
             ),
             sessions=sessions,

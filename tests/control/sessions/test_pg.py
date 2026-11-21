@@ -376,3 +376,45 @@ async def test_reserve_in_use_heartbeat_and_sessions_nobody_holds(
     assert await store.reserve_in_use(now=now) == 0
     assert await PgRunQueue(dispatcher_db).claim_next() is not None
     assert await store.reserve_in_use(now=now) == 1
+
+
+async def test_cross_company_writes_and_reads_are_refused(
+    app_db: Database, superuser_engine: AsyncEngine
+) -> None:
+    a = await make_tenant(app_db, "Atravessa A")
+    b = await make_tenant(app_db, "Atravessa B")
+    store = PgSessionStore(app_db)
+    record = _record(a)
+    await store.insert(record, company_limit=5)
+    params = {
+        "a": a.company_id,
+        "b": b.company_id,
+        "sid": new_id(),
+        "rid": new_id(),
+        "id": record.session_id,
+        "area": a.area_id,
+        "exp": datetime.now(UTC) + timedelta(hours=1),
+    }
+    refused = {
+        # Sob a empresa B, nada é incluído em nome da A.
+        "INSERT INTO recording_sessions (company_id, id, area_id, owner, start_url, status,"
+        " expires_at) VALUES (:a, :sid, :area, 'x', 'https://x.example/', 'active', :exp)": "42501",
+        "INSERT INTO recordings (company_id, id, session_id, created_by, recording)"
+        " VALUES (:a, :rid, :id, 'x', '{}')": "42501",
+        # Nem uma gravação da B que aponte para a sessão da A.
+        "INSERT INTO recordings (company_id, id, session_id, created_by, recording)"
+        " VALUES (:b, :rid, :id, 'x', '{}')": "23503",
+    }
+    for statement, sqlstate in refused.items():
+        with pytest.raises(DBAPIError) as caught:
+            async with app_db.tenant_session(b.company_id) as session:
+                await session.execute(text(statement), params)
+        assert getattr(caught.value.orig, "sqlstate", None) == sqlstate, statement
+    async with app_db.tenant_session(b.company_id) as session:
+        found = await session.scalar(
+            text("SELECT count(*) FROM recording_sessions WHERE company_id = :a"), params
+        )
+    assert found == 0
+    # Sem empresa fixada, a aplicação não vê linha nenhuma.
+    async with app_db.engine.connect() as conn:
+        assert await conn.scalar(text("SELECT count(*) FROM recording_sessions")) == 0

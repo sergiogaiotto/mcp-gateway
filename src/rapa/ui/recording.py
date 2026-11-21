@@ -8,9 +8,14 @@ roda e teclado (com acentos, composição e colar) e fala direto com o websocket
 API com um bilhete de uso único, que a página pede ao backend. O token de acesso
 nunca chega ao navegador.
 
-A revisão mostra cada proposta (entradas, nomes de passos, repetições, efeitos e
-conferências) com "Aceitar" ou "Rejeitar" (começa em "Rejeitar": nada entra sem a
-pessoa aceitar) e campos para editar. "Criar rascunho" manda só o que foi aceito.
+A revisão mostra cada proposta (entradas, nomes de passos, repetições, efeitos,
+conferências e o título e a descrição sugeridos pelo modelo) com "Aceitar" ou
+"Rejeitar" (começa em "Rejeitar": nada entra sem a pessoa aceitar) e campos para
+editar; o título e a descrição do formulário começam com os da compilação. "Criar
+rascunho" manda só o que foi aceito.
+
+Os diálogos da página do portal (``alert``, ``confirm``, ``prompt``) aparecem dentro
+da tela ao vivo, com a origem escrita, nunca como diálogos do navegador da pessoa.
 """
 
 import json
@@ -468,6 +473,7 @@ async def review_page(viewer: Viewer, session_id: str) -> None:
             .classes("w-full")
             .mark("descricao-robo")
         )
+        _robot_info_suggestion(form)
     _repetitions_card(form)
     _parameters_card(form)
     _names_card(form)
@@ -510,6 +516,45 @@ async def review_page(viewer: Viewer, session_id: str) -> None:
         ):
             for reason in proposals.model_rejected:
                 ui.label(f"• {reason}").classes("text-caption")
+
+
+def _robot_info_suggestion(form: ReviewForm) -> None:
+    """A sugestão do modelo para o título e a descrição: à parte, e só entra se aceita.
+
+    Aceitar põe o texto do modelo nos campos (que continuam editáveis); rejeitar volta
+    os da compilação, se a pessoa não os mudou depois.
+    """
+    proposals = form.proposals
+    suggestion = proposals.robot_info
+    if suggestion is None or form.title is None or form.description is None:
+        return
+    title_field, description_field = form.title, form.description
+    with ui.column().classes("w-full gap-1 p-2 bg-blue-grey-1").mark("sugestao-robo"):
+        ui.label("Sugestão do modelo para quem aprova").classes("text-weight-medium")
+        if suggestion.title:
+            ui.label(f"Título: {suggestion.title}").mark("sugestao-robo-titulo")
+        if suggestion.description:
+            ui.label(f"Descrição: {suggestion.description}").classes("break-all").mark(
+                "sugestao-robo-descricao"
+            )
+        with ui.row().classes("items-center gap-2"):
+            decision = _decision("decisao-sugestao-robo")
+            _source(suggestion.source)
+
+    def apply(event: Any) -> None:
+        accepted = event.value == _ACCEPT
+        for target, suggested, compiled in (
+            (title_field, suggestion.title, proposals.title),
+            (description_field, suggestion.description, proposals.description),
+        ):
+            if not suggested:
+                continue
+            if accepted:
+                target.value = suggested
+            elif target.value == suggested:
+                target.value = compiled
+
+    decision.on_value_change(apply)
 
 
 def _repetitions_card(form: ReviewForm) -> None:

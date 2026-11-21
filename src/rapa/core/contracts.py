@@ -43,6 +43,7 @@ __all__ = [
     "RobotAdmin",
     "RobotCatalog",
     "RobotInfo",
+    "RobotInfoProposal",
     "RobotStatus",
     "RobotSummary",
     "RobotVersionInfo",
@@ -396,8 +397,10 @@ class RecordingSessionInfo(_Model):
 class ViewerTicket(_Model):
     """Bilhete de uso único para abrir a visão ao vivo de uma sessão.
 
-    Vale por pouco tempo e só uma vez; quem o recebe abre o websocket em
-    ``path`` com ``?bilhete=<ticket>``. Nunca vai para o banco nem para o log.
+    Vale por pouco tempo e só uma vez; quem o recebe abre o websocket em ``path``
+    (sem nada no endereço) e manda, como primeira mensagem,
+    ``{"tipo": "bilhete", "bilhete": "<ticket>"}``. Nunca vai para o banco, para o
+    endereço nem para o log.
     """
 
     session_id: UUID
@@ -491,15 +494,31 @@ class CheckProposal(_Model):
     source: ProposalSource = ProposalSource.MODEL
 
 
+class RobotInfoProposal(_Model):
+    """O título e a descrição que o modelo sugere para o robô.
+
+    Fica fora do formulário: o título e a descrição de :class:`GeneralizationProposals`
+    são os da compilação, e o texto do modelo (que pode ter vindo de uma página
+    demonstrada, escrito para quem aprova) só entra se a pessoa aceitar.
+    """
+
+    title: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, min_length=1, max_length=2000)
+    source: ProposalSource = ProposalSource.MODEL
+
+
 class GeneralizationProposals(_Model):
     """Tudo o que a revisão mostra: nada disso entra no robô sem a confirmação da pessoa."""
 
     session_id: UUID
     recording_id: UUID
+    #: Nome técnico, título e descrição da compilação (os valores iniciais do formulário).
     name: str
     title: str
     description: str
     steps: list[StepOverview]
+    #: A sugestão do modelo para o título e a descrição, à parte (começa em "Rejeitar").
+    robot_info: RobotInfoProposal | None = None
     parameters: list[ParameterProposal] = Field(default_factory=list)
     step_names: list[StepNameProposal] = Field(default_factory=list)
     repetitions: list[RepetitionProposal] = Field(default_factory=list)

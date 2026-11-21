@@ -22,6 +22,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from rapa.control.api.errors import error_response, install_error_handlers, log_unexpected
 from rapa.control.api.ratelimit import RateLimiter
 from rapa.control.api.routes import ApiServices, create_api_router
+from rapa.control.api.sessions import live_origins
 from rapa.control.auth import Authenticator, BearerVerifier, PrincipalResolver, StaticTokenVerifier
 from rapa.control.mcp.server import McpGateway, McpSettings
 from rapa.control.validation import InputValidator
@@ -64,6 +65,9 @@ class HttpSettings(BaseModel):
     #: URL pública do serviço (sem barra no fim), usada no OpenAPI dos robôs e nos
     #: metadados do recurso protegido.
     public_url: str | None = None
+    #: Origens da interface aceitas no websocket da visão ao vivo, além da de ``public_url``
+    #: (a interface servida noutro endereço).
+    live_allowed_origins: tuple[str, ...] = ()
     #: Emissores (Keycloak) anunciados nos metadados do recurso protegido (RFC 9728).
     authorization_servers: tuple[str, ...] = ()
     #: Expõe ``/v1/docs`` e ``/v1/openapi.json`` da própria API.
@@ -227,6 +231,7 @@ def create_http_app(
         validator=validator,
         public_url=public_url,
         sessions=sessions,
+        live_origins=live_origins(public_url, settings.live_allowed_origins),
     )
     app.include_router(create_api_router(services))
     app.router.routes.append(Route("/mcp", endpoint=gateway, include_in_schema=False))

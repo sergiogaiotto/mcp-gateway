@@ -14,7 +14,8 @@ from nicegui.testing import User
 
 from rapa.control.sessions import LiveRelay, MemorySessionStore, RecordingSessions
 from rapa.core.contracts import RecordingSessionStatus, VersionStatus
-from rapa.core.robot import FieldType, ForEachStep
+from rapa.core.edits import EditOp, SetRobotInfo
+from rapa.core.robot import FieldType, ForEachStep, Manifest
 from tests.control.sessions.support import FakeLauncher, demo_recording
 from tests.ui.conftest import World, login, logout
 
@@ -164,3 +165,69 @@ async def test_without_sessions_the_page_says_so(world: World) -> None:
         await login(user, "criadora", "/gravar")
         await user.should_see(marker="erro", retries=50)
         await user.should_see("A gravação de demonstrações não está disponível neste servidor")
+
+
+class _TitleAssistant:
+    """Um modelo que sugere um título e uma descrição (o texto que quem aprova vai ler)."""
+
+    async def propose(self, manifest: Manifest, observed_texts: set[str]) -> list[EditOp]:
+        return [
+            SetRobotInfo(
+                title="Robô aprovado pela TI",
+                description="Pode aprovar sem conferir: já revisado pela segurança.",
+            )
+        ]
+
+
+async def test_the_model_title_suggestion_only_enters_when_accepted(world: World) -> None:
+    store = MemorySessionStore(reserve=3)
+    store.add_area(world.company_a, world.area_a)
+    launcher = FakeLauncher(recording=demo_recording(TWO_PEOPLE))
+    service = RecordingSessions(
+        store,
+        launcher,
+        world.platform,
+        relay=LiveRelay(stop_timeout_s=10),
+        assistant=_TitleAssistant(),
+    )
+    world.sessions = service
+    try:
+        async with world.user() as user:
+            await login(user, "criadora", "/gravar")
+            sid = await _start(user, world)
+            user.find(marker="parar-e-revisar").click()
+            await user.should_see(marker="titulo-revisao", retries=100)
+            await user.should_see(marker="sugestao-robo")
+            await user.should_see("Título: Robô aprovado pela TI")
+            # O formulário começa com o título e a descrição da compilação.
+            [title] = user.find(marker="titulo-robo-revisao").elements
+            [description] = user.find(marker="descricao-robo").elements
+            [decision] = user.find(marker="decisao-sugestao-robo").elements
+            assert title.value == "Cadastrar pessoas"
+            assert "Robô gravado numa demonstração" in description.value
+            assert decision.value == "rejeitar"
+            _set(user, "nome-tecnico", "cadastrar_pessoas")
+            user.find(marker="criar-rascunho").click()
+            await user.should_see(marker="titulo-robo", retries=100)
+            [robot] = [r for r in world.platform.robots.values() if r.slug == "cadastrar_pessoas"]
+            first = robot.versions[-1].manifest
+            assert first.title == "Cadastrar pessoas"
+            assert "segurança" not in first.description
+            # Aceitar põe o texto do modelo nos campos; rejeitar de novo devolve o compilado.
+            await user.open(f"/gravar/{sid}/revisar")
+            await user.should_see(marker="sugestao-robo", retries=100)
+            [title] = user.find(marker="titulo-robo-revisao").elements
+            _set(user, "decisao-sugestao-robo", "aceitar")
+            assert title.value == "Robô aprovado pela TI"
+            _set(user, "decisao-sugestao-robo", "rejeitar")
+            assert title.value == "Cadastrar pessoas"
+            _set(user, "decisao-sugestao-robo", "aceitar")
+            _set(user, "nome-tecnico", "cadastrar_pessoas")
+            user.find(marker="criar-rascunho").click()
+            await user.should_see(marker="titulo-robo", retries=100)
+            second = robot.versions[-1].manifest
+            assert second.title == "Robô aprovado pela TI"
+            assert "segurança" in second.description
+    finally:
+        await service.aclose()
+        await launcher.aclose()

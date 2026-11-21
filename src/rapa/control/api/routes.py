@@ -86,6 +86,8 @@ class ApiServices:
     public_url: str | None = None
     #: Sessões de gravação (Demonstrar e Generalizar); sem elas, ``/v1/sessoes`` responde 503.
     sessions: RecordingSessions | None = None
+    #: Origens da interface aceitas no websocket da visão ao vivo (vazio: não confere).
+    live_origins: frozenset[str] = frozenset()
 
 
 def check_idempotency_key(key: str | None) -> str | None:
@@ -254,7 +256,9 @@ def create_api_router(services: ApiServices) -> APIRouter:
 
     # -- sessões de gravação ------------------------------------------------
 
-    add_session_routes(router, services.sessions, current_principal)
+    add_session_routes(
+        router, services.sessions, current_principal, allowed_origins=services.live_origins
+    )
 
     # -- OpenAPI dos robôs --------------------------------------------------
 

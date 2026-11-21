@@ -57,7 +57,13 @@ from rapa.compiler.naming import slugify
 from rapa.compiler.review import apply_choices, build_proposals
 from rapa.control.sessions.assistant import AssistantUnavailable, GeneralizationAssistant
 from rapa.control.sessions.launcher import SessionJob, SessionLauncher, SessionNotStarted
-from rapa.control.sessions.relay import LiveRelay, SessionGone, StopFailed, Viewer
+from rapa.control.sessions.relay import (
+    LiveRelay,
+    SessionGone,
+    StopFailed,
+    StopInProgress,
+    Viewer,
+)
 from rapa.control.sessions.store import LIVE_STATUSES, SessionRecord, SessionStore
 from rapa.control.sessions.tickets import TicketBook
 from rapa.core.contracts import (
@@ -378,23 +384,30 @@ class RecordingSessions:
     async def _end(
         self, record: SessionRecord, status: RecordingSessionStatus, reason: str
     ) -> SessionRecord:
-        """Encerra uma sessão que não recebeu ``parar``: o hospedeiro sai na hora (SIGTERM)."""
+        """Encerra uma sessão que não recebeu ``parar``: o hospedeiro sai na hora (SIGTERM).
+
+        A situação é gravada primeiro (quem consulta já vê a sessão encerrada e a vaga
+        livre) e o navegador sai depois; enquanto isso, ninguém encerra a mesma sessão
+        de novo.
+        """
         session_id = record.session_id
         self._live.pop(session_id, None)
         self._ending.add(session_id)
         try:
             self.tickets.revoke(session_id)
-            with contextlib.suppress(Exception):
-                await self.launcher.terminate(session_id)
-            await self.relay.forget(session_id)
-            updated = await self.store.set_status(
-                record.company_id,
-                session_id,
-                expected=LIVE_STATUSES,
-                status=status,
-                end_reason=reason,
-                stopped_at=self._clock(),
-            )
+            try:
+                updated = await self.store.set_status(
+                    record.company_id,
+                    session_id,
+                    expected=LIVE_STATUSES,
+                    status=status,
+                    end_reason=reason,
+                    stopped_at=self._clock(),
+                )
+            finally:
+                await self.relay.forget(session_id)
+                with contextlib.suppress(Exception):
+                    await self.launcher.terminate(session_id)
         finally:
             self._ending.discard(session_id)
         if updated is None:
@@ -535,6 +548,9 @@ class RecordingSessions:
             raise Conflict("a sessão de gravação não está aberta neste servidor; grave de novo")
         try:
             payload = await self.relay.stop(session_id)
+        except StopInProgress:
+            # Um segundo "parar" (dois cliques, duas abas) não estraga o primeiro.
+            raise Conflict("a sessão de gravação já está sendo parada; aguarde") from None
         except (SessionGone, StopFailed) as exc:
             await self._end(record, RecordingSessionStatus.FAILED, "parada_falhou")
             raise Conflict(f"não foi possível fechar a gravação: {exc}") from None

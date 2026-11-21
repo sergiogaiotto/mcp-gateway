@@ -2,9 +2,11 @@
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
 from typing import Any
+from uuid import UUID
 
 import httpx2
 import pytest
@@ -12,6 +14,7 @@ from fastapi import FastAPI
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
+from rapa.control.api.sessions import live_origins
 from rapa.control.auth import StaticTokenVerifier
 from rapa.control.http_app import HttpSettings, create_http_app
 from rapa.core.contracts import RecordingSessionStatus
@@ -28,7 +31,7 @@ TOKENS = {
 }
 
 
-def _app(world: SessionsWorld | None) -> FastAPI:
+def _app(world: SessionsWorld | None, public_url: str | None = None) -> FastAPI:
     people = world.people if world is not None else build_world().people
     platform = world.platform if world is not None else build_world().platform
     return create_http_app(
@@ -37,14 +40,16 @@ def _app(world: SessionsWorld | None) -> FastAPI:
         admin=platform,
         verifier=StaticTokenVerifier({t: people[who] for t, who in TOKENS.items()}),
         resolver=DictResolver(),
-        settings=HttpSettings(allow_static_tokens=True, rate_limit_per_s=None),
+        settings=HttpSettings(
+            allow_static_tokens=True, rate_limit_per_s=None, public_url=public_url
+        ),
         sessions=world.service if world is not None else None,
     )
 
 
 @contextmanager
-def _served(world: SessionsWorld | None) -> Iterator[str]:
-    with serve(_app(world)) as base:
+def _served(world: SessionsWorld | None, public_url: str | None = None) -> Iterator[str]:
+    with serve(_app(world, public_url)) as base:
         yield base
 
 
@@ -75,9 +80,26 @@ async def _ticket(client: httpx2.AsyncClient, session_id: str, who: str = "token
     return ticket
 
 
-async def _viewer(base: str, session_id: str, ticket: str) -> ClientConnection:
+async def _viewer(
+    base: str, session_id: str, ticket: str, *, origin: str | None = None
+) -> ClientConnection:
+    """Abre a visão ao vivo como a interface: o bilhete é a primeira mensagem."""
     ws_base = base.replace("http://", "ws://")
-    return await connect(f"{ws_base}/v1/sessoes/{session_id}/ao-vivo?bilhete={ticket}")
+    ws = await connect(
+        f"{ws_base}/v1/sessoes/{session_id}/ao-vivo",
+        origin=origin,  # type: ignore[arg-type]
+    )
+    await ws.send(json.dumps({"tipo": "bilhete", "bilhete": ticket}))
+    return ws
+
+
+async def _refused(ws: ClientConnection) -> int | None:
+    """O servidor fechou sem mandar nada: devolve o código de fechamento."""
+    with pytest.raises(ConnectionClosed) as closed:
+        while True:
+            message = await asyncio.wait_for(ws.recv(), timeout=10)
+            raise AssertionError(f"a janela recusada recebeu {message!r}")
+    return closed.value.rcvd.code if closed.value.rcvd is not None else None
 
 
 async def _until(ws: ClientConnection, check: Any, within: float = 10) -> list[Any]:
@@ -173,10 +195,8 @@ async def test_live_websocket_needs_a_fresh_ticket_and_relays_both_ways(
     world, base, client = http
     sid = (await _create(client, area_id=str(world.area_a)))["session_id"]
     ticket = await _ticket(client, sid)
-    for bad in ("", "inventado", ticket + "x"):
-        with pytest.raises(InvalidStatus) as caught:
-            await _viewer(base, sid, bad)
-        assert caught.value.response.status_code == 403
+    for bad in ("", "inventado", ticket + "x", "A" * 43, "A" * 5000):
+        assert await _refused(await _viewer(base, sid, bad)) == 1008
     # Os testes acima não gastaram o bilhete certo.
     ws = await _viewer(base, sid, ticket)
     seen = await _until(
@@ -194,9 +214,7 @@ async def test_live_websocket_needs_a_fresh_ticket_and_relays_both_ways(
     assert [m["tipo"] for m in host.received] == ["mouse", "texto"]
     assert host.received[1]["texto"] == "Conceição"
     # O mesmo bilhete não abre outra janela.
-    with pytest.raises(InvalidStatus) as caught:
-        await _viewer(base, sid, ticket)
-    assert caught.value.response.status_code == 403
+    assert await _refused(await _viewer(base, sid, ticket)) == 1008
     # Outra janela, com outro bilhete, substitui a primeira.
     second = await _viewer(base, sid, await _ticket(client, sid))
     await _until(second, lambda s: any(isinstance(m, bytes) and m.startswith(FRAME) for m in s))
@@ -238,3 +256,94 @@ async def test_sessions_are_not_mcp_tools() -> None:
     async with running(app), mcp_client(app, "token-criadora") as mcp:
         names = {tool.name for tool in (await mcp.list_tools()).tools}
     assert not any("sess" in name or "grav" in name for name in names)
+
+
+async def test_the_ticket_never_travels_in_the_address(
+    http: tuple[SessionsWorld, str, httpx2.AsyncClient],
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world, base, client = http
+    ws_base = base.replace("http://", "ws://")
+    sid = (await _create(client, area_id=str(world.area_a)))["session_id"]
+    other = await _create(client, who="token-outra", area_id=str(world.area_b))
+    # O log do servidor HTTP, com as linhas de acesso dos websockets.
+    for name in ("", "uvicorn.error", "uvicorn.access"):
+        caplog.set_level(logging.DEBUG, logger=name)
+    # Um bilhete no endereço é recusado antes de abrir, mesmo válido (e não é gasto).
+    in_address = await _ticket(client, sid)
+    with pytest.raises(InvalidStatus) as caught:
+        await connect(f"{ws_base}/v1/sessoes/{sid}/ao-vivo?bilhete={in_address}")
+    assert caught.value.response.status_code == 403
+    ticket = await _ticket(client, sid)
+    # Sem mensagem nenhuma, ou com outra coisa no lugar do bilhete, a conexão fecha.
+    monkeypatch.setattr("rapa.control.api.sessions.TICKET_TIMEOUT_S", 0.3)
+    silent = await connect(f"{ws_base}/v1/sessoes/{sid}/ao-vivo")
+    assert await _refused(silent) == 1008
+    wrong = await connect(f"{ws_base}/v1/sessoes/{sid}/ao-vivo")
+    await wrong.send(json.dumps({"tipo": "mouse", "acao": "mover", "x": 1, "y": 1}))
+    assert await _refused(wrong) == 1008
+    # O bilhete de outra empresa não abre esta sessão.
+    foreign = await _ticket(client, other["session_id"], who="token-outra")
+    assert await _refused(await _viewer(base, sid, foreign)) == 1008
+    # Uma colega da mesma área não recebe bilhete da sessão alheia.
+    colleague = await client.post(f"/v1/sessoes/{sid}/bilhete", headers=auth("token-colega"))
+    assert colleague.status_code == 404
+    # O bilhete que ficou no endereço recusado ainda vale (nunca foi lido), mas a interface
+    # nunca o põe lá: ela manda o bilhete como a primeira mensagem.
+    ws = await _viewer(base, sid, ticket)
+    seen = await _until(ws, lambda s: any(isinstance(m, dict) and m["tipo"] == "pagina" for m in s))
+    assert seen[0]["tipo"] == "sessao"
+    # "parar" vindo da janela nunca chega ao hospedeiro; uma mensagem enorme não derruba.
+    await ws.send(json.dumps({"tipo": "parar"}))
+    await ws.send("x" * (1024 * 1024))
+    await ws.send(json.dumps({"tipo": "mouse", "acao": "mover", "x": 1, "y": 1}))
+    host = world.launcher.hosts[UUID(sid)]
+    for _ in range(100):
+        if host.received:
+            break
+        await asyncio.sleep(0.05)
+    assert [m["tipo"] for m in host.received] == ["mouse"]
+    await ws.close()
+    # Nenhum bilhete mandado como mensagem aparece em log nenhum (nem no de acesso).
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "ao-vivo" in logged
+    for value in (ticket, foreign):
+        assert value not in logged
+
+
+async def test_with_a_public_url_only_the_interface_origin_opens_the_live_view() -> None:
+    world = build_world()
+    # Os hospedeiros falsos vivem no laço do servidor e fecham com ele.
+    with _served(world, public_url="https://rapa.exemplo.gov.br/api") as base:
+        async with httpx2.AsyncClient(base_url=base, trust_env=False, timeout=20) as client:
+            sid = (await _create(client, area_id=str(world.area_a)))["session_id"]
+            ticket = await _ticket(client, sid)
+            ws_base = base.replace("http://", "ws://")
+            for evil in ("https://evil.example", "https://rapa.exemplo.gov.br.evil.example"):
+                with pytest.raises(InvalidStatus) as caught:
+                    await connect(
+                        f"{ws_base}/v1/sessoes/{sid}/ao-vivo",
+                        origin=evil,  # type: ignore[arg-type]
+                    )
+                assert caught.value.response.status_code == 403
+            # A origem da interface (a da URL pública) abre; o bilhete não foi gasto acima.
+            ws = await _viewer(base, sid, ticket, origin="https://RAPA.exemplo.gov.br")
+            seen = await _until(ws, lambda s: any(isinstance(m, dict) for m in s))
+            assert seen[0]["tipo"] == "sessao"
+            await ws.close()
+            # Fora do navegador (sem Origin), só o bilhete vale.
+            ws = await _viewer(base, sid, await _ticket(client, sid))
+            assert (await _until(ws, lambda s: bool(s)))[0]["tipo"] == "sessao"
+            await ws.close()
+
+
+def test_live_origins_come_from_the_public_url_and_the_extra_list() -> None:
+    assert live_origins(None) == frozenset()
+    assert live_origins("https://RaPA.exemplo.gov.br:8443/base/") == {
+        "https://rapa.exemplo.gov.br:8443"
+    }
+    assert live_origins("https://api.exemplo", ["https://ui.exemplo/", " "]) == {
+        "https://api.exemplo",
+        "https://ui.exemplo",
+    }

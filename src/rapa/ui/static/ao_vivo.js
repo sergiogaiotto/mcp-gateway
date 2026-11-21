@@ -2,9 +2,9 @@
  * Visão ao vivo da gravação (RaPA): o único JavaScript que o time mantém na interface.
  *
  * Desenha num <canvas> as imagens da tela do navegador da nuvem e manda o mouse, a roda
- * e o teclado da pessoa pelo websocket da API (/v1/sessoes/{id}/ao-vivo), aberto com um
- * bilhete de uso único que a página recebe do servidor (window.RAPA_AO_VIVO). O token de
- * acesso nunca chega aqui.
+ * e o teclado da pessoa pelo websocket da API (/v1/sessoes/{id}/ao-vivo). O bilhete de uso
+ * único que a página recebe do servidor (window.RAPA_AO_VIVO) vai como a primeira mensagem
+ * do websocket, nunca no endereço (que fica nos logs). O token de acesso nunca chega aqui.
  *
  * Teclado: um <textarea> invisível sobre a tela recebe o foco. O texto (letras, acentos,
  * teclas mortas, composição do IME e o que se cola com Ctrl+V) sai do próprio campo, já
@@ -92,6 +92,7 @@
     });
     this.status = el("div", { role: "status", "aria-live": "polite", style: "min-height:1.4em;font-size:0.85em;color:#8a5300" }, this.root);
     var stage = el("div", { style: "position:relative;width:100%;background:#222;line-height:0" }, this.root);
+    this.stage = stage;
     this.canvas = el("canvas", {
       width: String(this.screen.w), height: String(this.screen.h), tabindex: "-1",
       "aria-label": "Tela do navegador da gravação",
@@ -133,7 +134,7 @@
   LiveView.prototype.url = function () {
     var base = this.config.base;
     if (!base) base = (location.protocol === "https:" ? "wss://" : "ws://") + location.host;
-    return base + this.config.caminho + "?bilhete=" + encodeURIComponent(this.ticket);
+    return base + this.config.caminho;
   };
 
   LiveView.prototype.connect = function () {
@@ -142,6 +143,9 @@
     ws.binaryType = "blob";
     this.ws = ws;
     ws.onopen = function () {
+      // O bilhete primeiro: o servidor fecha a conexão se a primeira mensagem não for ele.
+      ws.send(JSON.stringify({ tipo: "bilhete", bilhete: self.ticket }));
+      self.ticket = null;
       self.say("");
       self.scheduleResize();
     };
@@ -201,6 +205,7 @@
         break;
       case "fim":
         this.ended = true;
+        this.closeDialog();
         this.say(event.motivo === "parada" ? "Gravação parada." : (event.mensagem || "A gravação terminou."));
         emit("rapa_sessao_fim", event.motivo || "");
         break;
@@ -209,22 +214,76 @@
     }
   };
 
+  // Um diálogo da página do portal (alert, confirm, prompt) aparece aqui, dentro da tela
+  // da gravação e com a origem escrita, nunca como diálogo do próprio navegador da pessoa:
+  // um diálogo nativo sairia com o nome do RaPA, e a página poderia fingir ser o RaPA.
   LiveView.prototype.answerDialog = function (event) {
     var self = this;
-    // Um diálogo da página do portal: a pessoa responde aqui mesmo.
-    setTimeout(function () {
-      var kind = event.tipo_dialogo;
-      if (kind === "prompt") {
-        var text = window.prompt(event.texto || "", event.padrao || "");
-        self.send({ tipo: "dialogo", aceitar: text !== null, texto: text });
-      } else if (kind === "alert") {
-        window.alert(event.texto || "");
-        self.send({ tipo: "dialogo", aceitar: true });
-      } else {
-        self.send({ tipo: "dialogo", aceitar: window.confirm(event.texto || "") });
-      }
+    this.closeDialog();
+    var kind = event.tipo_dialogo;
+    var asks = kind === "prompt";
+    var box = el("div", {
+      role: "dialog", "aria-modal": "true", "aria-label": "Diálogo da página do portal",
+      "data-rapa-dialogo": kind || "",
+      style: "position:absolute;inset:0;display:flex;align-items:center;justify-content:center;" +
+        "background:rgba(0,0,0,0.55);line-height:normal;z-index:10"
+    }, this.stage);
+    var card = el("div", {
+      style: "background:#fff;color:#222;max-width:560px;width:90%;border-radius:6px;padding:16px;" +
+        "border-top:6px solid #8a5300;box-shadow:0 4px 18px rgba(0,0,0,0.45);font:inherit"
+    }, box);
+    el("div", {
+      text: "Mensagem da página aberta no navegador da gravação (não é do RaPA)",
+      style: "font-weight:600;color:#8a5300;margin-bottom:4px"
+    }, card);
+    el("div", {
+      text: "Quem escreveu o texto abaixo foi o site. O RaPA nunca pede senha por aqui.",
+      style: "font-size:0.85em;color:#555;margin-bottom:8px"
+    }, card);
+    el("div", {
+      text: event.texto || "", "data-rapa-dialogo-texto": "1",
+      style: "white-space:pre-wrap;overflow-wrap:anywhere;max-height:40vh;overflow:auto;" +
+        "padding:8px;background:#f4f4f4;border-radius:4px"
+    }, card);
+    var input = null;
+    if (asks) {
+      input = el("input", {
+        type: "text", "aria-label": "Resposta para a página", autocomplete: "off",
+        style: "width:100%;box-sizing:border-box;margin-top:8px;padding:6px 8px;border:1px solid #bbb;border-radius:4px;font:inherit"
+      }, card);
+      input.value = event.padrao || "";
+    }
+    var row = el("div", { style: "display:flex;gap:8px;justify-content:flex-end;margin-top:12px" }, card);
+    var cancel = null;
+    if (kind !== "alert") cancel = el("button", { type: "button", text: "Cancelar", style: "padding:6px 16px" }, row);
+    var ok = el("button", { type: "button", text: "OK", style: "padding:6px 16px" }, row);
+    function answer(accept) {
+      if (self.dialogBox !== box) return;
+      self.closeDialog();
+      var message = { tipo: "dialogo", aceitar: accept };
+      if (asks && accept) message.texto = input.value.slice(0, 2000);
+      self.send(message);
       self.touch();
-    }, 0);
+      self.keys.focus({ preventScroll: true });
+    }
+    ok.addEventListener("click", function () { answer(true); });
+    if (cancel) cancel.addEventListener("click", function () { answer(false); });
+    box.addEventListener("keydown", function (e) {
+      // As teclas do diálogo ficam aqui: nada vai para o navegador da gravação.
+      e.stopPropagation();
+      if (e.key === "Enter") { e.preventDefault(); answer(true); }
+      else if (e.key === "Escape") { e.preventDefault(); answer(kind === "alert"); }
+    });
+    this.dialogBox = box;
+    // O hospedeiro recusa o diálogo sozinho em 60 s; aqui ele some junto.
+    this.dialogTimer = setTimeout(function () { if (self.dialogBox === box) self.closeDialog(); }, 60000);
+    (input || ok).focus({ preventScroll: true });
+  };
+
+  LiveView.prototype.closeDialog = function () {
+    clearTimeout(this.dialogTimer);
+    if (this.dialogBox && this.dialogBox.parentNode) this.dialogBox.parentNode.removeChild(this.dialogBox);
+    this.dialogBox = null;
   };
 
   LiveView.prototype.setScreen = function (w, h) {

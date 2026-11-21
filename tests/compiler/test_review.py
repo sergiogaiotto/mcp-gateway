@@ -209,7 +209,15 @@ def test_model_proposals_are_checked_by_the_code() -> None:
         ("abrir", "write"),
     }
     assert [c.text for c in proposals.checks] == ["Cadastro salvo com sucesso"]
-    assert proposals.title == "Cadastrar pessoa"
+    # O título e a descrição do formulário são os da compilação; os do modelo ficam à parte.
+    assert (proposals.title, proposals.description) == (
+        compiled.manifest.title,
+        compiled.manifest.description,
+    )
+    assert proposals.robot_info is not None
+    assert proposals.robot_info.title == "Cadastrar pessoa"
+    assert proposals.robot_info.description == "Cadastra uma pessoa no portal."
+    assert proposals.robot_info.source is ProposalSource.MODEL
     assert len(proposals.model_rejected) == 2
     assert any("nao_existe" in reason for reason in proposals.model_rejected)
     assert any("não apareceu" in reason for reason in proposals.model_rejected)
@@ -284,3 +292,115 @@ def test_choices_the_code_refuses_are_reported_not_dropped() -> None:
     assert "digitar_nome_2" in reasons
     assert "já usa uma entrada" in reasons
     assert "não apareceu" in reasons
+
+
+def test_a_model_suggestion_equal_to_the_compiled_info_is_not_a_proposal() -> None:
+    compiled = _compiled(_cadastro(PEOPLE[:1]))
+    same = SetRobotInfo(title=compiled.manifest.title, description=compiled.manifest.description)
+    proposals = build_proposals(
+        compiled, session_id=uuid4(), recording_id=uuid4(), model_ops=[same]
+    )
+    assert proposals.robot_info is None
+    only_description = SetRobotInfo(description="Escrito pelo modelo.")
+    proposals = build_proposals(
+        compiled, session_id=uuid4(), recording_id=uuid4(), model_ops=[only_description]
+    )
+    assert proposals.robot_info is not None
+    assert proposals.robot_info.title is None
+    assert proposals.robot_info.description == "Escrito pelo modelo."
+    assert proposals.description == compiled.manifest.description
+
+
+def _click_step(step_id: str, name: str) -> dict[str, Any]:
+    return {
+        "kind": "click",
+        "id": step_id,
+        "title": f"Clicar em {name}",
+        "effect": "write",
+        "target": {
+            "intent": f"botão {name}",
+            "locators": [{"by": "role", "value": "button", "name": name}],
+        },
+    }
+
+
+def _two_blocks() -> Manifest:
+    steps: list[dict[str, Any]] = [
+        {"kind": "navigate", "id": "abrir", "title": "Abrir", "url": f"{BASE}/cadastro"}
+    ]
+    for n, nome in enumerate(["Maria", "João"], start=1):
+        steps += [_fill(f"nome_{n}", "Nome", nome), _click_step(f"salvar_{n}", "Salvar")]
+    steps.append(
+        {"kind": "navigate", "id": "abrir_produtos", "title": "Produtos", "url": f"{BASE}/produtos"}
+    )
+    for n, produto in enumerate(["Caneta", "Lápis"], start=1):
+        steps += [
+            _fill(f"produto_{n}", "Produto", produto),
+            _click_step(f"adicionar_{n}", "Adicionar"),
+        ]
+    return Manifest.model_validate(
+        {
+            "name": "dois_blocos",
+            "title": "Robô gravado",
+            "description": "Robô gravado.",
+            "allowed_domains": [HOST],
+            "steps": steps,
+        }
+    )
+
+
+def _accept_all(proposals: Any) -> list[RepetitionChoice]:
+    return [
+        RepetitionChoice(
+            proposal_id=r.proposal_id,
+            list_name=r.list_name,
+            list_title=r.list_title,
+            fields=[
+                RepetitionFieldChoice(step_id=f.step_id, name=f.name, title=f.title, type=f.type)
+                for f in r.fields
+            ],
+        )
+        for r in proposals.repetitions
+    ]
+
+
+def test_two_accepted_repetitions_apply_together() -> None:
+    compiled = _compiled(_two_blocks())
+    proposals = build_proposals(compiled, session_id=uuid4(), recording_id=uuid4(), model_ops=[])
+    assert len(proposals.repetitions) == 2
+    choices = DraftChoices(
+        name="dois_blocos",
+        title="Dois blocos",
+        description="Dois blocos.",
+        repetitions=_accept_all(proposals),
+    )
+    manifest = apply_choices(compiled, choices)
+    assert sorted(i.name for i in manifest.inputs) == sorted(
+        r.list_name for r in proposals.repetitions
+    )
+    assert len({i.name for i in manifest.inputs}) == 2
+
+
+def test_a_parameter_inside_an_accepted_repetition_is_refused() -> None:
+    compiled = _compiled(_two_blocks())
+    proposals = build_proposals(compiled, session_id=uuid4(), recording_id=uuid4(), model_ops=[])
+    rep = proposals.repetitions[0]
+    choices = DraftChoices(
+        name="dois_blocos",
+        title="Dois blocos",
+        description="Dois blocos.",
+        repetitions=[
+            RepetitionChoice(
+                proposal_id=rep.proposal_id,
+                list_name="pessoas",
+                list_title="Pessoas",
+                fields=[
+                    RepetitionFieldChoice(step_id=f.step_id, name="nome", title="Nome")
+                    for f in rep.fields
+                ],
+            )
+        ],
+        parameters=[ParameterChoice(step_id="nome_2", name="nome_da_segunda", title="Nome")],
+    )
+    with pytest.raises(InvalidInput):
+        apply_choices(compiled, choices)

@@ -2,19 +2,33 @@
 
 Os pedidos REST usam a mesma autenticação da API (``Authorization: Bearer``) e o
 mesmo limite por empresa. O websocket ``/v1/sessoes/{id}/ao-vivo`` não recebe o
-token de acesso: só um bilhete de uso único (``?bilhete=``), pedido antes pelo
-REST pela dona da sessão. Um bilhete inválido, vencido ou já usado é recusado
-antes de abrir o websocket (HTTP 403). A sessão é da dona: só uma janela por vez
-assiste, e uma segunda janela substitui a primeira
-(:mod:`rapa.control.sessions.relay`).
+token de acesso: só um bilhete de uso único (60 s), pedido antes pelo REST pela
+dona da sessão, que a janela manda como **primeira mensagem**
+(``{"tipo": "bilhete", "bilhete": "..."}``), nunca no endereço: assim ele não
+aparece no log de acesso do servidor nem de nenhum proxy no caminho.
+
+- Antes de abrir (HTTP 403): um endereço com consulta (``?bilhete=`` não vale) ou
+  um ``Origin`` fora das origens da interface, quando elas estão configuradas (a
+  origem de ``RAPA_PUBLIC_URL`` e as de ``RAPA_ORIGENS_AO_VIVO``). Navegadores
+  sempre mandam ``Origin`` no websocket; um cliente fora do navegador, sem
+  ``Origin``, depende só do bilhete.
+- Depois de abrir: sem uma mensagem de bilhete válida em
+  :data:`TICKET_TIMEOUT_S`, o websocket fecha com o código 1008, sem dizer por quê
+  (bilhete inválido, vencido, já usado ou de outra sessão).
+
+A sessão é da dona: só uma janela por vez assiste, e uma segunda janela substitui
+a primeira (:mod:`rapa.control.sessions.relay`).
 
 Sem o serviço de gravação configurado, todas as rotas respondem 503.
 """
 
+import asyncio
 import contextlib
+import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Response, WebSocket
@@ -36,12 +50,40 @@ from rapa.core.contracts import (
 )
 from rapa.session.protocol import dump_event
 
-__all__ = ["CreateSessionBody", "add_session_routes"]
+__all__ = ["TICKET_TIMEOUT_S", "CreateSessionBody", "add_session_routes", "live_origins"]
 
 logger = logging.getLogger(__name__)
 
 #: Código de fechamento do websocket quando a sessão acaba por um erro de regra.
 _POLICY_CLOSE = 1008
+#: Prazo para a janela mandar o bilhete, a primeira mensagem do websocket.
+TICKET_TIMEOUT_S = 5.0
+#: Maior mensagem de bilhete aceita (o bilhete tem 43 caracteres).
+_MAX_TICKET_MESSAGE = 512
+
+
+def live_origins(public_url: str | None, extra: Iterable[str] = ()) -> frozenset[str]:
+    """Origens aceitas no websocket da visão ao vivo: a da URL pública e as informadas."""
+    origins = {o.strip().rstrip("/") for o in extra if o.strip()}
+    if public_url:
+        parts = urlsplit(public_url)
+        if parts.scheme and parts.netloc:
+            origins.add(f"{parts.scheme}://{parts.netloc}".lower())
+    return frozenset(o.lower() for o in origins)
+
+
+def _ticket_of(raw: str | None) -> str | None:
+    """O bilhete da primeira mensagem, se ela tiver o formato certo."""
+    if raw is None or len(raw) > _MAX_TICKET_MESSAGE:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or data.get("tipo") != "bilhete":
+        return None
+    ticket = data.get("bilhete")
+    return ticket if isinstance(ticket, str) and ticket else None
 
 
 class CreateSessionBody(BaseModel):
@@ -86,9 +128,19 @@ def add_session_routes(
     router: APIRouter,
     sessions: RecordingSessions | None,
     caller: Callable[..., Any],
+    *,
+    allowed_origins: frozenset[str] = frozenset(),
 ) -> None:
-    """Acrescenta as rotas das sessões ao roteador de ``/v1``."""
+    """Acrescenta as rotas das sessões ao roteador de ``/v1``.
+
+    ``allowed_origins`` (de :func:`live_origins`): as origens da interface que podem
+    abrir a visão ao vivo; vazio, o ``Origin`` não é conferido (só o bilhete vale).
+    """
     caller_dep = Depends(caller)
+
+    def origin_ok(websocket: WebSocket) -> bool:
+        origin = websocket.headers.get("origin")
+        return not allowed_origins or origin is None or origin.lower() in allowed_origins
 
     def service() -> RecordingSessions:
         if sessions is None:
@@ -152,18 +204,25 @@ def add_session_routes(
         return info
 
     @router.websocket("/sessoes/{session_id}/ao-vivo")
-    async def live(websocket: WebSocket, session_id: UUID, bilhete: str = "") -> None:
-        if sessions is None:
-            await websocket.close(code=_POLICY_CLOSE)
-            return
-        try:
-            greeting = await sessions.admit_viewer(session_id, bilhete)
-        except ContractError:
+    async def live(websocket: WebSocket, session_id: UUID) -> None:
+        if sessions is None or websocket.query_params or not origin_ok(websocket):
             # Antes de aceitar: o navegador recebe HTTP 403, sem dizer por quê.
             await websocket.close(code=_POLICY_CLOSE)
             return
         await websocket.accept()
         viewer = _SocketViewer(websocket)
+        try:
+            raw = await asyncio.wait_for(viewer.receive_text(), TICKET_TIMEOUT_S)
+        except TimeoutError:
+            raw = None
+        ticket = _ticket_of(raw)
+        try:
+            if ticket is None:
+                raise NotFound("bilhete ausente")
+            greeting = await sessions.admit_viewer(session_id, ticket)
+        except ContractError:
+            await viewer.close(_POLICY_CLOSE, "recusada")
+            return
         try:
             await sessions.relay_viewer(session_id, viewer, greeting)
         except ContractError as exc:

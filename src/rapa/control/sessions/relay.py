@@ -16,9 +16,13 @@ hospedeiro aceita uma conexão por vez; a ligação é essa conexão.
   audita.
 - **Sem fila.** Os quadros vão para a janela por um
   :class:`rapa.session.protocol.FrameSender`: numa rede lenta, os intermediários
-  são descartados e o último sempre chega. O último quadro e os últimos eventos
-  ``pronta``, ``tela`` e ``pagina`` ficam guardados (só em memória) para a próxima
-  janela começar com a tela certa.
+  são descartados e o último sempre chega. Os eventos vão por uma caixa de saída
+  da janela (:class:`_Outbox`, no máximo :data:`OUTBOX_LIMIT` esperando, e um
+  ``pagina`` ou ``tela`` novo toma o lugar do que ainda não saiu): uma janela que
+  para de ler (aba em segundo plano, rede lenta) nunca trava a ligação com o
+  hospedeiro, que continua lendo (o ``ping``, a gravação do ``parar``). O último
+  quadro e os últimos eventos ``pronta``, ``tela`` e ``pagina`` ficam guardados (só
+  em memória) para a próxima janela começar com a tela certa.
 - **A gravação não passa.** O evento ``gravacao`` só serve ao pedido de parar e
   nunca vai para a janela; quadros e eventos nunca vão para o log.
 """
@@ -27,6 +31,7 @@ import asyncio
 import contextlib
 import json
 import logging
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -47,11 +52,13 @@ from rapa.session.protocol import (
 )
 
 __all__ = [
+    "OUTBOX_LIMIT",
     "REPLACED_CLOSE_CODE",
     "HostLink",
     "LiveRelay",
     "SessionGone",
     "StopFailed",
+    "StopInProgress",
     "Viewer",
 ]
 
@@ -62,6 +69,14 @@ REPLACED_CLOSE_CODE = 4001
 #: A gravação pode ser grande (texto das páginas); o canal com o hospedeiro aceita até isto.
 MAX_HOST_MESSAGE = 64 * 1024 * 1024
 _CACHED_EVENTS = ("pronta", "tela", "pagina")
+#: Eventos esperando a janela, no máximo; acima disso, o mais velho cai.
+OUTBOX_LIMIT = 64
+#: Eventos em que só o último interessa (um novo toma o lugar do que ainda não saiu).
+_COALESCED = frozenset({"pagina", "tela"})
+#: Eventos que só caem se não houver outro para descartar.
+_KEPT = frozenset({"fim", "dialogo", "sessao"})
+#: Espera pela janela para entregar o que ficou (o ``fim``) antes de fechá-la.
+_FLUSH_TIMEOUT_S = 2.0
 
 type EndCallback = Callable[[UUID, str], Awaitable[None]]
 
@@ -72,6 +87,10 @@ class SessionGone(RuntimeError):
 
 class StopFailed(RuntimeError):
     """O hospedeiro não devolveu a gravação; a mensagem é fixa, em pt-BR."""
+
+
+class StopInProgress(StopFailed):
+    """Outro pedido já está parando a sessão (este não muda nada)."""
 
 
 class Viewer(Protocol):
@@ -88,11 +107,74 @@ class Viewer(Protocol):
     async def close(self, code: int, reason: str) -> None: ...
 
 
+class _Outbox:
+    """Eventos para a janela, enviados por uma tarefa própria e sem acúmulo."""
+
+    def __init__(self, send: Callable[[str], Awaitable[None]], limit: int = OUTBOX_LIMIT) -> None:
+        self._send = send
+        self._limit = limit
+        self._items: deque[tuple[str, str]] = deque()
+        self._task: asyncio.Task[None] | None = None
+        self._closed = False
+        self.dropped = 0
+
+    @property
+    def pending(self) -> int:
+        return len(self._items)
+
+    def offer(self, kind: str, raw: str) -> None:
+        """Põe o evento na fila da janela; nunca espera."""
+        if self._closed:
+            return
+        if kind in _COALESCED:
+            before = len(self._items)
+            self._items = deque(item for item in self._items if item[0] != kind)
+            self.dropped += before - len(self._items)
+        if len(self._items) >= self._limit:
+            victim = next((i for i, item in enumerate(self._items) if item[0] not in _KEPT), 0)
+            del self._items[victim]
+            self.dropped += 1
+        self._items.append((kind, raw))
+        if self._task is None or self._task.done():
+            self._task = asyncio.get_running_loop().create_task(self._pump())
+
+    async def _pump(self) -> None:
+        while self._items and not self._closed:
+            _, raw = self._items.popleft()
+            try:
+                await self._send(raw)
+            except Exception:
+                # A janela caiu: quem é dono dela percebe e encerra; aqui só para.
+                self._closed = True
+                self._items.clear()
+                return
+
+    async def flush(self) -> None:
+        """Espera o que está na fila sair (com prazo: a janela pode não estar lendo)."""
+        task = self._task
+        if task is not None and not task.done():
+            with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(task), _FLUSH_TIMEOUT_S)
+
+    async def close(self) -> None:
+        self._closed = True
+        self._items.clear()
+        task, self._task = self._task, None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
 @dataclass
 class _Attached:
     viewer: Viewer
     sender: FrameSender
+    outbox: _Outbox
     replaced: bool = False
+
+    async def detach(self) -> None:
+        await self.sender.close()
+        await self.outbox.close()
 
 
 @dataclass
@@ -154,19 +236,20 @@ class HostLink:
                 self.recording.set_exception(StopFailed(text[:300]))
         viewer = self.viewer
         if viewer is not None:
-            with contextlib.suppress(Exception):
-                await viewer.viewer.send_text(raw)
+            # Nunca espera a janela: a leitura do hospedeiro segue mesmo se ela parou de ler.
+            viewer.outbox.offer(kind, raw)
 
     async def _closed(self) -> None:
         if self.recording is not None and not self.recording.done():
             self.recording.set_exception(SessionGone("o navegador da gravação fechou"))
         viewer, self.viewer = self.viewer, None
         if viewer is not None:
-            await viewer.sender.close()
+            if self.ended is None:
+                viewer.outbox.offer("fim", dump_event("fim", motivo="perdida"))
+            await viewer.outbox.flush()
+            await viewer.detach()
             with contextlib.suppress(Exception):
-                if self.ended is None:
-                    await viewer.viewer.send_text(dump_event("fim", motivo="perdida"))
-                await viewer.viewer.close(1000, "fim")
+                await asyncio.wait_for(viewer.viewer.close(1000, "fim"), _FLUSH_TIMEOUT_S)
         if self.on_end is not None:
             with contextlib.suppress(Exception):
                 await self.on_end(self.session_id, self.ended or "perdida")
@@ -255,28 +338,37 @@ class LiveRelay:
     async def watch(self, session_id: UUID, viewer: Viewer, *, greeting: str | None = None) -> None:
         """Liga a janela à sessão até ela sair, a sessão acabar ou outra janela a substituir."""
         link = await self._link(session_id)
-        attached = _Attached(viewer=viewer, sender=FrameSender(viewer.send_bytes))
+        attached = _Attached(
+            viewer=viewer,
+            sender=FrameSender(viewer.send_bytes),
+            outbox=_Outbox(viewer.send_text),
+        )
+        # A saudação e a tela guardada entram na caixa antes de qualquer evento novo.
+        if greeting is not None:
+            attached.outbox.offer("sessao", greeting)
+        for kind in _CACHED_EVENTS:
+            if kind in link.cached:
+                attached.outbox.offer(kind, link.cached[kind])
         previous, link.viewer = link.viewer, attached
+        if link.last_frame is not None:
+            attached.sender.offer(link.last_frame)
         if previous is not None:
             previous.replaced = True
-            await previous.sender.close()
+            await previous.detach()
             with contextlib.suppress(Exception):
-                await previous.viewer.send_text(dump_event("fim", motivo="substituida"))
-                await previous.viewer.close(REPLACED_CLOSE_CODE, "substituida")
+                await asyncio.wait_for(
+                    previous.viewer.send_text(dump_event("fim", motivo="substituida")),
+                    _FLUSH_TIMEOUT_S,
+                )
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    previous.viewer.close(REPLACED_CLOSE_CODE, "substituida"), _FLUSH_TIMEOUT_S
+                )
         try:
-            try:
-                if greeting is not None:
-                    await viewer.send_text(greeting)
-                for kind in _CACHED_EVENTS:
-                    if kind in link.cached:
-                        await viewer.send_text(link.cached[kind])
-            except Exception:
-                return  # a janela fechou logo ao abrir
-            if link.last_frame is not None:
-                attached.sender.offer(link.last_frame)
             while link.open and not attached.replaced:
                 raw = await viewer.receive_text()
-                if raw is None:
+                # Outra janela pode ter tomado o lugar enquanto esta esperava: nada dela passa.
+                if raw is None or attached.replaced:
                     break
                 forwarded = _viewer_message(raw)
                 if forwarded is None:
@@ -288,13 +380,13 @@ class LiveRelay:
         finally:
             if link.viewer is attached:
                 link.viewer = None
-            await attached.sender.close()
+            await attached.detach()
 
     async def stop(self, session_id: UUID) -> dict[str, Any]:
         """Pede ao hospedeiro a gravação e devolve o JSON dela (já sem segredos)."""
         link = await self._link(session_id)
         if link.recording is not None:
-            raise StopFailed("a sessão já está sendo parada")
+            raise StopInProgress("a sessão já está sendo parada")
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         link.recording = future
         try:

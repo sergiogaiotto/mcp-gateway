@@ -72,8 +72,10 @@ async def test_record_by_input_messages_generalize_draft_publish_and_run(
             ticket = await client.post(f"/v1/sessoes/{sid}/bilhete", headers=creator)
             assert ticket.status_code == 200
             ws_url = api.replace("http://", "ws://") + ticket.json()["path"]
-            ws = await connect(f"{ws_url}?bilhete={ticket.json()['ticket']}", max_size=None)
+            ws = await connect(ws_url, max_size=None)
             live = LiveClient(ws)
+            # O bilhete é a primeira mensagem, nunca vai no endereço.
+            await live.send(tipo="bilhete", bilhete=ticket.json()["ticket"])
             # Um navegador do mesmo tamanho só mede onde ficam os campos (sem eventos no outro).
             browser = await playwright.chromium.launch(
                 executable_path=chromium_path, args=[HOST_RESOLVER_ARG]
