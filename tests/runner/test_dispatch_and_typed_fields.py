@@ -2136,6 +2136,60 @@ async def test_a_target_taller_than_its_shifted_modal_iframe_is_never_clicked_bl
     _wrote(outcome, srv, RunState.FAILED, "")
 
 
+@pytest.mark.parametrize(
+    ("page_style", "modal_style"),
+    [
+        ("", "transform:translate(-50%,-50%);zoom:0.8"),
+        ("zoom:0.8", "transform:translate(-50%,-50%)"),
+    ],
+    ids=["no_modal", "na_pagina"],
+)
+async def test_a_shifted_modal_iframe_under_css_zoom_is_never_clicked_blind(
+    run_robot: RobotRunner, srv: _Server, page_style: str, modal_style: str
+) -> None:
+    # Com CSS zoom em volta do iframe de um modal transformado, o Playwright erra o ponto do
+    # clique (põe as caixas sem o zoom) e não confere o que está por cima: o clique cairia no
+    # fundo do modal, que fecha e grava. A espera conta o alvo como coberto, e nada é feito.
+    form = _page(
+        "<div style='height:110px'></div><div style='padding-left:180px'>"
+        f"<button type='button' style='width:90px;height:32px' onclick=\"{_SAVE_S}\">"
+        "Salvar</button></div>"
+    )
+    host = (
+        f"<!doctype html><html style='{page_style}'><head><meta charset='utf-8'></head><body>"
+        "<div style='position:fixed;inset:0;z-index:1;background:rgba(0,0,0,.1)' "
+        "onclick=\"fetch('/api',{method:'POST',body:'FECHA;'})\"></div>"
+        "<div style='position:fixed;left:50%;top:50%;background:#fff;z-index:3;"
+        f"{modal_style}'><iframe id='f' src='/form' "
+        "style='width:400px;height:220px;border:0;display:block'></iframe></div></body></html>"
+    )
+    srv.app = _api_app(srv, {"/host": host, "/form": form})
+    save = _click("salvar", "Salvar", effect="write", timeout=4_000)
+    save["target"]["frames"] = ["#f"]
+    outcome = await _run(run_robot, _manifest([_nav(srv.base, "/host"), save]))
+    _wrote(outcome, srv, RunState.FAILED, "")
+
+
+async def test_a_button_inside_deeply_nested_components_is_clicked_in_time(
+    run_robot: RobotRunner, srv: _Server
+) -> None:
+    # O texto do botão passa por 18 componentes aninhados, cada um com um <slot>. O rótulo que
+    # o vigia confere lê cada nó posto num slot uma vez só, pelo slot: o custo não dobra a cada
+    # nível, e o clique vai dentro do prazo do passo.
+    inner = "Salvar"
+    for _ in range(18):
+        inner = f"<x-w>{inner}</x-w>"
+    page = _page(
+        f"<button type='button' onclick=\"{_SAVE_S}\">{inner}</button>"
+        "<script>customElements.define('x-w',class extends HTMLElement{constructor(){super();"
+        "this.attachShadow({mode:'open'}).innerHTML='<span><slot></slot></span>'}})</script>"
+    )
+    srv.app = _api_app(srv, {"/p": page})
+    manifest = _manifest([_nav(srv.base, "/p"), _click("salvar", "Salvar", effect="write")])
+    outcome = await _run(run_robot, manifest)
+    _wrote(outcome, srv, RunState.SUCCEEDED, "S;")
+
+
 async def test_a_drawer_inside_a_shifted_modal_iframe_never_gives_the_click_to_the_page_over_it(
     run_robot: RobotRunner, srv: _Server
 ) -> None:
