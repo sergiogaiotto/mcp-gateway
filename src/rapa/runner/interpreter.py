@@ -757,8 +757,10 @@ Object.defineProperty(window, key, {
 # executor lê depois de agir. O ouvinte do vigia é o que :data:`_GUARD_HOOK_JS` pôs no
 # documento antes dos scripts dele (senão, um posto agora, depois dos que a página já pôs na
 # janela). Num clique ou numa marcação, o rótulo do alvo (``aria-label``, ``title``, o texto
-# de ``aria-labelledby`` e dos ``<label>`` dele, ``data-testid``, o texto do HTML com o ``alt``
-# das imagens e o ``aria-label`` dos elementos de dentro, como o de um ``<svg>``) também
+# de ``aria-labelledby``, com o ``aria-label`` e o ``title`` do elemento dele, e dos ``<label>``
+# dele, ``data-testid``, o texto do HTML com o ``alt`` das imagens e o valor dos campos de
+# dentro, e os nomes dos elementos de dentro: o ``aria-label`` de um ``<svg>``, o nome do
+# ``aria-labelledby`` deles e, sem um nem outro, o ``title`` de um ícone) também
 # precisa ser o da hora em que o vigia foi posto: uma lista virtual que reaproveita o nó para
 # outro item enquanto o Playwright rola até ele troca o rótulo. Vale também o rótulo que os
 # ouvintes da página para a chegada do mouse ao alvo puseram (``pointerover`` e ``mouseover``,
@@ -766,8 +768,9 @@ Object.defineProperty(window, key, {
 # depois deles), se ele era o da hora do vigia quando o mouse chegou e se só a dica mudou: o
 # ``title`` que sai ou chega e o ``aria-label`` que chega igual ao ``title`` da chegada, sem
 # que um ou outro tenha passado por outro valor desde o vigia; o texto, os ``<label>``, o
-# ``aria-labelledby``, o ``data-testid`` e os nomes de dentro iguais. Depois do primeiro evento de um clique ou
-# de uma marcação, e até o ``click``, o vigia confere de novo, em cada evento do navegador, o
+# ``aria-labelledby`` e o ``data-testid`` iguais; os nomes de dentro iguais, ou chegando quando
+# o ``title`` e o ``aria-label`` não mudaram. Depois do primeiro evento de um clique ou de uma
+# marcação, e até o ``click``, o vigia confere de novo, em cada evento do navegador, o
 # endereço, a linha e o rótulo (os ouvintes da página já receberam os eventos de antes e podem
 # tê-los mudado); se mudaram, ele cancela esse evento e os seguintes (``meio``). Um clique
 # cujos eventos não chegaram à janela do alvo vale ``fora``.
@@ -843,13 +846,45 @@ const typedHold = () => (typed || []).every(([node, value]) => fieldValue(node) 
 const armedAt = view.performance.now();
 const prompt = () => late === null || view.performance.now() - armedAt <= late;
 // O rótulo do alvo num clique ou numa marcação (uma lista virtual que reaproveita o nó).
-const named = (ids) => (ids ?? '').split(/\s+/).filter(Boolean)
-  .map((id) => target.getRootNode().getElementById?.(id) ?? null)
-  .map((node) => (node ? normalize(htmlText(node)) : '')).join(' ');
-// O texto do nome também vem do alt (<img>, <area>, <input type=image>) e do aria-label de
-// um elemento de dentro (o <svg role=img aria-label>).
+// O elemento do aria-labelledby vale com o aria-label, o title e os nomes de dentro dele (sem
+// seguir outro aria-labelledby, como o nome também não segue). Uma vez por id em cada leitura
+// do rótulo: muitos elementos de dentro podem apontar para o mesmo.
+const memo = new Map();
+const refName = (root, id) => {
+  const node = root.getElementById?.(id) ?? null;
+  if (!node) return '';
+  const sub = [];
+  const text = normalize(embedded(node) ?? nameText(node, sub, false));
+  return [node.getAttribute('aria-label') ?? '', node.getAttribute('title') ?? '', text, ...sub]
+    .join(' ');
+};
+// O id vale no documento ou no shadow root de quem aponta (o nó posto num <slot> aponta para o
+// documento dele).
+const named = (ids, from) => {
+  const root = from.getRootNode();
+  if (!memo.has(root)) memo.set(root, new Map());
+  const known = memo.get(root);
+  return (ids ?? '').split(/\s+/).filter(Boolean).map((id) => {
+    if (!known.has(id)) known.set(id, refName(root, id));
+    return known.get(id);
+  }).join(' ');
+};
+// O valor de um campo embutido (o nome também o usa).
+const embedded = (node) => {
+  if (node instanceof HTMLSelectElement) return [...node.selectedOptions].map((o) => o.text).join(' ');
+  if (node instanceof HTMLTextAreaElement) return node.value;
+  if (node instanceof HTMLInputElement && !buttons.has(node.type) && node.type !== 'image') return node.value;
+  return null;
+};
+// O texto do nome também vem do alt (<img>, <area>, <input type=image>), também no elemento
+// do aria-labelledby.
 const inner = [];
-const nameText = (node) => {
+// Os nomes de dentro (into): o aria-label de um elemento de dentro (o <svg role=img>), o nome
+// do aria-labelledby dele e, sem um nem outro, o title dele (o <i title> de um ícone, o
+// <img title> sem alt, o title de um texto aria-hidden). O valor de um campo de dentro entra
+// no texto. Sem ``follow``, o aria-labelledby de dentro não é seguido (no elemento de um
+// aria-labelledby, como o nome também não segue).
+const nameText = (node, into = inner, follow = true) => {
   if (node.nodeType === 1 && skipped.has(node.nodeName)) return '';
   if (node instanceof HTMLInputElement && buttons.has(node.type)) return node.value;
   if ((node instanceof HTMLInputElement && node.type === 'image') || node instanceof HTMLImageElement
@@ -857,30 +892,48 @@ const nameText = (node) => {
     return node.getAttribute('alt') ?? '';
   }
   let text = '';
-  for (let child = node.firstChild; child; child = child.nextSibling) {
+  // Um <slot> vale com o que a página pôs nele (o botão de dentro de um componente).
+  const kids = node instanceof HTMLSlotElement && node.assignedNodes().length
+    ? node.assignedNodes() : node.childNodes;
+  for (const child of kids) {
     if (child.nodeType === 3) text += child.nodeValue ?? '';
     else if (child.nodeType === 1) {
       const own = child.getAttribute('aria-label');
-      if (own) inner.push(own);
-      text += nameText(child);
+      const refs = follow ? child.getAttribute('aria-labelledby') : null;
+      const sub = embedded(child) ?? nameText(child, into, follow);
+      if (own) into.push(own);
+      if (refs) into.push(named(refs, child));
+      // O title de um elemento de dentro, também com texto (o texto pode ser aria-hidden).
+      const tip = child.getAttribute('title');
+      if (tip && !own && !refs) into.push(tip);
+      text += sub;
     }
   }
-  if (node.shadowRoot) text += nameText(node.shadowRoot);
+  if (node.shadowRoot) text += nameText(node.shadowRoot, into, follow);
   return text;
+};
+// A <label> vale também com o aria-label, o title e o aria-labelledby dela (o nome os usa).
+const labelText = (node) => {
+  const sub = [];
+  return [node.getAttribute('aria-label') ?? '', node.getAttribute('title') ?? '',
+    named(node.getAttribute('aria-labelledby'), node), normalize(nameText(node, sub)), ...sub]
+    .join(' ');
 };
 const parts = () => {
   inner.length = 0;
+  memo.clear();
   const text = normalize(nameText(target));
   return [target.getAttribute('aria-label') ?? '', target.getAttribute('title') ?? '',
-    named(target.getAttribute('aria-labelledby')),
-    [...(target.labels ?? [])].map((node) => normalize(htmlText(node))).join(' '),
+    named(target.getAttribute('aria-labelledby'), target),
+    [...(target.labels ?? [])].map(labelText).join(' '),
     target.getAttribute('data-testid') ?? '', text, inner.join(' ')];
 };
 const label = () => JSON.stringify(parts());
 // Só a dica mudou: o title que sai ou chega, o aria-label que chega igual ao title da chegada
-// (o Bootstrap 5); o resto, igual. Os valores por que o title e o aria-label do alvo passaram
-// desde o vigia também contam: um nó reaproveitado nos ouvintes da chegada, antes de uma dica
-// que tira o title (o jQuery UI), passa pelo title do outro item.
+// (o Bootstrap 5), os nomes de dentro que chegam com o title e o aria-label iguais; o resto,
+// igual. Os valores por que o title e o aria-label do alvo passaram desde o vigia também
+// contam: um nó reaproveitado nos ouvintes da chegada, antes de uma dica que tira o title (o
+// jQuery UI), passa pelo title do outro item.
 const seen = [];
 const keep = (records) => {
   for (const record of records) seen.push([record.attributeName, record.oldValue ?? '']);
@@ -900,7 +953,7 @@ const tooltipOnly = (h, a) => (drain(), true)
   && passed('aria-label', h[0], '') && passed('title', h[1], '')
   && (a[1] === h[1] || a[1] === '' || h[1] === '')
   && a[2] === h[2] && a[3] === h[3] && a[4] === h[4] && a[5] === h[5]
-  && (a[6] === h[6] || h[6] === '');
+  && (a[6] === h[6] || (h[6] === '' && a[0] === h[0] && a[1] === h[1]));
 const armedLabel = kind === 'clique' || kind === 'marca' ? label() : null;
 // O rótulo quando o mouse chega ao alvo, antes dos ouvintes da página, e logo depois dos
 // ouvintes dela para a chegada: a mudança que a chegada do mouse fez só vale se for a de
@@ -1008,7 +1061,16 @@ if (!want.matches('input, textarea, select') && !want.isContentEditable) {
 }
 let view = element.ownerDocument.defaultView;
 let box = null;
-for (const rect of element.getClientRects()) {
+// Um elemento sem caixa própria (display: contents) não diz onde o clique cai: o Playwright
+// clica no meio do primeiro pedaço desenhado, que pode ser um texto, um ::before ou o shadow
+// root fechado de um componente. Conta como coberto.
+const drawn = [...element.getClientRects()];
+// Num iframe, o Playwright corta as caixas só pela janela de cima: uma caixa que passa da
+// janela do iframe (um alvo maior que ela) pode levar o clique para fora dele. Só vale com
+// todas as caixas dentro da janela de cada iframe.
+let rects = drawn.filter((rect) => rect.width > 0 && rect.height > 0)
+  .map((rect) => [rect.left, rect.top, rect.right, rect.bottom]);
+for (const rect of drawn) {
   const left = Math.max(rect.left, 0);
   const top = Math.max(rect.top, 0);
   const right = Math.min(rect.right, view.innerWidth);
@@ -1077,6 +1139,11 @@ for (;;) {
     frame = null;
   }
   if (!frame) return true;
+  const here = doc.defaultView;
+  if (rects.some((r) => r[0] < -1 || r[1] < -1 || r[2] > here.innerWidth + 1
+      || r[3] > here.innerHeight + 1)) {
+    return false;
+  }
   const outer = frame.ownerDocument.defaultView;
   for (let node = frame; node && node.nodeType === 1;
       node = node.parentElement ?? node.parentNode?.host ?? null) {
@@ -1088,6 +1155,7 @@ for (;;) {
   const sy = frame.offsetHeight ? rect.height / frame.offsetHeight : 1;
   const ox = rect.left + (frame.clientLeft + (parseFloat(style.paddingLeft) || 0)) * sx;
   const oy = rect.top + (frame.clientTop + (parseFloat(style.paddingTop) || 0)) * sy;
+  rects = rects.map((r) => [ox + r[0] * sx, oy + r[1] * sy, ox + r[2] * sx, oy + r[3] * sy]);
   box = [Math.max(ox + box[0] * sx, 0), Math.max(oy + box[1] * sy, 0),
     Math.min(ox + box[2] * sx, outer.innerWidth), Math.min(oy + box[3] * sy, outer.innerHeight)];
   // Fora da janela de cima (uma gaveta que ainda entra): ainda não dá para clicar.
@@ -4159,14 +4227,15 @@ class Interpreter:
         )
         ctx.held = _held(typed)
         await self._arm_guard(step, ctx, target, page, typed, frame)
-        if points or await self._points_at(step, ctx.element):
+        if points or isinstance(step, CheckStep):
             # A página pode ter reaproveitado o nó para outro item depois de ele ser preso (a
             # lista virtual que redesenha no quadro seguinte à rolagem da espera, o feed que
             # põe um item no topo): com o vigia já posto, o elemento preso ainda precisa ser
             # o único do localizador. O que a página redesenha antes do vigia falha aqui; o
-            # que ela redesenha depois troca o rótulo que o vigia guardou. Numa marcação, se a
-            # caixa já estava como devia, a pergunta é feita de novo: o nó reaproveitado pode
-            # mostrar um item no outro estado, e a marcação clicaria nele.
+            # que ela redesenha depois troca o rótulo que o vigia guardou. Numa marcação, também
+            # quando a caixa já estava como devia: o nó reaproveitado pode mostrar um item no
+            # outro estado (a marcação clicaria nele) ou outro item já como devia (o passo daria
+            # certo sem o item pedido).
             await self._still_the_only_one(step, ctx, target)
         return act
 
