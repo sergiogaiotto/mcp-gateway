@@ -19,7 +19,9 @@ gravou é o do servidor (o corpo de cada ``POST /api``).
 
 from __future__ import annotations
 
+import json
 import threading
+import time
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -33,7 +35,7 @@ from rapa.core import policy
 from rapa.core.contracts import RunState
 from rapa.core.robot import Manifest
 from rapa.runner.errors import ErrorCode
-from rapa.runner.interpreter import _typed_value_matches
+from rapa.runner.interpreter import Interpreter, _typed_value_matches
 from tests.runner.support import Outcome, RobotRunner
 
 pytestmark = pytest.mark.browser
@@ -1350,3 +1352,196 @@ async def test_an_iframe_in_a_shadow_root_under_a_scaled_parent_is_not_held_back
     )
     outcome = await _run(run_robot, manifest)
     _wrote(outcome, srv, RunState.SUCCEEDED, "Praça da Sé;")
+
+
+def _rewritten(page: str, how: str) -> str:
+    """A página reescreve o próprio documento logo depois de carregar: com
+    ``document.open/write/close`` (``open``) ou só com ``document.write`` (``write``, que
+    abre o documento)."""
+    literal = json.dumps(page).replace("</", "<\\/")
+    opening = "document.open();" if how == "open" else ""
+    return _page(
+        "Carregando<script>addEventListener('load',()=>setTimeout(()=>{"
+        f"{opening}document.write({literal});document.close()}},0))</script>"
+    )
+
+
+@pytest.mark.parametrize("how", ["open", "write"])
+async def test_a_page_that_rewrites_its_document_is_still_guarded(
+    run_robot: RobotRunner, srv: _Server, how: str
+) -> None:
+    # document.open() tira da janela os ouvintes do gancho do vigia (a janela e o símbolo
+    # ficam). Cada vigia os põe de novo: o logradouro que a página troca enquanto a camada
+    # cobre o Salvar nunca é enviado.
+    srv.app = _api_app(srv, {"/p": _rewritten(_cover_cep("camada")["/p"], how)})
+    manifest = _manifest(
+        [
+            _nav(srv.base, "/p"),
+            _fill("digitar_log", "Logradouro", "Praça da Sé"),
+            _fill("digitar_num", "Número", "100"),
+            _fill("digitar_cep", "CEP", "01001000"),
+            _click("salvar", "Salvar", effect="write", timeout=5_000),
+        ]
+    )
+    outcome = await _run(run_robot, manifest)
+    _wrote(outcome, srv, RunState.FAILED, "")
+    assert outcome.result.error_code == ErrorCode.ACAO_FALHOU
+
+
+@pytest.mark.parametrize("how", ["open", "write"])
+async def test_a_click_in_a_rewritten_document_reaches_the_page(
+    run_robot: RobotRunner, srv: _Server, how: str
+) -> None:
+    # Sem os ouvintes do gancho, o vigia nunca via o clique certo e o dava como entregue
+    # a outro documento.
+    button = f"<button type='button' onclick=\"{_post(chr(39) + 'S;' + chr(39))}\">Salvar</button>"
+    srv.app = _api_app(srv, {"/p": _rewritten(_page(button), how)})
+    manifest = _manifest([_nav(srv.base, "/p"), _save()])
+    outcome = await _run(run_robot, manifest)
+    _wrote(outcome, srv, RunState.SUCCEEDED, "S;")
+
+
+_SAVE_S = _post(chr(39) + "S;" + chr(39))
+_HOVER_LABELS = {
+    # Uma dica que tira o title quando o mouse chega (como a do jQuery UI).
+    "dica": (
+        "Salvar",
+        f"<button type='button' title='Salvar a nota' onclick=\"{_SAVE_S}\">Salvar</button>"
+        "<script>document.addEventListener('mouseover',(e)=>{const t=e.target.closest('[title]');"
+        "if(t){t.dataset.dica=t.title;t.removeAttribute('title')}})</script>",
+    ),
+    # Um botão de ícone, com o nome só no title.
+    "icone": (
+        "Excluir",
+        f"<button type='button' title='Excluir' onclick=\"{_SAVE_S}\">"
+        "<span aria-hidden='true'>&#128465;</span></button>"
+        "<script>document.addEventListener('mouseover',(e)=>{const t=e.target.closest('[title]');"
+        "if(t){t.dataset.dica=t.title;t.removeAttribute('title')}})</script>",
+    ),
+    # "Seguindo" que vira "Deixar de seguir" com o mouse em cima.
+    "seguir": (
+        "Seguindo",
+        f"<button id='b' type='button' onclick=\"{_SAVE_S}\">Seguindo</button>"
+        "<script>const b=document.getElementById('b');"
+        "b.addEventListener('mouseenter',()=>{b.textContent='Deixar de seguir'});"
+        "b.addEventListener('mouseleave',()=>{b.textContent='Seguindo'})</script>",
+    ),
+    # "Salvando..." no pointerdown, antes do click.
+    "salvando": (
+        "Salvar",
+        f"<button id='b' type='button' onclick=\"{_SAVE_S}\">Salvar</button>"
+        "<script>document.getElementById('b').addEventListener('pointerdown',(e)=>{"
+        "e.currentTarget.textContent='Salvando...'})</script>",
+    ),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_HOVER_LABELS))
+async def test_a_label_the_page_changes_when_the_mouse_arrives_is_not_a_refusal(
+    run_robot: RobotRunner, srv: _Server, kind: str
+) -> None:
+    # O vigia vê a chegada do mouse antes dos ouvintes da página: o rótulo que eles põem
+    # nela (e o "Salvando..." do pointerdown, depois do primeiro evento) vale.
+    name, body = _HOVER_LABELS[kind]
+    srv.app = _api_app(srv, {"/p": _page(body)})
+    manifest = _manifest([_nav(srv.base, "/p"), _click("salvar", name, effect="write")])
+    outcome = await _run(run_robot, manifest)
+    _wrote(outcome, srv, RunState.SUCCEEDED, "S;")
+
+
+async def test_a_recycled_list_named_by_another_element_never_deletes_another_item(
+    run_robot: RobotRunner, srv: _Server
+) -> None:
+    # Botões de ícone com o nome num aria-labelledby: o rótulo que o vigia confere inclui o
+    # texto do elemento que dá o nome.
+    page = _recycled_list("addEventListener('load',()=>cobre(1000))")
+    page = (
+        page.replace(
+            "b.textContent='Excluir Item '+i;b.setAttribute('aria-label','Excluir Item '+i)",
+            "b.textContent='\\u{1F5D1}';b.nome.textContent='Excluir Item '+i",
+        )
+        .replace(
+            "inn.appendChild(b);pool.push(b)",
+            "const n=document.createElement('span');n.id='nome'+k;n.hidden=true;b.nome=n;"
+            "b.setAttribute('aria-labelledby',n.id);inn.appendChild(n);inn.appendChild(b);"
+            "pool.push(b)",
+        )
+        .replace("body:b.getAttribute('aria-label')+';'", "body:b.nome.textContent+';'")
+    )
+    assert "b.nome.textContent='Excluir Item '" in page and "body:b.nome" in page
+    srv.app = _api_app(srv, {"/p": page})
+    manifest = _manifest(
+        [_nav(srv.base, "/p"), _click("excluir", "Excluir Item 57", effect="write", timeout=6_000)]
+    )
+    _deleted_57_or_nothing(await _run(run_robot, manifest), srv)
+
+
+async def test_a_list_redrawn_between_the_wait_and_the_guard_never_deletes_another_item(
+    run_robot: RobotRunner, srv: _Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A lista virtual redesenha o nó preso (rolada pela espera) logo antes de o vigia ser
+    # posto, e o vigia guarda o rótulo do outro item. A conferência do elemento único vem
+    # com o vigia já posto e recusa o passo.
+    page = _recycled_list("", "<iframe id='g' src='/obs' style='width:400px;height:80px'></iframe>")
+    srv.app = _api_app(srv, {"/p": page, "/obs": _page("<label for='o'>Obs</label><input id='o'>")})
+    original = Interpreter._arm_guard
+    redrawn: list[bool] = []
+
+    async def arm_after_a_redraw(self: Interpreter, step: Any, ctx: Any, *args: Any) -> None:
+        if not redrawn and ctx.element is not None:
+            redrawn.append(True)
+            await ctx.element.evaluate("() => { sc.scrollTop += 150; render(); }")
+        await original(self, step, ctx, *args)
+
+    monkeypatch.setattr(Interpreter, "_arm_guard", arm_after_a_redraw)
+    note = _fill("digitar_obs", "Obs", "observação")
+    note["target"]["frames"] = ["#g"]
+    manifest = _manifest(
+        [
+            _nav(srv.base, "/p"),
+            note,
+            _click("excluir", "Excluir Item 57", effect="write", timeout=6_000),
+        ]
+    )
+    outcome = await _run(run_robot, manifest)
+    assert redrawn
+    _wrote(outcome, srv, RunState.FAILED, "")
+    assert outcome.result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+
+
+async def test_a_button_past_the_edge_of_a_shifted_modal_iframe_is_clicked(
+    run_robot: RobotRunner, srv: _Server
+) -> None:
+    # O iframe do modal centralizado é mais alto que a janela, e o Salvar passa da borda de
+    # baixo: a espera corta a caixa dele pela janela de cima e confere o pedaço visível,
+    # onde o Playwright clica.
+    form = _page(
+        "<button type='button' style='position:absolute;left:20px;bottom:70px;height:60px' "
+        f'onclick="{_SAVE_S}">Salvar</button>'
+    )
+    host = _page(
+        "<div style='position:fixed;left:50%;top:50%;width:600px;height:calc(100vh + 200px);"
+        "transform:translate(-50%,-50%)'>"
+        "<iframe id='f' src='/form' style='width:600px;height:100%;border:0'></iframe></div>"
+    )
+    srv.app = _api_app(srv, {"/host": host, "/form": form})
+    save = _click("salvar", "Salvar", effect="write", timeout=6_000)
+    save["target"]["frames"] = ["#f"]
+    started = time.monotonic()
+    outcome = await _run(run_robot, _manifest([_nav(srv.base, "/host"), save]))
+    _wrote(outcome, srv, RunState.SUCCEEDED, "S;")
+    assert time.monotonic() - started < 5.5
+
+
+@pytest.mark.parametrize(
+    "transform",
+    ["translate(-50%,-50%) perspective(1px) translateZ(0)", "translate(-50%,-50%);rotate:0deg"],
+)
+async def test_a_click_in_a_flat_modal_iframe_with_fields_elsewhere_is_not_refused(
+    run_robot: RobotRunner, srv: _Server, transform: str
+) -> None:
+    # A perspectiva que não muda o plano do iframe (contra o borrão do texto) e a rotação
+    # de zero grau não giram nada: a espera traduz o ponto e espera o "Desfazer" sair.
+    srv.app = _modal_iframe_app(srv, transform)
+    outcome = await _run(run_robot, _modal_iframe_robot(srv, typed=True))
+    _wrote(outcome, srv, RunState.SUCCEEDED, "S:Praça da Sé;")

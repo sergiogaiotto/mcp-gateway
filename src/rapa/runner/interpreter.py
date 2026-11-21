@@ -696,15 +696,19 @@ _PINNED_ROW_JS = (
 
 #: Os eventos que o vigia de um passo que grava confere (:data:`_DISPATCH_GUARD_JS`).
 _GUARD_TYPES_JS = (
-    "['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'keydown', "
-    "'keypress', 'keyup', 'beforeinput', 'input', 'change']"
+    "['pointerover', 'mouseover', 'pointermove', 'mousemove', 'pointerdown', 'mousedown', "
+    "'pointerup', 'mouseup', 'click', 'keydown', 'keypress', 'keyup', 'beforeinput', "
+    "'input', 'change']"
 )
 
 # Posto em cada documento antes de qualquer script dele (:meth:`Interpreter._open_page`): um
 # ouvinte na fase de captura da janela, para cada evento que o vigia confere, que passa o
 # evento ao vigia do passo, quando há um. Assim o vigia decide antes de qualquer ouvinte da
 # própria página, também dos que ela põe na janela, na fase de captura, quando carrega: o
-# evento que ele recusa não chega a nenhum.
+# evento que ele recusa não chega a nenhum. ``document.open()`` (também o ``document.write``
+# depois de a página carregar) tira da janela os ouvintes dela, mas a janela e o símbolo
+# ficam: cada vigia põe de novo os ouvintes do gancho (com o ``addEventListener`` de antes
+# dos scripts da página; sem efeito quando eles ainda estão lá).
 _GUARD_HOOK_JS = (
     "(() => {\nconst types = "
     + _GUARD_TYPES_JS
@@ -715,10 +719,15 @@ let current = null;
 const forward = (event) => {
   if (current !== null) current(event);
 };
-for (const type of types) window.addEventListener(type, forward, true);
+const listen = EventTarget.prototype.addEventListener;
+const attach = () => {
+  for (const type of types) listen.call(window, type, forward, true);
+};
+attach();
 Object.defineProperty(window, key, {
   value: Object.freeze({
     set: (listener) => {
+      attach();
       current = listener;
     },
     clear: (listener) => {
@@ -747,14 +756,18 @@ Object.defineProperty(window, key, {
 # da ação (``preventDefault`` e ``stopImmediatePropagation``) e marca a recusa, que o
 # executor lê depois de agir. O ouvinte do vigia é o que :data:`_GUARD_HOOK_JS` pôs no
 # documento antes dos scripts dele (senão, um posto agora, depois dos que a página já pôs na
-# janela). Num clique ou numa marcação, o rótulo do alvo (``aria-label``, ``title`` e o texto
-# do HTML) também precisa ser o da hora em que o vigia foi posto: uma lista virtual que
-# reaproveita o nó para outro item enquanto o Playwright rola até ele troca o rótulo. Depois
-# do primeiro evento de um clique ou de uma marcação, e até o ``click``, o vigia confere de
-# novo, em cada evento do navegador, o endereço, a linha e o rótulo (os ouvintes da página já
-# receberam os eventos de antes e podem tê-los mudado); se mudaram, ele cancela esse evento e
-# os seguintes (``meio``). Um clique cujos eventos não chegaram à janela do alvo vale
-# ``fora``.
+# janela). Num clique ou numa marcação, o rótulo do alvo (``aria-label``, ``title``, o texto
+# de ``aria-labelledby`` e dos ``<label>`` dele, ``data-testid`` e o texto do HTML) também
+# precisa ser o da hora em que o vigia foi posto: uma lista virtual que reaproveita o nó para
+# outro item enquanto o Playwright rola até ele troca o rótulo. Vale também o rótulo que os
+# ouvintes da página para a chegada do mouse ao alvo puseram (``pointerover`` e ``mouseover``,
+# que o vigia vê antes deles; o rótulo é lido de novo no ``pointermove`` e no ``mousemove``,
+# depois deles), se ele era o da hora do vigia quando o mouse chegou. Depois do primeiro
+# evento de um clique ou de uma marcação, e até o ``click``, o vigia confere de novo, em cada
+# evento do navegador, o endereço e a linha (os ouvintes da página já receberam os eventos de
+# antes e podem tê-los mudado; o rótulo não: "Salvando..." no ``pointerdown``); se mudaram,
+# ele cancela esse evento e os seguintes (``meio``). Um clique cujos eventos não chegaram à
+# janela do alvo vale ``fora``.
 _DISPATCH_GUARD_JS = (
     "(element, [kind, row, key, typed, late]) => {"
     + _FIELD_OF_FN
@@ -827,10 +840,27 @@ const typedHold = () => (typed || []).every(([node, value]) => fieldValue(node) 
 const armedAt = view.performance.now();
 const prompt = () => late === null || view.performance.now() - armedAt <= late;
 // O rótulo do alvo num clique ou numa marcação (uma lista virtual que reaproveita o nó).
+const named = (ids) => (ids ?? '').split(/\s+/).filter(Boolean)
+  .map((id) => target.getRootNode().getElementById?.(id) ?? null)
+  .map((node) => (node ? normalize(htmlText(node)) : '')).join(' ');
 const label = () => [target.getAttribute('aria-label') ?? '', target.getAttribute('title') ?? '',
-  normalize(htmlText(target))].join('\n');
+  named(target.getAttribute('aria-labelledby')),
+  [...(target.labels ?? [])].map((node) => normalize(htmlText(node))).join(' '),
+  target.getAttribute('data-testid') ?? '', normalize(htmlText(target))].join('\n');
 const armedLabel = kind === 'clique' || kind === 'marca' ? label() : null;
-const sameLabel = () => armedLabel === null || label() === armedLabel;
+// O rótulo quando o mouse chega ao alvo, antes dos ouvintes da página, e logo depois dos
+// ouvintes dela para a chegada (uma dica que tira o ``title``, um "Seguindo" que vira
+// "Deixar de seguir"): a mudança que a chegada do mouse fez vale.
+let hovered = null;
+let afterHover = null;
+const sameLabel = () => {
+  if (armedLabel === null) return true;
+  const now = label();
+  return now === armedLabel
+    || (hovered === armedLabel && afterHover !== null && now === afterHover);
+};
+const hoverTypes = new Set(['pointerover', 'mouseover']);
+const moveTypes = new Set(['pointermove', 'mousemove']);
 const types = """
     + _GUARD_TYPES_JS
     + r""";
@@ -842,7 +872,7 @@ const off = () => {
   else for (const type of types) view.removeEventListener(type, listener, true);
 };
 // Num clique ou numa marcação, depois do primeiro evento e até o ``click``: os ouvintes da
-// página já receberam os eventos de antes e podem ter mudado o endereço, a linha ou o rótulo.
+// página já receberam os eventos de antes e podem ter mudado o endereço ou a linha.
 const pointer = kind === 'clique' || kind === 'marca';
 const done = () => {
   state = 'feito';
@@ -850,9 +880,21 @@ const done = () => {
 };
 const listener = (event) => {
   if (state === 'feito') return;
+  if (hoverTypes.has(event.type) || moveTypes.has(event.type)) {
+    // A chegada do mouse não age: o vigia só guarda o rótulo.
+    if (state === 'armado' && armedLabel !== null && event.isTrusted
+        && event.composedPath().includes(target)) {
+      if (hoverTypes.has(event.type)) {
+        if (hovered === null) hovered = label();
+      } else if (hovered !== null) {
+        afterHover = label();
+      }
+    }
+    return;
+  }
   if (state === 'passou') {
     if (!event.isTrusted) return;
-    if (!moved() && inRow() && sameLabel()) {
+    if (!moved() && inRow()) {
       if (event.type === 'click') done();
       return;
     }
@@ -895,9 +937,10 @@ return {
 # e, num iframe da mesma origem, o elemento do ponto no documento de cima é o iframe, e
 # assim por diante (o ponto vai para o documento de cima pela caixa do iframe, também
 # deslocado ou em escala por uma transformação, dele ou de um elemento em volta dele, também
-# através de shadow roots). O texto de um botão que vem de um ``<slot>`` sobe pelo slot. Fora
-# da janela ou num documento de outra origem acima, não dá para saber: vale ``true`` (o vigia
-# confere a demora do primeiro evento). Num iframe girado, inclinado, espelhado ou em
+# através de shadow roots; a caixa do elemento vai junto, cortada pela janela de cada
+# documento, e o ponto é o centro dela). O texto de um botão que vem de um ``<slot>`` sobe
+# pelo slot. Fora da janela ou num documento de outra origem acima, não dá para saber: vale
+# ``true`` (o vigia confere a demora do primeiro evento). Num iframe girado, inclinado, espelhado ou em
 # perspectiva, o ponto de dentro não se traduz pela caixa: vale ``null``.
 _UNCOVERED_JS = r"""(element) => {
 let want = element;
@@ -920,10 +963,15 @@ if (box === null) return true;
 let x = (box[0] + box[2]) / 2;
 let y = (box[1] + box[3]) / 2;
 const up = (node) => node.parentNode ?? node.host ?? null;
-// Só deslocamento e escala positiva, sem girar, inclinar, espelhar nem perspectiva.
+// Só deslocamento e escala positiva, sem girar, inclinar, espelhar nem perspectiva que mude
+// o plano do iframe (m31, m32 e m34 só multiplicam z, que é 0 nele: "perspective(1px)
+// translateZ(0)", contra o borrão do texto, vale).
 const near = (value) => Math.abs(value) < 1e-6;
 const flat = (style) => {
-  if (style.rotate && style.rotate !== 'none') return false;
+  if (style.rotate && style.rotate !== 'none'
+      && parseFloat(style.rotate.split(' ').pop()) !== 0) {
+    return false;
+  }
   if (style.scale && style.scale !== 'none'
       && style.scale.split(' ').some((part) => !(parseFloat(part) > 0))) {
     return false;
@@ -936,8 +984,7 @@ const flat = (style) => {
     return false;
   }
   return m.m11 > 0 && m.m22 > 0 && near(m.m12) && near(m.m21) && near(m.m13)
-    && near(m.m23) && near(m.m31) && near(m.m32) && near(m.m14) && near(m.m24)
-    && near(m.m34) && near(m.m44 - 1);
+    && near(m.m23) && near(m.m14) && near(m.m24) && near(m.m44 - 1);
 };
 for (;;) {
   const doc = want.ownerDocument;
@@ -980,8 +1027,13 @@ for (;;) {
   const style = outer.getComputedStyle(frame);
   const sx = frame.offsetWidth ? rect.width / frame.offsetWidth : 1;
   const sy = frame.offsetHeight ? rect.height / frame.offsetHeight : 1;
-  x = rect.left + (frame.clientLeft + (parseFloat(style.paddingLeft) || 0) + x) * sx;
-  y = rect.top + (frame.clientTop + (parseFloat(style.paddingTop) || 0) + y) * sy;
+  const ox = rect.left + (frame.clientLeft + (parseFloat(style.paddingLeft) || 0)) * sx;
+  const oy = rect.top + (frame.clientTop + (parseFloat(style.paddingTop) || 0)) * sy;
+  box = [Math.max(ox + box[0] * sx, 0), Math.max(oy + box[1] * sy, 0),
+    Math.min(ox + box[2] * sx, outer.innerWidth), Math.min(oy + box[3] * sy, outer.innerHeight)];
+  if (box[2] - box[0] < 1 || box[3] - box[1] < 1) return true;
+  x = (box[0] + box[2]) / 2;
+  y = (box[1] + box[3]) / 2;
   want = frame;
 }
 }"""
@@ -4042,13 +4094,40 @@ class Interpreter:
             # Há campos digitados noutro documento (o vigia não os lê no primeiro evento: a
             # espera pelo alvo livre vem antes da releitura), ou o alvo está num iframe
             # transformado, onde o Playwright não confere o que está por cima dele.
-            await self._wait_uncovered(step, ctx, ctx.element, elsewhere=elsewhere)
+            scrolled = await self._wait_uncovered(step, ctx, ctx.element, elsewhere=elsewhere)
+        else:
+            scrolled = False
         typed = await self._typed_fields_hold(
             step, ctx.element if isinstance(step, FillStep) else None
         )
         ctx.held = _held(typed)
         await self._arm_guard(step, ctx, target, page, typed, frame)
+        if scrolled:
+            # A rolagem da espera pode ter feito a página reaproveitar o nó para outro item
+            # (uma lista virtual que redesenha no quadro seguinte): com o vigia já posto, o
+            # elemento preso ainda precisa ser o único do localizador. O que a página
+            # redesenha antes do vigia falha aqui; o que ela redesenha depois troca o rótulo
+            # que o vigia guardou.
+            await self._still_the_only_one(step, ctx, target)
         return act
+
+    async def _still_the_only_one(self, step: Step, ctx: _StepCtx, target: Target) -> None:
+        """O elemento preso ainda é o único que o localizador encontra; senão, o passo falha
+        com ``elemento_ambiguo`` sem agir."""
+        element = ctx.element
+        if ctx.locator is None or element is None:  # pragma: no cover - preso antes
+            return
+        try:
+            handles = await ctx.locator.element_handles()
+        except PlaywrightError:
+            handles = []
+        try:
+            same = await self._same_elements(element, handles)
+        finally:
+            for handle in handles:
+                await self._dispose(handle)
+        if same != [True]:
+            raise self._page_changed(step, target)
 
     def _raise_if_page_changed(self, step: Step, target: Target, ctx: _StepCtx, page: str) -> None:
         """A página principal mudou de endereço ou de documento desde a conferência do alvo."""
@@ -4202,7 +4281,7 @@ class Interpreter:
 
     async def _wait_uncovered(
         self, step: Step, ctx: _StepCtx, element: ElementHandle, *, elsewhere: bool
-    ) -> None:
+    ) -> bool:
         """Espera, só lendo a página, que um clique no centro do elemento chegue a ele
         (:data:`_UNCOVERED_JS`: nada do documento dele, nem dos documentos da mesma origem
         acima dele, por cima), como o Playwright esperaria antes de clicar.
@@ -4214,13 +4293,13 @@ class Interpreter:
         iframe): a espera confere por ele. Como o Playwright, rola o elemento para a janela de novo a
         cada tentativa (no fim, no centro, no começo: um cabeçalho fixo por cima dele). Se
         o alvo continua coberto quando falta menos de :data:`_UNCOVERED_MARGIN_S` do prazo
-        do passo, o passo falha sem agir (``tempo_do_passo_esgotado``); num iframe girado ou
-        inclinado, onde o ponto não se traduz, falha logo (``acao_falhou``) se há campos
-        digitados noutro documento, e senão deixa a ação para o Playwright. Se o elemento
-        sai da página, a própria ação decide. Depois da espera, o elemento preso ainda
-        precisa ser o único que o localizador encontra (uma lista virtual que reaproveita o
-        nó para outro item enquanto a página rola), senão o passo falha com
-        ``elemento_ambiguo`` sem agir.
+        do passo, o passo falha sem agir (``tempo_do_passo_esgotado``). Num iframe girado
+        ou inclinado, onde o ponto não se traduz, deixa a ação para o Playwright se não há
+        campos digitados noutro documento; se há, espera como por uma camada (uma animação
+        de entrada que gira o modal) e, no fim do prazo, falha sem agir (``acao_falhou``).
+        Se o elemento sai da página, a própria ação decide (devolve ``False``). Senão,
+        devolve ``True``: a página rolou, e o elemento preso ainda precisa ser o único que o
+        localizador encontra (:meth:`_confirm_target` confere, com o vigia já posto).
         """
         loop = asyncio.get_running_loop()
         aligns = ("end", "center", "start")
@@ -4230,9 +4309,12 @@ class Interpreter:
         try:
             await element.scroll_into_view_if_needed(timeout=ctx.remaining_ms())
             while not (free := await element.evaluate(_UNCOVERED_JS)):
-                if free is None:
-                    if not elsewhere:
-                        return  # sem campos digitados noutro documento: como o Playwright
+                if free is None and not elsewhere:
+                    return True  # sem campos digitados noutro documento: como o Playwright
+                if (
+                    free is None
+                    and loop.time() + self._poll_s + _UNCOVERED_MARGIN_S >= ctx.deadline
+                ):
                     raise StepError(
                         ErrorCode.ACAO_FALHOU,
                         f"O alvo do passo '{step.title}' está num iframe girado, inclinado ou "
@@ -4251,21 +4333,8 @@ class Interpreter:
                 await element.evaluate(_SCROLL_INTO_VIEW_JS, aligns[tries % len(aligns)])
                 tries += 1
         except PlaywrightError:
-            return
-        # A rolagem pode ter feito a página reaproveitar o nó para outro item (uma lista
-        # virtual): o elemento preso ainda precisa ser o único do localizador.
-        if ctx.locator is not None and isinstance(target, Target):
-            try:
-                handles = await ctx.locator.element_handles()
-            except PlaywrightError:
-                handles = []
-            try:
-                same = await self._same_elements(element, handles)
-            finally:
-                for handle in handles:
-                    await self._dispose(handle)
-            if same != [True]:
-                raise self._page_changed(step, target)
+            return False
+        return True
 
     async def _act_on(
         self,
@@ -4298,7 +4367,7 @@ class Interpreter:
         ``acao_falhou``. Um clique que o navegador entregou a outro documento por cima do
         alvo (``fora``) falha com ``elemento_ambiguo``, dizendo que ele pode ter feito
         outra coisa; um clique que o vigia interrompeu depois do primeiro evento, porque a
-        página mudou o endereço, a linha ou o rótulo com os eventos de antes (``meio``),
+        página mudou o endereço ou a linha com os eventos de antes (``meio``),
         também, dizendo que esses eventos chegaram à página."""
         failure: Exception | None = None
         try:
@@ -4326,8 +4395,8 @@ class Interpreter:
         if reason == "meio" and isinstance(target, Target):
             raise StepError(
                 ErrorCode.ELEMENTO_AMBIGUO,
-                f"A página mudou durante o clique do passo '{step.title}' (o endereço, a linha "
-                f"ou o rótulo de '{target.intent}'), e o robô o interrompeu antes do fim: os "
+                f"A página mudou durante o clique do passo '{step.title}' (o endereço ou a linha "
+                f"de '{target.intent}'), e o robô o interrompeu antes do fim: os "
                 "primeiros eventos do clique já tinham chegado à página. Confira o sistema de "
                 "destino antes de repetir.",
                 details={"alvo": target.intent},
