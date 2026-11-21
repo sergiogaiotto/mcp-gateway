@@ -50,13 +50,18 @@ principais:
   seguida, sem ``force``: o Playwright ainda confere, sem esperar de novo o que já
   esperou, que o alvo não está coberto (também por outro documento: um iframe por
   cima do botão, a página por cima de um iframe) nem inerte (um diálogo modal), e
-  espera ficar livre. Antes dela, um vigia na fase de captura da janela confere o
-  primeiro evento da ação: se ele não cai no alvo (o botão ou link em volta dele,
-  num clique; o campo, ao digitar), se o endereço mudou ou se a linha já não tem
-  um elemento cujo texto inteiro do HTML é a chave (a mesma regra da escolha da
-  linha: a linha reaproveitada de "12" para "120" não vale), o evento e os
-  seguintes da ação são cancelados e o passo falha; um clique cujos eventos não
-  chegam à janela do alvo também falha. Uma mudança de endereço (também no mesmo documento) ou de linha falha com
+  espera ficar livre. Antes dela, um vigia na fase de captura da janela (com o
+  ouvinte posto antes dos scripts de cada documento, e que decide antes dos da
+  página) confere o primeiro evento da ação: se ele não cai no alvo (o botão ou
+  link em volta dele, num clique; o campo, ao digitar), se o endereço mudou, se a
+  linha já não tem um elemento cujo texto inteiro do HTML é a chave (a mesma regra
+  da escolha da linha: a linha reaproveitada de "12" para "120" não vale) ou, num
+  clique ou numa marcação, se o rótulo do alvo mudou (uma lista virtual que
+  reaproveita o botão para outro item), o evento e os seguintes da ação são
+  cancelados e o passo falha; um clique cujos eventos não chegam à janela do alvo
+  foi entregue a outro documento e falha dizendo que pode ter feito outra coisa.
+  Num iframe deslocado ou em escala, onde o Playwright não confere o que está por
+  cima do alvo, o clique espera o alvo ficar livre só lendo a página. Uma mudança de endereço (também no mesmo documento) ou de linha falha com
   ``elemento_ambiguo``, e nada é feito; se a página troca de documento durante a
   espera, o elemento sai da página e o passo falha com ``acao_falhou``. Um
   elemento que sai da página durante a espera sem navegação (o botão montado de
@@ -65,8 +70,8 @@ principais:
   (``acao_falhou``). Ficam de fora (resíduos conhecidos) os shadow roots fechados,
   a chave que só o CSS mostra, uma lista virtual que troca o que a linha é sem
   trocar o texto dela, a linha trocada entre o primeiro evento do clique e o
-  último (o vigia decide no primeiro) e um ouvinte da própria página, na janela,
-  posto antes do vigia. Perdas de disponibilidade aceitas: qualquer mudança de endereço da
+  último (o vigia decide no primeiro) e o clique num iframe girado sem campos
+  digitados noutro documento (fica com o Playwright). Perdas de disponibilidade aceitas: qualquer mudança de endereço da
   página principal entre a conferência do alvo e a ação (também um filtro que
   muda a consulta do endereço), e uma tecla para um elemento que não recebe o
   foco. Um segredo vai para o elemento em que a origem foi conferida, sem o
@@ -687,6 +692,41 @@ _PINNED_ROW_JS = (
     "}"
 )
 
+#: Os eventos que o vigia de um passo que grava confere (:data:`_DISPATCH_GUARD_JS`).
+_GUARD_TYPES_JS = (
+    "['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'keydown', "
+    "'keypress', 'keyup', 'beforeinput', 'input', 'change']"
+)
+
+# Posto em cada documento antes de qualquer script dele (:meth:`Interpreter._open_page`): um
+# ouvinte na fase de captura da janela, para cada evento que o vigia confere, que passa o
+# evento ao vigia do passo, quando há um. Assim o vigia decide antes de qualquer ouvinte da
+# própria página, também dos que ela põe na janela, na fase de captura, quando carrega: o
+# evento que ele recusa não chega a nenhum.
+_GUARD_HOOK_JS = (
+    "(() => {\nconst types = "
+    + _GUARD_TYPES_JS
+    + r""";
+const key = Symbol.for('rapa.vigia');
+if (Object.prototype.hasOwnProperty.call(window, key)) return;
+let current = null;
+const forward = (event) => {
+  if (current !== null) current(event);
+};
+for (const type of types) window.addEventListener(type, forward, true);
+Object.defineProperty(window, key, {
+  value: Object.freeze({
+    set: (listener) => {
+      current = listener;
+    },
+    clear: (listener) => {
+      if (current === listener) current = null;
+    },
+  }),
+});
+})();"""
+)
+
 # O vigia de um passo que grava, posto na janela do elemento conferido logo antes de agir:
 # um ouvinte na fase de captura que decide no primeiro evento da ação (o do mouse, de
 # qualquer elemento; o do teclado ou da digitação, também sintético quando é no alvo; o
@@ -703,7 +743,12 @@ _PINNED_ROW_JS = (
 # evento nenhum (``marca``) e não é recusa. ``stop()`` devolve o motivo da recusa (``alvo``,
 # ``campo`` ou ``espera``) ou ``null``. Senão, ele cancela esse evento e todos os seguintes
 # da ação (``preventDefault`` e ``stopImmediatePropagation``) e marca a recusa, que o
-# executor lê depois de agir.
+# executor lê depois de agir. O ouvinte do vigia é o que :data:`_GUARD_HOOK_JS` pôs no
+# documento antes dos scripts dele (senão, um posto agora, depois dos que a página já pôs na
+# janela). Num clique ou numa marcação, o rótulo do alvo (``aria-label``, ``title`` e o texto
+# do HTML) também precisa ser o da hora em que o vigia foi posto: uma lista virtual que
+# reaproveita o nó para outro item enquanto o Playwright rola até ele troca o rótulo. Um
+# clique cujos eventos não chegaram à janela do alvo vale ``fora``.
 _DISPATCH_GUARD_JS = (
     "(element, [kind, row, key, typed, late]) => {"
     + _FIELD_OF_FN
@@ -775,19 +820,27 @@ const typedHold = () => (typed || []).every(([node, value]) => fieldValue(node) 
 // Com campos digitados noutro documento, que o vigia não lê: o primeiro evento não demorou.
 const armedAt = view.performance.now();
 const prompt = () => late === null || view.performance.now() - armedAt <= late;
-const types = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'keydown',
-  'keypress', 'keyup', 'beforeinput', 'input', 'change'];
+// O rótulo do alvo num clique ou numa marcação (uma lista virtual que reaproveita o nó).
+const label = () => [target.getAttribute('aria-label') ?? '', target.getAttribute('title') ?? '',
+  normalize(htmlText(target))].join('\n');
+const armedLabel = kind === 'clique' || kind === 'marca' ? label() : null;
+const sameLabel = () => armedLabel === null || label() === armedLabel;
+const types = """
+    + _GUARD_TYPES_JS
+    + r""";
+const hook = view[Symbol.for('rapa.vigia')] ?? null;
 let state = 'armado';
 let reason = 'alvo';
 const off = () => {
-  for (const type of types) view.removeEventListener(type, listener, true);
+  if (hook !== null) hook.clear(listener);
+  else for (const type of types) view.removeEventListener(type, listener, true);
 };
 const listener = (event) => {
   if (state === 'passou') return;
   if (state === 'armado') {
     const onTarget = event.composedPath().includes(target);
     if (!onTarget && (event.type === 'change' || !event.isTrusted)) return;
-    if (onTarget && !moved() && inRow()) {
+    if (onTarget && !moved() && inRow() && sameLabel()) {
       const hold = typedHold();
       if (hold && prompt()) {
         state = 'passou';
@@ -801,12 +854,13 @@ const listener = (event) => {
   event.preventDefault();
   event.stopImmediatePropagation();
 };
-for (const type of types) view.addEventListener(type, listener, true);
+if (hook !== null) hook.set(listener);
+else for (const type of types) view.addEventListener(type, listener, true);
 return {
   stop: () => {
     off();
     if (state === 'recusou') return reason;
-    return state === 'armado' && kind === 'clique' ? 'alvo' : null;
+    return state === 'armado' && kind === 'clique' ? 'fora' : null;
   },
 };
 }"""
@@ -818,9 +872,12 @@ return {
 # hospedeiro de um shadow root fechado em volta dele (nunca só um elemento em volta dele: a
 # camada com ``pointer-events: none`` ou ``inert`` deixa o ponto cair no que está atrás);
 # e, num iframe da mesma origem, o elemento do ponto no documento de cima é o iframe, e
-# assim por diante. Fora da janela, num iframe transformado ou num documento de outra
-# origem acima, não dá para saber: vale ``true`` (o vigia confere a demora do primeiro
-# evento).
+# assim por diante (o ponto vai para o documento de cima pela caixa do iframe, também
+# deslocado ou em escala por uma transformação, dele ou de um elemento em volta dele, também
+# através de shadow roots). O texto de um botão que vem de um ``<slot>`` sobe pelo slot. Fora
+# da janela ou num documento de outra origem acima, não dá para saber: vale ``true`` (o vigia
+# confere a demora do primeiro evento). Num iframe girado, inclinado, espelhado ou em
+# perspectiva, o ponto de dentro não se traduz pela caixa: vale ``null``.
 _UNCOVERED_JS = r"""(element) => {
 let want = element;
 if (!want.matches('input, textarea, select') && !want.isContentEditable) {
@@ -842,17 +899,36 @@ if (box === null) return true;
 let x = (box[0] + box[2]) / 2;
 let y = (box[1] + box[3]) / 2;
 const up = (node) => node.parentNode ?? node.host ?? null;
+// Só deslocamento e escala positiva, sem girar, inclinar, espelhar nem perspectiva.
+const near = (value) => Math.abs(value) < 1e-6;
+const flat = (style) => {
+  if (style.rotate && style.rotate !== 'none') return false;
+  if (style.scale && style.scale !== 'none'
+      && style.scale.split(' ').some((part) => !(parseFloat(part) > 0))) {
+    return false;
+  }
+  if (style.transform === 'none') return true;
+  let m;
+  try {
+    m = new DOMMatrixReadOnly(style.transform);
+  } catch (error) {
+    return false;
+  }
+  return m.m11 > 0 && m.m22 > 0 && near(m.m12) && near(m.m21) && near(m.m13)
+    && near(m.m23) && near(m.m31) && near(m.m32) && near(m.m14) && near(m.m24)
+    && near(m.m34) && near(m.m44 - 1);
+};
 for (;;) {
   const doc = want.ownerDocument;
   let hit = doc.elementFromPoint(x, y);
   while (hit && hit.shadowRoot) {
-    const inner = hit.shadowRoot.elementFromPoint(x, y);
+    const inner = hit.shadowRoot.elementsFromPoint(x, y)[0];
     if (!inner || inner === hit) break;
     hit = inner;
   }
   if (!hit) return false;
   let at = hit;
-  while (at && at !== want) at = up(at);
+  while (at && at !== want) at = at.assignedSlot ?? up(at);
   if (at !== want) {
     // O ponto cai no hospedeiro de um shadow root fechado em volta do alvo (o caminho do
     // alvo para cima entra nele por um shadow root que não é visto): não dá para ver dentro.
@@ -875,20 +951,51 @@ for (;;) {
   }
   if (!frame) return true;
   const outer = frame.ownerDocument.defaultView;
-  for (let node = frame; node && node.nodeType === 1; node = node.parentElement) {
-    // Num iframe transformado (escala, rotação), o ponto de dentro não se traduz assim.
-    if (outer.getComputedStyle(node).transform !== 'none') return true;
+  for (let node = frame; node && node.nodeType === 1;
+      node = node.parentElement ?? node.parentNode?.host ?? null) {
+    if (!flat(outer.getComputedStyle(node))) return null;
   }
   const rect = frame.getBoundingClientRect();
   const style = outer.getComputedStyle(frame);
-  x += rect.left + frame.clientLeft + (parseFloat(style.paddingLeft) || 0);
-  y += rect.top + frame.clientTop + (parseFloat(style.paddingTop) || 0);
+  const sx = frame.offsetWidth ? rect.width / frame.offsetWidth : 1;
+  const sy = frame.offsetHeight ? rect.height / frame.offsetHeight : 1;
+  x = rect.left + (frame.clientLeft + (parseFloat(style.paddingLeft) || 0) + x) * sx;
+  y = rect.top + (frame.clientTop + (parseFloat(style.paddingTop) || 0) + y) * sy;
   want = frame;
 }
 }"""
 
 
-_SCROLL_INTO_VIEW_JS = "(element, align) => element.scrollIntoView({block: align, inline: align})"
+# Se o elemento está num iframe transformado (dele ou de um elemento em volta dele, também
+# através de shadow roots, num documento da mesma origem acima): o Playwright não confere o
+# que está por cima de um alvo nele.
+_IN_TRANSFORMED_FRAME_JS = r"""(element) => {
+const moved = (style) => style.transform !== 'none' || (style.rotate && style.rotate !== 'none')
+  || (style.scale && style.scale !== 'none')
+  || (style.translate && style.translate !== 'none');
+let view = element.ownerDocument.defaultView;
+for (;;) {
+  let frame = null;
+  try {
+    frame = view.frameElement;
+  } catch (error) {
+    return false;
+  }
+  if (!frame) return false;
+  const outer = frame.ownerDocument.defaultView;
+  for (let node = frame; node && node.nodeType === 1;
+      node = node.parentElement ?? node.parentNode?.host ?? null) {
+    if (moved(outer.getComputedStyle(node))) return true;
+  }
+  view = outer;
+}
+}"""
+
+
+#: Sem animação (``behavior: 'instant'``), também numa página com ``scroll-behavior: smooth``.
+_SCROLL_INTO_VIEW_JS = (
+    "(element, align) => element.scrollIntoView({block: align, inline: align, behavior: 'instant'})"
+)
 
 
 class _StopBeforeWrite(Exception):
@@ -1867,6 +1974,8 @@ class Interpreter:
         try:
             if self._block_other_domains:
                 await context.route("**/*", self._guard_request)
+            # O vigia dos passos que gravam decide antes dos ouvintes da própria página.
+            await context.add_init_script(script=_GUARD_HOOK_JS)
             page = await context.new_page()
         except PlaywrightError as exc:
             raise StepError(
@@ -3905,12 +4014,14 @@ class Interpreter:
                 raise self._page_changed(step, target)
             act = self._row_not_acted_on(step)
         frame = await self._frame_of(ctx.element) if self._typed else None
-        if any(
-            frame is None or entry.frame is not frame for entry in self._typed
-        ) and await self._points_at(step, ctx.element):
-            # Há campos digitados noutro documento: o vigia não os lê no primeiro evento.
-            # A espera pelo alvo livre vem antes da releitura (:meth:`_wait_uncovered`).
-            await self._wait_uncovered(step, ctx, ctx.element)
+        elsewhere = any(frame is None or entry.frame is not frame for entry in self._typed)
+        if await self._points_at(step, ctx.element) and (
+            elsewhere or await self._in_transformed_frame(ctx.element)
+        ):
+            # Há campos digitados noutro documento (o vigia não os lê no primeiro evento: a
+            # espera pelo alvo livre vem antes da releitura), ou o alvo está num iframe
+            # transformado, onde o Playwright não confere o que está por cima dele.
+            await self._wait_uncovered(step, ctx, ctx.element, elsewhere=elsewhere)
         typed = await self._typed_fields_hold(
             step, ctx.element if isinstance(step, FillStep) else None
         )
@@ -4059,40 +4170,81 @@ class Interpreter:
                 return True
         return False
 
-    async def _wait_uncovered(self, step: Step, ctx: _StepCtx, element: ElementHandle) -> None:
+    @staticmethod
+    async def _in_transformed_frame(element: ElementHandle) -> bool:
+        """O elemento está num iframe deslocado, em escala ou girado por uma transformação
+        (dele ou de um elemento em volta dele, num documento da mesma origem acima)."""
+        try:
+            return await element.evaluate(_IN_TRANSFORMED_FRAME_JS) is True
+        except PlaywrightError:
+            return False
+
+    async def _wait_uncovered(
+        self, step: Step, ctx: _StepCtx, element: ElementHandle, *, elsewhere: bool
+    ) -> None:
         """Espera, só lendo a página, que um clique no centro do elemento chegue a ele
         (:data:`_UNCOVERED_JS`: nada do documento dele, nem dos documentos da mesma origem
         acima dele, por cima), como o Playwright esperaria antes de clicar.
 
-        Só antes de a releitura dos campos digitados valer para outro documento: o que a
-        página muda nesses campos enquanto uma camada de "buscando CEP" cobre o alvo é visto
-        pela releitura, depois. Como o Playwright, rola o elemento para a janela de novo a
+        Com campos digitados noutro documento (``elsewhere``), vem antes da releitura
+        deles: o que a página muda nesses campos enquanto uma camada de "buscando CEP"
+        cobre o alvo é visto pela releitura, depois. Num iframe transformado, o Playwright
+        não confere o que está por cima do alvo (clicaria no aviso da página por cima do
+        iframe): a espera confere por ele. Como o Playwright, rola o elemento para a janela de novo a
         cada tentativa (no fim, no centro, no começo: um cabeçalho fixo por cima dele). Se
         o alvo continua coberto quando falta menos de :data:`_UNCOVERED_MARGIN_S` do prazo
-        do passo, o passo falha sem agir (``tempo_do_passo_esgotado``). Se o elemento sai
-        da página, a própria ação decide.
+        do passo, o passo falha sem agir (``tempo_do_passo_esgotado``); num iframe girado ou
+        inclinado, onde o ponto não se traduz, falha logo (``acao_falhou``) se há campos
+        digitados noutro documento, e senão deixa a ação para o Playwright. Se o elemento
+        sai da página, a própria ação decide. Depois da espera, o elemento preso ainda
+        precisa ser o único que o localizador encontra (uma lista virtual que reaproveita o
+        nó para outro item enquanto a página rola), senão o passo falha com
+        ``elemento_ambiguo`` sem agir.
         """
         loop = asyncio.get_running_loop()
         aligns = ("end", "center", "start")
         tries = 0
+        target = getattr(step, "target", None)
+        intent = target.intent if isinstance(target, Target) else step.title
         try:
             await element.scroll_into_view_if_needed(timeout=ctx.remaining_ms())
-            while not await element.evaluate(_UNCOVERED_JS):
+            while not (free := await element.evaluate(_UNCOVERED_JS)):
+                if free is None:
+                    if not elsewhere:
+                        return  # sem campos digitados noutro documento: como o Playwright
+                    raise StepError(
+                        ErrorCode.ACAO_FALHOU,
+                        f"O alvo do passo '{step.title}' está num iframe girado, inclinado ou "
+                        "em perspectiva, onde não dá para conferir que o clique chega a ele, e "
+                        "há campos digitados noutro documento. Nada foi feito.",
+                        details={"alvo": intent},
+                    )
                 if loop.time() + self._poll_s + _UNCOVERED_MARGIN_S >= ctx.deadline:
-                    target = getattr(step, "target", None)
                     raise StepError(
                         ErrorCode.TEMPO_DO_PASSO_ESGOTADO,
                         f"O alvo do passo '{step.title}' ficou coberto por outro elemento "
                         "até o fim do prazo do passo, e nada foi feito.",
-                        details={
-                            "alvo": target.intent if isinstance(target, Target) else step.title
-                        },
+                        details={"alvo": intent},
                     )
                 await asyncio.sleep(self._poll_s)
                 await element.evaluate(_SCROLL_INTO_VIEW_JS, aligns[tries % len(aligns)])
                 tries += 1
         except PlaywrightError:
             return
+        # A rolagem pode ter feito a página reaproveitar o nó para outro item (uma lista
+        # virtual): o elemento preso ainda precisa ser o único do localizador.
+        if ctx.locator is not None and isinstance(target, Target):
+            try:
+                handles = await ctx.locator.element_handles()
+            except PlaywrightError:
+                handles = []
+            try:
+                same = await self._same_elements(element, handles)
+            finally:
+                for handle in handles:
+                    await self._dispose(handle)
+            if same != [True]:
+                raise self._page_changed(step, target)
 
     async def _act_on(
         self,
@@ -4119,10 +4271,12 @@ class Interpreter:
 
     async def _dispatched(self, step: Step, ctx: _StepCtx, action: Awaitable[object]) -> None:
         """Age e lê o vigia: se ele recusou o primeiro evento da ação (outro endereço, outro
-        elemento, a linha mudou), o evento foi cancelado e o passo falha com
+        elemento, a linha ou o rótulo mudou), o evento foi cancelado e o passo falha com
         ``elemento_ambiguo``; se um campo digitado mudou, ou pode ter mudado sem ser visto
         (o primeiro evento demorou, com campos digitados noutro documento), com
-        ``acao_falhou``."""
+        ``acao_falhou``. Um clique que o navegador entregou a outro documento por cima do
+        alvo (``fora``) falha com ``elemento_ambiguo``, dizendo que ele pode ter feito
+        outra coisa."""
         failure: Exception | None = None
         try:
             await action
@@ -4146,6 +4300,15 @@ class Interpreter:
                 "visto: ele enviaria um valor que não foi digitado, então nada foi feito.",
                 details={"alvo": target.intent if isinstance(target, Target) else step.title},
             ) from None
+        if reason == "fora" and failure is None and isinstance(target, Target):
+            raise StepError(
+                ErrorCode.ELEMENTO_AMBIGUO,
+                f"O clique do passo '{step.title}' não chegou a '{target.intent}': o navegador "
+                "o entregou a outro documento por cima dele (a página por cima de um iframe), "
+                "onde ele pode ter feito outra coisa. Confira o sistema de destino antes de "
+                "repetir.",
+                details={"alvo": target.intent},
+            ) from None
         if reason is not None and isinstance(target, Target):
             raise self._page_changed(step, target) from None
         if failure is not None:
@@ -4153,7 +4316,7 @@ class Interpreter:
 
     async def _guard_refused(self, ctx: _StepCtx) -> str | None:
         """Tira o vigia da página e diz por que ele recusou um evento (``alvo``, ``campo``
-        ou ``espera``), ou ``None``.
+        ou ``espera``), se o clique não chegou à janela do alvo (``fora``), ou ``None``.
 
         Se o documento já foi trocado (a própria ação navegou), não há o que ler, e vale o
         resultado da ação: um evento recusado é cancelado e não leva a página a outro

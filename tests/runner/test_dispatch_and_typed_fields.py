@@ -1053,8 +1053,8 @@ def _scaled_iframe_app(srv: _Server) -> App:
 async def test_a_click_in_a_scaled_iframe_with_fields_elsewhere_is_not_held_back(
     run_robot: RobotRunner, srv: _Server
 ) -> None:
-    # Num iframe transformado, a espera antes da releitura não traduz o ponto e deixa a
-    # conferência para o Playwright: o clique vai logo.
+    # Num iframe em escala, a espera antes da releitura traduz o ponto pela caixa do
+    # iframe (o painel fica onde o ponto cairia sem a escala): o clique vai logo.
     srv.app = _scaled_iframe_app(srv)
     save = _click("salvar", "Salvar", effect="write", timeout=6_000)
     save["target"]["frames"] = ["#f"]
@@ -1076,14 +1076,17 @@ _STICKY_HEADER = _page(
 )
 
 
+@pytest.mark.parametrize("smooth", [False, True])
 async def test_a_button_under_a_sticky_header_with_fields_elsewhere_is_scrolled_free(
-    run_robot: RobotRunner, srv: _Server
+    run_robot: RobotRunner, srv: _Server, smooth: bool
 ) -> None:
     # O Salvar fica embaixo de um cabeçalho fixo (onde está o iframe com o campo digitado):
-    # a espera antes da releitura rola o Salvar para a janela de novo, como o Playwright.
-    srv.app = _api_app(
-        srv, {"/p": _STICKY_HEADER, "/obs": _page("<label for='o'>Obs</label><input id='o'>")}
-    )
+    # a espera antes da releitura rola o Salvar para a janela de novo, como o Playwright,
+    # sem animação (também numa página com rolagem suave).
+    page = _STICKY_HEADER
+    if smooth:
+        page = page.replace("</body>", "<style>:root{scroll-behavior:smooth}</style></body>")
+    srv.app = _api_app(srv, {"/p": page, "/obs": _page("<label for='o'>Obs</label><input id='o'>")})
     obs = _fill("digitar_obs", "Obs", "observação")
     obs["target"]["frames"] = ["#o"]
     manifest = _manifest(
@@ -1091,3 +1094,259 @@ async def test_a_button_under_a_sticky_header_with_fields_elsewhere_is_scrolled_
     )
     outcome = await _run(run_robot, manifest)
     _wrote(outcome, srv, RunState.SUCCEEDED, "S;")
+
+
+def _modal_iframe_app(srv: _Server, transform: str, *, on_load: bool = False) -> App:
+    """O CEP e o Salvar num iframe dentro de um modal centralizado por uma transformação; o
+    logradouro, na página principal. Quando o CEP é digitado (ou quando a página carrega,
+    ``on_load``), a página põe por 1,5 s um botão "Desfazer" que cobre a tela."""
+    form = _page(
+        "<label for='cep'>CEP</label><input id='cep'>"
+        "<button type='button' onclick=\"fetch('/api',{method:'POST',body:'S:'+"
+        "parent.document.getElementById('log').value+';'})\">Salvar</button>"
+        "<script>let feito=false;document.getElementById('cep').addEventListener('input',(e)=>{"
+        "if(feito||e.target.value.length<8)return;feito=true;parent.postMessage('cep','*')})"
+        "</script>"
+    )
+    show = (
+        "const d=document.getElementById('desfaz');d.hidden=false;"
+        "setTimeout(()=>{d.hidden=true},1500);"
+    )
+    trigger = "load" if on_load else "message"
+    host = _page(
+        "<label for='log'>Logradouro</label><input id='log'>"
+        "<div style='position:fixed;left:50%;top:50%;width:600px;height:200px;"
+        f"transform:{transform}'>"
+        "<iframe id='f' src='/form' style='width:600px;height:200px;border:0'></iframe></div>"
+        "<button id='desfaz' type='button' hidden style='position:fixed;inset:0;z-index:10' "
+        "onclick=\"fetch('/api',{method:'POST',body:'DESFAZ;'})\">Desfazer</button>"
+        f"<script>addEventListener('{trigger}',()=>{{{show}}})</script>"
+    )
+    return _api_app(srv, {"/host": host, "/form": form})
+
+
+def _modal_iframe_robot(srv: _Server, *, typed: bool) -> Manifest:
+    save = _click("salvar", "Salvar", effect="write", timeout=6_000)
+    save["target"]["frames"] = ["#f"]
+    if not typed:
+        return _manifest([_nav(srv.base, "/host"), save])
+    cep = _fill("digitar_cep", "CEP", "01001000")
+    cep["target"]["frames"] = ["#f"]
+    log = _fill("digitar_log", "Logradouro", "Praça da Sé")
+    return _manifest([_nav(srv.base, "/host"), log, cep, save])
+
+
+_SHIFTED = [
+    "translate(-50%,-50%)",
+    "translate3d(-50%,-50%,0)",
+    "translate(-50%,-50%) scale(.9)",
+]
+
+
+@pytest.mark.parametrize("transform", _SHIFTED)
+async def test_a_click_in_a_shifted_modal_iframe_waits_for_the_page_over_it(
+    run_robot: RobotRunner, srv: _Server, transform: str
+) -> None:
+    # O Playwright não confere o que está por cima de um alvo num iframe transformado: o
+    # clique cairia no "Desfazer" da página por cima do modal. A espera antes da releitura
+    # traduz o ponto (deslocado ou em escala) e espera o "Desfazer" sair.
+    srv.app = _modal_iframe_app(srv, transform)
+    outcome = await _run(run_robot, _modal_iframe_robot(srv, typed=True))
+    _wrote(outcome, srv, RunState.SUCCEEDED, "S:Praça da Sé;")
+
+
+@pytest.mark.parametrize("transform", _SHIFTED)
+async def test_a_click_in_a_shifted_modal_iframe_never_goes_to_the_page_over_it(
+    run_robot: RobotRunner, srv: _Server, transform: str
+) -> None:
+    # Também sem campos digitados: o alvo num iframe transformado espera o que cobre o
+    # iframe sair, em vez de o clique ir para o "Desfazer".
+    srv.app = _modal_iframe_app(srv, transform, on_load=True)
+    outcome = await _run(run_robot, _modal_iframe_robot(srv, typed=False))
+    _wrote(outcome, srv, RunState.SUCCEEDED, "S:;")
+
+
+async def test_a_click_in_a_rotated_iframe_with_fields_elsewhere_is_refused(
+    run_robot: RobotRunner, srv: _Server
+) -> None:
+    # Num iframe girado, o ponto do Salvar não se traduz pela caixa do iframe: com o
+    # logradouro digitado noutro documento, o passo falha logo, sem agir.
+    srv.app = _modal_iframe_app(srv, "translate(-50%,-50%) rotate(3deg)")
+    outcome = await _run(run_robot, _modal_iframe_robot(srv, typed=True))
+    _wrote(outcome, srv, RunState.FAILED, "")
+    assert outcome.result.error_code == ErrorCode.ACAO_FALHOU
+    assert "girado" in (outcome.result.error_message or "")
+
+
+async def test_a_click_the_browser_gives_to_another_document_says_it_may_have_acted(
+    run_robot: RobotRunner, srv: _Server
+) -> None:
+    # Sem campos digitados, num iframe girado, o clique fica com o Playwright, que não
+    # confere o que está por cima do alvo: ele vai para o "Desfazer" da página. O passo
+    # falha dizendo que o clique pode ter feito outra coisa (e não que nada foi feito).
+    srv.app = _modal_iframe_app(srv, "translate(-50%,-50%) rotate(3deg)", on_load=True)
+    outcome = await _run(run_robot, _modal_iframe_robot(srv, typed=False))
+    assert outcome.result.state is RunState.FAILED, outcome.result.error_message
+    assert outcome.result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert "pode ter feito outra coisa" in (outcome.result.error_message or "")
+    assert "S:" not in "".join(srv.log)
+
+
+def _recycled_list(trigger: str, extra: str = "") -> str:
+    """Uma lista virtual de 100 itens que reaproveita 12 botões: cada botão mostra o item da
+    posição dele, e rolar a lista troca o item de cada um. "Excluir Item 57" começa
+    visível. ``trigger`` põe a camada "salvando" por cima da página."""
+    return _page(
+        "<div id='sc' style='height:300px;overflow:auto;position:relative'>"
+        "<div id='in' style='position:relative;height:3000px'></div></div>"
+        "<div id='cobre' hidden style='position:fixed;inset:0;z-index:10;"
+        "background:rgba(0,0,0,.2)'>salvando</div>"
+        + extra
+        + "<script>const sc=document.getElementById('sc'),inn=document.getElementById('in');"
+        "const pool=[];for(let k=0;k<12;k++){const b=document.createElement('button');"
+        "b.type='button';b.style.cssText='position:absolute;left:0;height:30px';"
+        "b.onclick=()=>fetch('/api',{method:'POST',body:b.getAttribute('aria-label')+';'});"
+        "inn.appendChild(b);pool.push(b)}"
+        "const render=()=>{const first=Math.floor(sc.scrollTop/30);pool.forEach((b,k)=>{"
+        "const i=first+k;b.style.top=(i*30)+'px';b.textContent='Excluir Item '+i;"
+        "b.setAttribute('aria-label','Excluir Item '+i)})};"
+        "sc.addEventListener('scroll',render);sc.scrollTop=57*30-100;render();"
+        "const cobre=(ms)=>{const c=document.getElementById('cobre');c.hidden=false;"
+        f"setTimeout(()=>{{c.hidden=true}},ms)}};{trigger}</script>"
+    )
+
+
+def _deleted_57_or_nothing(outcome: Outcome, srv: _Server) -> None:
+    sent = "".join(srv.log)
+    assert sent in ("", "Excluir Item 57;"), sent
+    if sent == "":
+        assert outcome.result.state is RunState.FAILED
+        assert outcome.result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    else:
+        assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+
+
+@pytest.mark.parametrize("cover_ms", [300, 500, 1000])
+async def test_a_recycled_list_scrolled_by_the_wait_never_deletes_another_item(
+    run_robot: RobotRunner, srv: _Server, cover_ms: int
+) -> None:
+    # A Obs está num iframe: a espera antes da releitura rola o botão para a janela de novo
+    # enquanto a camada cobre a página, e a lista reaproveita o botão para outro item. O
+    # botão preso ainda precisa ser o único do localizador.
+    obs = _page(
+        "<label for='o'>Obs</label><input id='o'><script>document.getElementById('o')"
+        ".addEventListener('input',()=>parent.postMessage('obs','*'),{once:true})</script>"
+    )
+    page = _recycled_list(
+        f"addEventListener('message',()=>cobre({cover_ms}))",
+        "<iframe id='g' src='/obs' style='width:400px;height:80px'></iframe>",
+    )
+    srv.app = _api_app(srv, {"/p": page, "/obs": obs})
+    note = _fill("digitar_obs", "Obs", "observação")
+    note["target"]["frames"] = ["#g"]
+    manifest = _manifest(
+        [
+            _nav(srv.base, "/p"),
+            note,
+            _click("excluir", "Excluir Item 57", effect="write", timeout=6_000),
+        ]
+    )
+    _deleted_57_or_nothing(await _run(run_robot, manifest), srv)
+
+
+async def test_a_recycled_list_scrolled_by_the_browser_never_deletes_another_item(
+    run_robot: RobotRunner, srv: _Server
+) -> None:
+    # Sem campos digitados: o próprio Playwright rola o botão enquanto a camada o cobre, e
+    # a lista o reaproveita para outro item. O vigia confere o rótulo no primeiro evento.
+    srv.app = _api_app(srv, {"/p": _recycled_list("addEventListener('load',()=>cobre(1000))")})
+    manifest = _manifest(
+        [_nav(srv.base, "/p"), _click("excluir", "Excluir Item 57", effect="write", timeout=6_000)]
+    )
+    _deleted_57_or_nothing(await _run(run_robot, manifest), srv)
+
+
+async def test_a_page_listener_on_the_window_never_sees_a_refused_click(
+    run_robot: RobotRunner, srv: _Server
+) -> None:
+    # A página põe, quando carrega, ouvintes na janela, na fase de captura, que agem no
+    # clique do Salvar. O vigia é posto antes dos scripts dela: o clique recusado (o
+    # logradouro mudou enquanto a camada cobria o Salvar) não chega a eles.
+    pages = _cover_cep("camada")
+    listener = (
+        "<script>for(const t of ['pointerdown','mousedown','click'])addEventListener(t,(e)=>{"
+        "if(e.target.closest&&e.target.closest('button'))"
+        "fetch('/api',{method:'POST',body:'CAPTURA:'+t+';'})},true)</script>"
+    )
+    pages["/p"] = pages["/p"].replace("<body>", "<body>" + listener, 1)
+    srv.app = _api_app(srv, pages)
+    manifest = _manifest(
+        [
+            _nav(srv.base, "/p"),
+            _fill("digitar_log", "Logradouro", "Praça da Sé"),
+            _fill("digitar_cep", "CEP", "01001000"),
+            _click("salvar", "Salvar", effect="write", timeout=5_000),
+        ]
+    )
+    outcome = await _run(run_robot, manifest)
+    _wrote(outcome, srv, RunState.FAILED, "")
+    assert outcome.result.error_code == ErrorCode.ACAO_FALHOU
+
+
+_SLOTTED_BUTTON = (
+    "<script>customElements.define('x-btn',class extends HTMLElement{constructor(){super();"
+    "const r=this.attachShadow({mode:'open'});"
+    "r.innerHTML=\"<button type='button'><span part='label'><slot></slot></span></button>\";"
+    "r.querySelector('button').onclick=()=>fetch('/api',{method:'POST',body:'S;'})}})"
+    "</script>"
+)
+
+
+async def test_a_slotted_shadow_button_with_fields_elsewhere_is_not_held_back(
+    run_robot: RobotRunner, srv: _Server
+) -> None:
+    # O texto do botão vem de um <slot> (como num componente de botão): o ponto cai no
+    # hospedeiro, e a espera sobe pelo slot até o botão.
+    page = _page(
+        "<iframe id='o' src='/obs' style='width:400px;height:80px'></iframe>"
+        "<x-btn>Salvar</x-btn>" + _SLOTTED_BUTTON
+    )
+    srv.app = _api_app(srv, {"/p": page, "/obs": _page("<label for='o'>Obs</label><input id='o'>")})
+    obs = _fill("digitar_obs", "Obs", "observação")
+    obs["target"]["frames"] = ["#o"]
+    manifest = _manifest(
+        [_nav(srv.base, "/p"), obs, _click("salvar", "Salvar", effect="write", timeout=6_000)]
+    )
+    outcome = await _run(run_robot, manifest)
+    _wrote(outcome, srv, RunState.SUCCEEDED, "S;")
+
+
+async def test_an_iframe_in_a_shadow_root_under_a_scaled_parent_is_not_held_back(
+    run_robot: RobotRunner, srv: _Server
+) -> None:
+    # O iframe do Salvar fica num shadow root, dentro de um elemento em escala: a escala é
+    # vista através do hospedeiro, e o ponto não cai no painel.
+    form = _page(
+        "<button type='button' style='position:absolute;left:400px;top:200px' onclick=\""
+        "fetch('/api',{method:'POST',body:parent.document.getElementById('log').value+';'})"
+        '">Salvar</button>'
+    )
+    host = _page(
+        "<div style='position:absolute;left:0;top:0;transform:scale(.5);"
+        "transform-origin:0 0'><x-f></x-f></div>"
+        "<div style='position:absolute;left:380px;top:180px;width:160px;height:100px;"
+        "background:#ddd'>Painel</div>"
+        "<div style='position:absolute;left:0;top:400px'>"
+        "<label for='log'>Logradouro</label><input id='log'></div>"
+        "<script>customElements.define('x-f',class extends HTMLElement{constructor(){super();"
+        "this.attachShadow({mode:'open'}).innerHTML=\"<iframe id='f' src='/form' "
+        "style='width:600px;height:300px'></iframe>\"}})</script>"
+    )
+    srv.app = _api_app(srv, {"/host": host, "/form": form})
+    save = _click("salvar", "Salvar", effect="write", timeout=6_000)
+    save["target"]["frames"] = ["#f"]
+    manifest = _manifest(
+        [_nav(srv.base, "/host"), _fill("digitar_log", "Logradouro", "Praça da Sé"), save]
+    )
+    outcome = await _run(run_robot, manifest)
+    _wrote(outcome, srv, RunState.SUCCEEDED, "Praça da Sé;")
