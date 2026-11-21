@@ -19,7 +19,7 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, pool, text
 
-from rapa.control.db.roles import RoleNames, grants_sql
+from rapa.control.db.roles import RoleNames, all_grants_sql
 from rapa.control.db.session import psycopg_url
 
 __all__ = ["MIGRATIONS_DIR", "alembic_config", "apply_grants", "main", "upgrade"]
@@ -46,7 +46,7 @@ def apply_grants(url: str, roles: RoleNames | None = None) -> None:
     engine = create_engine(psycopg_url(url), poolclass=pool.NullPool)
     try:
         with engine.begin() as conn:
-            for statement in grants_sql(roles or RoleNames.from_env()):
+            for statement in all_grants_sql(roles or RoleNames.from_env()):
                 conn.execute(text(statement))
     finally:
         engine.dispose()

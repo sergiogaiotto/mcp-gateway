@@ -14,6 +14,7 @@ from rapa.ui.auth import LOGIN_PATH
 from rapa.ui.backend import BackendError, NotAuthenticated, describe_error
 from rapa.ui.context import Viewer
 from rapa.ui.labels import EFFECT_COLORS, EFFECT_LABELS, RUN_STATE_COLORS, RUN_STATE_LABELS
+from rapa.ui.permissions import can_record
 
 __all__ = [
     "NAV_ITEMS",
@@ -30,8 +31,10 @@ NAV_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("catalogo", "Catálogo", "/catalogo"),
     ("robos", "Robôs", "/robos"),
     ("execucoes", "Execuções", "/execucoes"),
-    ("ao_vivo", "Visão ao vivo", "/ao-vivo"),
+    ("gravar", "Gravar", "/gravar"),
 )
+#: Itens que só aparecem para quem pode usá-los (o servidor confere de novo).
+_NAV_RULES = {"gravar": can_record}
 
 
 def page_frame(viewer: Viewer, active: str) -> ui.column:
@@ -41,6 +44,9 @@ def page_frame(viewer: Viewer, active: str) -> ui.column:
         with ui.row().classes("items-center gap-4"):
             ui.label(settings.title).classes("text-h6 text-white")
             for key, label, path in NAV_ITEMS:
+                rule = _NAV_RULES.get(key)
+                if rule is not None and not rule(viewer.principal):
+                    continue
                 link = ui.link(label, path).classes("text-white no-underline").mark(f"nav-{key}")
                 if key == active:
                     link.classes("text-weight-bold underline")

@@ -3,14 +3,24 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from rapa.core.contracts import RobotStatus, RunState, RunTrigger, VersionStatus
+from rapa.core.contracts import (
+    RecordingSessionStatus,
+    RobotStatus,
+    RunState,
+    RunTrigger,
+    VersionStatus,
+)
 from rapa.core.robot import CredentialKind, Effect, FieldType
 
 __all__ = [
     "CREDENTIAL_KIND_LABELS",
     "EFFECT_COLORS",
     "EFFECT_LABELS",
+    "END_REASON_LABELS",
     "FIELD_TYPE_LABELS",
+    "PARAMETER_TYPES",
+    "RECORDING_STATUS_COLORS",
+    "RECORDING_STATUS_LABELS",
     "ROBOT_STATUS_LABELS",
     "RUN_STATE_COLORS",
     "RUN_STATE_LABELS",
@@ -89,6 +99,48 @@ FIELD_TYPE_LABELS: dict[FieldType, str] = {
     FieldType.MONEY: "Valor em reais",
     FieldType.FILE: "Arquivo",
     FieldType.LIST: "Lista",
+}
+
+RECORDING_STATUS_LABELS: dict[RecordingSessionStatus, str] = {
+    RecordingSessionStatus.STARTING: "Abrindo o navegador",
+    RecordingSessionStatus.ACTIVE: "Gravando",
+    RecordingSessionStatus.STOPPED: "Pronta para revisar",
+    RecordingSessionStatus.DRAFTED: "Rascunho criado",
+    RecordingSessionStatus.EXPIRED: "Encerrada",
+    RecordingSessionStatus.FAILED: "Falhou",
+}
+
+RECORDING_STATUS_COLORS: dict[RecordingSessionStatus, str] = {
+    RecordingSessionStatus.STARTING: "grey-7",
+    RecordingSessionStatus.ACTIVE: "red-8",
+    RecordingSessionStatus.STOPPED: "blue-8",
+    RecordingSessionStatus.DRAFTED: "green-8",
+    RecordingSessionStatus.EXPIRED: "grey-8",
+    RecordingSessionStatus.FAILED: "red-9",
+}
+
+#: Por que uma sessão de gravação terminou sem gravação.
+END_REASON_LABELS: dict[str, str] = {
+    "ociosa": "Terminou depois de 10 minutos sem atividade; o que foi demonstrado se perdeu.",
+    "tempo_esgotado": "Passou do prazo máximo de uma gravação; o que foi demonstrado se perdeu.",
+    "encerrada": "O navegador da gravação foi fechado; o que foi demonstrado se perdeu.",
+    "perdida": "O navegador da gravação parou de responder; o que foi demonstrado se perdeu.",
+    "nao_iniciou": "O navegador da gravação não abriu.",
+    "parada_falhou": "Não foi possível fechar a gravação; grave de novo.",
+    "gravacao_invalida": "A gravação chegou inválida; grave de novo.",
+    "erro": "O navegador da gravação teve um erro; grave de novo.",
+}
+
+#: Tipos que uma entrada criada na revisão pode ter, na ordem do seletor.
+PARAMETER_TYPES: dict[str, str] = {
+    "string": "Texto",
+    "integer": "Número inteiro",
+    "number": "Número",
+    "boolean": "Sim ou não",
+    "date": "Data",
+    "cpf": "CPF",
+    "cnpj": "CNPJ",
+    "money": "Valor em reais",
 }
 
 CREDENTIAL_KIND_LABELS: dict[CredentialKind, str] = {

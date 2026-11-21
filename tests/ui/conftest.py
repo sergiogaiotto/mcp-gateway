@@ -31,7 +31,7 @@ from nicegui.storage import Storage
 from nicegui.testing import User
 from nicegui.testing.general import nicegui_reset_globals
 
-from rapa.core.contracts import Principal, Role
+from rapa.core.contracts import Principal, RecordingService, Role
 from rapa.core.ids import new_id
 from rapa.fixtures.memory import MemoryPlatform
 from rapa.fixtures.robots import baixar_notas, emitir_protocolo
@@ -88,6 +88,8 @@ class World:
     robot_ids: dict[str, UUID] = field(default_factory=dict)
     #: Resolvedor que a sessão consulta para conferir conta e papéis (como o banco).
     resolver: PrincipalResolver | None = None
+    #: Sessões de gravação (Gravar e a revisão); sem elas, a interface mostra que não há.
+    sessions: RecordingService | None = None
 
     def auth(self) -> UiAuth:
         profiles = [
@@ -112,7 +114,9 @@ class World:
     def build(self, app: FastAPI) -> None:
         create_ui(
             app,
-            backend_factory=ContractsBackendFactory.from_platform(self.platform),
+            backend_factory=ContractsBackendFactory.from_platform(
+                self.platform, sessions=self.sessions
+            ),
             auth=self.auth(),
             settings=self.settings(),
         )

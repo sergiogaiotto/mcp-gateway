@@ -74,6 +74,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from rapa.control.db.schema import (
     company_quotas,
     platform_settings,
+    recording_sessions,
     robot_versions,
     run_events,
     runs,
@@ -140,6 +141,8 @@ _WROTE_BEFORE_STOPPING = (
     "A execução chegou ao início de um passo que grava e pode ter gravado no sistema de "
     "destino: confira o sistema de destino antes de executar de novo."
 )
+#: Situações de uma sessão de gravação que ainda ocupa um navegador.
+_LIVE_SESSIONS = ("starting", "active")
 
 
 class StaleAttempt(Conflict):
@@ -257,6 +260,14 @@ async def _loads(
             waiting[company_id] += int(count)
         else:
             running[company_id] += int(count)
+    # Cada sessão de gravação aberta ocupa um navegador da reserva interativa.
+    live_sessions = await session.scalar(
+        select(func.count(recording_sessions.c.company_id)).where(
+            recording_sessions.c.status.in_(_LIVE_SESSIONS),
+            recording_sessions.c.expires_at > func.now(),
+        )
+    )
+    interactive_running += int(live_sessions or 0)
     companies = set(running) | set(waiting)
     quotas: dict[UUID, tuple[int, Decimal]] = {}
     if companies:

@@ -6,6 +6,7 @@ transação sem empresa não vê nada de ninguém.
 """
 
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
@@ -16,7 +17,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from rapa.control.db import Database
 from rapa.control.db.schema import TENANT_TABLES
 from rapa.control.services import PgPlatform, PgProvisioning, PgRunQueue
-from rapa.core.contracts import RunTrigger
+from rapa.control.services.sessions import PgSessionStore
+from rapa.control.sessions import SessionRecord
+from rapa.core.contracts import RecordingSessionStatus, RunTrigger
 from rapa.core.events import RunEventKind
 from rapa.core.ids import new_id
 from rapa.core.robot import CredentialRef
@@ -32,6 +35,7 @@ class World:
     b: Tenant
     a_robot: UUID
     a_run: UUID
+    a_session: UUID
 
 
 async def _world(app_db: Database, dispatcher_db: Database, superuser: AsyncEngine) -> World:
@@ -62,7 +66,36 @@ async def _world(app_db: Database, dispatcher_db: Database, superuser: AsyncEngi
             job.attempt,
             [event(job.run_id, job.attempt, 0, RunEventKind.RUN_STARTED)],
         )
-    return World(a=a, b=b, a_robot=a_version.robot_id, a_run=a_run.run_id)
+    sessions = {tenant.company_id: await _stopped_session(app_db, tenant) for tenant in (a, b)}
+    return World(
+        a=a, b=b, a_robot=a_version.robot_id, a_run=a_run.run_id, a_session=sessions[a.company_id]
+    )
+
+
+async def _stopped_session(db: Database, tenant: Tenant) -> UUID:
+    """Uma sessão de gravação parada, com a gravação, para a empresa."""
+    store = PgSessionStore(db)
+    now = datetime.now(UTC)
+    record = SessionRecord(
+        company_id=tenant.company_id,
+        session_id=new_id(),
+        area_id=tenant.area_id,
+        owner=tenant.creator.subject,
+        title="Demonstração",
+        start_url="http://portal-v1.rapa.test:8080/login",
+        status=RecordingSessionStatus.ACTIVE,
+        created_at=now,
+        expires_at=now + timedelta(hours=1),
+    )
+    await store.insert(record, company_limit=10)
+    await store.save_recording(
+        tenant.company_id,
+        record.session_id,
+        {"version": 1, "started_at": now.isoformat(), "events": []},
+        actor=tenant.creator.subject,
+        stopped_at=now,
+    )
+    return record.session_id
 
 
 async def _counts(session: AsyncSession, company_id: UUID) -> dict[str, tuple[int, int]]:
@@ -94,11 +127,17 @@ async def test_company_b_sees_nothing_of_company_a(
             "run_events": await session.scalar(
                 text("SELECT count(*) FROM run_events WHERE run_id = :id"), {"id": world.a_run}
             ),
+            "recordings": await session.scalar(
+                text("SELECT count(*) FROM recordings WHERE session_id = :id"),
+                {"id": world.a_session},
+            ),
         }
     for table, (visible, foreign) in counts.items():
         assert foreign == 0, f"{table}: B enxerga linhas de outra empresa"
         assert visible > 0, f"{table}: B deveria ver as próprias linhas"
-    assert a_ids == {"robots": 0, "runs": 0, "run_events": 0}
+    assert a_ids == {"robots": 0, "runs": 0, "run_events": 0, "recordings": 0}
+    assert await PgSessionStore(app_db).get(world.b.company_id, world.a_session) is None
+    assert await PgSessionStore(app_db).get_recording(world.b.company_id, world.a_session) is None
 
     # Pelos serviços, com o principal da B.
     platform = PgPlatform(app_db)
@@ -137,6 +176,17 @@ async def test_writes_with_another_company_id_fail_with_check(
             "INSERT INTO credentials (id, company_id, area_id, name, kind, origin, vault_path) "
             "VALUES (:new, :a, :area, 'x', 'password', 'https://x.rapa.test', 'x')",
             {"area": a.area_id},
+        ),
+        "recording_sessions": (
+            "INSERT INTO recording_sessions (company_id, id, area_id, owner, start_url, "
+            "expires_at) VALUES (:a, :new, :area, 'b', 'https://x.rapa.test/', "
+            "now() + interval '1 hour')",
+            {"area": a.area_id},
+        ),
+        "recordings": (
+            "INSERT INTO recordings (company_id, id, session_id, created_by, recording) "
+            "VALUES (:a, :new, :sessao, 'b', '{}')",
+            {"sessao": world.a_session},
         ),
     }
     for table, (statement, extra) in attempts.items():

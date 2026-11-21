@@ -72,6 +72,44 @@ def test_minimal_dev_configuration(tmp_path: Path) -> None:
     assert "senha" not in repr(settings)
 
 
+def test_recording_sessions_and_llm_configuration(tmp_path: Path) -> None:
+    base = {"RAPA_DATABASE_URL": DB, "RAPA_DEV": "1", "RAPA_TOKENS_DEV": str(_tokens(tmp_path))}
+    defaults = ServerSettings.from_env(base)
+    assert defaults.sessions and defaults.sessions_per_company == 2
+    assert defaults.sessions_max is None
+    assert (defaults.session_idle_s, defaults.session_max_s) == (600.0, 3600.0)
+    assert defaults.llm_base_url is None
+    matrix = tmp_path / "matriz.json"
+    settings = ServerSettings.from_env(
+        {
+            **base,
+            "RAPA_SESSOES_POR_EMPRESA": "3",
+            "RAPA_SESSOES_MAX": "5",
+            "RAPA_SESSAO_OCIOSA_S": "300",
+            "RAPA_SESSAO_MAX_S": "1800",
+            "RAPA_PASTA_SESSOES": str(tmp_path / "sessoes"),
+            "RAPA_LLM_BASE_URL": "https://hub.exemplo/v1",
+            "RAPA_LLM_MODEL": "qwen-latest",
+            "RAPA_LLM_API_KEY": "sk-chave-que-nao-aparece",
+            "RAPA_LLM_CAPACIDADES": str(matrix),
+        }
+    )
+    assert (settings.sessions_per_company, settings.sessions_max) == (3, 5)
+    assert (settings.session_idle_s, settings.session_max_s) == (300.0, 1800.0)
+    assert settings.sessions_dir == tmp_path / "sessoes"
+    assert settings.llm_capabilities_file == matrix
+    assert "sk-chave-que-nao-aparece" not in repr(settings)
+    assert not ServerSettings.from_env({**base, "RAPA_SESSOES": "0"}).sessions
+    for env, message in (
+        ({"RAPA_LLM_BASE_URL": "https://hub.exemplo/v1"}, "endereço e o modelo"),
+        ({"RAPA_LLM_BASE_URL": "https://hub", "RAPA_LLM_MODEL": "q"}, "RAPA_LLM_CAPACIDADES"),
+        ({"RAPA_SESSAO_OCIOSA_S": "7200"}, "prazo máximo"),
+        ({"RAPA_SESSOES_POR_EMPRESA": "0"}, "sessions_per_company"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            ServerSettings.from_env({**base, **env})
+
+
 def test_keycloak_configuration() -> None:
     settings = ServerSettings.from_env(
         {

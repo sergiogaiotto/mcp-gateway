@@ -7,22 +7,39 @@ implementações em memória.
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
-from rapa.core.robot import Effect, Manifest
+from rapa.core.robot import NAME_PATTERN, SLUG_PATTERN, Effect, Manifest
 
 __all__ = [
     "MAX_RUNS_LISTED",
+    "MAX_SESSIONS_LISTED",
+    "CheckProposal",
     "Conflict",
     "ContractError",
+    "DraftChoices",
+    "EffectChoice",
+    "EffectProposal",
     "Forbidden",
+    "GeneralizationProposals",
     "InvalidInput",
     "NotFound",
+    "ParameterChoice",
+    "ParameterProposal",
+    "ParameterType",
     "Principal",
+    "ProposalSource",
     "QuotaExceeded",
+    "RecordingService",
+    "RecordingSessionInfo",
+    "RecordingSessionStatus",
+    "RepetitionChoice",
+    "RepetitionField",
+    "RepetitionFieldChoice",
+    "RepetitionProposal",
     "RobotAdmin",
     "RobotCatalog",
     "RobotInfo",
@@ -36,7 +53,12 @@ __all__ = [
     "RunStatus",
     "RunTrigger",
     "RunnerJob",
+    "ServiceUnavailable",
+    "StepNameChoice",
+    "StepNameProposal",
+    "StepOverview",
     "VersionStatus",
+    "ViewerTicket",
 ]
 
 
@@ -238,6 +260,12 @@ class InvalidInput(ContractError):
         self.errors = errors or []
 
 
+class ServiceUnavailable(ContractError):
+    """Um recurso da plataforma não está disponível agora (por exemplo, o navegador da gravação)."""
+
+    code = "indisponivel"
+
+
 class QuotaExceeded(ContractError):
     code = "limite_excedido"
 
@@ -304,4 +332,264 @@ class RobotAdmin(Protocol):
 
     async def publish(
         self, principal: Principal, robot_id: UUID, version_no: int
+    ) -> RobotVersionInfo: ...
+
+
+# ---------------------------------------------------------------------------
+# Demonstração e generalização (sessões de gravação)
+# ---------------------------------------------------------------------------
+
+#: Quantas sessões de gravação, no máximo, uma listagem devolve.
+MAX_SESSIONS_LISTED = 100
+
+#: Tipos simples que uma entrada criada na revisão pode ter (os de ``rapa.core.edits``).
+type ParameterType = Literal[
+    "string", "integer", "number", "boolean", "date", "cpf", "cnpj", "money"
+]
+
+
+class RecordingSessionStatus(StrEnum):
+    """Situação de uma sessão de gravação (o navegador na nuvem de uma demonstração)."""
+
+    STARTING = "starting"
+    ACTIVE = "active"
+    #: A pessoa parou: a gravação está guardada e pronta para a revisão.
+    STOPPED = "stopped"
+    #: A revisão virou um rascunho de robô.
+    DRAFTED = "drafted"
+    #: Terminou sozinha (sem atividade, prazo máximo, navegador perdido): nada foi guardado.
+    EXPIRED = "expired"
+    FAILED = "failed"
+
+    @property
+    def live(self) -> bool:
+        """O navegador da sessão ainda está (ou deveria estar) aberto."""
+        return self in {RecordingSessionStatus.STARTING, RecordingSessionStatus.ACTIVE}
+
+    @property
+    def reviewable(self) -> bool:
+        """Há uma gravação guardada para revisar."""
+        return self in {RecordingSessionStatus.STOPPED, RecordingSessionStatus.DRAFTED}
+
+
+class RecordingSessionInfo(_Model):
+    """Uma sessão de gravação, como a dona dela a vê."""
+
+    session_id: UUID
+    company_id: UUID
+    area_id: UUID
+    owner: str
+    title: str
+    start_url: str
+    status: RecordingSessionStatus
+    created_at: datetime
+    expires_at: datetime
+    started_at: datetime | None = None
+    stopped_at: datetime | None = None
+    #: Código de por que terminou sem gravação (``ociosa``, ``tempo_esgotado``, ``perdida``...).
+    end_reason: str | None = None
+    recording_id: UUID | None = None
+    robot_id: UUID | None = None
+    version_no: int | None = None
+
+
+class ViewerTicket(_Model):
+    """Bilhete de uso único para abrir a visão ao vivo de uma sessão.
+
+    Vale por pouco tempo e só uma vez; quem o recebe abre o websocket em
+    ``path`` com ``?bilhete=<ticket>``. Nunca vai para o banco nem para o log.
+    """
+
+    session_id: UUID
+    ticket: str = Field(min_length=32, max_length=200, repr=False)
+    expires_at: datetime
+    path: str
+
+
+class ProposalSource(StrEnum):
+    """De onde veio uma proposta da revisão."""
+
+    #: Regras determinísticas do compilador.
+    RULES = "regras"
+    #: O modelo de linguagem (validado pelo código antes de aparecer).
+    MODEL = "modelo"
+
+
+class StepOverview(_Model):
+    """Um passo do robô compilado, para a pessoa se localizar na revisão."""
+
+    step_id: str
+    number: str
+    title: str
+    kind: str
+    effect: Effect
+    depth: int = 0
+
+
+class ParameterProposal(_Model):
+    """Um valor digitado ou escolhido que pode virar entrada do robô."""
+
+    step_id: str
+    step_title: str
+    field_label: str | None = None
+    #: Valor gravado, encurtado para exibição.
+    value_preview: str
+    name: str = Field(pattern=NAME_PATTERN)
+    title: str = Field(min_length=1, max_length=200)
+    type: ParameterType = "string"
+    source: ProposalSource = ProposalSource.RULES
+
+
+class StepNameProposal(_Model):
+    step_id: str
+    current_title: str
+    title: str = Field(min_length=1, max_length=200)
+    source: ProposalSource = ProposalSource.MODEL
+
+
+class RepetitionField(_Model):
+    """Um valor que muda a cada volta da repetição e vira um campo do item."""
+
+    step_id: str
+    name: str = Field(pattern=NAME_PATTERN)
+    title: str = Field(min_length=1, max_length=200)
+    type: ParameterType = "string"
+    #: Os valores de cada volta, encurtados para exibição.
+    values: list[str] = Field(default_factory=list)
+
+
+class RepetitionProposal(_Model):
+    """Passos que a pessoa repetiu, em sequência, com valores diferentes."""
+
+    proposal_id: str
+    first_step_id: str
+    #: Os passos da primeira volta (viram o corpo da repetição).
+    body_step_ids: list[str]
+    #: Todos os passos cobertos (as voltas seguintes saem do robô).
+    step_ids: list[str]
+    times: int = Field(ge=2)
+    list_name: str = Field(pattern=NAME_PATTERN)
+    list_title: str = Field(min_length=1, max_length=200)
+    fields: list[RepetitionField] = Field(min_length=1)
+    source: ProposalSource = ProposalSource.RULES
+
+
+class EffectProposal(_Model):
+    """O modelo acha que o passo grava mais do que o compilador concluiu (o efeito só sobe)."""
+
+    step_id: str
+    step_title: str
+    current: Effect
+    proposed: Literal["write", "irreversible"]
+    source: ProposalSource = ProposalSource.MODEL
+
+
+class CheckProposal(_Model):
+    """Texto visto na gravação que confirma o sucesso, para conferir no fim de cada execução."""
+
+    text: str = Field(min_length=3, max_length=200)
+    source: ProposalSource = ProposalSource.MODEL
+
+
+class GeneralizationProposals(_Model):
+    """Tudo o que a revisão mostra: nada disso entra no robô sem a confirmação da pessoa."""
+
+    session_id: UUID
+    recording_id: UUID
+    name: str
+    title: str
+    description: str
+    steps: list[StepOverview]
+    parameters: list[ParameterProposal] = Field(default_factory=list)
+    step_names: list[StepNameProposal] = Field(default_factory=list)
+    repetitions: list[RepetitionProposal] = Field(default_factory=list)
+    effects: list[EffectProposal] = Field(default_factory=list)
+    checks: list[CheckProposal] = Field(default_factory=list)
+    #: Avisos do compilador em pt-BR.
+    warnings: list[str] = Field(default_factory=list)
+    #: O modelo respondeu agora; sem ele, só as sugestões das regras aparecem.
+    model_available: bool = False
+    model_message: str | None = None
+    #: Propostas do modelo que o código recusou, com o motivo.
+    model_rejected: list[str] = Field(default_factory=list)
+
+
+class ParameterChoice(_Model):
+    step_id: str = Field(min_length=1, max_length=40)
+    name: str = Field(pattern=NAME_PATTERN)
+    title: str = Field(min_length=1, max_length=200)
+    type: ParameterType = "string"
+    description: str = Field(default="", max_length=1000)
+
+
+class StepNameChoice(_Model):
+    step_id: str = Field(min_length=1, max_length=40)
+    title: str = Field(min_length=1, max_length=200)
+
+
+class RepetitionFieldChoice(_Model):
+    step_id: str = Field(min_length=1, max_length=40)
+    name: str = Field(pattern=NAME_PATTERN)
+    title: str = Field(min_length=1, max_length=200)
+    type: ParameterType = "string"
+
+
+class RepetitionChoice(_Model):
+    proposal_id: str = Field(min_length=1, max_length=80)
+    list_name: str = Field(pattern=NAME_PATTERN)
+    list_title: str = Field(min_length=1, max_length=200)
+    fields: list[RepetitionFieldChoice] = Field(min_length=1, max_length=50)
+
+
+class EffectChoice(_Model):
+    step_id: str = Field(min_length=1, max_length=40)
+    effect: Literal["write", "irreversible"]
+
+
+class DraftChoices(_Model):
+    """O que a pessoa confirmou na revisão; o código aplica e o portão de política confere."""
+
+    name: str = Field(pattern=SLUG_PATTERN)
+    title: str = Field(min_length=1, max_length=120)
+    description: str = Field(min_length=1, max_length=2000)
+    parameters: list[ParameterChoice] = Field(default_factory=list, max_length=50)
+    step_names: list[StepNameChoice] = Field(default_factory=list, max_length=500)
+    repetitions: list[RepetitionChoice] = Field(default_factory=list, max_length=20)
+    effects: list[EffectChoice] = Field(default_factory=list, max_length=500)
+    checks: list[str] = Field(default_factory=list, max_length=20)
+
+
+class RecordingService(Protocol):
+    """Demonstrar e generalizar: sessões de gravação, a revisão e o rascunho.
+
+    Só quem tem o papel de criação na área abre uma sessão, e só a dona dela a vê,
+    controla, para e revisa.
+    """
+
+    async def create_session(
+        self, principal: Principal, area_id: UUID, start_url: str, title: str = ""
+    ) -> RecordingSessionInfo: ...
+
+    async def get_session(
+        self, principal: Principal, session_id: UUID
+    ) -> RecordingSessionInfo | None: ...
+
+    async def list_sessions(
+        self, principal: Principal, limit: int = 20
+    ) -> list[RecordingSessionInfo]:
+        """Sessões da própria pessoa, das mais novas às mais antigas."""
+        ...
+
+    async def issue_ticket(self, principal: Principal, session_id: UUID) -> ViewerTicket: ...
+
+    async def stop_session(
+        self, principal: Principal, session_id: UUID
+    ) -> RecordingSessionInfo: ...
+
+    async def get_proposals(
+        self, principal: Principal, session_id: UUID
+    ) -> GeneralizationProposals: ...
+
+    async def create_draft(
+        self, principal: Principal, session_id: UUID, choices: DraftChoices
     ) -> RobotVersionInfo: ...

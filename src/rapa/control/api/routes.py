@@ -18,7 +18,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from rapa.control.api.errors import error_response
 from rapa.control.api.openapi_robots import build_robots_openapi
 from rapa.control.api.ratelimit import RateLimiter
+from rapa.control.api.sessions import add_session_routes
 from rapa.control.auth import Authenticator
+from rapa.control.sessions.service import RecordingSessions
 from rapa.control.validation import InputValidator, InvalidSchemaError
 from rapa.core.contracts import (
     MAX_RUNS_LISTED,
@@ -82,6 +84,8 @@ class ApiServices:
     validator: InputValidator = field(default_factory=InputValidator)
     #: URL pública da API, citada no documento OpenAPI dos robôs.
     public_url: str | None = None
+    #: Sessões de gravação (Demonstrar e Generalizar); sem elas, ``/v1/sessoes`` responde 503.
+    sessions: RecordingSessions | None = None
 
 
 def check_idempotency_key(key: str | None) -> str | None:
@@ -247,6 +251,10 @@ def create_api_router(services: ApiServices) -> APIRouter:
         robot_id: UUID, n: Annotated[int, Path(ge=1)], principal: Annotated[Principal, caller_dep]
     ) -> RobotVersionInfo:
         return await services.admin.publish(principal, robot_id, n)
+
+    # -- sessões de gravação ------------------------------------------------
+
+    add_session_routes(router, services.sessions, current_principal)
 
     # -- OpenAPI dos robôs --------------------------------------------------
 

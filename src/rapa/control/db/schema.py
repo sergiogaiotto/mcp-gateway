@@ -34,6 +34,8 @@ __all__ = [
     "memberships",
     "metadata",
     "platform_settings",
+    "recording_sessions",
+    "recordings",
     "robot_versions",
     "robots",
     "run_events",
@@ -235,6 +237,36 @@ audit_log = Table(
     Column("row_hash", Text, nullable=False, server_default=""),
 )
 
+recording_sessions = Table(
+    "recording_sessions",
+    metadata,
+    Column("company_id", Uuid, primary_key=True),
+    Column("id", Uuid, primary_key=True),
+    Column("area_id", Uuid, nullable=False),
+    Column("owner", Text, nullable=False),
+    Column("title", Text, nullable=False, server_default=""),
+    Column("start_url", Text, nullable=False),
+    Column("status", Text, nullable=False),
+    Column("end_reason", Text, nullable=True),
+    Column("robot_id", Uuid, nullable=True),
+    Column("version_no", Integer, nullable=True),
+    _ts("created_at", nullable=False, server_default=True),
+    _ts("started_at"),
+    _ts("stopped_at"),
+    _ts("expires_at", nullable=False),
+)
+
+recordings = Table(
+    "recordings",
+    metadata,
+    Column("company_id", Uuid, primary_key=True),
+    Column("id", Uuid, primary_key=True),
+    Column("session_id", Uuid, nullable=False),
+    Column("created_by", Text, nullable=False),
+    Column("recording", JSONB, nullable=False),
+    _ts("created_at", nullable=False, server_default=True),
+)
+
 #: Tabelas com dados de empresa (todas com isolamento por linha).
 TENANT_TABLES: tuple[Table, ...] = (
     companies,
@@ -249,4 +281,6 @@ TENANT_TABLES: tuple[Table, ...] = (
     idempotency_keys,
     run_events,
     audit_log,
+    recording_sessions,
+    recordings,
 )

@@ -30,11 +30,15 @@ from pydantic import TypeAdapter, ValidationError
 from rapa.core.contracts import (
     Conflict,
     ContractError,
+    DraftChoices,
     Forbidden,
+    GeneralizationProposals,
     InvalidInput,
     NotFound,
     Principal,
     QuotaExceeded,
+    RecordingService,
+    RecordingSessionInfo,
     RobotAdmin,
     RobotCatalog,
     RobotInfo,
@@ -43,6 +47,7 @@ from rapa.core.contracts import (
     RunService,
     RunStatus,
     RunTrigger,
+    ViewerTicket,
 )
 from rapa.core.robot import SLUG_PATTERN, Manifest
 
@@ -50,6 +55,7 @@ if TYPE_CHECKING:
     from rapa.ui.auth import UiSession
 
 __all__ = [
+    "SESSIONS_OFF",
     "Backend",
     "BackendError",
     "BackendUnavailable",
@@ -114,6 +120,28 @@ class Backend(Protocol):
     async def get_run(self, run_id: UUID) -> RunStatus | None: ...
 
     async def list_runs(self, limit: int = 50) -> list[RunStatus]: ...
+
+    # -- gravação (Demonstrar e Generalizar) ------------------------------------
+
+    async def list_sessions(self, limit: int = 20) -> list[RecordingSessionInfo]: ...
+
+    async def get_session(self, session_id: UUID) -> RecordingSessionInfo | None: ...
+
+    async def create_session(
+        self, area_id: UUID, start_url: str, title: str = ""
+    ) -> RecordingSessionInfo: ...
+
+    async def issue_ticket(self, session_id: UUID) -> ViewerTicket: ...
+
+    async def stop_session(self, session_id: UUID) -> RecordingSessionInfo: ...
+
+    async def get_proposals(self, session_id: UUID) -> GeneralizationProposals: ...
+
+    async def create_draft(self, session_id: UUID, choices: DraftChoices) -> RobotVersionInfo: ...
+
+
+#: Mensagem quando este servidor não oferece a gravação de demonstrações.
+SESSIONS_OFF = "a gravação de demonstrações não está disponível neste servidor"
 
 
 # ---------------------------------------------------------------------------
@@ -206,11 +234,14 @@ class ContractsBackend:
         runs: RunService,
         admin: RobotAdmin,
         principal: Principal,
+        *,
+        sessions: RecordingService | None = None,
     ) -> None:
         self._catalog = catalog
         self._runs = runs
         self._admin = admin
         self._principal = principal
+        self._sessions = sessions
 
     def __repr__(self) -> str:
         return f"ContractsBackend(subject={self._principal.subject!r})"
@@ -264,6 +295,34 @@ class ContractsBackend:
     async def list_runs(self, limit: int = 50) -> list[RunStatus]:
         return await self._runs.list_recent(self._principal, limit)
 
+    def _recording(self) -> RecordingService:
+        if self._sessions is None:
+            raise BackendUnavailable(SESSIONS_OFF)
+        return self._sessions
+
+    async def list_sessions(self, limit: int = 20) -> list[RecordingSessionInfo]:
+        return await self._recording().list_sessions(self._principal, limit)
+
+    async def get_session(self, session_id: UUID) -> RecordingSessionInfo | None:
+        return await self._recording().get_session(self._principal, session_id)
+
+    async def create_session(
+        self, area_id: UUID, start_url: str, title: str = ""
+    ) -> RecordingSessionInfo:
+        return await self._recording().create_session(self._principal, area_id, start_url, title)
+
+    async def issue_ticket(self, session_id: UUID) -> ViewerTicket:
+        return await self._recording().issue_ticket(self._principal, session_id)
+
+    async def stop_session(self, session_id: UUID) -> RecordingSessionInfo:
+        return await self._recording().stop_session(self._principal, session_id)
+
+    async def get_proposals(self, session_id: UUID) -> GeneralizationProposals:
+        return await self._recording().get_proposals(self._principal, session_id)
+
+    async def create_draft(self, session_id: UUID, choices: DraftChoices) -> RobotVersionInfo:
+        return await self._recording().create_draft(self._principal, session_id, choices)
+
 
 class _Platform(RobotCatalog, RunService, RobotAdmin, Protocol):
     """Um objeto que segue os três contratos (como a plataforma em memória)."""
@@ -272,17 +331,29 @@ class _Platform(RobotCatalog, RunService, RobotAdmin, Protocol):
 class ContractsBackendFactory:
     """Cria um :class:`ContractsBackend` para o principal de cada sessão."""
 
-    def __init__(self, catalog: RobotCatalog, runs: RunService, admin: RobotAdmin) -> None:
+    def __init__(
+        self,
+        catalog: RobotCatalog,
+        runs: RunService,
+        admin: RobotAdmin,
+        *,
+        sessions: RecordingService | None = None,
+    ) -> None:
         self._catalog = catalog
         self._runs = runs
         self._admin = admin
+        self._sessions = sessions
 
     @classmethod
-    def from_platform(cls, platform: _Platform) -> ContractsBackendFactory:
-        return cls(platform, platform, platform)
+    def from_platform(
+        cls, platform: _Platform, *, sessions: RecordingService | None = None
+    ) -> ContractsBackendFactory:
+        return cls(platform, platform, platform, sessions=sessions)
 
     def __call__(self, session: UiSession) -> ContractsBackend:
-        return ContractsBackend(self._catalog, self._runs, self._admin, session.principal)
+        return ContractsBackend(
+            self._catalog, self._runs, self._admin, session.principal, sessions=self._sessions
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +367,10 @@ _VERSION: TypeAdapter[RobotVersionInfo] = TypeAdapter(RobotVersionInfo)
 _VERSIONS: TypeAdapter[list[RobotVersionInfo]] = TypeAdapter(list[RobotVersionInfo])
 _RUN: TypeAdapter[RunStatus] = TypeAdapter(RunStatus)
 _RUNS: TypeAdapter[list[RunStatus]] = TypeAdapter(list[RunStatus])
+_SESSION: TypeAdapter[RecordingSessionInfo] = TypeAdapter(RecordingSessionInfo)
+_SESSIONS: TypeAdapter[list[RecordingSessionInfo]] = TypeAdapter(list[RecordingSessionInfo])
+_TICKET: TypeAdapter[ViewerTicket] = TypeAdapter(ViewerTicket)
+_PROPOSALS: TypeAdapter[GeneralizationProposals] = TypeAdapter(GeneralizationProposals)
 
 _MAX_MESSAGE = 500
 _MAX_DETAILS = 50
@@ -349,6 +424,8 @@ def _api_error(response: httpx2.Response) -> Exception:
                 _clean(message, "limite de uso atingido; tente de novo mais tarde"),
                 _retry_after(response.headers.get("Retry-After")),
             )
+    if status == 503:
+        return BackendUnavailable(_clean(message, _UNAVAILABLE))
     if status >= 500:
         return BackendUnavailable(_UNAVAILABLE)
     return BackendError(_clean(message, f"o serviço do RaPA recusou o pedido (HTTP {status})"))
@@ -481,6 +558,41 @@ class RestBackend:
     async def list_runs(self, limit: int = 50) -> list[RunStatus]:
         data = await self._send("GET", "/v1/execucoes", params={"limite": str(limit)})
         return self._parse(_RUNS, data)
+
+    async def list_sessions(self, limit: int = 20) -> list[RecordingSessionInfo]:
+        limit = min(max(limit, 1), 100)
+        data = await self._send("GET", "/v1/sessoes", params={"limite": str(limit)})
+        return self._parse(_SESSIONS, data)
+
+    async def get_session(self, session_id: UUID) -> RecordingSessionInfo | None:
+        data = await self._send("GET", f"/v1/sessoes/{session_id}", not_found_is_none=True)
+        return None if data is None else self._parse(_SESSION, data)
+
+    async def create_session(
+        self, area_id: UUID, start_url: str, title: str = ""
+    ) -> RecordingSessionInfo:
+        body = {"area_id": str(area_id), "endereco": start_url, "titulo": title}
+        return self._parse(_SESSION, await self._send("POST", "/v1/sessoes", json_body=body))
+
+    async def issue_ticket(self, session_id: UUID) -> ViewerTicket:
+        data = await self._send("POST", f"/v1/sessoes/{session_id}/bilhete")
+        return self._parse(_TICKET, data)
+
+    async def stop_session(self, session_id: UUID) -> RecordingSessionInfo:
+        data = await self._send("POST", f"/v1/sessoes/{session_id}/parar")
+        return self._parse(_SESSION, data)
+
+    async def get_proposals(self, session_id: UUID) -> GeneralizationProposals:
+        data = await self._send("GET", f"/v1/sessoes/{session_id}/propostas")
+        return self._parse(_PROPOSALS, data)
+
+    async def create_draft(self, session_id: UUID, choices: DraftChoices) -> RobotVersionInfo:
+        data = await self._send(
+            "POST",
+            f"/v1/sessoes/{session_id}/rascunho",
+            json_body=choices.model_dump(mode="json"),
+        )
+        return self._parse(_VERSION, data)
 
 
 class RestBackendFactory:

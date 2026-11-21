@@ -54,6 +54,7 @@ from rapa.ui.permissions import (
     publish_block_reason,
     validate_block_reason,
 )
+from rapa.ui.recording import live_page, record_page, review_page
 
 #: Quantas execuções a tela Execuções mostra.
 RECENT_RUNS = 50
@@ -150,9 +151,22 @@ def register_pages(ctx: UiContext) -> None:
     async def run_detail_page(request: Request, run_id: str) -> Response | None:
         return await _protected(ctx, request, "execucoes", lambda v: _run_detail(v, run_id))
 
-    @ui.page("/ao-vivo", title=f"Visão ao vivo · {name}", response_timeout=timeout)
-    async def live_page(request: Request) -> Response | None:
-        return await _protected(ctx, request, "ao_vivo", _live)
+    @ui.page("/ao-vivo", title=f"Gravar · {name}", response_timeout=timeout)
+    async def live_redirect(request: Request) -> Response:
+        # A visão ao vivo é a da gravação; o endereço antigo leva para Gravar.
+        return RedirectResponse("/gravar", status_code=303)
+
+    @ui.page("/gravar", title=f"Gravar · {name}", response_timeout=timeout)
+    async def record(request: Request) -> Response | None:
+        return await _protected(ctx, request, "gravar", record_page)
+
+    @ui.page("/gravar/{session_id}", title=f"Gravando · {name}", response_timeout=timeout)
+    async def record_live(request: Request, session_id: str) -> Response | None:
+        return await _protected(ctx, request, "gravar", lambda v: live_page(v, session_id))
+
+    @ui.page("/gravar/{session_id}/revisar", title=f"Revisar · {name}", response_timeout=timeout)
+    async def record_review(request: Request, session_id: str) -> Response | None:
+        return await _protected(ctx, request, "gravar", lambda v: review_page(v, session_id))
 
 
 # ---------------------------------------------------------------------------
@@ -819,23 +833,3 @@ async def _run_detail(viewer: Viewer, run_id: str) -> None:
         return
     ui.label("Execução").classes("text-h5")
     RunPanel(viewer, status).build()
-
-
-# ---------------------------------------------------------------------------
-# Visão ao vivo
-# ---------------------------------------------------------------------------
-
-
-async def _live(viewer: Viewer) -> None:
-    ui.label("Visão ao vivo").classes("text-h5")
-    with ui.card().classes("w-full").mark("ao-vivo"):
-        ui.label("Esta tela chega numa próxima fase.").classes("text-weight-medium")
-        ui.label(
-            "Aqui você vai acompanhar ao vivo o navegador na nuvem enquanto demonstra uma tarefa "
-            "ou enquanto um robô roda numa execução supervisionada: a imagem da tela, o mouse e o "
-            "teclado (com acentos), e o botão para assumir o controle quando o robô pedir ajuda."
-        )
-        ui.label(
-            "Por enquanto, acompanhe as execuções pela tela Execuções, que mostra o estado e o "
-            "resultado de cada uma."
-        ).classes("text-caption")
