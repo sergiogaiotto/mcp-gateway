@@ -26,9 +26,13 @@ aqui com o nome do destino; a guarda:
    recebem 0x07), com prazo para o aperto de mão, para a resolução e para a conexão,
    e no máximo :data:`MAX_CONNECTIONS` conexões ao mesmo tempo.
 
-O UDP fica de fora do proxy: o hospedeiro desliga o QUIC (``--disable-quic``) e
-força o WebRTC a só usar o que passa pelo proxy
-(``--force-webrtc-ip-handling-policy=disable_non_proxied_udp``).
+O UDP não passa pelo proxy, então fica fora do navegador: o hospedeiro desliga o
+QUIC (``--disable-quic``; com proxy SOCKS o Chromium já não o usa), força o WebRTC a
+só usar o que passa pelo proxy (``--webrtc-ip-handling-policy=disable_non_proxied_udp``,
+que o Chromium completo respeita e o ``chrome-headless-shell`` ignora) e, para os
+dois, tira o WebRTC das páginas (:data:`WEBRTC_OFF_SCRIPT`, em todo documento, também
+em iframes e janelas novas). Nenhum ``--disable-features`` é acrescentado: o
+Chromium só obedece ao último, e ele desfaria a lista do próprio Playwright.
 
 Os nomes que o operador mapeia explicitamente em ``--host-resolver-rules`` (``MAP
 nome endereço``; os portais de teste em ``*.rapa.test``) valem como mapeados, mesmo
@@ -44,6 +48,7 @@ import asyncio
 import contextlib
 import fnmatch
 import ipaddress
+import json
 import logging
 import socket
 from collections.abc import Awaitable, Callable, Sequence
@@ -52,6 +57,7 @@ from dataclasses import dataclass
 __all__ = [
     "BROWSER_NETWORK_ARGS",
     "MAX_CONNECTIONS",
+    "WEBRTC_OFF_SCRIPT",
     "EgressGuard",
     "HostRule",
     "blocked_address",
@@ -76,6 +82,28 @@ _CHUNK = 65536
 BROWSER_NETWORK_ARGS = (
     "--disable-quic",
     "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+)
+
+_WEBRTC_NAMES = (
+    "RTCPeerConnection",
+    "webkitRTCPeerConnection",
+    "RTCDataChannel",
+    "RTCIceCandidate",
+    "RTCIceTransport",
+    "RTCDtlsTransport",
+    "RTCSctpTransport",
+    "RTCRtpSender",
+    "RTCRtpReceiver",
+    "RTCRtpTransceiver",
+    "RTCSessionDescription",
+    "RTCCertificate",
+)
+#: Script de toda página da sessão: sem WebRTC, nenhum UDP sai do navegador, nem no
+#: ``chrome-headless-shell``, que ignora a política do WebRTC.
+WEBRTC_OFF_SCRIPT = (
+    "(() => { for (const name of "
+    + json.dumps(list(_WEBRTC_NAMES))
+    + ") { try { delete globalThis[name]; } catch (e) {} } })();"
 )
 
 # Respostas SOCKS5 (RFC 1928).

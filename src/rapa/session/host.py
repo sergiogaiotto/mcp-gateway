@@ -74,7 +74,7 @@ from websockets.http11 import Request, Response
 
 from rapa.recorder.recorder import Recorder, RecorderError, redact_url
 from rapa.runner.browser import LOCALE, TIMEZONE, resolve_executable
-from rapa.session.egress import BROWSER_NETWORK_ARGS, EgressGuard
+from rapa.session.egress import BROWSER_NETWORK_ARGS, WEBRTC_OFF_SCRIPT, EgressGuard
 from rapa.session.keys import MouseState, key_commands, text_commands, wheel_commands
 from rapa.session.protocol import (
     MAX_CLIENT_MESSAGE,
@@ -255,6 +255,7 @@ class SessionHost:
             )
             self._context = context
             try:
+                await context.add_init_script(WEBRTC_OFF_SCRIPT)
                 await self._recorder.start(context)
                 context.on("page", self._on_page)
                 first = context.pages[0] if context.pages else await context.new_page()
