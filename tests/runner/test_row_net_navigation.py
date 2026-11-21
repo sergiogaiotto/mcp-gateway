@@ -993,8 +993,9 @@ async def test_a_button_mounted_again_in_the_same_row_is_checked_again_and_click
     assert_seq(outcome.events)
 
 
-# Um ouvinte da página, na janela e antes do vigia do executor, muda a página no
-# ``pointerdown`` do clique: o endereço (``pushState``) ou os números das linhas.
+# Um ouvinte da página, na janela (depois do vigia do executor, que é posto antes dos
+# scripts dela), muda a página no ``pointerdown`` do clique: o endereço (``pushState``) ou
+# os números das linhas.
 _NO_POINTERDOWN = {
     "endereco": "history.pushState({}, '', '/notas/outra');",
     "linha": "const cells = [...document.querySelectorAll('tbody tr')].map((row) => row.cells[0]);"
@@ -1002,18 +1003,27 @@ _NO_POINTERDOWN = {
 }
 
 
+@pytest.mark.parametrize("where", ["janela", "botao"])
 @pytest.mark.parametrize("change", list(_NO_POINTERDOWN))
 async def test_a_page_that_changes_in_the_moment_of_the_click_is_never_clicked(
-    run_robot: RobotRunner, server: _Server, change: str
+    run_robot: RobotRunner, server: _Server, change: str, where: str
 ) -> None:
-    # Na hora do clique, depois de toda a conferência: o vigia vê o primeiro evento do
-    # clique já com outro endereço, ou com a linha do botão mostrando outra nota, e cancela
-    # o clique inteiro. Nada é cancelado no portal.
+    # Na hora do clique, depois de toda a conferência: o vigia deixa passar o primeiro
+    # evento, a página muda com ele, e o vigia vê o evento seguinte do clique já com outro
+    # endereço, ou com a linha do botão mostrando outra nota, e interrompe o clique antes do
+    # ``click``. Nada é cancelado no portal, e o passo diz que o clique chegou à página.
     button = _CANCELA_A_LINHA.replace(" disabled", "")
     html = _page(
         _table(f"<tr><td>120</td><td>{button}</td></tr><tr><td>7</td><td>{button}</td></tr>")
-        + "<script>let feito = false; window.addEventListener('pointerdown', () => {"
-        f" if (feito) return; feito = true; {_NO_POINTERDOWN[change]} }}, true);</script>"
+        + "<script>let feito = false; const muda = () => {"
+        f" if (feito) return; feito = true; {_NO_POINTERDOWN[change]} }};"
+        + (
+            " window.addEventListener('pointerdown', muda, true);"
+            if where == "janela"
+            else " document.querySelectorAll('tbody button')"
+            ".forEach((b) => b.addEventListener('pointerdown', muda));"
+        )
+        + "</script>"
     )
     server.app = _api_app(server, html)
     outcome = await _run(run_robot, _cancel_120(server.base))
@@ -1022,5 +1032,5 @@ async def test_a_page_that_changes_in_the_moment_of_the_click_is_never_clicked(
     assert result.state is RunState.FAILED
     assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO, result.error_message
     assert result.failed_step_id == "cancelar"
-    assert "A página mudou" in (result.error_message or "")
+    assert "A página mudou durante o clique" in (result.error_message or "")
     assert_seq(outcome.events)

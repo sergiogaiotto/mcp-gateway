@@ -69,9 +69,11 @@ principais:
   contador, rede e linha única), uma vez; na segunda vez, o passo falha
   (``acao_falhou``). Ficam de fora (resíduos conhecidos) os shadow roots fechados,
   a chave que só o CSS mostra, uma lista virtual que troca o que a linha é sem
-  trocar o texto dela, a linha trocada entre o primeiro evento do clique e o
-  último (o vigia decide no primeiro) e o clique num iframe girado sem campos
-  digitados noutro documento (fica com o Playwright). Perdas de disponibilidade aceitas: qualquer mudança de endereço da
+  trocar o texto dela, e o clique num iframe girado sem campos digitados noutro
+  documento (fica com o Playwright). Se a página muda o endereço, a linha ou o
+  rótulo com os primeiros eventos de um clique (no ``pointerdown``), o vigia
+  interrompe o clique antes do ``click`` e o passo falha dizendo que esses eventos
+  chegaram à página. Perdas de disponibilidade aceitas: qualquer mudança de endereço da
   página principal entre a conferência do alvo e a ação (também um filtro que
   muda a consulta do endereço), e uma tecla para um elemento que não recebe o
   foco. Um segredo vai para o elemento em que a origem foi conferida, sem o
@@ -747,8 +749,12 @@ Object.defineProperty(window, key, {
 # documento antes dos scripts dele (senão, um posto agora, depois dos que a página já pôs na
 # janela). Num clique ou numa marcação, o rótulo do alvo (``aria-label``, ``title`` e o texto
 # do HTML) também precisa ser o da hora em que o vigia foi posto: uma lista virtual que
-# reaproveita o nó para outro item enquanto o Playwright rola até ele troca o rótulo. Um
-# clique cujos eventos não chegaram à janela do alvo vale ``fora``.
+# reaproveita o nó para outro item enquanto o Playwright rola até ele troca o rótulo. Depois
+# do primeiro evento de um clique ou de uma marcação, e até o ``click``, o vigia confere de
+# novo, em cada evento do navegador, o endereço, a linha e o rótulo (os ouvintes da página já
+# receberam os eventos de antes e podem tê-los mudado); se mudaram, ele cancela esse evento e
+# os seguintes (``meio``). Um clique cujos eventos não chegaram à janela do alvo vale
+# ``fora``.
 _DISPATCH_GUARD_JS = (
     "(element, [kind, row, key, typed, late]) => {"
     + _FIELD_OF_FN
@@ -835,16 +841,31 @@ const off = () => {
   if (hook !== null) hook.clear(listener);
   else for (const type of types) view.removeEventListener(type, listener, true);
 };
+// Num clique ou numa marcação, depois do primeiro evento e até o ``click``: os ouvintes da
+// página já receberam os eventos de antes e podem ter mudado o endereço, a linha ou o rótulo.
+const pointer = kind === 'clique' || kind === 'marca';
+const done = () => {
+  state = 'feito';
+  off();
+};
 const listener = (event) => {
-  if (state === 'passou') return;
-  if (state === 'armado') {
+  if (state === 'feito') return;
+  if (state === 'passou') {
+    if (!event.isTrusted) return;
+    if (!moved() && inRow() && sameLabel()) {
+      if (event.type === 'click') done();
+      return;
+    }
+    state = 'recusou';
+    reason = 'meio';
+  } else if (state === 'armado') {
     const onTarget = event.composedPath().includes(target);
     if (!onTarget && (event.type === 'change' || !event.isTrusted)) return;
     if (onTarget && !moved() && inRow() && sameLabel()) {
       const hold = typedHold();
       if (hold && prompt()) {
-        state = 'passou';
-        off();
+        if (pointer && event.type !== 'click') state = 'passou';
+        else done();
         return;
       }
       reason = hold ? 'espera' : 'campo';
@@ -4276,7 +4297,9 @@ class Interpreter:
         (o primeiro evento demorou, com campos digitados noutro documento), com
         ``acao_falhou``. Um clique que o navegador entregou a outro documento por cima do
         alvo (``fora``) falha com ``elemento_ambiguo``, dizendo que ele pode ter feito
-        outra coisa."""
+        outra coisa; um clique que o vigia interrompeu depois do primeiro evento, porque a
+        página mudou o endereço, a linha ou o rótulo com os eventos de antes (``meio``),
+        também, dizendo que esses eventos chegaram à página."""
         failure: Exception | None = None
         try:
             await action
@@ -4300,6 +4323,15 @@ class Interpreter:
                 "visto: ele enviaria um valor que não foi digitado, então nada foi feito.",
                 details={"alvo": target.intent if isinstance(target, Target) else step.title},
             ) from None
+        if reason == "meio" and isinstance(target, Target):
+            raise StepError(
+                ErrorCode.ELEMENTO_AMBIGUO,
+                f"A página mudou durante o clique do passo '{step.title}' (o endereço, a linha "
+                f"ou o rótulo de '{target.intent}'), e o robô o interrompeu antes do fim: os "
+                "primeiros eventos do clique já tinham chegado à página. Confira o sistema de "
+                "destino antes de repetir.",
+                details={"alvo": target.intent},
+            ) from None
         if reason == "fora" and failure is None and isinstance(target, Target):
             raise StepError(
                 ErrorCode.ELEMENTO_AMBIGUO,
@@ -4315,8 +4347,9 @@ class Interpreter:
             raise failure
 
     async def _guard_refused(self, ctx: _StepCtx) -> str | None:
-        """Tira o vigia da página e diz por que ele recusou um evento (``alvo``, ``campo``
-        ou ``espera``), se o clique não chegou à janela do alvo (``fora``), ou ``None``.
+        """Tira o vigia da página e diz por que ele recusou um evento (``alvo``, ``campo``,
+        ``espera`` ou ``meio``), se o clique não chegou à janela do alvo (``fora``), ou
+        ``None``.
 
         Se o documento já foi trocado (a própria ação navegou), não há o que ler, e vale o
         resultado da ação: um evento recusado é cancelado e não leva a página a outro
