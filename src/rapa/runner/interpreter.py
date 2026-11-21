@@ -99,13 +99,14 @@ principais:
   escolha, o vigia confere de novo, no primeiro evento, os campos digitados do
   documento do alvo (a página que troca o campo enquanto o clique espera uma camada
   sair); com campos digitados noutro documento, o clique espera o alvo ficar livre
-  antes da releitura, só lendo a página, e um primeiro evento que chega mais de 2 s
-  depois do vigia (um documento de outra origem por cima do alvo) é recusado. O
-  campo digitado de novo vale pela última vez, e o que saiu da página (ou cujo
-  documento acabou) deixa de contar; cada campo é lido no próprio documento.
+  antes da releitura, só lendo a página (e falha sem agir se o alvo continua coberto
+  no fim do prazo), e um primeiro evento que chega mais de 0,5 s depois do vigia (um
+  documento de outra origem por cima do alvo, uma camada que chegou depois da espera)
+  é recusado. O campo digitado de novo vale pela última vez, e o que saiu da página
+  (ou cujo documento acabou) deixa de contar; cada campo é lido no próprio documento.
   Resíduos: a mudança que chega durante um clique, uma tecla ou uma escolha do robô
   vira a referência, e a que chega entre a releitura e a ação de um passo de digitar
-  ou de teclar (ou, noutro documento, até 2 s depois da releitura) não é vista. Os valores do campo nunca vão para eventos nem
+  ou de teclar (ou, noutro documento, até 0,5 s depois da releitura) não é vista. Os valores do campo nunca vão para eventos nem
   mensagens;
 - valores de entradas, variáveis e itens nunca mudam o alvo de um passo: não
   entram em seletores CSS/XPath, cada um vira um único trecho codificado do
@@ -334,8 +335,12 @@ _ACTS_ON_TARGET = (ClickStep, FillStep, SelectStep, CheckStep, PressStep, Upload
 _TYPED_READ_S = 5.0
 #: Com campos digitados noutro documento que o do alvo, o vigia recusa o primeiro evento de
 #: um clique, marcação ou escolha que chega mais que isso (em ms) depois dele: o Playwright
-#: esperou o alvo ficar livre, e esses campos podem ter mudado nessa espera sem ser vistos.
-_LATE_EVENT_MS = 2000.0
+#: esperou o alvo ficar livre (uma camada que a espera antes da releitura não viu), e esses
+#: campos podem ter mudado nessa espera sem ser vistos.
+_LATE_EVENT_MS = 500.0
+#: A espera pelo alvo livre antes da releitura desiste (e o passo falha sem agir) quando
+#: falta menos que isso (em s) para o fim do prazo do passo: a ação precisa de tempo.
+_UNCOVERED_MARGIN_S = 1.0
 
 
 def _refreshes_typed(step: Step) -> bool:
@@ -810,10 +815,12 @@ return {
 
 # Se um clique no centro do elemento (da primeira caixa dele na janela) chegaria a ele: o
 # elemento do ponto, também dentro de shadow roots abertos, é ele, algo dentro dele ou o
-# hospedeiro de um shadow root fechado em volta dele; e, num iframe da mesma origem, o
-# elemento do ponto no documento de cima é o iframe, e assim por diante. Fora da janela, ou
-# num documento de outra origem acima, não dá para saber: vale ``true`` (o vigia confere a
-# demora do primeiro evento).
+# hospedeiro de um shadow root fechado em volta dele (nunca só um elemento em volta dele: a
+# camada com ``pointer-events: none`` ou ``inert`` deixa o ponto cair no que está atrás);
+# e, num iframe da mesma origem, o elemento do ponto no documento de cima é o iframe, e
+# assim por diante. Fora da janela, num iframe transformado ou num documento de outra
+# origem acima, não dá para saber: vale ``true`` (o vigia confere a demora do primeiro
+# evento).
 _UNCOVERED_JS = r"""(element) => {
 let want = element;
 if (!want.matches('input, textarea, select') && !want.isContentEditable) {
@@ -847,10 +854,18 @@ for (;;) {
   let at = hit;
   while (at && at !== want) at = up(at);
   if (at !== want) {
-    // O ponto cai num hospedeiro de shadow root fechado em volta do alvo: não dá para ver.
+    // O ponto cai no hospedeiro de um shadow root fechado em volta do alvo (o caminho do
+    // alvo para cima entra nele por um shadow root que não é visto): não dá para ver dentro.
+    let below = want;
     let around = up(want);
-    while (around && around !== hit) around = up(around);
-    if (!(around === hit && hit.shadowRoot === null)) return false;
+    while (around && around !== hit) {
+      below = around;
+      around = up(around);
+    }
+    if (!(around === hit && below.nodeType === 11 && below.host === hit
+        && hit.shadowRoot === null)) {
+      return false;
+    }
   }
   let frame = null;
   try {
@@ -859,13 +874,21 @@ for (;;) {
     frame = null;
   }
   if (!frame) return true;
+  const outer = frame.ownerDocument.defaultView;
+  for (let node = frame; node && node.nodeType === 1; node = node.parentElement) {
+    // Num iframe transformado (escala, rotação), o ponto de dentro não se traduz assim.
+    if (outer.getComputedStyle(node).transform !== 'none') return true;
+  }
   const rect = frame.getBoundingClientRect();
-  const style = frame.ownerDocument.defaultView.getComputedStyle(frame);
+  const style = outer.getComputedStyle(frame);
   x += rect.left + frame.clientLeft + (parseFloat(style.paddingLeft) || 0);
   y += rect.top + frame.clientTop + (parseFloat(style.paddingTop) || 0);
   want = frame;
 }
 }"""
+
+
+_SCROLL_INTO_VIEW_JS = "(element, align) => element.scrollIntoView({block: align, inline: align})"
 
 
 class _StopBeforeWrite(Exception):
@@ -1040,11 +1063,11 @@ def _typed_value_matches(
     editável, o espaço rígido) normalizados; e, num texto sem letras, a máscara da página:
     os
     mesmos dígitos, na mesma ordem (CPF, CNPJ, CEP, telefone, datas, centavos), com o sinal
-    de menos que o texto tem (e sem um que ele não tem); num número com casas decimais ou com o ponto dos milhares
+    de menos que o texto tem (e sem um que ele não tem: :func:`_negative`); num número com casas decimais ou com o ponto dos milhares
     ("1.234,56", "10,5", "1234.56", "1.234"), o mesmo número ("1234,5" vira
     "R$ 1.234,50", mas "10,5" nunca vira "1,05", nem "1.234,00" vira "123.400,00"); e um
     inteiro pode ganhar uma ou duas casas decimais zeradas ("10" vira "10,00", "10.00" ou
-    "10,00 €"). Um campo vazio nunca vale por um texto que não é branco
+    "10,00 €"; nunca "10,00 mil"). Um campo vazio nunca vale por um texto que não é branco
     (o navegador apaga o que um ``input[type=number]`` não aceita), e num
     ``input[type=number]`` (``number``) a regra dos dígitos não vale. Qualquer outra
     diferença não vale: o ``maxlength`` que cortou o texto, uma página que troca letras.
@@ -1061,7 +1084,7 @@ def _typed_value_matches(
     digits = _NOT_DIGIT.sub("", text)
     if not digits:
         return False
-    if text.strip().startswith("-") != bool(_NEGATIVE.match(value)):
+    if _negative(text) != _negative(value):
         # O sinal de menos que o texto tem precisa ficar, e o que ele não tem não aparece.
         return False
     decimal = _decimal_parts(text, typed=True)
@@ -1085,10 +1108,30 @@ def _typed_value_matches(
     )
 
 
-#: Um valor com o sinal de menos antes do primeiro dígito.
-_NEGATIVE = re.compile(r"^[^0-9]*-")
-#: Uma ou duas casas decimais zeradas, com o que vem depois que não é dígito (" €", "%").
-_ZERO_FRACTION = re.compile(r"\s*0{1,2}[^0-9]*")
+#: Do primeiro ao último dígito de um texto.
+_DIGIT_SPAN = re.compile(r"[0-9](?:.*[0-9])?", re.DOTALL)
+#: O sinal de menos: o hífen, o sinal de menos (U+2212) e o traço (U+2013).
+_MINUS_SIGNS = ("-", "\u2212", "\u2013")
+#: Uma ou duas casas decimais zeradas, com brancos e, no máximo, um "%", "€" ou "$" depois
+#: (nunca letras, parênteses ou um sinal: "10,00 mil", "(10,00)", "10,00-", "10,00 D").
+_ZERO_FRACTION = re.compile(r"\s*0{1,2}\s*(?:%|€|\$)?\s*")
+
+
+def _negative(text: str) -> bool:
+    """Se o número do texto é negativo: com um sinal de menos antes do primeiro dígito
+    ("-10", "R$ -10,00", "−10,00", e também "OS-12345"), entre parênteses ("(10,00)",
+    "($10.00)") ou com o sinal de menos depois do último dígito ("10,00-")."""
+    span = _DIGIT_SPAN.search(text)
+    if span is None:
+        return False
+    before, after = text[: span.start()], text[span.end() :]
+    if any(sign in before for sign in _MINUS_SIGNS):
+        return True
+    if before.count("(") > before.count(")") and after.count(")") > after.count("("):
+        return True
+    return after.rstrip().endswith(_MINUS_SIGNS)
+
+
 #: Números como se digitam: com casas decimais ("1.234,56", "1234,56", "-10,5", "1234.56")
 #: ou com o ponto dos milhares ("1.234").
 _PT_DECIMAL = re.compile(r"-?(?:\d{1,3}(?:\.\d{3})+|\d+),\d+")
@@ -3839,7 +3882,7 @@ class Interpreter:
         ) and await self._points_at(step, ctx.element):
             # Há campos digitados noutro documento: o vigia não os lê no primeiro evento.
             # A espera pelo alvo livre vem antes da releitura (:meth:`_wait_uncovered`).
-            await self._wait_uncovered(ctx, ctx.element)
+            await self._wait_uncovered(step, ctx, ctx.element)
         typed = await self._typed_fields_hold(
             step, ctx.element if isinstance(step, FillStep) else None
         )
@@ -3912,8 +3955,8 @@ class Interpreter:
         de outro documento (``frame`` é o do alvo) foram relidos depois de o alvo ficar
         livre (:meth:`_wait_uncovered`); se, mesmo assim, o primeiro evento chega mais de
         :data:`_LATE_EVENT_MS` depois do vigia (o Playwright esperou algo que a espera não
-        viu, como um documento de outra origem por cima do alvo), ele é cancelado e o passo
-        falha com ``acao_falhou``.
+        viu, como um documento de outra origem por cima do alvo, ou uma camada que chegou
+        depois dela), ele é cancelado e o passo falha com ``acao_falhou``.
         """
         element = ctx.element
         if element is None:  # pragma: no cover - preso em _confirm_target
@@ -3988,24 +4031,38 @@ class Interpreter:
                 return True
         return False
 
-    async def _wait_uncovered(self, ctx: _StepCtx, element: ElementHandle) -> None:
+    async def _wait_uncovered(self, step: Step, ctx: _StepCtx, element: ElementHandle) -> None:
         """Espera, só lendo a página, que um clique no centro do elemento chegue a ele
         (:data:`_UNCOVERED_JS`: nada do documento dele, nem dos documentos da mesma origem
         acima dele, por cima), como o Playwright esperaria antes de clicar.
 
         Só antes de a releitura dos campos digitados valer para outro documento: o que a
         página muda nesses campos enquanto uma camada de "buscando CEP" cobre o alvo é visto
-        pela releitura, depois. Nunca falha: se o elemento sai da página, ou o prazo do
-        passo está no fim, a própria ação decide (e o vigia recusa um primeiro evento que
-        demorou).
+        pela releitura, depois. Como o Playwright, rola o elemento para a janela de novo a
+        cada tentativa (no fim, no centro, no começo: um cabeçalho fixo por cima dele). Se
+        o alvo continua coberto quando falta menos de :data:`_UNCOVERED_MARGIN_S` do prazo
+        do passo, o passo falha sem agir (``tempo_do_passo_esgotado``). Se o elemento sai
+        da página, a própria ação decide.
         """
         loop = asyncio.get_running_loop()
+        aligns = ("end", "center", "start")
+        tries = 0
         try:
             await element.scroll_into_view_if_needed(timeout=ctx.remaining_ms())
             while not await element.evaluate(_UNCOVERED_JS):
-                if loop.time() + self._poll_s + _LATE_EVENT_MS / 1000 >= ctx.deadline:
-                    return
+                if loop.time() + self._poll_s + _UNCOVERED_MARGIN_S >= ctx.deadline:
+                    target = getattr(step, "target", None)
+                    raise StepError(
+                        ErrorCode.TEMPO_DO_PASSO_ESGOTADO,
+                        f"O alvo do passo '{step.title}' ficou coberto por outro elemento "
+                        "até o fim do prazo do passo, e nada foi feito.",
+                        details={
+                            "alvo": target.intent if isinstance(target, Target) else step.title
+                        },
+                    )
                 await asyncio.sleep(self._poll_s)
+                await element.evaluate(_SCROLL_INTO_VIEW_JS, aligns[tries % len(aligns)])
+                tries += 1
         except PlaywrightError:
             return
 
