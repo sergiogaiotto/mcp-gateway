@@ -301,25 +301,30 @@ async def _remove_profiles(path: Path, *, attempts: int = 20) -> None:
     """Apaga a pasta da sessão, mesmo com o Chromium ainda de pé.
 
     O Chromium roda noutro grupo de processos e, quando o hospedeiro morre, ainda
-    escreve no perfil por um instante antes de perceber: os que ficaram com o perfil
-    desta sessão na linha de comando recebem SIGKILL, e a pasta é apagada de novo
-    até sumir.
+    escreve no perfil (e pode até abrir um processo novo) por um instante antes de
+    perceber: os que têm o perfil desta sessão na linha de comando recebem SIGKILL, e
+    a pasta é apagada de novo, até ela sumir e nenhum processo usá-la.
     """
     for _ in range(attempts):
-        await asyncio.to_thread(_kill_strays, path)
+        strays = await asyncio.to_thread(_kill_strays, path)
         await asyncio.to_thread(shutil.rmtree, path, True)
-        if not await asyncio.to_thread(path.exists):
+        if not strays and not await asyncio.to_thread(path.exists):
             return
         await asyncio.sleep(0.5)
     logger.warning("a pasta do perfil de uma sessão não pôde ser apagada")
 
 
-def _kill_strays(path: Path) -> None:
-    """SIGKILL nos processos com ``--user-data-dir`` dentro de ``path`` (Linux, por /proc)."""
+def _kill_strays(path: Path) -> int:
+    """SIGKILL nos processos com ``--user-data-dir`` dentro de ``path`` (Linux, por /proc).
+
+    Devolve quantos ainda estavam de pé (um processo morto e ainda não recolhido tem a
+    linha de comando vazia e não conta).
+    """
     marker = f"--user-data-dir={path}{os.sep}".encode()
     proc = Path("/proc")
     if not proc.is_dir():  # pragma: no cover - fora do Linux, o Chromium sai sozinho
-        return
+        return 0
+    found = 0
     for entry in proc.iterdir():
         if not entry.name.isdigit():
             continue
@@ -328,8 +333,10 @@ def _kill_strays(path: Path) -> None:
         except OSError:
             continue
         if marker in cmdline:
+            found += 1
             with contextlib.suppress(OSError):
                 os.kill(int(entry.name), signal.SIGKILL)
+    return found
 
 
 async def _drain(stream: asyncio.StreamReader) -> None:

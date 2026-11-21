@@ -39,6 +39,49 @@ async def _open(
     return sid, live
 
 
+async def _new_tab_search_box(
+    playwright: Any, chromium_path: str, tmp_path: Path, base: str, ready: dict[str, Any]
+) -> tuple[float, float] | None:
+    """O centro da caixa de busca da nova aba num navegador sem a guarda, ou ``None`` se a nova
+    aba não abre ou não tem a caixa neste Chromium."""
+    measure = await playwright.chromium.launch_persistent_context(
+        str(tmp_path / "medidor"),
+        executable_path=chromium_path,
+        headless=True,
+        args=[HOST_RESOLVER_ARG],
+        viewport={"width": ready["largura"], "height": ready["altura"]},
+    )
+    try:
+        first = measure.pages[0] if measure.pages else await measure.new_page()
+        await first.goto(f"{base}/")
+        cdp = await measure.new_cdp_session(first)
+        key = {
+            "key": "t",
+            "code": "KeyT",
+            "windowsVirtualKeyCode": 84,
+            "nativeVirtualKeyCode": 84,
+            "modifiers": 2,
+            "autoRepeat": False,
+            "location": 0,
+        }
+        try:
+            async with measure.expect_page(timeout=10_000) as opened:
+                await cdp.send("Input.dispatchKeyEvent", {"type": "rawKeyDown", **key})
+                await cdp.send("Input.dispatchKeyEvent", {"type": "keyUp", **key})
+            page = await opened.value
+            await page.set_viewport_size({"width": ready["largura"], "height": ready["altura"]})
+            box = page.locator("input#input").first
+            await box.wait_for(state="visible", timeout=10_000)
+            bounds = await box.bounding_box()
+        except Exception:
+            return None
+        if bounds is None:
+            return None
+        return bounds["x"] + bounds["width"] / 2, bounds["y"] + bounds["height"] / 2
+    finally:
+        await measure.close()
+
+
 async def test_the_new_tab_page_never_opens_and_server_files_stay_unread(
     platform_app: tuple[FastAPI, Tenant, Tenant],
     portal_v1: RunningPortal,
@@ -60,37 +103,16 @@ async def test_the_new_tab_page_never_opens_and_server_files_stay_unread(
             await live.press("t", "KeyT", 2)
             await asyncio.sleep(1.5)
             # Onde ficaria a caixa de busca da nova aba, medido num navegador do mesmo tamanho.
-            measure = await playwright.chromium.launch_persistent_context(
-                str(tmp_path / "medidor"),
-                executable_path=chromium_path,
-                headless=True,
-                args=[HOST_RESOLVER_ARG],
-                viewport={"width": ready["largura"], "height": ready["altura"]},
+            # A medição é só uma tentativa: a nova aba muda de um Chromium para outro (no do
+            # Debian ela pode nem abrir sem interface). Sem ela, o clique vai no meio da tela;
+            # o que importa é que nenhuma página chrome:// ou file:// chegue à pessoa.
+            point = await _new_tab_search_box(
+                playwright, chromium_path, tmp_path, portal_v1.base_url, ready
             )
-            try:
-                first = measure.pages[0] if measure.pages else await measure.new_page()
-                await first.goto(f"{portal_v1.base_url}/")
-                cdp = await measure.new_cdp_session(first)
-                key = {
-                    "key": "t",
-                    "code": "KeyT",
-                    "windowsVirtualKeyCode": 84,
-                    "nativeVirtualKeyCode": 84,
-                    "modifiers": 2,
-                    "autoRepeat": False,
-                    "location": 0,
-                }
-                async with measure.expect_page() as opened:
-                    await cdp.send("Input.dispatchKeyEvent", {"type": "rawKeyDown", **key})
-                    await cdp.send("Input.dispatchKeyEvent", {"type": "keyUp", **key})
-                page = await opened.value
-                await asyncio.sleep(1.0)
-                await page.set_viewport_size({"width": ready["largura"], "height": ready["altura"]})
-                box = page.locator("input#input").first
-                await box.wait_for(state="visible")
-                await live.click_on(box)
-            finally:
-                await measure.close()
+            if point is None:
+                await live.click(ready["largura"] / 2, ready["altura"] / 3)
+            else:
+                await live.click(*point)
             await live.type(f"file://{tokens_file}")
             await live.press("Enter")
             await asyncio.sleep(3)
