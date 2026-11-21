@@ -13,9 +13,13 @@ Uso::
   ``pfx_password``. O worker apaga o arquivo logo depois de ler.
 - ``EVENTS.jsonl`` recebe um :class:`rapa.core.events.RunEvent` por linha.
 - ``RESULT.json`` recebe o :class:`rapa.runner.result.RunResult`.
-- Com ``--ack-dir``, antes de cada passo irreversível o worker espera o arquivo
-  ``<seq>.ack`` nesse diretório, criado por quem acompanha a execução depois de
-  gravar o aviso (ver :class:`rapa.runner.ports.AckingEventSink`).
+- Com ``--ack-dir``, antes de cada passo que grava (efeito ``write`` ou
+  ``irreversible``) o worker espera o arquivo ``<seq>.ack`` nesse diretório,
+  criado por quem acompanha a execução depois de gravar o início do passo (ver
+  :class:`rapa.runner.ports.AckingEventSink` e
+  :func:`rapa.runner.ports.waits_for_ack`). Sem ele no prazo, o passo falha
+  com ``sem_confirmacao`` sem ter começado. A validação segura para antes do
+  primeiro passo que grava e não espera nada.
 
 O código de saída é 0 sempre que o RESULT.json foi escrito, qualquer que seja o
 estado da execução; diferente de 0 só quando o próprio worker quebra. Argumentos
@@ -88,7 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--ack-dir",
         type=Path,
         default=None,
-        help="diretório das confirmações antes de passos irreversíveis",
+        help="diretório das confirmações antes de cada passo que grava",
     )
     parser.add_argument(
         "--ack-timeout",

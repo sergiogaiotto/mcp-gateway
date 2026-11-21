@@ -8,6 +8,7 @@ import pytest
 from rapa.recorder import (
     REDACTED,
     ClickEvent,
+    DownloadEvent,
     ElementDescriptor,
     Heading,
     InputEvent,
@@ -17,9 +18,19 @@ from rapa.recorder import (
     Recorder,
     RecorderError,
     Recording,
+    RequestEvent,
+    SelectEvent,
 )
 from rapa.recorder.recorder import redact_url
-from rapa.recorder.sensitivity import is_password_like_text, password_by_name
+from rapa.recorder.sensitivity import (
+    field_key,
+    is_password_like_text,
+    mentions_secret_name,
+    password_by_name,
+    same_element,
+    username_by_signal,
+)
+from tests.recorder.texts import has_text
 
 
 def test_redact_url_masks_sensitive_params_and_drops_fragment() -> None:
@@ -144,7 +155,7 @@ def test_username_typed_right_before_the_password_leaves_the_recording() -> None
     recorder._append(NavigationEvent, page_id=0, url=after, cause=NavigationCause.CLICK)
     recorder._append(PageTextEvent, page_id=0, url=after, text=f"Início\nOlá, {user}")
 
-    recorder._hide_usernames()
+    recorder._hide_secret_page_fields()
     events = [recorder._scrub(event) for event in recorder._events]
     dumped = Recording(started_at=datetime.now(UTC), events=events).model_dump_json()
     for leaked in (user, "ana+souza", "ana%20souza", "souza%40exemplo"):
@@ -234,26 +245,31 @@ def test_password_rule_ignores_the_accessible_name_like_the_page_script() -> Non
     assert is_password_like_text(field(placeholder="Sua senha", name="Acesso"))
 
 
-def test_username_before_a_password_without_a_login_button_stays_in_the_recording() -> None:
+def test_a_field_beside_a_password_leaves_the_recording_without_becoming_the_username() -> None:
     recorder = Recorder(probe_locators=False, capture_text=False)
     page = _FakePage()
     frame = _FakeFrame(page, "https://banco.exemplo.com.br/pix")
     recorder._register_page(page)
     recorder._append(NavigationEvent, page_id=0, url=frame.url, cause=NavigationCause.TYPED)
-    _send_input(recorder, frame, "1250,00", label="Valor", name="Valor", css="#v", id="v")
+    _send_input(
+        recorder, frame, "1250,00", label="Valor", name="Valor", css="#v", id="v", name_attr="v"
+    )
     _send_input(
         recorder, frame, "s3nh4", input_type="password", css="#s", is_password=True, sensitive=True
     )
-    # "Confirmar" com usuário e senha não é login: o campo fica como estava.
+    # "Confirmar" depois de um valor e uma senha não é login, mas o valor estava numa
+    # página com senha: sai da gravação, sem a marca de usuário.
     _send_click(recorder, frame, "Confirmar", css="#ok")
-    recorder._hide_usernames()
+    recorder._hide_secret_page_fields()
     valor = recorder._events[1]
     assert isinstance(valor, InputEvent)
-    assert valor.value == "1250,00" and not valor.element.sensitive
-    assert "1250,00" not in recorder._secret_values
+    assert valor.value is None and valor.typed is None
+    assert valor.element.sensitive and not valor.element.is_username
+    assert "1250,00" in recorder._secret_values
+    assert "v" in recorder._pages[page].sensitive_names
 
 
-def test_scrub_ignores_letter_case_only_in_the_free_text_of_the_page() -> None:
+def test_scrub_ignores_letter_case_in_page_texts_and_names() -> None:
     recorder = Recorder(probe_locators=False, capture_text=False)
     page = _FakePage()
     frame = _FakeFrame(page, "https://erp.exemplo.com.br/inicio")
@@ -278,10 +294,144 @@ def test_scrub_ignores_letter_case_only_in_the_free_text_of_the_page() -> None:
     assert text.headings[0].text == f"Olá, {REDACTED}"
     assert text.text == f"Usuário: {REDACTED}\nMenu {REDACTED}"
     assert text.frame_texts == [REDACTED]
-    # Valores digitados e nomes de elementos: só o valor exato.
+    # Valores digitados: só o valor exato.
     assert isinstance(departamento, InputEvent) and departamento.value == "Financeiro Corporativo"
     assert isinstance(equipe, InputEvent) and equipe.value == f"equipe {REDACTED}"
-    assert isinstance(menu, ClickEvent) and menu.element.name == "Financeiro"
+    # O nome e o texto do elemento chegam ao robô e ao prompt: qualquer caixa.
+    assert isinstance(menu, ClickEvent) and menu.element.name == REDACTED
+    assert menu.element.text == REDACTED
+
+
+def test_scrub_ignores_letter_case_in_the_text_of_the_element_and_of_its_row() -> None:
+    recorder = Recorder(probe_locators=False, capture_text=False)
+    page = _FakePage()
+    frame = _FakeFrame(page, "https://portal.exemplo.com.br/inicio")
+    recorder._register_page(page)
+    recorder._remember_secret("ana.souza")
+    # innerText com text-transform: uppercase; a chave da linha vem do texto do DOM.
+    row = {
+        "text": "ANA.SOUZA NF 10 Abrir",
+        "cells": ["ANA.SOUZA", "NF 10", "Abrir"],
+        "key": "ana.souza",
+    }
+    _send_click(recorder, frame, "Abrir", css="#abrir", text="Abrir", row=row)
+    _send_click(recorder, frame, "ana.souza", css="#perfil", text="ANA.SOUZA", role="link")
+    _send_click(recorder, frame, "Ana.Souza", css="#outro", text="Ana.Souza")
+    abrir, perfil, outro = (recorder._scrub(e) for e in recorder._events)
+    assert isinstance(abrir, ClickEvent) and abrir.element.row is not None
+    assert abrir.element.row.text == f"{REDACTED} NF 10 Abrir"
+    assert abrir.element.row.cells == [REDACTED, "NF 10", "Abrir"]
+    assert abrir.element.row.key == REDACTED
+    assert isinstance(perfil, ClickEvent)
+    assert perfil.element.text == REDACTED and perfil.element.name == REDACTED
+    # O nome (do texto do DOM, sem CSS) também perde o valor em qualquer caixa.
+    assert isinstance(outro, ClickEvent)
+    assert outro.element.name == REDACTED and outro.element.text == REDACTED
+
+
+def test_scrub_ignores_letter_case_in_everything_but_values_row_keys_and_addresses() -> None:
+    recorder = Recorder(probe_locators=False, capture_text=False)
+    page = _FakePage()
+    frame = _FakeFrame(page, "https://portal.exemplo.com.br/inicio")
+    recorder._register_page(page)
+    recorder._remember_secret("ana.souza")
+    # S3: nome acessível do DOM em maiúsculas (aria-label), título, rótulo,
+    # placeholder, id, atributo name, seletor e iframe com o usuário em outra caixa.
+    _send_click(
+        recorder,
+        frame,
+        "Menu de ANA.SOUZA",
+        css="#menu-Ana\\.Souza",
+        id="menu-Ana.Souza",
+        title="Perfil de Ana.Souza",
+        label="Conta de ANA.SOUZA",
+        placeholder="Ana.Souza",
+        name_attr="ANA.SOUZA",
+        test_id="menu-ANA.SOUZA",
+        frame_path=[{"tag": "iframe", "title": "Painel de Ana.Souza", "src": "/ANA.SOUZA"}],
+        row={"text": "Ana.Souza", "cells": ["Ana.Souza"], "key": "Ana.Souza"},
+        href="https://portal.exemplo.com.br/ANA.SOUZA",
+    )
+    recorder._append(
+        InputEvent,
+        page_id=0,
+        frame_url="https://portal.exemplo.com.br/Ana.Souza",
+        element=ElementDescriptor(tag="input", input_type="text", css="#nota", label="Nota"),
+        value="Ana.Souza",
+        typed="Ana.Souza",
+    )
+    recorder._append(
+        SelectEvent,
+        page_id=0,
+        element=ElementDescriptor(tag="select", css="#resp", label="Responsável"),
+        label="ANA.SOUZA",
+        value="ANA.SOUZA",
+    )
+    recorder._append(
+        DownloadEvent,
+        page_id=0,
+        url="https://portal.exemplo.com.br/arquivos/Ana.Souza.pdf",
+        suggested_filename="Relatório de ANA.SOUZA.pdf",
+    )
+    recorder._append(
+        RequestEvent,
+        page_id=0,
+        method="POST",
+        url="https://portal.exemplo.com.br/api/Ana.Souza",
+        resource_type="fetch",
+    )
+    click, nota, escolha, download, request = (recorder._scrub(e) for e in recorder._events)
+    assert isinstance(click, ClickEvent)
+    element = click.element
+    assert element.name == f"Menu de {REDACTED}" and element.title == f"Perfil de {REDACTED}"
+    assert element.label == f"Conta de {REDACTED}" and element.placeholder == REDACTED
+    assert element.id == f"menu-{REDACTED}" and element.name_attr == REDACTED
+    assert element.test_id == f"menu-{REDACTED}"
+    assert element.frame_path is not None
+    assert element.frame_path[0].title == f"Painel de {REDACTED}"
+    assert element.row is not None and element.row.text == REDACTED
+    assert element.row.cells == [REDACTED]
+    # O que o executor compara com a página como está: só o valor exato.
+    assert element.row.key == "Ana.Souza"
+    assert element.href == "https://portal.exemplo.com.br/ANA.SOUZA"
+    assert element.frame_path[0].src == "/ANA.SOUZA"
+    assert isinstance(nota, InputEvent) and nota.value == "Ana.Souza" and nota.typed == "Ana.Souza"
+    assert nota.frame_url == "https://portal.exemplo.com.br/Ana.Souza"
+    assert isinstance(escolha, SelectEvent) and escolha.label == "ANA.SOUZA"
+    assert isinstance(download, DownloadEvent)
+    assert download.suggested_filename == f"Relatório de {REDACTED}.pdf"
+    assert download.url == "https://portal.exemplo.com.br/arquivos/Ana.Souza.pdf"
+    assert isinstance(request, RequestEvent) and request.url.endswith("/api/Ana.Souza")
+
+
+def test_scrub_keeps_the_minimum_length_and_the_structure_of_the_element() -> None:
+    recorder = Recorder(probe_locators=False, capture_text=False)
+    page = _FakePage()
+    frame = _FakeFrame(page, "https://portal.exemplo.com.br/inicio")
+    recorder._register_page(page)
+    recorder._remember_secret("ana")  # curto demais: não é procurado
+    recorder._remember_secret("Button")
+    _send_click(recorder, frame, "Ana BUTTON", css="#b", text="Ana")
+    (click,) = (recorder._scrub(e) for e in recorder._events)
+    assert isinstance(click, ClickEvent)
+    assert click.element.name == f"Ana {REDACTED}" and click.element.text == "Ana"
+    # As marcas de estrutura (etiqueta e papel) não são texto da página.
+    assert click.element.tag == "button" and click.element.role == "button"
+
+
+def test_scrub_cuts_a_text_that_grew_past_its_limit() -> None:
+    recorder = Recorder(probe_locators=False, capture_text=False)
+    page = _FakePage()
+    frame = _FakeFrame(page, "https://portal.exemplo.com.br/inicio")
+    recorder._register_page(page)
+    recorder._remember_secret("ana")
+    recorder._remember_secret("anas")
+    # O script já cortou o texto da linha no limite (500); "anas" vira "REMOVIDO".
+    text = ("x " * 248) + "anas"
+    _send_click(recorder, frame, "Abrir", css="#abrir", row={"text": text, "cells": []})
+    (event,) = (recorder._scrub(e) for e in recorder._events)
+    assert isinstance(event, ClickEvent) and event.element.row is not None
+    assert len(event.element.row.text) == 500 and "anas" not in event.element.row.text
 
 
 def test_field_named_like_a_password_is_hidden_without_becoming_a_password() -> None:
@@ -304,3 +454,210 @@ def test_field_named_like_a_password_is_hidden_without_becoming_a_password() -> 
     assert "918273" in recorder._secret_values
     assert "cod" in recorder._pages[frame.page].sensitive_names
     assert password_by_name(event.element)
+
+
+def test_an_aria_label_of_a_password_hides_the_field_even_with_another_name() -> None:
+    def field(**kw: object) -> ElementDescriptor:
+        return ElementDescriptor.model_validate(
+            {"tag": "input", "input_type": "text", "css": "#k", **kw}
+        )
+
+    # aria-labelledby ("Código pessoal") vira o nome acessível; o aria-label
+    # ("Senha de 6 dígitos") chega à parte, no sinal do script.
+    named = field(label="Código pessoal", name="Código pessoal", aria_mentions_password=True)
+    assert password_by_name(named) and not is_password_like_text(named)
+    assert not password_by_name(field(label="Código pessoal", name="Código pessoal"))
+    # Com o sinal, o campo que diz ser o usuário (rótulo "CPF") fica ambíguo: o valor
+    # sai e ele não é o usuário.
+    cpf = field(label="CPF", name="CPF", aria_mentions_password=True)
+    assert password_by_name(cpf) and not username_by_signal(cpf)
+    recorder = Recorder(probe_locators=False, capture_text=False)
+    frame = _FakeFrame(_FakePage(), "https://banco.exemplo.com.br/entrar")
+    _send_input(
+        recorder,
+        frame,
+        "918273",
+        label="Código pessoal",
+        name="Código pessoal",
+        css="#k",
+        aria_mentions_password=True,
+    )
+    (event,) = recorder._events
+    assert isinstance(event, InputEvent)
+    assert event.value is None and event.element.sensitive and not event.element.is_password
+
+
+@pytest.mark.parametrize(
+    "element",
+    [
+        # F1: rótulo "CPF", aria-labelledby "Digite a senha numérica", sozinho no form.
+        {"label": "CPF", "name": "Digite a senha numérica", "name_attr": "cpf"},
+        # F2: rótulo "Usuário", aria-label "Senha do usuário", sem form.
+        {"label": "Usuário", "name": "Senha do usuário", "aria_mentions_password": True},
+        {
+            "label": "E-mail",
+            "name": "E-mail",
+            "input_type": "email",
+            "aria_mentions_password": True,
+        },
+    ],
+    ids=["cpf", "usuario", "e-mail"],
+)
+def test_a_username_named_like_a_password_is_hidden_by_the_recorder_too(
+    element: dict[str, object],
+) -> None:
+    recorder = Recorder(probe_locators=False, capture_text=False)
+    frame = _FakeFrame(_FakePage(), "https://banco.exemplo.com.br/login")
+    _send_input(recorder, frame, "918273", css="#c", id="c", **element)
+    (event,) = recorder._events
+    assert isinstance(event, InputEvent)
+    assert event.value is None and event.typed is None
+    assert event.element.sensitive and not event.element.is_password
+    assert not event.element.is_username
+    assert "918273" in recorder._secret_values
+    assert password_by_name(event.element) and not username_by_signal(event.element)
+
+
+def test_the_username_of_a_page_that_leads_to_the_password_leaves_the_recording() -> None:
+    # Login em duas páginas: a página do usuário não tem senha, mas o "Continuar" leva
+    # (por navegação de documento) à página da senha.
+    recorder = Recorder(probe_locators=False, capture_text=False)
+    page = _FakePage()
+    frame = _FakeFrame(page, "https://portal.exemplo.com.br/login")
+    recorder._register_page(page)
+    recorder._append(NavigationEvent, page_id=0, url=frame.url, cause=NavigationCause.TYPED)
+    _send_input(
+        recorder, frame, "ana.souza", label="Usuário", name="Usuário", css="#u", name_attr="u"
+    )
+    _send_click(recorder, frame, "Continuar", css="#c")
+    after = "https://portal.exemplo.com.br/login/senha?u=ana.souza"
+    recorder._append(
+        NavigationEvent, page_id=0, url=after, cause=NavigationCause.CLICK, trigger_index=2
+    )
+    _send_input(
+        recorder,
+        frame,
+        "S3nh@Forte!",
+        input_type="password",
+        css="#p",
+        is_password=True,
+        sensitive=True,
+    )
+    _send_click(recorder, frame, "Entrar", css="#e")
+    recorder._append(PageTextEvent, page_id=0, url=after, text="Olá, ANA.SOUZA")
+    recorder._hide_secret_page_fields()
+    events = [recorder._scrub(event) for event in recorder._events]
+    dumped = Recording(started_at=datetime.now(UTC), events=events).model_dump_json()
+    assert "ana.souza" not in dumped.lower()
+    usuario = events[1]
+    assert isinstance(usuario, InputEvent) and usuario.value is None
+    assert usuario.element.is_username and usuario.element.sensitive
+    navigation = events[3]
+    assert isinstance(navigation, NavigationEvent) and f"u={REDACTED}" in navigation.url
+
+
+def test_a_short_numeric_secret_is_searched_only_in_the_texts_of_the_recording() -> None:
+    # H3 (rodada 7): o "4829" que um teste achou uma vez sob carga estava num número
+    # da gravação (o t_ms de um evento ou os microssegundos do finished_at), não num
+    # texto: sob carga, 7 de 900 gravações tinham "4829" assim, nenhuma num texto.
+    events = [
+        NavigationEvent(
+            index=0,
+            t_ms=276.62648299883585,
+            page_id=0,
+            url="https://portal.exemplo.com.br/login",
+            cause=NavigationCause.TYPED,
+        ),
+        PageTextEvent(
+            index=1, t_ms=463.6024829997041, page_id=0, url="https://portal.exemplo.com.br/"
+        ),
+    ]
+    recording = Recording(
+        started_at=datetime(2026, 11, 19, 6, 46, 37, 100000, tzinfo=UTC),
+        finished_at=datetime(2026, 11, 19, 6, 46, 37, 864829, tzinfo=UTC),
+        events=events,
+    )
+    assert "4829" in recording.model_dump_json()
+    assert not has_text(recording, "4829")
+    leaked = recording.model_copy(
+        update={"events": [events[0], events[1].model_copy(update={"text": "PIN 4829"})]}
+    )
+    assert has_text(leaked, "4829")
+
+
+def test_the_identity_of_a_field_has_the_hosts_of_its_shadow_roots() -> None:
+    def field(**extra: object) -> ElementDescriptor:
+        return ElementDescriptor.model_validate(
+            {"tag": "input", "input_type": "text", "label": "Valor", "css": "#input", **extra}
+        )
+
+    assert field_key(0, field(shadow_path=["#fa"])) != field_key(0, field(shadow_path=["#fb"]))
+    assert field_key(0, field()) != field_key(0, field(shadow_path=["#fa"]))
+    # O que a pessoa vê do campo também conta (seletor cortado, gravação sem hospedeiros).
+    assert field_key(0, field()) != field_key(0, field(label="Quantidade"))
+    assert field_key(0, field(shadow_path=["#fa"])) == field_key(0, field(shadow_path=["#fa"]))
+
+
+def test_the_identity_of_a_field_has_everything_a_locator_can_use() -> None:
+    # N10: o data-testid vira localizador, então separa os campos; os iframes também
+    # contam por tudo o que os localiza (id, nome, título, endereço, seletor).
+    def field(**extra: object) -> ElementDescriptor:
+        return ElementDescriptor.model_validate(
+            {
+                "tag": "input",
+                "input_type": "text",
+                "label": "Quantidade",
+                "css": "li input",
+                **extra,
+            }
+        )
+
+    def framed(**frame: object) -> ElementDescriptor:
+        return field(frame_path=[{"tag": "iframe", "css": "div > iframe", **frame}])
+
+    assert field_key(0, field(test_id="qtd-1")) != field_key(0, field(test_id="qtd-2"))
+    assert field_key(0, field(role="textbox")) != field_key(0, field(role="combobox"))
+    assert field_key(0, framed(title="Cartão 1")) != field_key(0, framed(title="Cartão 2"))
+    assert field_key(0, framed(src="/a")) != field_key(0, framed(src="/b"))
+    assert field_key(0, framed(title="Cartão 1")) == field_key(0, framed(title="Cartão 1"))
+
+
+def test_only_the_same_element_merges_when_the_recording_numbers_them() -> None:
+    def field(**extra: object) -> ElementDescriptor:
+        return ElementDescriptor.model_validate(
+            {
+                "tag": "input",
+                "input_type": "text",
+                "label": "Quantidade",
+                "css": "li input",
+                **extra,
+            }
+        )
+
+    assert same_element(field(serial=1), field(serial=1))
+    assert not same_element(field(serial=1), field(serial=2))
+    # Gravação antiga (sem número): só a descrição conta.
+    assert same_element(field(), field())
+    # Um com número e outro sem: nunca o mesmo (na dúvida, dois passos).
+    assert not same_element(field(serial=1), field())
+    assert same_element(None, None) and not same_element(field(), None)
+
+
+@pytest.mark.parametrize(
+    ("name", "secret"),
+    [
+        ("Assinatura eletrônica", True),
+        ("Assinatura-eletrônica", True),
+        ("assinatura_digital", True),
+        ("Código de transação", True),
+        ("Código de segurança", True),
+        ("Senha", True),
+        ("Assinatura mensal", False),
+        ("Tipo de assinatura", False),
+        ("Código do produto", False),
+    ],
+)
+def test_the_name_of_a_signature_or_a_transaction_code_is_secret(name: str, secret: bool) -> None:
+    # A assinatura eletrônica ou digital e o código de transação ou de segurança, no nome
+    # do campo, o fazem sigiloso (nunca a senha do cofre); a assinatura de um plano, não.
+    assert mentions_secret_name(name) is secret

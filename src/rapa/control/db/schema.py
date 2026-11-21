@@ -183,6 +183,8 @@ runs = Table(
     Column("artifacts", JSONB, nullable=False),
     Column("idempotency_key", Text, nullable=True),
     _ts("irreversible_started_at"),
+    #: Início do primeiro passo que grava (revisão 0002): a execução não volta para a fila.
+    _ts("write_started_at"),
     _ts("lease_expires_at"),
     _ts("deadline_at"),
     _ts("queued_at", nullable=False, server_default=True),

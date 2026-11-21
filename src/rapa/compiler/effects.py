@@ -4,11 +4,12 @@
   transferir, assinar, autorizar, excluir...) é ``irreversible``, venha antes
   dele uma senha ou não. A exceção é um link que só abriu outra página por GET
   onde a pessoa passou a preencher um formulário: isso é navegação.
-- Login é leitura, mas só pela regra conservadora de
+- Login é leitura, mas só pela regra de
   ``rapa.recorder.sensitivity.analyze_logins``: o texto inteiro do botão é de
-  login (ou é o Enter num campo de credencial), na página a pessoa só preencheu
-  credenciais e nada gravou antes no robô. Quem decide é o compilador
-  (``ActionContext.authentication``); na dúvida, o envio grava.
+  login (o Enter só conta quando aciona esse botão no mesmo ``<form>``), na
+  página a pessoa só preencheu credenciais de uma credencial e nada gravou antes
+  no robô. Quem decide é o compilador (``ActionContext.authentication``); na
+  dúvida, o envio grava.
 - Um clique (ou Enter) cujas requisições seguintes incluem um documento, XHR ou
   fetch que não é GET grava algo: efeito ``write``.
 """
@@ -18,7 +19,7 @@ from dataclasses import dataclass
 
 from rapa.core.robot import Effect
 from rapa.recorder.models import ElementDescriptor, RequestEvent
-from rapa.recorder.sensitivity import action_label, irreversible_verb
+from rapa.recorder.sensitivity import action_label, irreversible_verb, writes_in
 
 __all__ = [
     "AUTHENTICATION",
@@ -29,17 +30,8 @@ __all__ = [
     "writes_in",
 ]
 
-_WRITE_TYPES = frozenset({"document", "xhr", "fetch"})
-_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 #: Motivo da classificação de um envio de login.
 AUTHENTICATION = "autenticação"
-
-
-def writes_in(requests: Sequence[RequestEvent]) -> list[RequestEvent]:
-    """Requisições que gravam algo (documento, XHR ou fetch que não é GET)."""
-    return [
-        r for r in requests if r.resource_type in _WRITE_TYPES and r.method not in _SAFE_METHODS
-    ]
 
 
 @dataclass(frozen=True)

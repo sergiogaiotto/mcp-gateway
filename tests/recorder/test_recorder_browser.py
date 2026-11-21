@@ -44,6 +44,7 @@ from rapa.recorder import (
     RecorderError,
     Recording,
 )
+from tests.recorder.texts import has_text, texts_of
 
 pytestmark = pytest.mark.browser
 
@@ -99,12 +100,15 @@ def compile_(recording: Recording, name: str) -> CompileResult:
     return result
 
 
-def assert_no_secrets(text: str, codes: list[str], *, username: bool = True) -> None:
-    assert DEFAULT_PASSWORD not in text
-    for code in codes:
-        assert not re.search(rf"(?<!\d){code}(?!\d)", text), "código TOTP vazou"
-    if username:
-        assert DEFAULT_USER not in text
+def assert_no_secrets(value: object, codes: list[str], *, username: bool = True) -> None:
+    """Nenhum segredo nos textos de ``value`` (os números e as datas não contam: um código
+    de seis dígitos pode aparecer por acaso num ``t_ms`` ou no ``finished_at``)."""
+    for text in texts_of(value):
+        assert DEFAULT_PASSWORD not in text
+        for code in codes:
+            assert not re.search(rf"(?<!\d){code}(?!\d)", text), "código TOTP vazou"
+        if username:
+            assert DEFAULT_USER not in text
 
 
 def assert_login_steps(result: CompileResult) -> None:
@@ -145,15 +149,15 @@ async def test_login_totp_and_issue_protocol(browser: Browser, portal_v1: Runnin
     recording = await record(browser, scenario)
     assert portal_v1.state.protocolos[0]["cpf"] == "529.982.247-25"
     # Nem o nome de usuário que o portal mostra depois do login ("Olá, ...") fica na gravação.
-    assert_no_secrets(recording.model_dump_json(), codes)
+    assert_no_secrets(recording, codes)
     assert any(f"Olá, {REDACTED}" in text for text in recording.observed_texts())
     sensitive = [e for e in recording.events if isinstance(e, InputEvent) and e.element.sensitive]
     assert len(sensitive) == 3 and all(e.value is None for e in sensitive)
 
     result = compile_(recording, "emitir_protocolo_gravado")
     manifest = result.manifest
-    assert_no_secrets(manifest.model_dump_json(), codes)
-    assert_no_secrets(result.model_dump_json(), codes)
+    assert_no_secrets(manifest, codes)
+    assert_no_secrets(result, codes)
     assert_login_steps(result)
 
     emitir = manifest.step_by_id("clicar_emitir")
@@ -227,7 +231,7 @@ async def test_issue_protocol_on_the_changed_layout(
     assert portal_v2.state.protocolos[0]["uf"] == "RS"
     result = compile_(recording, "emitir_documento_gravado")
     manifest = result.manifest
-    assert_no_secrets(manifest.model_dump_json(), codes)
+    assert_no_secrets(manifest, codes)
     secrets_used = [
         s.value.field
         for s in manifest.steps
@@ -262,10 +266,10 @@ async def test_read_notes_and_download_one_file(browser: Browser, portal_v1: Run
 
     recording = await record(browser, scenario)
     assert portal_v1.state.downloads == ["001003"]
-    assert_no_secrets(recording.model_dump_json(), codes)
+    assert_no_secrets(recording, codes)
     result = compile_(recording, "baixar_nota_gravada")
     manifest = result.manifest
-    assert_no_secrets(manifest.model_dump_json(), codes)
+    assert_no_secrets(manifest, codes)
     # Enter no campo de senha: fica só o clique implícito em "Entrar".
     assert_login_steps(result)
     assert not any(s.kind == "press" for s in manifest.steps)
@@ -299,7 +303,7 @@ async def test_upload_a_file(browser: Browser, portal_v1: RunningPortal) -> None
     assert portal_v1.state.uploads == [{"nome": "comprovante.txt", "tamanho": 8}]
     result = compile_(recording, "enviar_arquivo_gravado")
     manifest = result.manifest
-    assert_no_secrets(manifest.model_dump_json(), codes)
+    assert_no_secrets(manifest, codes)
     assert_login_steps(result)
     upload = next(s for s in manifest.steps if isinstance(s, UploadStep))
     field = next(f for f in manifest.inputs if f.name == upload.file_input)
@@ -323,7 +327,7 @@ async def test_click_inside_iframe(browser: Browser, portal_v1: RunningPortal) -
     recording = await record(browser, scenario)
     result = compile_(recording, "consulta_em_quadro")
     manifest = result.manifest
-    assert_no_secrets(manifest.model_dump_json(), codes)
+    assert_no_secrets(manifest, codes)
     typed = [s for s in manifest.steps if isinstance(s, NavigateStep)]
     assert [s.url.rsplit("/", 1)[-1] for s in typed] == ["login", "quadro"]
     click = manifest.steps[-1]
@@ -394,21 +398,28 @@ async def test_recording_starts_on_an_open_page(browser: Browser, portal_v1: Run
 ROUTED = "https://portal.exemplo.com.br"
 SPA_USER = "ana.souza@exemplo.com.br"
 SPA_PASSWORD = "S3nh@Forte!"
-#: Quatro campos de texto soltos antes do login: o script não reconhece o usuário
-#: pelo grupo de campos (no máximo três), só a regra do gravador ao fechar.
+#: Quatro campos de texto soltos antes do login, que a pessoa não preenche: o
+#: usuário continua sendo o usuário (pelo próprio campo).
 MANY_FIELDS = (
     '<div><input aria-label="Busca"><input aria-label="Filtro 1">'
     '<input aria-label="Filtro 2"><input aria-label="Filtro 3"></div>'
 )
 
 
-def spa_login(extra: str = "") -> str:
-    """Login de SPA: campos soltos numa <div>, sem <form> e sem autocomplete."""
+def spa_login(extra: str = "", *, split: bool = False) -> str:
+    """Login de SPA: campos soltos numa <div>, sem <form> e sem autocomplete.
+
+    ``split``: a senha fica num ``<form>`` só dela (o script não a vê no grupo do
+    usuário, que são os campos soltos).
+    """
+    secret = '<label for="p">Senha</label><input id="p" name="senha" type="password">'
+    if split:
+        secret = f'<form onsubmit="return false">{secret}</form>'
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>Entrar</title></head>
 <body><h1>Portal</h1>{extra}
 <div class="login">
   <label for="u">Usuário</label><input id="u" name="usuario">
-  <label for="p">Senha</label><input id="p" name="senha" type="password">
+  {secret}
   <button id="entrar" type="button">Entrar</button>
 </div>
 <script>
@@ -461,7 +472,7 @@ async def record_routed(browser: Browser, login_html: str, scenario: Scenario) -
         await context.close()
 
 
-def assert_spa_username_hidden(recording: Recording) -> None:
+def assert_spa_username_hidden(recording: Recording, *, login: bool = True) -> None:
     dumped = recording.model_dump_json()
     for leaked in (SPA_USER, SPA_USER.upper(), quote(SPA_USER, safe=""), SPA_PASSWORD):
         assert leaked not in dumped
@@ -478,11 +489,14 @@ def assert_spa_username_hidden(recording: Recording) -> None:
 
     result = compile_(recording, "entrar_no_portal")
     fills = [s for s in result.manifest.steps if isinstance(s, FillStep)]
-    assert all(isinstance(s.value, SecretValue) for s in fills)
-    assert sorted(s.value.field for s in fills if isinstance(s.value, SecretValue)) == [
-        "password",
-        "username",
-    ]
+    secrets_used = sorted(s.value.field for s in fills if isinstance(s.value, SecretValue))
+    if login:
+        assert all(isinstance(s.value, SecretValue) for s in fills)
+        assert secrets_used == ["password", "username"]
+    else:
+        # Fora da regra do login o usuário do cofre não é digitado: o robô pede o valor.
+        assert secrets_used == ["password"]
+        assert fills[0].value == TextValue(template="{{ inputs.usuario }}")
     assert SPA_USER not in result.model_dump_json()
     assert not any(SPA_USER in text for text in result.observed_texts)
     prompt = build_user_prompt(result.manifest, result.observed_texts)
@@ -501,8 +515,8 @@ async def test_username_of_a_login_without_form_never_reaches_the_recording(
 
 
 async def test_page_script_finds_the_username_of_a_login_without_form(browser: Browser) -> None:
-    # A senha antes do usuário: só o script (campo de texto logo antes da senha na
-    # página) reconhece o usuário; a regra do gravador olha a ordem das entradas.
+    # A senha antes do usuário: o usuário é reconhecido pelo próprio campo, e o
+    # login vale em qualquer ordem.
     async def scenario(page: Page) -> None:
         await page.get_by_label("Senha").fill(SPA_PASSWORD)
         await page.get_by_label("Usuário").fill(SPA_USER)
@@ -511,13 +525,17 @@ async def test_page_script_finds_the_username_of_a_login_without_form(browser: B
     assert_spa_username_hidden(await record_routed(browser, spa_login(), scenario))
 
 
-async def test_recorder_hides_the_username_the_page_script_missed(browser: Browser) -> None:
+@pytest.mark.parametrize("variant", ["muitos_campos", "senha_em_outro_form"])
+async def test_recorder_hides_the_username_the_page_script_missed(
+    browser: Browser, variant: str
+) -> None:
     async def scenario(page: Page) -> None:
         await page.get_by_label("Usuário").fill(SPA_USER)
         await page.get_by_label("Senha").fill(SPA_PASSWORD)
         await page.get_by_role("button", name="Entrar").click()
 
-    assert_spa_username_hidden(await record_routed(browser, spa_login(MANY_FIELDS), scenario))
+    login_html = spa_login(MANY_FIELDS) if variant == "muitos_campos" else spa_login(split=True)
+    assert_spa_username_hidden(await record_routed(browser, login_html, scenario))
 
 
 async def test_hidden_password_does_not_turn_a_field_without_form_into_username(
@@ -540,17 +558,17 @@ async def test_hidden_password_does_not_turn_a_field_without_form_into_username(
 
 
 @pytest.mark.parametrize(
-    ("label", "name", "style", "login"),
+    ("label", "name", "style"),
     [
-        ("Chave pessoal", "chave", "-webkit-text-security: disc", True),
-        ("Senha", "senha", "", True),
-        # Assinatura eletrônica é segredo de transação: some da gravação, mas não é login.
-        ("Assinatura eletrônica", "assinatura", "-webkit-text-security: disc", False),
+        ("Chave pessoal", "chave", "-webkit-text-security: disc"),
+        ("Senha", "senha", ""),
+        # Assinatura eletrônica é segredo de transação: some da gravação.
+        ("Assinatura eletrônica", "assinatura", "-webkit-text-security: disc"),
     ],
     ids=["mascara-css", "rotulo", "assinatura-mascarada"],
 )
 async def test_password_in_a_text_field_is_never_recorded(
-    browser: Browser, label: str, name: str, style: str, login: bool
+    browser: Browser, label: str, name: str, style: str
 ) -> None:
     async def scenario(page: Page) -> None:
         await page.get_by_label("Conta").fill("12345-6")
@@ -563,22 +581,20 @@ async def test_password_in_a_text_field_is_never_recorded(
     inputs = {e.element.name_attr: e for e in recording.events if isinstance(e, InputEvent)}
     assert inputs[name].element.is_password and inputs[name].value is None
     assert inputs["conta"].element.sensitive and inputs["conta"].value is None
-    assert inputs["conta"].element.is_username is login
+    # "Conta" não é usuário pelo próprio campo: sai da gravação sem a marca.
+    assert not inputs["conta"].element.is_username
 
     result = compile_(recording, "entrar_no_banco")
     manifest = result.manifest
     conta, senha = (s for s in manifest.steps if isinstance(s, FillStep))
-    if login:
-        assert conta.value == SecretValue(credential="portal", field="username")
-    else:
-        # Antes de uma assinatura eletrônica o campo não vira o usuário do cofre.
-        assert conta.value == TextValue(template="{{ inputs.conta }}")
+    # A conta não vira o usuário do cofre: o robô pede o valor numa entrada.
+    assert conta.value == TextValue(template="{{ inputs.conta }}")
     assert senha.value == SecretValue(credential="portal", field="password")
     assert [c.kind for c in manifest.credentials] == [CredentialKind.PASSWORD]
     entrar = manifest.step_by_id("clicar_entrar")
     assert isinstance(entrar, ClickStep)
-    # Login fica como leitura; com assinatura de transação, o POST grava.
-    assert entrar.effect is (Effect.READ if login else Effect.WRITE)
+    # Sem um usuário pelo próprio campo e uma senha type=password, o POST grava.
+    assert entrar.effect is Effect.WRITE
     assert SPA_PASSWORD not in result.model_dump_json()
 
 
@@ -626,7 +642,10 @@ async def test_username_of_a_two_step_login_never_reaches_the_recording(
         await page.get_by_label("Senha").fill(SPA_PASSWORD)
         await page.get_by_role("button", name="Entrar").click()
 
-    assert_spa_username_hidden(await record_routed(browser, two_step_login(reveal), scenario))
+    recording = await record_routed(browser, two_step_login(reveal), scenario)
+    # O Enter nunca é a ponte do login em duas etapas: o usuário sai da gravação do
+    # mesmo jeito (página com senha), mas o robô pede o valor numa entrada.
+    assert_spa_username_hidden(recording, login=reveal == "continuar")
 
 
 def payment_page(fields: str) -> str:
@@ -663,7 +682,8 @@ async def test_payment_confirmation_with_a_transaction_password_is_irreversible(
 
     recording = await record_routed(browser, payment_page(fields), scenario)
     dumped = recording.model_dump_json()
-    assert "4829" not in dumped
+    # Só nos textos: "4829" aparece por acaso num t_ms ou no finished_at (rodada 7, H3).
+    assert not has_text(recording, "4829")
     result = compile_(recording, "pagar_boleto")
     manifest = result.manifest
     confirmar = manifest.step_by_id("clicar_confirmar_pagamento")
@@ -677,10 +697,10 @@ async def test_payment_confirmation_with_a_transaction_password_is_irreversible(
         assert "1250,00" not in dumped
         usuario = next(e for e in recording.events if isinstance(e, InputEvent))
         assert usuario.element.sensitive and not usuario.element.is_username
-    assert "4829" not in result.model_dump_json()
+    assert not has_text(result, "4829")
 
 
-async def test_page_script_and_recorder_agree_on_a_username_named_like_a_password(
+async def test_page_script_and_recorder_agree_that_a_username_named_like_a_password_is_ambiguous(
     browser: Browser,
 ) -> None:
     page_html = """<!doctype html><html><head><meta charset="utf-8"><title>Entrar</title></head>
@@ -698,14 +718,20 @@ async def test_page_script_and_recorder_agree_on_a_username_named_like_a_passwor
 
     recording = await record_routed(browser, page_html, scenario)
     inputs = {e.element.name_attr: e for e in recording.events if isinstance(e, InputEvent)}
-    assert inputs["cpf"].element.is_username and not inputs["cpf"].element.is_password
-    assert "12345678900" not in recording.model_dump_json()
+    # O rótulo diz CPF (usuário) e o aria-labelledby fala em senha: o campo é ambíguo.
+    cpf_event = inputs["cpf"]
+    assert cpf_event.element.sensitive and cpf_event.element.aria_mentions_password
+    assert not cpf_event.element.is_username and not cpf_event.element.is_password
+    assert not has_text(recording, "12345678900")
     result = compile_(recording, "entrar_com_cpf")
     cpf, senha = (s for s in result.manifest.steps if isinstance(s, FillStep))
-    assert cpf.value == SecretValue(credential="portal", field="username")
+    # Nunca credencial: o login grava e o robô pede o valor numa entrada.
+    assert isinstance(cpf.value, TextValue) and cpf.value.template.startswith("{{ inputs.")
     assert senha.value == SecretValue(credential="portal", field="password")
     entrar = result.manifest.step_by_id("clicar_entrar")
-    assert isinstance(entrar, ClickStep) and entrar.effect is Effect.READ
+    assert isinstance(entrar, ClickStep) and entrar.effect is Effect.WRITE
+    assert any("fala em senha" in w for w in result.warnings)
+    assert not has_text(result, "12345678900")
 
 
 @pytest.mark.parametrize("leave", ["tab", "clique"])

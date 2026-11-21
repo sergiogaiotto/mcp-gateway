@@ -38,10 +38,13 @@ SECRETS = {
 class RecordingIngestor:
     """Guarda os eventos como o banco guardaria (idempotente por ``seq``)."""
 
-    def __init__(self, *, refuse_irreversible: bool = False, stale: bool = False) -> None:
+    def __init__(
+        self, *, refuse_irreversible: bool = False, refuse_writes: bool = False, stale: bool = False
+    ) -> None:
         self.events: dict[int, RunEvent] = {}
         self.calls = 0
         self.refuse_irreversible = refuse_irreversible
+        self.refuse_writes = refuse_writes
         self.stale = stale
 
     async def ingest_events(
@@ -52,6 +55,8 @@ class RecordingIngestor:
             raise StaleAttempt("tentativa antiga")
         parsed = [RunEvent.model_validate(e) for e in events]
         if self.refuse_irreversible and any(e.data.get("irreversivel") for e in parsed):
+            raise ConnectionError("banco fora do ar")
+        if self.refuse_writes and any(e.data.get("grava") for e in parsed):
             raise ConnectionError("banco fora do ar")
         new = 0
         for event in parsed:
@@ -134,6 +139,32 @@ async def test_irreversible_step_never_runs_when_the_warning_is_not_recorded(
     assert result["error_code"] == "sem_confirmacao"
     assert result["irreversible_started"] is False
     assert portal_v1.state.protocolos == []
+
+
+@pytest.mark.browser
+async def test_step_that_writes_never_runs_when_its_start_is_not_recorded(
+    portal_v1: RunningPortal, chromium_path: str, tmp_path: Path
+) -> None:
+    files_dir = tmp_path / "arquivos"
+    company = new_id()
+    _company_files(files_dir, company, "planilha.csv", b"linha 1\n")
+    ingestor = RecordingIngestor(refuse_writes=True)
+    launcher = LocalProcessLauncher(
+        ingestor,
+        _settings(tmp_path, chromium_path, files_dir=files_dir, ack_timeout_s=1.5),
+        StaticSecretSource({company: SECRETS}),
+    )
+
+    result = await launcher(_upload_job(portal_v1, company, "planilha.csv"))
+
+    # O banco não gravou o início do passo "enviar" (que grava): sem a confirmação, o
+    # executor não clicou, e a execução pode voltar para a fila sem gravar duas vezes.
+    assert result["state"] == RunState.FAILED
+    assert result["error_code"] == "sem_confirmacao"
+    assert result["failed_step_id"] == "enviar"
+    assert portal_v1.state.uploads == []
+    assert not any(e.data.get("grava") for e in ingestor.events.values())
+    assert not (tmp_path / "trabalho").exists() or not any((tmp_path / "trabalho").iterdir())
 
 
 @pytest.mark.browser

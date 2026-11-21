@@ -11,6 +11,12 @@ concorrência → lançar cada uma com renovação periódica da concessão → 
 resultado. Se a tentativa deixar de ser a atual (renovação recusada), o
 lançamento é cancelado e o resultado descartado.
 
+Nada daqui devolve uma execução à fila: o resultado (real ou sintético, de
+:func:`failure_result`) sempre a conclui. Uma execução interrompida sem resultado
+(despachante que cai ou que encerra sem esperar) fica para o recolhedor, que só a
+devolve à fila se nenhum passo que grava tinha começado (ver
+:mod:`rapa.control.services.queue`).
+
 Um resultado em mãos não se perde por uma queda curta do banco: a concessão
 continua sendo renovada e a gravação é repetida, com espera crescente, até dar
 certo ou até o prazo da execução (mais uma folga). Enquanto isso, o recolhedor
@@ -76,6 +82,10 @@ def failure_result(
     por inteiro, não dá para saber se ele chegou a começar: o estado fica
     indeterminado para uma pessoa decidir. Com ``started=False`` (o executor nem
     foi iniciado), nada pode ter rodado e o estado é "falhou".
+
+    "Falhou" é final: a execução nunca volta à fila por aqui. Se o banco já tem o
+    início de um passo que grava, :func:`rapa.control.services.queue.finish` põe
+    na mensagem o pedido de conferir o sistema de destino.
     """
     may_have_written = (
         started and job.mode is RunMode.FULL and job.manifest.effect() is Effect.IRREVERSIBLE

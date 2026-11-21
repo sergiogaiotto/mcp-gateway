@@ -11,11 +11,30 @@ Funções para o despachante, todas recebendo uma sessão sem empresa (papel
 - :func:`ingest_events` grava eventos do executor, idempotente por
   ``(run_id, seq)``;
 - :func:`finish` grava o resultado do executor;
-- :func:`reap_expired` recolhe concessões vencidas: volta para a fila o que não
-  começou nenhum passo irreversível e marca o resto como indeterminado.
+- :func:`reap_expired` recolhe concessões vencidas: volta para a fila só o que
+  não começou nenhum passo que grava (ver a regra abaixo).
 
 Escritas de uma tentativa antiga (``attempt`` diferente do atual, ou execução
 já devolvida à fila) são recusadas com :class:`StaleAttempt`.
+
+Nada que gravou é repetido automaticamente. Antes de cada passo que grava no
+sistema de destino (efeito ``write`` ou ``irreversible``), o executor anuncia o
+passo (``step_started`` com ``"grava": true`` ou, no irreversível, o aviso
+``"irreversivel": true``) e só age depois de o lançador confirmar que
+:func:`ingest_events` gravou o anúncio. Gravar o primeiro desses anúncios marca
+``write_started_at`` (e o aviso irreversível marca também
+``irreversible_started_at``). Quando o executor some (concessão vencida), o
+recolhedor decide pelas marcas:
+
+- passo irreversível iniciado: ``indeterminate``, para uma pessoa conferir;
+- passo que grava iniciado: ``failed``, com o pedido de conferir o sistema de
+  destino antes de executar de novo, e nunca de volta à fila: a nova tentativa
+  recomeçaria do primeiro passo e gravaria de novo;
+- nada que grava iniciado: de volta à fila, até ``max_attempts`` tentativas.
+
+Nenhum outro caminho devolve uma execução à fila: o resultado (:func:`finish`)
+sempre a conclui, e o banco recusa devolver à fila uma execução marcada. A
+validação segura para antes do primeiro passo que grava e não marca nada.
 
 A numeração dos eventos é da execução, não da tentativa: :func:`claim_next`
 entrega no trabalho o ``first_seq`` (o número seguinte ao último evento
@@ -72,7 +91,7 @@ from rapa.core.contracts import (
     RunState,
 )
 from rapa.core.events import RunEvent, RunEventKind
-from rapa.core.robot import Manifest
+from rapa.core.robot import Effect, Manifest
 
 __all__ = [
     "DEFAULT_LEASE",
@@ -113,6 +132,13 @@ _MAX_ERROR_MESSAGE = 2000
 _MAX_INVALID_SKIPS = 20
 _STEP_ACTIVITY = frozenset(
     {RunEventKind.STEP_STARTED, RunEventKind.STEP_SUCCEEDED, RunEventKind.STEP_HEALED}
+)
+#: Código da execução recolhida depois de começar um passo que grava.
+_WROTE_AND_STOPPED = "executor_parou_depois_de_gravar"
+#: Começo da mensagem de uma execução que falhou depois de começar a gravar.
+_WROTE_BEFORE_STOPPING = (
+    "A execução chegou ao início de um passo que grava e pode ter gravado no sistema de "
+    "destino: confira o sistema de destino antes de executar de novo."
 )
 
 
@@ -416,6 +442,7 @@ async def _lock_run(session: AsyncSession, run_id: UUID) -> RowMapping:
                     runs.c.attempt,
                     runs.c.state,
                     runs.c.irreversible_started_at,
+                    runs.c.write_started_at,
                 )
                 .where(runs.c.id == run_id)
                 .with_for_update()
@@ -449,6 +476,23 @@ def _marks_irreversible(event: RunEvent) -> bool:
     if event.kind in (RunEventKind.RUN_SUCCEEDED, RunEventKind.RUN_FAILED):
         return event.data.get("irreversivel_iniciado") is True
     return False
+
+
+def _marks_write(event: RunEvent) -> bool:
+    """Se o evento mostra que um passo que grava no sistema de destino começou.
+
+    Vale o início de um passo que grava (``"grava": true``, o mesmo que o executor
+    espera ver confirmado antes de agir) e tudo o que marca um passo irreversível.
+    Na dúvida, um passo anunciado com efeito ``write`` também conta, mesmo sem o
+    campo (executor de uma versão anterior). Só o passo irreversível anunciado
+    sem o aviso não conta: ele falhou antes de agir (ver
+    :func:`_marks_irreversible`).
+    """
+    if _marks_irreversible(event):
+        return True
+    if event.kind is not RunEventKind.STEP_STARTED:
+        return False
+    return event.data.get("grava") is True or event.data.get("efeito") == Effect.WRITE.value
 
 
 def _event_data(event: RunEvent) -> Any:
@@ -531,8 +575,9 @@ async def ingest_events(
     eventos de uma execução que já terminou (por exemplo, encerrada pelo
     recolhedor) levantam :class:`StaleAttempt`; nos dois casos nada é gravado.
 
-    O aviso de passo irreversível marca ``irreversible_started_at``, o que
-    impede a execução de voltar para a fila.
+    O início do primeiro passo que grava marca ``write_started_at``, e o aviso de
+    passo irreversível marca também ``irreversible_started_at``: daí em diante a
+    execução nunca volta para a fila (ver o início do módulo).
     """
     parsed = _parse_events(run_id, attempt, events)
     run = await _lock_run(session, run_id)
@@ -619,6 +664,10 @@ async def ingest_events(
         marks = [_utc(e.at) for e in new if _marks_irreversible(e)]
         if marks:
             values["irreversible_started_at"] = min(marks)
+    if run["write_started_at"] is None:
+        marks = [_utc(e.at) for e in new if _marks_write(e)]
+        if marks:
+            values["write_started_at"] = min(marks)
     state = run["state"]
     for event in new:
         # Evento que chega atrasado (abaixo do último gravado) não muda o estado.
@@ -660,6 +709,10 @@ async def finish(
     Devolve ``False`` (sem mudar nada) se a execução já estava concluída, por
     exemplo quando o recolhedor a marcou como indeterminada antes do resultado
     chegar. Um resultado de tentativa antiga levanta :class:`StaleAttempt`.
+
+    O resultado sempre conclui a execução: nada daqui a devolve à fila. Uma falha
+    (ou um cancelamento) depois de um passo que grava ter começado ganha na
+    mensagem o pedido de conferir o sistema de destino antes de executar de novo.
     """
     try:
         outcome = (
@@ -687,6 +740,9 @@ async def finish(
             "A execução parou depois de começar um passo irreversível; "
             "confira o sistema de destino antes de repetir."
         )
+    if run["write_started_at"] is not None and state in (RunState.FAILED, RunState.CANCELLED):
+        # Vai no começo: a mensagem do executor pode ser cortada no limite.
+        error_message = _WROTE_BEFORE_STOPPING + (f" {error_message}" if error_message else "")
     values: dict[str, Any] = {
         "state": state.value,
         "outputs": outcome.outputs,
@@ -700,6 +756,8 @@ async def finish(
     }
     if run["irreversible_started_at"] is None and outcome.irreversible_started:
         values["irreversible_started_at"] = now
+    if run["write_started_at"] is None and outcome.irreversible_started:
+        values["write_started_at"] = now
     await session.execute(update(runs).where(runs.c.id == run_id).values(**values))
     await audit.append(
         session,
@@ -721,9 +779,11 @@ async def reap_expired(
 ) -> ReapReport:
     """Recolhe execuções cuja concessão venceu (executor sumiu).
 
-    Sem passo irreversível iniciado, a execução volta para a fila (até
-    ``max_attempts`` tentativas; depois disso, falha). Com passo irreversível
-    iniciado, vira indeterminada: uma pessoa confere o sistema de destino.
+    Com passo irreversível iniciado, a execução vira indeterminada; com passo que
+    grava iniciado, falha. Nos dois casos uma pessoa confere o sistema de destino,
+    e a execução nunca volta para a fila: a nova tentativa recomeçaria do primeiro
+    passo e gravaria de novo. Só a execução que não começou nenhum passo que grava
+    volta para a fila (até ``max_attempts`` tentativas; depois disso, falha).
 
     As execuções em ``skip`` ficam de fora: são as que o próprio despachante
     ainda acompanha (por exemplo, gravando o resultado depois de uma queda do
@@ -736,7 +796,13 @@ async def reap_expired(
     expired = (
         (
             await session.execute(
-                select(runs.c.id, runs.c.company_id, runs.c.attempt, runs.c.irreversible_started_at)
+                select(
+                    runs.c.id,
+                    runs.c.company_id,
+                    runs.c.attempt,
+                    runs.c.irreversible_started_at,
+                    runs.c.write_started_at,
+                )
                 .where(*conditions)
                 .order_by(runs.c.lease_expires_at)
                 .with_for_update(skip_locked=True)
@@ -761,6 +827,20 @@ async def reap_expired(
             }
             action = "execucao.indeterminada"
             report.indeterminate.append(run_id)
+        elif row["write_started_at"] is not None:
+            values = {
+                "state": RunState.FAILED.value,
+                "finished_at": now,
+                "lease_expires_at": None,
+                "error_code": _WROTE_AND_STOPPED,
+                "error_message": (
+                    "O executor parou de responder depois de começar um passo que grava no "
+                    "sistema de destino. A execução não foi repetida, para não gravar duas "
+                    "vezes: confira o sistema de destino antes de executar de novo."
+                ),
+            }
+            action = "execucao.falhou"
+            report.failed.append(run_id)
         elif row["attempt"] >= max_attempts:
             values = {
                 "state": RunState.FAILED.value,
@@ -783,13 +863,16 @@ async def reap_expired(
             action = "execucao.reenfileirada"
             report.requeued.append(run_id)
         await session.execute(update(runs).where(runs.c.id == run_id).values(**values))
+        payload: dict[str, Any] = {"tentativa": row["attempt"], "estado": values["state"]}
+        if values.get("error_code"):
+            payload["erro"] = values["error_code"]
         await audit.append(
             session,
             company_id=row["company_id"],
             actor=DISPATCHER_ACTOR,
             action=action,
             target=f"execucao:{run_id}",
-            payload={"tentativa": row["attempt"], "estado": values["state"]},
+            payload=payload,
         )
     return report
 

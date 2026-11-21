@@ -193,8 +193,11 @@ class Target(_Model):
             "Escolhe o contêiner que tem um elemento (por exemplo, uma célula) cujo "
             "texto inteiro é exatamente este, com as mesmas maiúsculas e minúsculas; "
             "só os brancos nas pontas e repetidos não contam. Use o texto do HTML, não "
-            "o mostrado depois do text-transform do CSS. Nenhum valor do template pode "
-            "ficar vazio (template)"
+            "o mostrado depois do text-transform do CSS. Nenhum outro contêiner pode ter "
+            "esse texto, nem no HTML nem no texto mostrado, nem mostrar o que este mostra "
+            "no lugar dele, ou o passo falha sem agir (numa condição, ela falha em vez "
+            "de valer como não encontrado). "
+            "Nenhum valor do template pode ficar vazio (template)"
         ),
     )
     snapshot: str | None = Field(

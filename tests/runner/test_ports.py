@@ -325,3 +325,58 @@ async def test_acking_sink_fails_the_step_without_ack(tmp_path: Path) -> None:
 def test_acking_sink_rejects_bad_timing(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         ports.AckingEventSink(ListEventSink(), tmp_path, timeout_s=0)
+
+
+# -- confirmação antes de qualquer passo que grava ---------------------------------
+
+
+@pytest.mark.parametrize(
+    ("kind", "data", "waits"),
+    [
+        # Início de um passo que grava (``grava``) e aviso de passo irreversível.
+        (RunEventKind.STEP_STARTED, {"efeito": "write", "grava": True}, True),
+        (RunEventKind.STEP_STARTED, {"efeito": "irreversible", "irreversivel": True}, True),
+        # Passo de leitura, e o passo irreversível que falhou antes do aviso.
+        (RunEventKind.STEP_STARTED, {"efeito": "read"}, False),
+        (RunEventKind.STEP_STARTED, {"efeito": "irreversible"}, False),
+        # Só o valor booleano vale; o texto "true" (que viria da página) não.
+        (RunEventKind.STEP_STARTED, {"efeito": "write", "grava": "true"}, False),
+        # Outros tipos de evento nunca esperam, mesmo com as mesmas chaves.
+        (RunEventKind.STEP_SUCCEEDED, {"grava": True}, False),
+        (RunEventKind.RUN_STOPPED_BEFORE_WRITE, {"efeito": "write", "grava": True}, False),
+    ],
+)
+def test_runner_waits_for_the_ack_before_every_step_that_writes(
+    kind: RunEventKind, data: dict[str, object], waits: bool
+) -> None:
+    event = _ack_event(0, kind, **data)
+    assert ports.waits_for_ack(event) is waits
+    # ``needs_ack`` continua dizendo só se é o aviso de passo irreversível.
+    assert ports.needs_ack(event) is (waits and data.get("irreversivel") is True)
+
+
+async def test_acking_sink_waits_for_the_ack_before_a_step_that_writes(tmp_path: Path) -> None:
+    import asyncio
+
+    inner = ListEventSink()
+    sink = ports.AckingEventSink(inner, tmp_path, timeout_s=5, poll_s=0.01)
+    event = _ack_event(4, RunEventKind.STEP_STARTED, efeito="write", grava=True)
+    task = asyncio.create_task(sink.emit(event))
+    await asyncio.sleep(0.05)
+    assert not task.done()  # o passo que grava não começa sem a confirmação
+    assert inner.events == [event]  # o início sai antes da espera
+    ports.ack_path(tmp_path, 4).write_text("ok")
+    await asyncio.wait_for(task, 2)
+
+
+async def test_acking_sink_fails_a_step_that_writes_without_ack(tmp_path: Path) -> None:
+    from rapa.runner.errors import ErrorCode, StepError
+
+    sink = ports.AckingEventSink(ListEventSink(), tmp_path, timeout_s=0.05, poll_s=0.01)
+    event = _ack_event(0, RunEventKind.STEP_STARTED, efeito="write", grava=True)
+    with pytest.raises(StepError) as caught:
+        await sink.emit(event)
+    assert caught.value.code is ErrorCode.SEM_CONFIRMACAO
+    assert caught.value.step_id == "emitir"  # o passo que não começou
+    assert "passo que grava" in caught.value.message
+    assert "não foi executado" in caught.value.message

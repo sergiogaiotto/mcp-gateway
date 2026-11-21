@@ -714,7 +714,12 @@ async def _stored(db: Database, run_id: UUID) -> list[tuple[int, int, str]]:
 async def _first_attempt_lost_before_emitting(
     queue: PgRunQueue, platform: PgPlatform, tenant: Tenant, now: datetime
 ) -> UUID:
-    """Tentativa 1 grava 7 eventos (com um "step_healed" a mais) e perde a concessão."""
+    """Tentativa 1 grava 7 eventos (com um "step_healed" a mais) e perde a concessão.
+
+    Os passos são de leitura, como no robô de exemplo (``digitar_cpf`` não grava):
+    só assim a execução volta para a fila. Um passo que grava não volta (ver
+    ``test_write_started.py``).
+    """
     run = await platform.start(
         tenant.operator, "emitir_protocolo", PROTOCOLO_INPUTS, RunTrigger.REST
     )
@@ -728,7 +733,7 @@ async def _first_attempt_lost_before_emitting(
             event(rid, 1, 0, RunEventKind.RUN_STARTED),
             event(rid, 1, 1, RunEventKind.STEP_STARTED, "abrir_protocolo", efeito="read"),
             event(rid, 1, 2, RunEventKind.STEP_SUCCEEDED, "abrir_protocolo"),
-            event(rid, 1, 3, RunEventKind.STEP_STARTED, "digitar_cpf", efeito="write"),
+            event(rid, 1, 3, RunEventKind.STEP_STARTED, "digitar_cpf", efeito="read"),
             event(rid, 1, 4, RunEventKind.STEP_HEALED, "digitar_cpf"),
             event(rid, 1, 5, RunEventKind.STEP_SUCCEEDED, "digitar_cpf"),
             event(rid, 1, 6, RunEventKind.ARTIFACT, "digitar_cpf"),

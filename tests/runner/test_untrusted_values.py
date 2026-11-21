@@ -6,17 +6,21 @@ de teste que não precisa de servidor.
 """
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 import pytest
-from playwright.async_api import BrowserContext, Route
+from playwright.async_api import Browser, BrowserContext, Route
+from playwright.async_api import Error as PlaywrightError
 
+from rapa.compiler import lower
 from rapa.core import policy
 from rapa.core.contracts import RunMode, RunState
 from rapa.core.events import RunEventKind
-from rapa.core.robot import Manifest
+from rapa.core.robot import ClickStep, Effect, Manifest
+from rapa.recorder import Recorder
 from rapa.runner.errors import ErrorCode
 from rapa.runner.interpreter import MASK
 from rapa.runner.ports import AckingEventSink, ListEventSink, ack_path, needs_ack
@@ -299,12 +303,33 @@ async def test_rows_that_differ_only_in_case_are_not_ambiguous(run_robot: RobotR
     outcome = await run_robot(
         _cancelar_notas("/caixas"),
         {"notas": [{"numero": "nf 8"}]},
-        # Duas linhas: "nf 8" (mostrada em maiúsculas pelo CSS) e "NF 8".
-        prepare_context=_serve({"/caixas": _CAIXAS.replace("nf 7", "nf 8")}),
+        # Duas linhas: "nf 8" e "NF 8", cada uma mostrada como está no HTML.
+        prepare_context=_serve(
+            {"/caixas": _CAIXAS.replace('<td style="text-transform: uppercase">nf 7', "<td>nf 8")}
+        ),
         after_run=page,
     )
     assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
     assert page.title == "cancelou 7"
+
+
+async def test_rows_shown_with_the_same_text_are_ambiguous(run_robot: RobotRunner) -> None:
+    # Duas linhas: "nf 8", mostrada em maiúsculas pelo CSS, e "NF 8". Pelo HTML só a
+    # primeira tem a chave, mas a página mostra "NF 8" nas duas: a chave "nf 8" pode
+    # ter vindo de qualquer uma delas, e nada é feito.
+    page = _Page()
+    outcome = await run_robot(
+        _cancelar_notas("/caixas"),
+        {"notas": [{"numero": "nf 8"}]},
+        prepare_context=_serve({"/caixas": _CAIXAS.replace("nf 7", "nf 8")}),
+        after_run=page,
+    )
+    result = outcome.result
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert "outra linha mostra" in (result.error_message or "")
+    assert not result.irreversible_started
+    assert page.title == "Notas"
 
 
 @pytest.mark.parametrize(
@@ -569,53 +594,72 @@ _TABELA_TRANSFORMADA = """<!doctype html><meta charset="utf-8"><title>Notas</tit
     <td><button onclick="document.title='cancelou 7'">Cancelar</button></td></tr>
 </tbody></table>"""
 
-# Duas notas que só mudam na caixa, a primeira mostrada em maiúsculas pelo CSS: lidas
-# da página (innerText), as duas viram "AB3X".
-_DUAS_CAIXAS = """<!doctype html><meta charset="utf-8"><title>Notas</title>
-<p id="log"></p>
-<table aria-label="Notas"><thead><tr><th>numero</th><th>acao</th></tr></thead><tbody>
-  <tr><td style="text-transform: uppercase">ab3x</td>
-    <td><button onclick="document.getElementById('log').textContent += 'ab3x;'">Cancelar</button></td></tr>
-  <tr><td>AB3X</td>
-    <td><button onclick="document.getElementById('log').textContent += 'AB3X;'">Cancelar</button></td></tr>
-</tbody></table>"""
-
 
 def _cancelar_lidas(effect: str = "irreversible") -> Manifest:
     """Lê a tabela de notas da página e cancela cada uma pela linha do seu número."""
     return _manifest(
         [
             _open("/notas"),
-            {
-                "kind": "extract_table",
-                "id": "ler",
-                "title": "Ler as notas",
-                "target": _target("notas", {"by": "role", "value": "table", "name": "Notas"}),
-                "into": "notas",
-                "columns": ["numero", "acao"],
-            },
-            {
-                "kind": "for_each",
-                "id": "cada_nota",
-                "title": "Para cada nota",
-                "items": "vars.notas",
-                "steps": [
-                    {
-                        "kind": "click",
-                        "id": "cancelar",
-                        "title": "Cancelar a nota",
-                        "effect": effect,
-                        "timeout_ms": 1_000,
-                        "target": _target(
-                            "botão Cancelar da nota",
-                            {"by": "role", "value": "button", "name": "Cancelar"},
-                            within={"by": "role", "value": "row"},
-                            within_has_text="{{ item.numero }}",
-                        ),
-                    }
-                ],
-            },
+            _ler_notas(["numero", "acao"]),
+            _for_each("vars.notas", [_cancel_in_row("cancelar", "{{ item.numero }}", effect)]),
         ]
+    )
+
+
+def _ler_notas(columns: list[str]) -> dict[str, Any]:
+    return {
+        "kind": "extract_table",
+        "id": "ler",
+        "title": "Ler as notas",
+        "target": _target("notas", {"by": "role", "value": "table", "name": "Notas"}),
+        "into": "notas",
+        "columns": columns,
+    }
+
+
+def _for_each(
+    items: str, steps: list[dict[str, Any]], step_id: str = "cada_nota"
+) -> dict[str, Any]:
+    return {
+        "kind": "for_each",
+        "id": step_id,
+        "title": "Para cada nota",
+        "items": items,
+        "steps": steps,
+    }
+
+
+def _if(
+    step_id: str,
+    condition: dict[str, Any],
+    then: list[dict[str, Any]],
+    otherwise: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "kind": "if",
+        "id": step_id,
+        "title": "Se a nota é do tipo",
+        "condition": condition,
+        "then": then,
+        "otherwise": otherwise or [],
+    }
+
+
+def _equals(left: str, right: str) -> dict[str, Any]:
+    return {"op": "equals", "left": left, "right": right}
+
+
+def _com_registro(rows: str, header: str = "") -> str:
+    """Página de notas com um registro dos cliques que sobrevive à navegação."""
+    return f"""<!doctype html><meta charset="utf-8"><title>Notas</title>
+<p id="log"></p><script>document.getElementById('log').textContent = localStorage.log || ''</script>
+<table aria-label="Notas">{header}<tbody>{rows}</tbody></table>"""
+
+
+def _botao(tag: str, name: str = "Cancelar") -> str:
+    return (
+        f"<td><button onclick=\"localStorage.log = (localStorage.log || '') + '{tag};'; "
+        f"document.getElementById('log').textContent = localStorage.log\">{name}</button></td>"
     )
 
 
@@ -638,25 +682,690 @@ async def test_row_key_read_from_a_page_with_text_transform_fails_closed(
     assert page.title == "Notas"
 
 
+# -- a linha escolhida precisa ser a única com o texto, no HTML e no texto mostrado ---------
+
+
+def _cabecalho(*names: str) -> str:
+    return "<thead><tr>" + "".join(f"<th>{name}</th>" for name in names) + "</tr></thead>"
+
+
+# Duas notas que só mudam na caixa, a primeira mostrada em maiúsculas pelo CSS: lidas da
+# página (innerText), as duas viram "AB3X", e a linha da nota AB3X é a única com esse
+# texto no HTML.
+_DUAS_CAIXAS = _com_registro(
+    f"<tr><td style='text-transform: uppercase'>ab3x</td><td>Pendente</td>{_botao('ab3x')}</tr>"
+    f"<tr><td>AB3X</td><td>Paga</td>{_botao('AB3X')}</tr>",
+    _cabecalho("numero", "situacao", "acao"),
+)
+# Uma chave de ordenação escondida na célula do número, como no DataTables: a página
+# mostra "7" (innerText), mas o HTML da célula é "00077"; a nota 12 tem quantidade 7.
+_CHAVE_ESCONDIDA = _com_registro(
+    f"<tr><td><span style='display:none'>0007</span>7</td><td>2</td>{_botao('N7')}</tr>"
+    f"<tr><td><span style='display:none'>0012</span>12</td><td>7</td>{_botao('N12')}</tr>",
+    _cabecalho("numero", "qtd", "acao"),
+)
+
+
+def _cancelar_filtradas(
+    second: str, column: str, value: str, effect: str = "irreversible"
+) -> Manifest:
+    """Lê as notas e cancela, pela linha do número, as que têm ``column`` igual a ``value``."""
+    return _manifest(
+        [
+            _open("/notas"),
+            _ler_notas(["numero", second, "acao"]),
+            _for_each(
+                "vars.notas",
+                [
+                    _if(
+                        "se_escolhida",
+                        _equals(f"{{{{ item.{column} }}}}", value),
+                        [_cancel_in_row("cancelar", "{{ item.numero }}", effect)],
+                    )
+                ],
+            ),
+        ]
+    )
+
+
 @pytest.mark.parametrize("effect", ["write", "irreversible"])
-async def test_same_step_never_acts_twice_on_the_same_row(
-    run_robot: RobotRunner, effect: str
+@pytest.mark.parametrize(
+    ("pagina", "second", "column", "value"),
+    [
+        # Cancelaria a nota AB3X, que está paga, em vez da ab3x pendente.
+        (_DUAS_CAIXAS, "situacao", "situacao", "Pendente"),
+        # Cancelaria a nota 12, pela quantidade 7, em vez da nota 7.
+        (_CHAVE_ESCONDIDA, "qtd", "numero", "7"),
+    ],
+)
+async def test_row_shown_with_the_key_of_another_row_is_ambiguous(
+    run_robot: RobotRunner, pagina: str, second: str, column: str, value: str, effect: str
 ) -> None:
-    # As duas linhas lidas viram "AB3X": a primeira repetição cancela a nota AB3X e a
-    # segunda é recusada antes de agir, em vez de cancelar a mesma nota de novo.
-    manifest = _cancelar_lidas(effect)
+    # Pelo texto do HTML só uma linha tem a chave, mas é a errada: a linha que a página
+    # mostra com a chave é outra. Na dúvida, nenhuma linha é escolhida e nada é feito.
+    manifest = _cancelar_filtradas(second, column, value, effect)
     assert policy.check(manifest) == []
+    page = _Page()
+    outcome = await run_robot(manifest, prepare_context=_serve({"/notas": pagina}), after_run=page)
+    result = outcome.result
+    assert page.log == ""  # nada foi clicado
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert result.failed_step_id == "cancelar"
+    assert "outra linha mostra" in (result.error_message or "")
+    assert not result.irreversible_started
+    assert not [event for event in outcome.events if needs_ack(event)]
+    [failure] = outcome.of(RunEventKind.STEP_FAILED, "cancelar")
+    assert failure.data["linhas_pelo_html"] == 1
+    assert failure.data["outras_linhas_pelo_texto_mostrado"] == 1
+    assert_seq(outcome.events)
+
+
+async def test_row_shown_with_the_key_of_another_row_is_ambiguous_in_branches(
+    run_robot: RobotRunner,
+) -> None:
+    # Os dois ramos do "if" agem na linha do número: a primeira ação já é recusada, e a
+    # nota AB3X nunca é cancelada duas vezes (nem uma).
+    manifest = _manifest(
+        [
+            _open("/notas"),
+            _ler_notas(["numero", "situacao", "acao"]),
+            _for_each(
+                "vars.notas",
+                [
+                    _if(
+                        "se_pendente",
+                        _equals("{{ item.situacao }}", "Pendente"),
+                        [_cancel_in_row("cancelar_pendente", "{{ item.numero }}")],
+                        [_cancel_in_row("cancelar_paga", "{{ item.numero }}")],
+                    )
+                ],
+            ),
+        ]
+    )
     page = _Page()
     outcome = await run_robot(
         manifest, prepare_context=_serve({"/notas": _DUAS_CAIXAS}), after_run=page
     )
     result = outcome.result
-    assert page.log == "AB3X;"  # nada foi clicado duas vezes; a nota ab3x, nunca
+    assert page.log == ""
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert result.failed_step_id == "cancelar_pendente"
+    assert not result.irreversible_started
+
+
+async def test_row_shown_with_the_key_of_another_row_is_ambiguous_for_reads(
+    run_robot: RobotRunner,
+) -> None:
+    # A leitura também não escolhe a linha: o valor lido poderia ir para um passo que grava.
+    manifest = _manifest(
+        [
+            _open("/notas"),
+            _ler_notas(["numero", "qtd", "acao"]),
+            _for_each(
+                "vars.notas",
+                [
+                    {
+                        "kind": "extract_text",
+                        "id": "ler_qtd",
+                        "title": "Ler a quantidade",
+                        "timeout_ms": 1_000,
+                        "target": _target(
+                            "quantidade da nota",
+                            {"by": "css", "value": "td:nth-child(2)"},
+                            within={"by": "role", "value": "row"},
+                            within_has_text="{{ item.numero }}",
+                        ),
+                        "into": "qtd",
+                    }
+                ],
+            ),
+        ]
+    )
+    outcome = await run_robot(manifest, prepare_context=_serve({"/notas": _CHAVE_ESCONDIDA}))
+    result = outcome.result
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert result.failed_step_id == "ler_qtd"
+
+
+async def test_row_shown_with_the_key_of_another_row_is_ambiguous_in_conditions(
+    run_robot: RobotRunner,
+) -> None:
+    # Numa condição, a linha que não é única nunca conta como não encontrada (uma
+    # condição negada levaria a um ramo que grava): a condição falha fechado, e nenhum
+    # ramo roda.
+    pagina = _DUAS_CAIXAS.replace(
+        "<table", f"<table><tr>{_botao('todas', 'Marcar')}</tr></table><table"
+    )
+    manifest = _manifest(
+        [
+            _open("/notas"),
+            _if(
+                "se_pendente_visivel",
+                {
+                    "op": "visible",
+                    "target": _target(
+                        "situação da nota AB3X",
+                        {"by": "text", "value": "Paga"},
+                        within={"by": "role", "value": "row"},
+                        within_has_text="AB3X",
+                    ),
+                },
+                [
+                    {
+                        "kind": "click",
+                        "id": "marcar",
+                        "title": "Marcar as notas",
+                        "effect": "write",
+                        "timeout_ms": 1_000,
+                        "target": _target(
+                            "botão Marcar", {"by": "role", "value": "button", "name": "Marcar"}
+                        ),
+                    }
+                ],
+            ),
+        ]
+    )
+    page = _Page()
+    outcome = await run_robot(manifest, prepare_context=_serve({"/notas": pagina}), after_run=page)
+    result = outcome.result
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert result.failed_step_id == "se_pendente_visivel"
+    assert "outra linha mostra" in (result.error_message or "")
+    assert not outcome.of(RunEventKind.STEP_STARTED, "marcar")
+    assert page.log == ""
+
+
+# Uma linha de notas e o botão que cria uma nota (fora da tabela).
+def _com_botao_criar(rows: str) -> str:
+    return _com_registro(rows).replace(
+        "<table", f"<table><tr>{_botao('CRIOU', 'Criar nota')}</tr></table><table"
+    )
+
+
+_AMBIGUAS = {
+    # A nota AB3X mostrada em minúsculas, ao lado da nota ab3x.
+    "minusculas_ao_lado": (
+        f"<tr><td style='text-transform: lowercase'>AB3X</td>{_botao('AB3X')}</tr>"
+        f"<tr><td>ab3x</td>{_botao('ab3x')}</tr>",
+        "AB3X",
+    ),
+    # A nota "nf 8" mostrada em maiúsculas, ao lado da nota NF 8 (chave "nf 8").
+    "maiusculas_ao_lado": (
+        f"<tr><td style='text-transform: uppercase'>nf 8</td>{_botao('nf8')}</tr>"
+        f"<tr><td>NF 8</td>{_botao('NF8')}</tr>",
+        "nf 8",
+    ),
+    # A nota ab3x mostrada como AB3X, ao lado da nota AB3X (chave "AB3X").
+    "mostra_a_chave": (
+        f"<tr><td style='text-transform: uppercase'>ab3x</td>{_botao('ab3x')}</tr>"
+        f"<tr><td>AB3X</td>{_botao('AB3X')}</tr>",
+        "AB3X",
+    ),
+    # Duas linhas com a chave no HTML.
+    "duas_no_html": (
+        f"<tr><td>AB3X</td>{_botao('AB3X-1')}</tr><tr><td>AB3X</td>{_botao('AB3X-2')}</tr>",
+        "AB3X",
+    ),
+}
+
+
+def _se_a_nota_nao_existe(key: str, condition: dict[str, Any]) -> Manifest:
+    """Cria a nota se a condição sobre a linha dela (negada) vale."""
+    target = _target(
+        "botão Cancelar da nota",
+        {"by": "role", "value": "button", "name": "Cancelar", "exact": True},
+        within={"by": "role", "value": "row"},
+        within_has_text=key,
+    )
+    return _manifest(
+        [
+            _open("/notas"),
+            _if(
+                "se_nao_existe",
+                {**condition, "negate": True, "target": target},
+                [
+                    {
+                        "kind": "click",
+                        "id": "criar",
+                        "title": "Criar a nota",
+                        "effect": "write",
+                        "timeout_ms": 1_000,
+                        "target": _target(
+                            "botão Criar nota",
+                            {"by": "role", "value": "button", "name": "Criar nota"},
+                        ),
+                    }
+                ],
+            ),
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "condition", [{"op": "visible"}, {"op": "text_contains", "text": "Cancelar"}]
+)
+@pytest.mark.parametrize("variant", list(_AMBIGUAS))
+async def test_negated_condition_on_an_ambiguous_row_never_runs_its_branch(
+    run_robot: RobotRunner, variant: str, condition: dict[str, Any]
+) -> None:
+    # "Se a linha da nota não está visível, crie a nota": a linha da nota não se
+    # distingue de outra, e contar isso como "não está" criaria a nota de novo.
+    rows, key = _AMBIGUAS[variant]
+    manifest = _se_a_nota_nao_existe(key, condition)
+    assert policy.check(manifest) == []
+    page = _Page()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/notas": _com_botao_criar(rows)}), after_run=page
+    )
+    result = outcome.result
+    assert page.log == ""  # nada foi criado nem cancelado
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert result.failed_step_id == "se_nao_existe"
+    assert not outcome.of(RunEventKind.STEP_STARTED, "criar")
+    [failure] = outcome.of(RunEventKind.STEP_FAILED, "se_nao_existe")
+    assert failure.data["alvo"] == "botão Cancelar da nota"
+    assert_seq(outcome.events)
+
+
+@pytest.mark.parametrize(
+    ("rows", "created"),
+    [
+        # A linha é a única com a chave: a nota existe, e nada é criado.
+        (f"<tr><td>AB3X</td>{_botao('AB3X')}</tr><tr><td>ab3y</td>{_botao('ab3y')}</tr>", ""),
+        # Nenhuma linha tem a chave: a nota não existe e é criada.
+        (f"<tr><td>ab3y</td>{_botao('ab3y')}</tr>", "CRIOU;"),
+    ],
+)
+async def test_negated_condition_on_a_unique_or_missing_row_decides(
+    run_robot: RobotRunner, rows: str, created: str
+) -> None:
+    manifest = _se_a_nota_nao_existe("AB3X", {"op": "visible"})
+    page = _Page()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/notas": _com_botao_criar(rows)}), after_run=page
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert page.log == created
+
+
+async def test_assert_on_an_ambiguous_row_fails_closed(run_robot: RobotRunner) -> None:
+    # A verificação espera a linha deixar de ser ambígua; no fim do prazo, falha com
+    # elemento_ambiguo, e não com "a verificação falhou" pela linha não encontrada.
+    rows, key = _AMBIGUAS["minusculas_ao_lado"]
+    manifest = _manifest(
+        [
+            _open("/notas"),
+            {
+                "kind": "assert",
+                "id": "conferir",
+                "title": "Conferir que a nota não está na lista",
+                "timeout_ms": 1_000,
+                "message": "A nota ainda está na lista.",
+                "condition": {
+                    "op": "visible",
+                    "negate": True,
+                    "target": _target(
+                        "botão Cancelar da nota",
+                        {"by": "role", "value": "button", "name": "Cancelar", "exact": True},
+                        within={"by": "role", "value": "row"},
+                        within_has_text=key,
+                    ),
+                },
+            },
+        ]
+    )
+    outcome = await run_robot(manifest, prepare_context=_serve({"/notas": _com_registro(rows)}))
+    result = outcome.result
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert result.failed_step_id == "conferir"
+
+
+_AB3X_MINUSCULO = "<span style='text-transform: lowercase'>AB3X</span>"
+
+
+def _com_sombra(tag: str, html: str, cell: str, chosen: str = _AB3X_MINUSCULO) -> str:
+    """A nota AB3X (``chosen``) e outra nota cuja célula (``cell``) usa o elemento ``tag``,
+    que mostra ``html`` de dentro de um shadow root aberto, que o innerText não vê."""
+    rows = f"<tr><td>{chosen}</td>{_botao('AB3X')}</tr><tr><td>{cell}</td>{_botao('outra')}</tr>"
+    script = (
+        f"<script>customElements.define('{tag}', class extends HTMLElement {{ "
+        f"connectedCallback() {{ this.attachShadow({{mode: 'open'}}).innerHTML = {html!r}; }} "
+        "});</script>"
+    )
+    return _com_registro(rows) + script
+
+
+_DE_SOMBRA = {
+    # O texto solto no shadow root.
+    "texto_solto": ("AB3X", _com_sombra("x-texto", "ab3x", "<x-texto></x-texto>")),
+    # O texto solto, transformado pelo CSS do próprio shadow root.
+    "texto_transformado": (
+        "AB3X",
+        _com_sombra(
+            "x-caixa",
+            "<style>:host { text-transform: uppercase }</style>ab3x",
+            "<x-caixa></x-caixa>",
+            "AB3X",
+        ),
+    ),
+    # Um slot mostra o texto do próprio elemento.
+    "slot": ("AB3X", _com_sombra("x-slot", "<b><slot></slot></b>", "<x-slot>ab3x</x-slot>")),
+    # Parte do texto fora e parte dentro do shadow root.
+    "em_partes": ("AB3X", _com_sombra("x-parte", "3x", "ab<x-parte></x-parte>")),
+    # Capitalize: o texto é comparado sem olhar maiúsculas.
+    "capitalize": (
+        "Ab3x",
+        _com_sombra(
+            "x-maiuscula",
+            "<style>:host { text-transform: capitalize }</style>ab3x",
+            "<x-maiuscula></x-maiuscula>",
+            "Ab3x",
+        ),
+    ),
+}
+
+
+@pytest.mark.parametrize("variant", list(_DE_SOMBRA))
+async def test_text_shown_from_a_shadow_root_makes_the_row_ambiguous(
+    run_robot: RobotRunner, variant: str
+) -> None:
+    # A outra linha mostra "ab3x" (ou o que a linha escolhida mostra) de dentro de um
+    # shadow root: a chave pode ter vindo de qualquer uma, e nada é feito.
+    key, page_html = _DE_SOMBRA[variant]
+    page = _Page()
+    outcome = await run_robot(
+        _cancelar_notas(),
+        {"notas": [{"numero": key}]},
+        prepare_context=_serve({"/notas": page_html}),
+        after_run=page,
+    )
+    result = outcome.result
+    assert page.log == "", variant  # nenhuma das duas notas foi cancelada
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert "outra linha mostra" in (result.error_message or "")
+    [failure] = outcome.of(RunEventKind.STEP_FAILED, "cancelar")
+    assert failure.data["outras_linhas_pelo_texto_mostrado"] == 1
+
+
+@pytest.mark.parametrize(
+    "html", ["zz9", "<style>:host { visibility: hidden }</style>ab3x"], ids=["outro", "escondido"]
+)
+async def test_text_in_a_shadow_root_that_shows_something_else_is_not_ambiguous(
+    run_robot: RobotRunner, html: str
+) -> None:
+    # O shadow root da outra linha mostra outro número, ou nada: só a linha AB3X
+    # mostra "ab3x", e ela é cancelada.
+    pagina = _com_sombra("x-outra", html, "<x-outra></x-outra>")
+    page = _Page()
+    outcome = await run_robot(
+        _cancelar_notas(),
+        {"notas": [{"numero": "AB3X"}]},
+        prepare_context=_serve({"/notas": pagina}),
+        after_run=page,
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert page.log == "AB3X;"
+
+
+# Um componente com shadow root aberto (um ícone) que não mostra texto.
+_ICONE = (
+    "<script>customElements.define('x-icone', class extends HTMLElement { "
+    "connectedCallback() { this.attachShadow({mode: 'open'}).innerHTML = '<span></span>'; } "
+    "});</script>"
+)
+_EM_DUAS_LINHAS = {
+    # A quebra de linha (<br>) e o ícone na mesma célula: o innerText é "AB\n3X".
+    "br_com_icone": "<td>AB<br>3X<x-icone></x-icone></td>",
+    "br_sem_icone": "<td>AB<br>3X</td>",
+    "div_com_icone": "<td><div>AB</div><div>3X</div><x-icone></x-icone></td>",
+    # O ícone na outra célula da mesma linha.
+    "br_icone_fora": "<td>AB<br>3X</td>",
+}
+
+
+@pytest.mark.parametrize("source", ["lida_da_tabela", "chave_fixa"])
+@pytest.mark.parametrize("cell", list(_EM_DUAS_LINHAS))
+async def test_cell_shown_in_two_lines_is_ambiguous_with_a_shadow_component(
+    run_robot: RobotRunner, cell: str, source: str
+) -> None:
+    # A primeira linha mostra "AB" e "3X" em duas linhas (lida da página, a chave é
+    # "AB 3X"), e a segunda tem "AB 3X" no HTML. O texto que a página mostra nunca é
+    # trocado pelo montado para o shadow root, e o <br> separa as palavras: nenhuma
+    # das duas é cancelada.
+    first = _EM_DUAS_LINHAS[cell]
+    button = _botao("R1")
+    if cell == "br_icone_fora":
+        button = button.replace("<td>", "<td><x-icone></x-icone>", 1)
+    pagina = (
+        _com_registro(
+            f"<tr>{first}{button}</tr><tr><td>AB 3X</td>{_botao('R2')}</tr>",
+            _cabecalho("numero", "acao"),
+        )
+        + _ICONE
+    )
+    cancel = _cancel_in_row(
+        "cancelar", "{{ item.numero }}" if source == "lida_da_tabela" else "AB 3X", "write"
+    )
+    if source == "lida_da_tabela":
+        ler = _ler_notas(["numero", "acao"]) | {"max_rows": 1}  # só a linha R1
+        manifest = _manifest([_open("/notas"), ler, _for_each("vars.notas", [cancel])])
+    else:
+        manifest = _manifest([_open("/notas"), cancel])
+    assert policy.check(manifest) == []
+    page = _Page()
+    outcome = await run_robot(manifest, prepare_context=_serve({"/notas": pagina}), after_run=page)
+    result = outcome.result
+    assert page.log == "", result.error_message  # nem R1 nem R2
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert result.failed_step_id == "cancelar"
+    assert "outra linha mostra" in (result.error_message or "")
+    [failure] = outcome.of(RunEventKind.STEP_FAILED, "cancelar")
+    assert failure.data["linhas_pelo_html"] == 1
+    assert failure.data["outras_linhas_pelo_texto_mostrado"] == 1
+
+
+# Componentes cujo shadow root mostra "ab" e "3x" em duas linhas, com o text-transform do
+# próprio shadow root.
+_EM_DUAS_LINHAS_TRANSFORMADAS = "".join(
+    f"<script>customElements.define('{tag}', class extends HTMLElement {{ "
+    "connectedCallback() { this.attachShadow({mode: 'open'}).innerHTML = "
+    f"'<style>:host {{ text-transform: {transform} }}</style>ab<br>3x'; }} }});</script>"
+    for tag, transform in (("x-maiusculas", "uppercase"), ("x-capitalize", "capitalize"))
+)
+# (célula da linha R1, célula da linha R2, chave). A chave escolhe uma linha pelo HTML; a
+# outra, lida com o <br> juntando as palavras, mostra a mesma chave (ou, na escolhida, a
+# outra mostra o que a escolhida mostra lida assim).
+_LINHAS_JUNTADAS = {
+    "maiusculas_na_celula": (
+        "<td style='text-transform: uppercase'>ab<br>3x<x-icone></x-icone></td>",
+        "<td>AB3X</td>",
+        "AB3X",
+    ),
+    "maiusculas_no_shadow_root": (
+        "<td><x-maiusculas></x-maiusculas></td>",
+        "<td>AB3X</td>",
+        "AB3X",
+    ),
+    "capitalize_na_celula": (
+        "<td style='text-transform: capitalize'>ab<br>3x<x-icone></x-icone></td>",
+        "<td>Ab3x</td>",
+        "Ab3x",
+    ),
+    "capitalize_no_shadow_root": (
+        "<td><x-capitalize></x-capitalize></td>",
+        "<td>Ab3x</td>",
+        "Ab3x",
+    ),
+    "minusculas_na_escolhida": (
+        "<td style='text-transform: lowercase'>AB<br>3X<x-icone></x-icone></td>",
+        "<td>ab3x</td>",
+        "AB3X",
+    ),
+}
+
+
+@pytest.mark.parametrize("cells", list(_LINHAS_JUNTADAS))
+async def test_cell_shown_in_two_lines_is_also_read_with_the_lines_joined(
+    run_robot: RobotRunner, cells: str
+) -> None:
+    # Uma das linhas tem a chave no HTML; a outra mostra, pelo CSS, "AB" e "3X" em duas
+    # linhas (ou "Ab" e "3x"). Lida com o <br> separando as palavras, ela mostra outra
+    # coisa; lida com o <br> juntando-as, mostra a chave. Na dúvida, qualquer leitura
+    # conta, e nenhuma das duas é cancelada.
+    first, second, key = _LINHAS_JUNTADAS[cells]
+    pagina = (
+        _com_registro(
+            f"<tr>{first}{_botao('R1')}</tr><tr>{second}{_botao('R2')}</tr>",
+            _cabecalho("numero", "acao"),
+        )
+        + _ICONE
+        + _EM_DUAS_LINHAS_TRANSFORMADAS
+    )
+    manifest = _manifest([_open("/notas"), _cancel_in_row("cancelar", key, "write")])
+    assert policy.check(manifest) == []
+    page = _Page()
+    outcome = await run_robot(manifest, prepare_context=_serve({"/notas": pagina}), after_run=page)
+    result = outcome.result
+    assert page.log == "", result.error_message  # nem R1 nem R2
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert "outra linha mostra" in (result.error_message or "")
+    [failure] = outcome.of(RunEventKind.STEP_FAILED, "cancelar")
+    assert failure.data["linhas_pelo_html"] == 1
+    assert failure.data["outras_linhas_pelo_texto_mostrado"] == 1
+
+
+async def test_row_key_in_another_row_without_the_target_is_ambiguous(
+    run_robot: RobotRunner,
+) -> None:
+    # Duas linhas têm a chave no HTML, e só uma tem o botão. Qual das duas a chave quer
+    # dizer não se sabe: nada é feito.
+    pagina = _com_registro(
+        f"<tr><td>120</td>{_botao('C120')}</tr><tr><td>120</td><td>sem ação</td></tr>"
+    )
+    page = _Page()
+    outcome = await run_robot(
+        _cancelar_notas(),
+        {"notas": [{"numero": "120"}]},
+        prepare_context=_serve({"/notas": pagina}),
+        after_run=page,
+    )
+    result = outcome.result
+    assert page.log == ""
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert "mais de uma linha" in (result.error_message or "")
+    assert not result.irreversible_started
+
+
+# A nota que se quer cancelar é a ab3x (Z), lida num relatório que a mostra em maiúsculas.
+# Na página das notas, a nota AB3X (X) é mostrada em minúsculas pelo CSS: pelo HTML, só a
+# linha X tem "AB3X", mas a página mostra "ab3x" nas duas.
+_AB3X_EM_MINUSCULAS = _com_registro(
+    f"<tr><td style='text-transform: lowercase'>AB3X</td><td>Paga</td>{_botao('AB3X')}</tr>"
+    f"<tr><td>ab3x</td><td>Pendente</td>{_botao('ab3x')}</tr>"
+)
+_RELATORIO_EM_MAIUSCULAS = _com_registro(
+    "<tr><td style='text-transform: uppercase'>ab3x</td><td>Pendente</td></tr>",
+    _cabecalho("numero", "situacao"),
+)
+
+
+@pytest.mark.parametrize("source", ["tabela_lida", "entrada"])
+async def test_row_whose_key_is_shown_like_another_row_is_ambiguous(
+    run_robot: RobotRunner, source: str
+) -> None:
+    # O que a linha escolhida pelo HTML mostra no lugar da chave ("ab3x") também é o que
+    # outra linha mostra: a chave pode ter vindo de qualquer uma, e nada é feito.
+    if source == "tabela_lida":
+        manifest = _manifest(
+            [
+                _open("/relatorio"),
+                _ler_notas(["numero", "situacao"]),
+                _open("/notas", "abrir_notas"),
+                _for_each("vars.notas", [_cancel_in_row("cancelar", "{{ item.numero }}")]),
+            ]
+        )
+        inputs: dict[str, Any] = {}
+    else:
+        manifest = _cancelar_notas()
+        inputs = {"notas": [{"numero": "AB3X"}]}
+    assert policy.check(manifest) == []
+    page = _Page()
+    outcome = await run_robot(
+        manifest,
+        inputs,
+        prepare_context=_serve(
+            {"/relatorio": _RELATORIO_EM_MAIUSCULAS, "/notas": _AB3X_EM_MINUSCULAS}
+        ),
+        after_run=page,
+    )
+    result = outcome.result
+    assert page.log == ""  # nem a nota AB3X nem a ab3x foram canceladas
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert result.failed_step_id == "cancelar"
+    assert "outra linha mostra" in (result.error_message or "")
+    assert not result.irreversible_started
+    assert not [event for event in outcome.events if needs_ack(event)]
+    [failure] = outcome.of(RunEventKind.STEP_FAILED, "cancelar")
+    assert failure.data["linhas_pelo_html"] == 1
+    assert failure.data["outras_linhas_pelo_texto_mostrado"] == 1
+
+
+# -- a mesma ação nunca se repete na mesma linha da mesma página ----------------------------
+
+# Relatório (outra página) com a mesma nota em duas linhas, de tipos diferentes.
+_RELATORIO = _com_registro(
+    "<tr><td>120</td><td>a</td><td>ok</td></tr><tr><td>120</td><td>b</td><td>ok</td></tr>",
+    _cabecalho("numero", "tipo", "acao"),
+)
+_NOTA_120 = _com_registro(f"<tr><td>120</td>{_botao('C120')}</tr><tr><td>7</td>{_botao('C7')}</tr>")
+
+
+def _cancelar_do_relatorio(steps: list[dict[str, Any]]) -> Manifest:
+    """Lê as notas do relatório e age nelas na página das notas."""
+    return _manifest(
+        [
+            _open("/relatorio"),
+            _ler_notas(["numero", "tipo", "acao"]),
+            _open("/notas", "abrir_notas"),
+            _for_each("vars.notas", steps),
+        ]
+    )
+
+
+@pytest.mark.parametrize("effect", ["write", "irreversible"])
+async def test_same_step_never_acts_twice_on_the_same_row(
+    run_robot: RobotRunner, effect: str
+) -> None:
+    # O relatório tem a nota 120 duas vezes: a primeira repetição cancela a nota, e a
+    # segunda é recusada antes de agir, em vez de cancelar a mesma nota de novo.
+    manifest = _cancelar_do_relatorio([_cancel_in_row("cancelar", "{{ item.numero }}", effect)])
+    assert policy.check(manifest) == []
+    page = _Page()
+    outcome = await run_robot(
+        manifest,
+        prepare_context=_serve({"/relatorio": _RELATORIO, "/notas": _NOTA_120}),
+        after_run=page,
+    )
+    result = outcome.result
+    assert page.log == "C120;"  # nada foi clicado duas vezes
     assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
     assert result.failed_step_id == "cancelar"
     assert "já agiu" in (result.error_message or "")
     assert len(outcome.of(RunEventKind.STEP_SUCCEEDED, "cancelar")) == 1
-    assert len(outcome.of(RunEventKind.STEP_FAILED, "cancelar")) == 1
+    [failure] = outcome.of(RunEventKind.STEP_FAILED, "cancelar")
+    assert failure.data["passo_anterior"] == "cancelar"
+    assert failure.data["iteracao_anterior"] == 0
     warnings = [event for event in outcome.events if needs_ack(event)]
     if effect == "irreversible":
         # A primeira já tinha agido: a falha deixa a execução indeterminada, e o aviso
@@ -669,16 +1378,440 @@ async def test_same_step_never_acts_twice_on_the_same_row(
     assert_seq(outcome.events)
 
 
-_NOTAS_COM_LOG = """<!doctype html><meta charset="utf-8"><title>Notas</title>
-<p id="log"></p>
-<table aria-label="Notas"><tbody>
-  <tr><td>120</td>
-    <td><button onclick="document.getElementById('log').textContent += 'M120;'">Marcar</button></td>
-    <td><button onclick="document.getElementById('log').textContent += 'C120;'">Cancelar</button></td></tr>
-  <tr><td>7</td>
-    <td><button onclick="document.getElementById('log').textContent += 'M7;'">Marcar</button></td>
-    <td><button onclick="document.getElementById('log').textContent += 'C7;'">Cancelar</button></td></tr>
-</tbody></table>"""
+async def test_steps_in_sibling_branches_never_act_twice_on_the_same_row(
+    run_robot: RobotRunner,
+) -> None:
+    # Passos diferentes nos dois ramos do "if", em repetições diferentes, agem na mesma
+    # linha: a nota 120 do tipo "a" e a do tipo "b" nunca cancelam a mesma linha duas vezes.
+    manifest = _cancelar_do_relatorio(
+        [
+            _if(
+                "se_tipo_a",
+                _equals("{{ item.tipo }}", "a"),
+                [_cancel_in_row("cancelar_a", "{{ item.numero }}")],
+                [_cancel_in_row("cancelar_b", "{{ item.numero }}")],
+            )
+        ]
+    )
+    page = _Page()
+    outcome = await run_robot(
+        manifest,
+        prepare_context=_serve({"/relatorio": _RELATORIO, "/notas": _NOTA_120}),
+        after_run=page,
+    )
+    result = outcome.result
+    assert page.log == "C120;"
+    assert result.state is RunState.INDETERMINATE, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert result.failed_step_id == "cancelar_b"
+    assert "já agiu" in (result.error_message or "")
+    [failure] = outcome.of(RunEventKind.STEP_FAILED, "cancelar_b")
+    assert failure.data["passo_anterior"] == "cancelar_a"
+    assert len([event for event in outcome.events if needs_ack(event)]) == 1
+
+
+def _filial(tag: str) -> str:
+    return _com_registro(f"<tr><td>1</td>{_botao(tag)}</tr>", _cabecalho("numero", "acao"))
+
+
+_FILIAIS = {"/filial/a": _filial("A1"), "/filial/b": _filial("B1")}
+
+
+def _abrir_filial() -> dict[str, Any]:
+    return {
+        "kind": "navigate",
+        "id": "abrir_filial",
+        "title": "Abrir a filial",
+        "url": f"{BASE}/filial/{{{{ item.filial }}}}",
+    }
+
+
+@pytest.mark.parametrize("effect", ["write", "irreversible"])
+@pytest.mark.parametrize("scenario", ["tabela_lida", "chave_fixa"])
+async def test_the_same_row_key_on_other_pages_is_another_row(
+    run_robot: RobotRunner, scenario: str, effect: str
+) -> None:
+    # A numeração recomeça em cada filial: a nota 1 da filial "a" e a nota 1 da filial
+    # "b" são linhas diferentes, em páginas diferentes, e as duas são canceladas.
+    if scenario == "tabela_lida":
+        body = [
+            _abrir_filial(),
+            _ler_notas(["numero", "acao"]),
+            _for_each("vars.notas", [_cancel_in_row("cancelar", "{{ item.numero }}", effect)]),
+        ]
+    else:
+        body = [_abrir_filial(), _cancel_in_row("cancelar", "1", effect)]
+    manifest = _manifest(
+        [_for_each("inputs.filiais", body, "cada_filial")],
+        inputs=[_list_input("filiais", {"name": "filial", "title": "Filial", "type": "string"})],
+    )
+    assert policy.check(manifest) == []
+    page = _Page()
+    outcome = await run_robot(
+        manifest,
+        {"filiais": [{"filial": "a"}, {"filial": "b"}]},
+        prepare_context=_serve(_FILIAIS),
+        after_run=page,
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert page.log == "A1;B1;"
+    assert len(outcome.of(RunEventKind.STEP_SUCCEEDED, "cancelar")) == 2
+    warnings = [event for event in outcome.events if needs_ack(event)]
+    assert len(warnings) == (2 if effect == "irreversible" else 0)
+
+
+def _filial_com_menu(tag: str) -> str:
+    menu = "".join(f"<a href='/filial/{filial}'>Filial {filial}</a> " for filial in "ab")
+    return _filial(tag).replace("<table", f"<nav>{menu}</nav><table")
+
+
+async def test_a_page_opened_by_a_click_in_a_later_iteration_counts_for_the_earlier_action(
+    run_robot: RobotRunner,
+) -> None:
+    # A filial é escolhida por um link, um clique do robô. A navegação que vem depois do
+    # clique pode ser dele ou de um temporizador ou popup da ação da volta anterior, e
+    # não dá para saber qual: na dúvida, a página conta como da ação anterior, e a nota 1
+    # da filial "b" não é cancelada. (Aberta com um ``navigate``, ela é outra linha:
+    # test_the_same_row_key_on_other_pages_is_another_row.)
+    escolher = {
+        "kind": "click",
+        "id": "escolher_filial",
+        "title": "Escolher a filial",
+        "expect_navigation": True,
+        "timeout_ms": 2_000,
+        "target": _target(
+            "link da filial",
+            {"by": "role", "value": "link", "name": "Filial {{ item.filial }}", "exact": True},
+        ),
+    }
+    manifest = _manifest(
+        [
+            _open("/filial/a", "abrir_filiais"),
+            _for_each("inputs.filiais", [escolher, _cancel_in_row("cancelar", "1")], "cada_filial"),
+        ],
+        inputs=[_list_input("filiais", {"name": "filial", "title": "Filial", "type": "string"})],
+    )
+    assert policy.check(manifest) == []
+    page = _Page()
+    outcome = await run_robot(
+        manifest,
+        {"filiais": [{"filial": "a"}, {"filial": "b"}]},
+        prepare_context=_serve(
+            {"/filial/a": _filial_com_menu("A1"), "/filial/b": _filial_com_menu("B1")}
+        ),
+        after_run=page,
+    )
+    result = outcome.result
+    assert page.log == "A1;", result.error_message
+    assert result.state is RunState.INDETERMINATE  # o cancelamento da filial "a" já agiu
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert result.failed_step_id == "cancelar"
+    assert "já agiu" in (result.error_message or "")
+    [failure] = outcome.of(RunEventKind.STEP_FAILED, "cancelar")
+    assert failure.data["repeticao"] == "cada_filial"
+    assert failure.data["iteracao_anterior"] == 0
+
+
+# -- a ação que grava leva a outro endereço com a mesma tabela -----------------------------
+
+
+class _Cliques:
+    """O registro dos cliques (``localStorage.log``), lido depois da execução.
+
+    Sem esperar o ``#log`` da página: a resposta de um formulário pode chegar depois.
+    """
+
+    def __init__(self) -> None:
+        self.log: str | None = None
+
+    async def __call__(self, context: BrowserContext) -> None:
+        if not context.pages:
+            return
+        page = context.pages[0]
+        for _ in range(50):
+            try:
+                await page.wait_for_load_state("load")
+                self.log = await page.evaluate("() => localStorage.log || ''")
+                return
+            except PlaywrightError:  # a página trocou no meio da leitura
+                await page.wait_for_timeout(100)
+
+
+def _formularios(action: str, method: str) -> str:
+    """Notas 120 e 7, cada uma num formulário cuja resposta mostra a mesma tabela."""
+    rows = "".join(
+        f"<tr><td>{numero}</td><td><form method='{method}' action='{action}'>"
+        f"<button onclick=\"localStorage.log = (localStorage.log || '') + 'C{numero};'\">"
+        "Cancelar</button></form></td></tr>"
+        for numero in ("120", "7")
+    )
+    return _com_registro(rows)
+
+
+_RELATORIO_REPETIDO = _com_registro(
+    "<tr><td>120</td><td>ok</td></tr>" * 2, _cabecalho("numero", "acao")
+)
+
+
+@pytest.mark.parametrize("expect_navigation", [True, False])
+@pytest.mark.parametrize(
+    ("action", "method", "redirect"),
+    [
+        ("/notas/cancelar", "post", False),  # a resposta do POST mostra a mesma tabela
+        ("/notas/cancelar", "post", True),  # a resposta do POST volta para /notas
+        ("/notas/", "get", False),  # a barra no fim do caminho
+        ("/Notas", "get", False),  # outra caixa no caminho
+        ("/notas?ok=1", "post", False),  # só a consulta muda
+    ],
+)
+async def test_action_that_lands_on_another_address_never_acts_twice(
+    run_robot: RobotRunner, action: str, method: str, redirect: bool, expect_navigation: bool
+) -> None:
+    # O relatório tem a nota 120 duas vezes. A primeira repetição cancela a nota, e a
+    # resposta do cancelamento é outro endereço com a mesma tabela (ou volta para a
+    # página das notas): a segunda repetição está nele, e mesmo assim é recusada antes
+    # de agir.
+    pagina = _formularios(action, method)
+    # O roteamento do Playwright não segue um 303 de route.fulfill: a volta é pela página.
+    de_volta = "<!doctype html><title>Cancelada</title><script>location.replace('/notas')</script>"
+
+    async def prepare(context: BrowserContext) -> None:
+        async def handler(route: Route) -> None:
+            path = urlsplit(route.request.url).path
+            if redirect and path == "/notas/cancelar":
+                body = de_volta
+            else:
+                body = _RELATORIO_REPETIDO if path == "/relatorio" else pagina
+            await route.fulfill(content_type="text/html; charset=utf-8", body=body)
+
+        await context.route("**/*", handler)
+
+    cancelar = _cancel_in_row("cancelar", "{{ item.numero }}")
+    cancelar["expect_navigation"] = expect_navigation
+    manifest = _manifest(
+        [
+            _open("/relatorio"),
+            _ler_notas(["numero", "acao"]),
+            _open("/notas", "abrir_notas"),
+            _for_each("vars.notas", [cancelar]),
+        ]
+    )
+    assert policy.check(manifest) == []
+    cliques = _Cliques()
+    outcome = await run_robot(manifest, prepare_context=prepare, after_run=cliques)
+    result = outcome.result
+    assert cliques.log == "C120;", result.error_message  # nunca duas vezes
+    assert result.state is RunState.INDETERMINATE
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert result.failed_step_id == "cancelar"
+    assert "já agiu" in (result.error_message or "")
+    assert len(outcome.of(RunEventKind.STEP_SUCCEEDED, "cancelar")) == 1
+    [failure] = outcome.of(RunEventKind.STEP_FAILED, "cancelar")
+    assert failure.data["passo_anterior"] == "cancelar"
+    assert failure.data["iteracao_anterior"] == 0
+    assert len([event for event in outcome.events if needs_ack(event)]) == 1
+
+
+async def test_branches_that_reach_the_same_row_by_other_locators_never_act_twice(
+    run_robot: RobotRunner,
+) -> None:
+    # Os dois ramos do "if" chegam ao mesmo botão por localizadores gravados de jeitos
+    # diferentes (pelo papel e pelo texto). Em repetições diferentes, a mesma linha da
+    # mesma página nunca recebe de novo uma ação que grava.
+    pelo_texto = _cancel_in_row("cancelar_b", "{{ item.numero }}")
+    pelo_texto["target"] = _target(
+        "botão Cancelar da nota",
+        {"by": "text", "value": "Cancelar", "exact": True},
+        within={"by": "role", "value": "row"},
+        within_has_text="{{ item.numero }}",
+    )
+    manifest = _cancelar_do_relatorio(
+        [
+            _if(
+                "se_tipo_a",
+                _equals("{{ item.tipo }}", "a"),
+                [_cancel_in_row("cancelar_a", "{{ item.numero }}")],
+                [pelo_texto],
+            )
+        ]
+    )
+    assert policy.check(manifest) == []
+    page = _Page()
+    outcome = await run_robot(
+        manifest,
+        prepare_context=_serve({"/relatorio": _RELATORIO, "/notas": _NOTA_120}),
+        after_run=page,
+    )
+    result = outcome.result
+    assert page.log == "C120;"
+    assert result.state is RunState.INDETERMINATE, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert result.failed_step_id == "cancelar_b"
+    assert "já agiu" in (result.error_message or "")
+    [failure] = outcome.of(RunEventKind.STEP_FAILED, "cancelar_b")
+    assert failure.data["passo_anterior"] == "cancelar_a"
+    assert failure.data["iteracao_anterior"] == 0
+
+
+async def test_crossed_row_keys_of_two_steps_never_act_twice(run_robot: RobotRunner) -> None:
+    # Cada passo escolhe a linha por um campo do item: no item 1, o primeiro passo
+    # chegaria à linha em que o segundo já agiu no item 0.
+    manifest = _manifest(
+        [
+            _open("/notas"),
+            _for_each(
+                "inputs.notas",
+                [
+                    _cancel_in_row("c1", "{{ item.numero }}", "write"),
+                    _cancel_in_row("c2", "{{ item.outra }}", "write"),
+                ],
+            ),
+        ],
+        inputs=[
+            _list_input(
+                "notas",
+                {"name": "numero", "title": "Número", "type": "string"},
+                {"name": "outra", "title": "Outra", "type": "string"},
+            )
+        ],
+    )
+    page = _Page()
+    outcome = await run_robot(
+        manifest,
+        {"notas": [{"numero": "120", "outra": "7"}, {"numero": "7", "outra": "120"}]},
+        prepare_context=_serve({"/notas": _NOTA_120}),
+        after_run=page,
+    )
+    result = outcome.result
+    assert page.log == "C120;C7;"
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+    assert result.failed_step_id == "c1"
+    [failure] = outcome.of(RunEventKind.STEP_FAILED, "c1")
+    assert failure.data["passo_anterior"] == "c2"
+
+
+# -- passos diferentes podem repetir a ação na mesma linha ----------------------------------
+
+_CARRINHO = _com_registro(
+    f"<tr><td>Produto A</td>{_botao('A+', '+')}</tr><tr><td>Produto B</td>{_botao('B+', '+')}</tr>"
+)
+
+
+def _mais(step_id: str, key: str, effect: str = "write") -> dict[str, Any]:
+    return {
+        "kind": "click",
+        "id": step_id,
+        "title": "Somar uma unidade",
+        "effect": effect,
+        "timeout_ms": 1_000,
+        "target": _target(
+            "botão + do produto",
+            {"by": "role", "value": "button", "name": "+", "exact": True},
+            within={"by": "role", "value": "row"},
+            within_has_text=key,
+        ),
+    }
+
+
+@pytest.mark.parametrize("effect", ["write", "irreversible"])
+@pytest.mark.parametrize("scenario", ["fora_de_repeticoes", "mesma_volta", "duas_repeticoes"])
+async def test_different_steps_may_repeat_an_action_on_the_same_row(
+    run_robot: RobotRunner, scenario: str, effect: str
+) -> None:
+    # Dois cliques gravados no "+" da mesma linha (dois passos) somam duas unidades: não
+    # são o mesmo item repetido de uma lista. Vale fora de repetições, na mesma volta de
+    # uma repetição e em duas repetições seguidas (uma não está dentro da outra).
+    ler = _ler_notas(["produto", "acao"])
+    first = _mais("clicar_mais", "{{ item.produto }}", effect)
+    second = _mais("clicar_mais_2", "{{ item.produto }}", effect)
+    if scenario == "fora_de_repeticoes":
+        steps = [
+            _mais("clicar_mais", "Produto A", effect),
+            _mais("clicar_mais_2", "Produto A", effect),
+        ]
+        log = "A+;A+;"
+    elif scenario == "mesma_volta":
+        steps = [ler, _for_each("vars.notas", [first, second])]
+        log = "A+;A+;B+;B+;"
+    else:
+        steps = [
+            ler,
+            _for_each("vars.notas", [first], "primeira_volta"),
+            _for_each("vars.notas", [second], "segunda_volta"),
+        ]
+        log = "A+;B+;A+;B+;"
+    manifest = _manifest([_open("/carrinho"), *steps])
+    assert policy.check(manifest) == []
+    page = _Page()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/carrinho": _CARRINHO}), after_run=page
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert page.log == log
+    warnings = [event for event in outcome.events if needs_ack(event)]
+    assert len(warnings) == (log.count(";") if effect == "irreversible" else 0)
+
+
+_CARRINHO_GRAVADO = """<!doctype html><html><head><meta charset="utf-8"><title>Carrinho</title>
+</head><body><h1>Carrinho</h1>
+<table>
+  <tr><th>Produto</th><th>Qtd</th><th>Ação</th></tr>
+  <tr><td>Produto A</td><td>1</td><td><button type="button" onclick="
+      localStorage.log = (localStorage.log || '') + 'A+;';
+      fetch('/carrinho/mais', {method: 'POST', body: 'A'})">+</button></td></tr>
+  <tr><td>Produto B</td><td>1</td><td><button type="button" onclick="
+      localStorage.log = (localStorage.log || '') + 'B+;';
+      fetch('/carrinho/mais', {method: 'POST', body: 'B'})">+</button></td></tr>
+</table>
+<a href="/inicio">Concluir</a>
+</body></html>"""
+_PAGINAS_DO_CARRINHO = {
+    "/carrinho": _CARRINHO_GRAVADO,
+    "/inicio": "<!doctype html><meta charset='utf-8'><title>Início</title><h1>Início</h1>",
+}
+
+
+async def test_recorded_clicks_on_the_same_row_button_both_act(
+    browser: Browser, run_robot: RobotRunner
+) -> None:
+    # A gravação de verdade de dois cliques no "+" da linha "Produto A" vira dois passos
+    # que gravam, com o mesmo alvo e a mesma linha. O robô gravado soma as duas unidades.
+    context = await browser.new_context()
+    try:
+        await _serve(_PAGINAS_DO_CARRINHO)(context)
+        recorder = Recorder()
+        await recorder.start(context)
+        page = await context.new_page()
+        await recorder.goto(page, f"{BASE}/carrinho")
+        row = page.get_by_role("row").filter(has=page.get_by_text("Produto A", exact=True))
+        for _ in range(2):
+            await row.get_by_role("button", name="+").click()
+            await page.wait_for_timeout(700)
+        await page.get_by_role("link", name="Concluir").click()
+        await page.get_by_role("heading", name="Início").wait_for()
+        recording = await recorder.stop()
+    finally:
+        await context.close()
+    compiled = lower(recording, name="somar_dois", title="Somar dois", description="Gravado.")
+    manifest = Manifest.model_validate(compiled.manifest.model_dump(mode="json"))
+    assert policy.check(manifest) == []
+    clicks = [
+        step
+        for step in manifest.steps
+        if isinstance(step, ClickStep) and step.target.within_has_text == "Produto A"
+    ]
+    assert len(clicks) == 2 and clicks[0].id != clicks[1].id
+    assert all(step.effect is not Effect.READ for step in clicks)
+    cliques = _Cliques()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve(_PAGINAS_DO_CARRINHO), after_run=cliques
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert cliques.log == "A+;A+;"
+
+
+# -- itens repetidos de uma entrada de lista: recusados antes do primeiro passo ------------
 
 
 def _marcar_e_cancelar(marcar_effect: str = "write") -> Manifest:
@@ -715,19 +1848,417 @@ def _marcar_e_cancelar(marcar_effect: str = "write") -> Manifest:
     )
 
 
-async def test_repeated_item_never_acts_twice_on_the_same_row(run_robot: RobotRunner) -> None:
-    page = _Page()
+async def test_repeated_item_is_refused_before_any_step(run_robot: RobotRunner) -> None:
+    # " 120 " escolhe a mesma linha que "120": a execução pararia no meio, depois de a
+    # nota 120 e a 7 já terem sido canceladas. A lista é recusada antes de tudo.
+    requests: list[str] = []
     outcome = await run_robot(
         _marcar_e_cancelar(),
         {"notas": [{"numero": "120"}, {"numero": "7"}, {"numero": " 120 "}]},
-        prepare_context=_serve({"/notas": _NOTAS_COM_LOG}),
+        prepare_context=_serve({"/notas": _NOTAS_COM_LOG}, requests=requests),
+    )
+    result = outcome.result
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ENTRADA_INVALIDA
+    message = result.error_message or ""
+    assert "os itens 'notas[0]' e 'notas[2]'" in message
+    assert "o passo 'marcar'" in message
+    assert "o passo 'cancelar'" in message
+    assert "'notas[1]'" not in message
+    assert not result.irreversible_started
+    assert outcome.kinds() == [RunEventKind.RUN_STARTED, RunEventKind.RUN_FAILED]
+    assert requests == []  # nem a página foi aberta
+
+
+def _cancelar_por_tipo(condition: dict[str, Any]) -> Manifest:
+    return _manifest(
+        [
+            _open("/notas"),
+            _for_each(
+                "inputs.notas",
+                [
+                    _if(
+                        "se_tipo_a",
+                        condition,
+                        [_cancel_in_row("cancelar_a", "{{ item.numero }}")],
+                        [_cancel_in_row("cancelar_b", "{{ item.numero }}")],
+                    )
+                ],
+            ),
+        ],
+        inputs=[
+            _list_input(
+                "notas",
+                {"name": "numero", "title": "Número", "type": "string"},
+                {"name": "tipo", "title": "Tipo", "type": "string"},
+            )
+        ],
+    )
+
+
+@pytest.mark.parametrize("decided", [True, False])
+async def test_repeated_item_in_sibling_branches_is_refused_before_any_step(
+    run_robot: RobotRunner, decided: bool
+) -> None:
+    # Os dois itens chegam a passos diferentes (um em cada ramo) com o mesmo alvo e a
+    # mesma linha. Com a condição só do item, já se sabe o ramo de cada um; com uma
+    # condição da página, na dúvida, a lista também é recusada, e a mensagem diz o ramo.
+    condition = (
+        _equals("{{ item.tipo }}", "a")
+        if decided
+        else {
+            "op": "visible",
+            "target": _target("tabela de notas", {"by": "role", "value": "table"}),
+        }
+    )
+    manifest = _cancelar_por_tipo(condition)
+    assert policy.check(manifest) == []
+    requests: list[str] = []
+    outcome = await run_robot(
+        manifest,
+        {"notas": [{"numero": "120", "tipo": "a"}, {"numero": "120", "tipo": "b"}]},
+        prepare_context=_serve({"/notas": _NOTA_120}, requests=requests),
+    )
+    result = outcome.result
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ENTRADA_INVALIDA
+    message = result.error_message or ""
+    assert "os itens 'notas[0]' e 'notas[1]'" in message
+    assert "'cancelar_a'" in message
+    assert "'cancelar_b'" in message
+    assert ("só durante a execução" in message) is not decided
+    assert outcome.kinds() == [RunEventKind.RUN_STARTED, RunEventKind.RUN_FAILED]
+    assert requests == []
+
+
+async def test_items_that_act_on_other_rows_or_pages_are_not_refused(
+    run_robot: RobotRunner,
+) -> None:
+    # A mesma lista com notas diferentes nos dois ramos, e a mesma nota em filiais
+    # diferentes (outra página): nenhuma ação se repete, e a lista não é recusada.
+    page = _Page()
+    outcome = await run_robot(
+        _cancelar_por_tipo(_equals("{{ item.tipo }}", "a")),
+        {"notas": [{"numero": "120", "tipo": "a"}, {"numero": "7", "tipo": "b"}]},
+        prepare_context=_serve({"/notas": _NOTA_120}),
+        after_run=page,
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert page.log == "C120;C7;"
+
+    manifest = _manifest(
+        [
+            _for_each(
+                "inputs.notas",
+                [_abrir_filial(), _cancel_in_row("cancelar", "{{ item.numero }}")],
+                "cada_filial",
+            )
+        ],
+        inputs=[
+            _list_input(
+                "notas",
+                {"name": "filial", "title": "Filial", "type": "string"},
+                {"name": "numero", "title": "Número", "type": "string"},
+            )
+        ],
+    )
+    page = _Page()
+    outcome = await run_robot(
+        manifest,
+        {"notas": [{"filial": "a", "numero": "1"}, {"filial": "b", "numero": "1"}]},
+        prepare_context=_serve(_FILIAIS),
+        after_run=page,
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert page.log == "A1;B1;"
+
+
+async def test_fixed_row_key_repeated_by_an_input_list_is_refused_before_any_step(
+    run_robot: RobotRunner,
+) -> None:
+    # Uma chave só de entradas (ou fixa) numa repetição sobre uma lista de entrada: o
+    # segundo item agiria de novo na mesma linha da mesma página.
+    manifest = _manifest(
+        [
+            _open("/notas"),
+            _for_each(
+                "inputs.notas",
+                [_cancel_in_row("cancelar", "{{ inputs.numero }}", "write")],
+            ),
+        ],
+        inputs=[
+            {"name": "numero", "title": "Número", "type": "string"},
+            _list_input("notas", {"name": "obs", "title": "Obs", "type": "string"}),
+        ],
+    )
+    assert policy.check(manifest) == []
+    requests: list[str] = []
+    outcome = await run_robot(
+        manifest,
+        {"numero": "120", "notas": [{"obs": "x"}, {"obs": "y"}]},
+        prepare_context=_serve({"/notas": _NOTA_120}, requests=requests),
+    )
+    result = outcome.result
+    assert result.error_code == ErrorCode.ENTRADA_INVALIDA, result.error_message
+    assert "os itens 'notas[0]' e 'notas[1]'" in (result.error_message or "")
+    assert requests == []
+
+
+@pytest.mark.parametrize(
+    ("url", "refused"),
+    [
+        ("/notas?mes={{ item.mes }}", True),  # o mês só muda a consulta: a mesma página
+        ("/notas/{{ item.mes }}", False),  # uma página por mês
+    ],
+)
+async def test_outer_input_list_that_repeats_an_inner_one_on_the_same_page(
+    run_robot: RobotRunner, url: str, refused: bool
+) -> None:
+    # Para cada mês (lista de fora), as notas 120 e 7 (lista de dentro). Se os dois meses
+    # caem na mesma página, o segundo mês cancelaria de novo as mesmas linhas: a lista de
+    # fora é recusada antes do primeiro passo. Uma página por mês são outras linhas.
+    manifest = _manifest(
+        [
+            _for_each(
+                "inputs.meses",
+                [
+                    {
+                        "kind": "navigate",
+                        "id": "abrir_mes",
+                        "title": "Abrir o mês",
+                        "url": f"{BASE}{url}",
+                    },
+                    _for_each(
+                        "inputs.notas",
+                        [_cancel_in_row("cancelar", "{{ item.numero }}", "write")],
+                        "cada_nota",
+                    ),
+                ],
+                "cada_mes",
+            )
+        ],
+        inputs=[
+            _list_input("meses", {"name": "mes", "title": "Mês", "type": "string"}),
+            _list_input("notas", {"name": "numero", "title": "Número", "type": "string"}),
+        ],
+    )
+    assert policy.check(manifest) == []
+    requests: list[str] = []
+    page = _Page()
+    outcome = await run_robot(
+        manifest,
+        {"meses": [{"mes": "jan"}, {"mes": "fev"}], "notas": [{"numero": "120"}, {"numero": "7"}]},
+        prepare_context=_serve(
+            {"/notas": _NOTA_120, "/notas/jan": _NOTA_120, "/notas/fev": _NOTA_120},
+            requests=requests,
+        ),
         after_run=page,
     )
     result = outcome.result
-    assert result.state is RunState.INDETERMINATE, result.error_message
-    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO
-    assert result.failed_step_id == "marcar"  # o primeiro passo que repetiria a linha
-    assert page.log == "M120;C120;M7;C7;"
+    if not refused:
+        assert result.state is RunState.SUCCEEDED, result.error_message
+        assert page.log == "C120;C7;C120;C7;"
+        return
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == ErrorCode.ENTRADA_INVALIDA
+    message = result.error_message or ""
+    assert "os itens 'meses[0]' e 'meses[1]'" in message
+    assert "o passo 'cancelar'" in message
+    assert "notas[" not in message  # a lista de dentro não tem itens repetidos
+    assert outcome.kinds() == [RunEventKind.RUN_STARTED, RunEventKind.RUN_FAILED]
+    assert requests == []
+
+
+# Formulário com a nota 1: digitar a observação, escolher a filial e salvar na linha.
+_FORMULARIO_NOTA = f"""<!doctype html><meta charset="utf-8"><title>Notas</title>
+<p id="log"></p><script>document.getElementById('log').textContent = localStorage.log || ''</script>
+<label>Obs <input name="obs"></label>
+<label for="filial">Filial</label> <select id="filial"><option>a</option><option>b</option></select>
+<table aria-label="Notas"><tbody><tr><td>1</td>{_botao("S1", "Salvar")}</tr></tbody></table>"""
+# A cada vez que abre, a página inicial aponta outra filial (a, depois b).
+_INICIO = """<!doctype html><meta charset="utf-8"><title>Início</title>
+<p id="filial"></p><script>
+  const n = Number(localStorage.n || 0);
+  localStorage.n = n + 1;
+  document.getElementById('filial').textContent = ['a', 'b'][n % 2];
+</script>"""
+
+
+def _salvar_nota(effect: str = "write", kind: str = "click") -> dict[str, Any]:
+    if kind == "click":
+        return _cancel_in_row("salvar", "{{ item.numero }}", effect) | {
+            "title": "Salvar a nota",
+            "target": _target(
+                "botão Salvar da nota",
+                {"by": "role", "value": "button", "name": "Salvar"},
+                within={"by": "role", "value": "row"},
+                within_has_text="{{ item.numero }}",
+            ),
+        }
+    return {  # uma leitura marcada como gravação: o efeito só pode subir
+        "kind": "extract_text",
+        "id": "salvar",
+        "title": "Ler a nota",
+        "effect": effect,
+        "timeout_ms": 1_000,
+        "target": _target(
+            "número da nota",
+            {"by": "role", "value": "cell"},
+            within={"by": "role", "value": "row"},
+            within_has_text="{{ item.numero }}",
+        ),
+        "into": "lida",
+    }
+
+
+def _digitar_obs() -> dict[str, Any]:
+    return {
+        "kind": "fill",
+        "id": "digitar_obs",
+        "title": "Digitar a observação",
+        "effect": "write",
+        "timeout_ms": 1_000,
+        "target": _target("campo Obs", {"by": "label", "value": "Obs"}),
+        "value": {"source": "text", "template": "{{ item.obs }}"},
+    }
+
+
+def _ler_campo(step_id: str, css: str, into: str) -> dict[str, Any]:
+    return {
+        "kind": "extract_text",
+        "id": step_id,
+        "title": f"Ler {into}",
+        "timeout_ms": 1_000,
+        "target": _target(into, {"by": "css", "value": css}),
+        "into": into,
+    }
+
+
+def _por_nota(body: list[dict[str, Any]], *before: dict[str, Any]) -> Manifest:
+    return _manifest(
+        [_open("/notas"), *before, _for_each("inputs.notas", body)],
+        inputs=[
+            _list_input(
+                "notas",
+                {"name": "numero", "title": "Número", "type": "string"},
+                {"name": "obs", "title": "Obs", "type": "string"},
+                {"name": "filial", "title": "Filial", "type": "string"},
+            )
+        ],
+    )
+
+
+_NOTAS_IGUAIS = [
+    {"numero": "1", "obs": "x", "filial": "a"},
+    {"numero": "1", "obs": "y", "filial": "b"},
+]
+
+
+@pytest.mark.parametrize("scenario", ["valor_digitado", "leitura_que_grava", "repeticao_que_so_le"])
+async def test_repeated_items_are_refused_when_nothing_else_changes_the_page(
+    run_robot: RobotRunner, scenario: str
+) -> None:
+    # Os dois itens escolhem a linha da nota 1 para salvar. Digitar outro texto no mesmo
+    # campo e ler a página não levam a outra página: a segunda vez seria recusada no
+    # meio da execução, e a lista é recusada antes.
+    if scenario == "valor_digitado":
+        manifest = _por_nota([_digitar_obs(), _salvar_nota()])
+    elif scenario == "leitura_que_grava":
+        manifest = _por_nota([_salvar_nota(kind="extract_text")])
+    else:
+        manifest = _por_nota(
+            [
+                _for_each("vars.notas", [_ler_campo("ler_obs", "input", "obs")], "cada_lida"),
+                _salvar_nota(),
+            ],
+            _ler_notas(["numero", "acao"]),
+        )
+    assert policy.check(manifest) == []
+    requests: list[str] = []
+    outcome = await run_robot(
+        manifest,
+        {"notas": _NOTAS_IGUAIS},
+        prepare_context=_serve({"/notas": _FORMULARIO_NOTA}, requests=requests),
+    )
+    result = outcome.result
+    assert result.error_code == ErrorCode.ENTRADA_INVALIDA, result.error_message
+    message = result.error_message or ""
+    assert "os itens 'notas[0]' e 'notas[1]'" in message
+    assert "o passo 'salvar'" in message
+    assert requests == []
+
+
+async def test_repeated_row_keys_that_may_be_on_other_pages_wait_for_the_run(
+    run_robot: RobotRunner,
+) -> None:
+    # A filial escolhida pode levar a outra página, e o endereço lido da página também:
+    # antes do primeiro passo não dá para saber, e a rede da execução decide pela página.
+    page = _Page()
+    outcome = await run_robot(
+        _por_nota(
+            [
+                {
+                    "kind": "select",
+                    "id": "escolher_filial",
+                    "title": "Escolher a filial",
+                    "timeout_ms": 1_000,
+                    "target": _target("filial", {"by": "label", "value": "Filial"}),
+                    "option": "{{ item.filial }}",
+                },
+                _salvar_nota(),
+            ]
+        ),
+        {"notas": _NOTAS_IGUAIS},
+        prepare_context=_serve({"/notas": _FORMULARIO_NOTA}),
+        after_run=page,
+    )
+    # A escolha não mudou o endereço: a segunda vez é recusada antes de agir.
+    result = outcome.result
+    assert page.log == "S1;", result.error_message
+    assert result.error_code == ErrorCode.ELEMENTO_AMBIGUO, result.error_message
+    assert result.failed_step_id == "salvar"
+    assert "já agiu" in (result.error_message or "")
+
+    page = _Page()
+    outcome = await run_robot(
+        _manifest(
+            [
+                _for_each(
+                    "inputs.notas",
+                    [
+                        _open("/inicio"),
+                        _ler_campo("ler_filial", "#filial", "filial"),
+                        {
+                            "kind": "navigate",
+                            "id": "abrir_filial",
+                            "title": "Abrir a filial",
+                            "url": f"{BASE}/filial/{{{{ vars.filial }}}}",
+                        },
+                        _cancel_in_row("cancelar", "{{ item.numero }}", "write"),
+                    ],
+                )
+            ],
+            inputs=[_list_input("notas", {"name": "numero", "title": "N", "type": "string"})],
+        ),
+        {"notas": [{"numero": "1"}, {"numero": "1"}]},
+        prepare_context=_serve({"/inicio": _INICIO, **_FILIAIS}),
+        after_run=page,
+    )
+    # O endereço veio da página: cada nota 1 ficou numa filial, e as duas foram canceladas.
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert page.log == "A1;B1;"
+
+
+_NOTAS_COM_LOG = """<!doctype html><meta charset="utf-8"><title>Notas</title>
+<p id="log"></p>
+<table aria-label="Notas"><tbody>
+  <tr><td>120</td>
+    <td><button onclick="document.getElementById('log').textContent += 'M120;'">Marcar</button></td>
+    <td><button onclick="document.getElementById('log').textContent += 'C120;'">Cancelar</button></td></tr>
+  <tr><td>7</td>
+    <td><button onclick="document.getElementById('log').textContent += 'M7;'">Marcar</button></td>
+    <td><button onclick="document.getElementById('log').textContent += 'C7;'">Cancelar</button></td></tr>
+</tbody></table>"""
 
 
 async def test_different_steps_and_reads_may_use_the_same_row(run_robot: RobotRunner) -> None:
@@ -772,12 +2303,12 @@ _SERIES = """<!doctype html><meta charset="utf-8"><title>Notas</title>
 _SERIE = {"name": "serie", "title": "Série", "type": "string", "required": False}
 
 
-def _cancel_in_row(step_id: str, key: str) -> dict[str, Any]:
+def _cancel_in_row(step_id: str, key: str, effect: str = "irreversible") -> dict[str, Any]:
     return {
         "kind": "click",
         "id": step_id,
         "title": "Cancelar a nota",
-        "effect": "irreversible",
+        "effect": effect,
         "timeout_ms": 1_000,
         "target": _target(
             "botão Cancelar da nota",
@@ -1753,3 +3284,428 @@ async def test_numbers_that_cannot_be_typed_fail_before_any_step(
     assert outcome.result.error_code == ErrorCode.ENTRADA_INVALIDA
     assert f"'{problem}'" in (outcome.result.error_message or "")
     assert outcome.kinds() == [RunEventKind.RUN_STARTED, RunEventKind.RUN_FAILED]
+
+
+# -- o campo fica com o texto digitado ------------------------------------------------------
+
+# O CEP preenche o logradouro quando o foco sai dele (no ``change``): o foco que a digitação
+# do logradouro põe nele dispara o preenchimento, e o texto digitado iria para o fim do
+# que a página pôs ("Rua do CEPPraça da Sé"). Cada valor que o logradouro recebe fica em
+# #digitado, e o que o "Salvar" envia, em #log.
+_ENDERECO_CAMPOS = (
+    '<label for="cep">CEP</label><input id="cep" name="cep">'
+    '<label for="logradouro">Logradouro</label><input id="logradouro" name="logradouro">'
+)
+_ENDERECO_SCRIPT = """
+const campo = (id) => %s.getElementById(id);
+campo('cep').addEventListener('change', () => { campo('logradouro').value = 'Rua do CEP'; });
+campo('logradouro').addEventListener('input', () => {
+  document.getElementById('digitado').textContent += campo('logradouro').value + '|';
+});"""
+_SALVAR = """<button onclick="document.getElementById('log').textContent +=
+  (document.querySelector('x-endereco')?.shadowRoot ?? document)
+    .getElementById('logradouro').value + '|'">Salvar</button>
+<p id="log"></p><p id="digitado"></p>"""
+_ENDERECO = {
+    "documento": f"""<!doctype html><meta charset="utf-8"><title>Endereço</title>
+{_ENDERECO_CAMPOS}{_SALVAR}
+<script>{_ENDERECO_SCRIPT % "document"}</script>""",
+    "shadow_root": f"""<!doctype html><meta charset="utf-8"><title>Endereço</title>
+<x-endereco></x-endereco>{_SALVAR}
+<script>
+customElements.define('x-endereco', class extends HTMLElement {{ connectedCallback() {{
+  this.attachShadow({{mode: 'open'}}).innerHTML = '{_ENDERECO_CAMPOS}';
+}} }});
+{_ENDERECO_SCRIPT % "document.querySelector('x-endereco').shadowRoot"}
+</script>""",
+}
+
+
+def _digitar(
+    step_id: str, label: str, text: str, *, effect: str = "read", sequential: bool = False
+) -> dict[str, Any]:
+    return _fill(step_id, label, text, effect=effect) | {"sequential": sequential}
+
+
+def _clicar(step_id: str, name: str) -> dict[str, Any]:
+    return {
+        "kind": "click",
+        "id": step_id,
+        "title": f"Clicar em {name}",
+        "effect": "write",
+        "target": _target(f"botão {name}", {"by": "role", "value": "button", "name": name}),
+    }
+
+
+class _Digitado(_Page):
+    """Também lê os valores que o logradouro recebeu (#digitado)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.typed: str | None = None
+
+    async def __call__(self, context: BrowserContext) -> None:
+        await super().__call__(context)
+        if context.pages:
+            self.typed = await context.pages[0].locator("#digitado").inner_text()
+
+
+@pytest.mark.parametrize("sequential", [False, True], ids=["fill", "tecla_a_tecla"])
+@pytest.mark.parametrize("where", list(_ENDERECO))
+async def test_text_typed_after_the_page_fills_the_field_is_exactly_the_text(
+    run_robot: RobotRunner, where: str, sequential: bool
+) -> None:
+    # Digitar o logradouro tira o foco do CEP, e a página preenche o logradouro antes de o
+    # texto entrar. O campo é conferido depois de digitar e, como mudou, é digitado de novo:
+    # o "Salvar" envia exatamente "Praça da Sé".
+    manifest = _manifest(
+        [
+            _open("/endereco"),
+            _digitar("digitar_cep", "CEP", "01001000", sequential=sequential),
+            _digitar("digitar_logradouro", "Logradouro", "Praça da Sé", sequential=sequential),
+            _clicar("salvar", "Salvar"),
+        ]
+    )
+    assert policy.check(manifest) == []
+    page = _Digitado()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/endereco": _ENDERECO[where]}), after_run=page
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert page.log == "Praça da Sé|"
+    assert page.typed is not None
+    assert page.typed.endswith("|Praça da Sé|")
+
+
+async def test_field_the_page_changes_in_a_step_that_writes_is_never_typed_again(
+    run_robot: RobotRunner,
+) -> None:
+    # O mesmo logradouro, num passo que grava: nada que gravou é repetido sozinho. O campo
+    # ficou com outro valor, e o passo falha sem digitar de novo e sem salvar.
+    manifest = _manifest(
+        [
+            _open("/endereco"),
+            _digitar("digitar_cep", "CEP", "01001000"),
+            _digitar("digitar_logradouro", "Logradouro", "Praça da Sé", effect="write"),
+            _clicar("salvar", "Salvar"),
+        ]
+    )
+    page = _Digitado()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/endereco": _ENDERECO["documento"]}), after_run=page
+    )
+    result = outcome.result
+    assert result.state is RunState.FAILED
+    assert result.error_code == ErrorCode.ACAO_FALHOU
+    assert result.failed_step_id == "digitar_logradouro"
+    assert page.log == ""  # nada foi salvo
+    assert page.typed == "Rua do CEPPraça da Sé|"  # digitado uma vez só
+    dump = outcome.dump()
+    assert "Praça" not in dump
+    assert "Rua do CEP" not in dump
+
+
+# Máscaras: a página formata o que recebe, sempre do mesmo jeito.
+_MASCARAS = """<!doctype html><meta charset="utf-8"><title>Cadastro</title>
+<label>CPF <input name="cpf"></label>
+<label>Valor <input name="valor"></label>
+<button onclick="document.getElementById('log').textContent +=
+  document.querySelector('[name=cpf]').value + ';' + document.querySelector('[name=valor]').value">
+Gravar</button>
+<p id="log"></p>
+<script>
+const cpf = document.querySelector('[name=cpf]');
+cpf.addEventListener('input', () => {
+  const d = cpf.value.replace(/\\D/g, '').slice(0, 11);
+  let out = d.slice(0, 3);
+  if (d.length > 3) out += '.' + d.slice(3, 6);
+  if (d.length > 6) out += '.' + d.slice(6, 9);
+  if (d.length > 9) out += '-' + d.slice(9, 11);
+  cpf.value = out;
+});
+const valor = document.querySelector('[name=valor]');
+valor.addEventListener('input', () => {
+  const d = valor.value.replace(/\\D/g, '').replace(/^0+/, '').padStart(3, '0');
+  const inteiro = d.slice(0, -2).replace(/\\B(?=(\\d{3})+(?!\\d))/g, '.');
+  valor.value = 'R$ ' + inteiro + ',' + d.slice(-2);
+});
+</script>"""
+
+
+@pytest.mark.parametrize("sequential", [False, True], ids=["fill", "tecla_a_tecla"])
+async def test_field_with_a_mask_keeps_the_page_formatting(
+    run_robot: RobotRunner, sequential: bool
+) -> None:
+    # A página formata o CPF e o valor: digitado de novo, o campo fica igual ao da primeira
+    # vez, e o formato da página vale.
+    manifest = _manifest(
+        [
+            _open("/cadastro"),
+            _digitar("digitar_cpf", "CPF", "52998224725", sequential=sequential),
+            _digitar("digitar_valor", "Valor", "123456", sequential=sequential),
+            _clicar("gravar", "Gravar"),
+        ]
+    )
+    page = _Page()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/cadastro": _MASCARAS}), after_run=page
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert page.log == "529.982.247-25;R$ 1.234,56"
+
+
+_REESCRITO = """<!doctype html><meta charset="utf-8"><title>Código</title>
+<label>Código <input name="codigo"></label>
+<button onclick="document.getElementById('log').textContent +=
+  document.querySelector('[name=codigo]').value">Gravar</button>
+<p id="log"></p>
+<script>
+let vezes = 0;
+const codigo = document.querySelector('[name=codigo]');
+codigo.addEventListener('input', () => {
+  vezes += 1;
+  codigo.value = codigo.value.replace(/-\\d+$/, '') + '-' + vezes;
+});
+</script>"""
+
+
+async def test_field_the_page_keeps_rewriting_fails_closed(run_robot: RobotRunner) -> None:
+    # Cada vez que recebe um texto, a página o troca por outro: digitado de novo, o campo
+    # não fica nem com o texto nem com o que ficou da primeira vez. O passo falha sem
+    # gravar, e a mensagem não mostra o valor do campo.
+    manifest = _manifest(
+        [
+            _open("/codigo"),
+            _digitar("digitar_codigo", "Código", "xyzzy42"),
+            _clicar("gravar", "Gravar"),
+        ]
+    )
+    page = _Page()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/codigo": _REESCRITO}), after_run=page
+    )
+    result = outcome.result
+    assert result.state is RunState.FAILED
+    assert result.error_code == ErrorCode.ACAO_FALHOU
+    assert result.failed_step_id == "digitar_codigo"
+    assert page.log == ""  # nada foi gravado
+    assert page.values == {"codigo": "xyzzy42-2"}  # digitado duas vezes, e só duas
+    assert "xyzzy42" not in outcome.dump()
+
+
+# Campos que o navegador ou a página guardam de outro jeito: máscaras de CPF e de moeda, um
+# e-mail com espaços nas pontas, um texto com \r\n numa caixa de texto e espaços repetidos num
+# elemento editável; um campo com maxlength e um que a página põe em maiúsculas. O "Gravar"
+# mostra em #log, em JSON, o valor de cada um.
+_FORMATADOS = (
+    """<!doctype html><meta charset="utf-8"><title>Cadastro</title>
+<label>CPF <input name="cpf"></label>
+<label>Valor <input name="valor"></label>
+<label>Email <input name="email" type="email"></label>
+<label>Obs <textarea name="obs"></textarea></label>
+<div contenteditable="true" role="textbox" aria-label="Editor"></div>
+<label>Curto <input name="curto" maxlength="5"></label>
+<label>Nome <input name="nome"></label>
+<button onclick="const campo = (nome) => document.querySelector('[name=' + nome + ']').value;
+  document.getElementById('log').textContent = JSON.stringify({cpf: campo('cpf'),
+  valor: campo('valor'), email: campo('email'), obs: campo('obs'), curto: campo('curto'),
+  nome: campo('nome'), editor: document.querySelector('[contenteditable]').innerText})">
+Gravar</button>
+<p id="log"></p>
+<script>"""
+    + _MASCARAS.split("<script>", 1)[1].split("</script>", 1)[0]
+    + """
+const nome = document.querySelector('[name=nome]');
+nome.addEventListener('input', () => { nome.value = nome.value.toUpperCase(); });
+</script>"""
+)
+
+_EDITOR = {"by": "role", "value": "textbox", "name": "Editor", "exact": True}
+
+
+def _digitar_formatado(field: str, label: str, text: str, sequential: bool) -> dict[str, Any]:
+    step = _digitar("digitar", label, text, effect="write", sequential=sequential)
+    if field == "editor":
+        step["target"] = _target("editor", _EDITOR)
+    return step
+
+
+@pytest.mark.parametrize(
+    ("field", "label", "text", "sequential", "expected"),
+    [
+        ("cpf", "CPF", "52998224725", False, "529.982.247-25"),
+        ("cpf", "CPF", "52998224725", True, "529.982.247-25"),
+        ("valor", "Valor", "123456", False, "R$ 1.234,56"),
+        ("email", "Email", " a@b.com ", False, "a@b.com"),
+        ("obs", "Obs", "um\r\ndois", False, "um\ndois"),
+        ("editor", "Editor", "Olá  mundo", False, None),
+    ],
+    ids=["cpf", "cpf_tecla_a_tecla", "moeda", "email", "obs_crlf", "editavel"],
+)
+async def test_field_formatted_by_the_browser_or_a_mask_is_accepted_in_a_step_that_writes(
+    run_robot: RobotRunner,
+    field: str,
+    label: str,
+    text: str,
+    sequential: bool,
+    expected: str | None,
+) -> None:
+    # Num passo que grava, o texto não é digitado de novo; o campo vale se tem o texto como o
+    # navegador o guarda (uma cópia do campo com o texto), com os brancos normalizados num
+    # elemento editável, ou com a máscara da página num texto sem letras.
+    manifest = _manifest(
+        [
+            _open("/cadastro"),
+            _digitar_formatado(field, label, text, sequential),
+            _clicar("gravar", "Gravar"),
+        ]
+    )
+    page = _Page()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/cadastro": _FORMATADOS}), after_run=page
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert page.log is not None
+    saved = json.loads(page.log)[field]
+    if expected is None:
+        assert saved.split() == ["Olá", "mundo"]
+    else:
+        assert saved == expected
+
+
+@pytest.mark.parametrize(
+    ("label", "text"), [("Curto", "abcdefgh"), ("Nome", "maria")], ids=["maxlength", "letras"]
+)
+async def test_field_changed_beyond_formatting_fails_closed_in_a_step_that_writes(
+    run_robot: RobotRunner, label: str, text: str
+) -> None:
+    # O maxlength cortou o texto, ou a página trocou as letras: o campo não tem o que o robô
+    # digitou, e o passo falha sem gravar e sem mostrar o valor.
+    manifest = _manifest(
+        [
+            _open("/cadastro"),
+            _digitar("digitar", label, text, effect="write"),
+            _clicar("gravar", "Gravar"),
+        ]
+    )
+    page = _Page()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/cadastro": _FORMATADOS}), after_run=page
+    )
+    result = outcome.result
+    assert result.state is RunState.FAILED
+    assert result.error_code == ErrorCode.ACAO_FALHOU
+    assert result.failed_step_id == "digitar"
+    assert page.log == ""  # nada foi gravado
+    dump = outcome.dump().lower()
+    assert text[:5] not in dump
+
+
+# -- o campo digitado continua com o texto até a gravação ----------------------------------
+
+
+def _cep_assincrono(delay_ms: int) -> str:
+    """O CEP preenche o logradouro ``delay_ms`` depois do ``change`` (uma consulta), e o aviso
+    de endereço conferido aparece 600 ms depois; o "Salvar" mostra o logradouro em #log."""
+    return f"""<!doctype html><meta charset="utf-8"><title>Endereço</title>
+<label>CEP <input name="cep"></label>
+<label>Logradouro <input name="logradouro"></label>
+<label>Número <input name="numero"></label>
+<p id="conferido" hidden>Endereço conferido</p>
+<button onclick="document.getElementById('log').textContent +=
+  document.querySelector('[name=logradouro]').value + '|'">Salvar</button>
+<p id="log"></p>
+<script>
+document.querySelector('[name=cep]').addEventListener('change', () => {{
+  setTimeout(() => {{
+    document.querySelector('[name=logradouro]').value = 'Rua do CEP';
+  }}, {delay_ms});
+  setTimeout(() => {{ document.getElementById('conferido').hidden = false; }}, 600);
+}});
+</script>"""
+
+
+@pytest.mark.parametrize("delay_ms", [40, 150])
+async def test_field_the_page_fills_later_is_checked_again_before_the_step_that_writes(
+    run_robot: RobotRunner, delay_ms: int
+) -> None:
+    # O logradouro foi conferido logo depois de digitado; a consulta do CEP o troca depois.
+    # Antes do "Salvar", que grava, os campos digitados são lidos de novo: o passo falha sem
+    # agir, e nada que a pessoa não digitou é enviado. (Se a página trocar o campo antes da
+    # conferência da digitação, o texto é digitado de novo e o "Salvar" envia o texto.)
+    manifest = _manifest(
+        [
+            _open("/endereco"),
+            _digitar("digitar_cep", "CEP", "01001000"),
+            _digitar("digitar_logradouro", "Logradouro", "Praça da Sé"),
+            _digitar("digitar_numero", "Número", "100"),
+            {
+                "kind": "wait_for",
+                "id": "esperar",
+                "title": "Esperar a conferência do endereço",
+                "target": _target(
+                    "aviso", {"by": "text", "value": "Endereço conferido", "exact": True}
+                ),
+                "timeout_ms": 5_000,
+            },
+            _clicar("salvar", "Salvar"),
+        ]
+    )
+    page = _Page()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/endereco": _cep_assincrono(delay_ms)}), after_run=page
+    )
+    result = outcome.result
+    assert page.log in ("", "Praça da Sé|"), page.log  # nunca 'Rua do CEP'
+    if delay_ms == 150 or page.log == "":
+        assert result.state is RunState.FAILED, result.error_message
+        assert result.error_code == ErrorCode.ACAO_FALHOU
+        assert result.failed_step_id == "salvar"
+        assert page.log == ""
+        assert "campo Logradouro" in (result.error_message or "")
+        assert outcome.of(RunEventKind.STEP_FAILED, "salvar")[0].data["alvo"] == "campo Logradouro"
+    else:
+        assert result.state is RunState.SUCCEEDED, result.error_message
+    dump = outcome.dump()
+    assert "Praça" not in dump
+    assert "Rua do CEP" not in dump
+
+
+_VALOR_NO_BLUR = """<!doctype html><meta charset="utf-8"><title>Pagamento</title>
+<label>Valor <input name="valor"></label>
+<label>Descrição <input name="descricao"></label>
+<button onclick="document.getElementById('log').textContent +=
+  document.querySelector('[name=valor]').value + '|'">Salvar</button>
+<p id="log"></p>
+<script>
+const valor = document.querySelector('[name=valor]');
+valor.addEventListener('blur', () => {
+  const d = valor.value.replace(/\\D/g, '').replace(/^0+/, '').padStart(3, '0');
+  const inteiro = d.slice(0, -2).replace(/\\B(?=(\\d{3})+(?!\\d))/g, '.');
+  valor.value = 'R$ ' + inteiro + ',' + d.slice(-2);
+});
+</script>"""
+
+
+@pytest.mark.parametrize("effect", ["read", "write"])
+async def test_field_masked_when_it_loses_focus_still_holds_before_the_step_that_writes(
+    run_robot: RobotRunner, effect: str
+) -> None:
+    # A página só formata o valor quando o foco sai do campo: na conferência antes do
+    # "Salvar", o valor tem os mesmos dígitos que o texto, e vale. O valor digitado de novo
+    # vale pela última digitação.
+    manifest = _manifest(
+        [
+            _open("/pagamento"),
+            _digitar("digitar_valor_antes", "Valor", "999", effect=effect),
+            _digitar("digitar_valor", "Valor", "123456", effect=effect),
+            _digitar("digitar_descricao", "Descrição", "Aluguel", effect=effect),
+            _clicar("salvar", "Salvar"),
+        ]
+    )
+    page = _Page()
+    outcome = await run_robot(
+        manifest, prepare_context=_serve({"/pagamento": _VALOR_NO_BLUR}), after_run=page
+    )
+    assert outcome.result.state is RunState.SUCCEEDED, outcome.result.error_message
+    assert page.log == "R$ 1.234,56|"

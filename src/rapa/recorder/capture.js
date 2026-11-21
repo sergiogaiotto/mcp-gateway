@@ -3,10 +3,43 @@
 //
 // Regras: só eventos confiáveis (isTrusted); nunca envia o valor de campos de
 // senha (inclusive campo de texto mascarado por CSS, com rótulo de senha ou cujo
-// nome acessível fala em senha), código de uso único, usuário de login (com ou
-// sem <form>) ou do campo logo antes de uma senha de transação; o valor final de
-// cada campo sai no change/blur (ou antes da próxima ação), com há quanto tempo a
-// edição começou.
+// aria-label ou aria-labelledby fala em senha, mesmo que ele também diga ser o
+// usuário), de código de uso único, nem de nenhum outro campo de texto do grupo
+// (o <form> ou, sem <form>, os campos soltos visíveis do documento e dos shadow
+// roots abertos) que tem senha ou código: o usuário (pelo próprio campo) e os
+// outros; o valor final de cada campo sai no change/blur (ou antes da próxima
+// ação), com há quanto tempo a edição começou. Campos dentro de shadow roots
+// abertos também contam: o alvo é o primeiro elemento do composedPath, listas,
+// caixas de seleção e arquivos de um shadow root saem pelo evento input (que,
+// ao contrário do change, atravessa o shadow root), os campos de texto saem no
+// change e no focusout do próprio shadow root (cada shadow root que aparece no
+// composedPath de um evento ganha ouvintes de change, blur e focusout, uma vez),
+// e, no blur na captura da janela e do shadow root (também quando a pessoa sai
+// para um iframe) e antes da próxima ação noutro elemento (pointerdown,
+// keydown, beforeinput), o script só tira um retrato do campo e decide num
+// setTimeout, depois dos ouvintes de blur do componente (o campo que virou
+// senha ou código só sai como segredo; o que saiu da página sai com o retrato).
+// O campo que o componente já tirou da página quando o change, o blur ou o
+// focusout chega (ou quando a janela perde o foco, só campos de shadow root)
+// sai com o retrato: o que o gravador tirou ao guardar o campo (na próxima ação
+// ou no blur, com o campo na página) vale como o valor; com só o retrato de
+// depois da última tecla (num setTimeout, com a tecla aplicada), o passo fica
+// com o alvo, mas o valor só sai como segredo: o robô nunca o repete (pede o
+// valor numa entrada) e ele nunca é gravado. O que saiu antes desse retrato é
+// esquecido. As marcas de sigilo de um campo só sobem
+// até o valor sair, e só os retratos de depois de uma tecla contam (o foco
+// sozinho não tira retrato: o mesmo input que a página reaproveita de "Senha"
+// para "Valor" não leva a marca de senha). O campo que era senha, código ou de
+// um login no foco só sai como segredo e vira uma entrada (a senha que a pessoa
+// mostra com o "olho" antes de digitar nunca sai como texto). O elemento leva o caminho dos hospedeiros (shadow_path) e um
+// seletor CSS que atravessa os shadow roots abertos ("#hospedeiro > #campo"),
+// para que dois componentes iguais (o mesmo id por dentro) nunca virem o mesmo
+// campo. Cada elemento também leva um número (serial) que dois elementos nunca
+// têm igual. Nenhum método de shadow DOM ou de eventos é embrulhado para isso; o
+// único nativo trocado é a propriedade value de HTMLInputElement e
+// HTMLTextAreaElement (hookValueSetter, o getter e o setter): o getter só
+// repassa, e o setter só marca o valor que a página muda enquanto a pessoa
+// digita.
 (() => {
   'use strict';
   const CONFIG = __RAPA_CONFIG__;
@@ -62,6 +95,51 @@
 
   const styleOf = (el) => {
     try { return el.ownerDocument.defaultView.getComputedStyle(el); } catch (e) { return null; }
+  };
+
+  // -- shadow roots -------------------------------------------------------------
+
+  const MAX_SHADOW_DEPTH = 16;
+  // A raiz do nó (o documento ou um shadow root) e o hospedeiro de um shadow root.
+  const rootOf = (node) => (node.getRootNode ? node.getRootNode() : node.ownerDocument);
+  const hostOf = (root) =>
+    (root && root.nodeType === 11 && root.host && root.host.nodeType === 1 ? root.host : null);
+  const inShadow = (el) => hostOf(rootOf(el)) !== null;
+  // Os hospedeiros dos shadow roots em volta do elemento, do mais externo ao mais interno.
+  const shadowHosts = (el) => {
+    const hosts = [];
+    let host = hostOf(rootOf(el));
+    while (host && hosts.length < 64) {
+      hosts.unshift(host);
+      host = hostOf(rootOf(host));
+    }
+    return hosts;
+  };
+  // O ancestral mais próximo que casa com o seletor, atravessando os hospedeiros
+  // (a linha da tabela de uma caixa de seleção que está num componente).
+  const closestComposed = (el, selector) => {
+    let cur = el;
+    for (let depth = 0; cur && depth < 64; depth++) {
+      let found = null;
+      try { found = cur.closest(selector); } catch (e) { return null; }
+      if (found) return found;
+      cur = hostOf(rootOf(cur));
+    }
+    return null;
+  };
+  // O nó e os shadow roots abertos abaixo dele (também os aninhados), ou null se
+  // forem grandes demais para olhar.
+  const rootsUnder = (node) => {
+    const roots = [node];
+    let budget = MAX_SCAN;
+    for (let i = 0; i < roots.length; i++) {
+      let all;
+      try { all = roots[i].querySelectorAll('*'); } catch (e) { return null; }
+      budget -= all.length;
+      if (budget < 0) return null;
+      for (const child of all) if (child.shadowRoot) roots.push(child.shadowRoot);
+    }
+    return roots;
   };
 
   const contentText = (node, skip, depth) => {
@@ -158,9 +236,11 @@
   const labelledByText = (el) => {
     const ids = norm(el.getAttribute('aria-labelledby'));
     if (!ids) return '';
-    const doc = el.ownerDocument;
+    // Os ids valem na mesma árvore (o documento ou o shadow root do campo).
+    const root = el.getRootNode ? el.getRootNode() : el.ownerDocument;
+    const scope = root && typeof root.getElementById === 'function' ? root : el.ownerDocument;
     return norm(ids.split(' ').map((id) => {
-      const ref = doc.getElementById(id);
+      const ref = scope.getElementById(id);
       return ref ? (norm(ref.getAttribute('aria-label')) || contentText(ref, null, 0)) : '';
     }).join(' '));
   };
@@ -243,6 +323,19 @@
     const t = plainWords(s);
     return !!t && PASSWORD_WORDS.test(t);
   };
+  // No nome do campo (aria-label, aria-labelledby ou o nome acessível), a assinatura
+  // eletrônica ou digital (a senha de transação dos bancos) também é um segredo: o valor
+  // nunca sai, e o campo não vira senha do cofre (isPasswordByName). A mesma regra está
+  // em rapa/recorder/sensitivity.py (mentions_secret_name).
+  const SIGNATURE_WORDS = /assinatura[\s_-]*(?:eletronica|digital)|codigo[\s_-]*de[\s_-]*(?:transacao|seguranca)/;
+  const mentionsSignature = (s) => {
+    const t = plainWords(s);
+    return !!t && SIGNATURE_WORDS.test(t);
+  };
+  const mentionsSecretName = (s) => {
+    const t = plainWords(s);
+    return !!t && (PASSWORD_WORDS.test(t) || SIGNATURE_WORDS.test(t));
+  };
 
   const isMaskedText = (el) => {
     const st = styleOf(el);
@@ -265,40 +358,49 @@
 
   const isPassword = (el) => el.tagName === 'INPUT' && (inputType(el) === 'password' || isPasswordLikeText(el));
 
-  // Campo que só o nome acessível (aria-labelledby, aria-label) diz ser senha: o
-  // valor não sai, mas o campo não vira senha (rapa/recorder/sensitivity.py,
-  // password_by_name) e o usuário marcado pelo grupo continua usuário.
+  // O aria-label ou o texto do aria-labelledby fala em senha: os dois, porque o
+  // nome acessível guarda só um deles (o aria-labelledby, quando há).
+  const ariaMentionsPassword = (el) =>
+    mentionsSecretName(el.getAttribute('aria-label')) || mentionsSecretName(labelledByText(el)) ||
+    mentionsSignature(el.getAttribute('name')) || mentionsSignature(el.id);
+
+  // Campo que só o nome (aria-label, aria-labelledby ou o nome acessível) diz ser
+  // senha: o valor nunca sai, mas o campo não vira senha nem usuário, mesmo que o
+  // próprio campo também diga ser o usuário (rapa/recorder/sensitivity.py,
+  // password_by_name).
+  const USERNAME_TYPES = new Set(['text', 'email', 'tel', 'number', '']);
   const isPasswordByName = (el) => {
     if (el.tagName !== 'INPUT' || isPassword(el) || isOneTimeCode(el)) return false;
-    if (!PASSWORD_LABEL_TYPES.has(inputType(el))) return false;
+    const type = inputType(el);
+    if (!PASSWORD_LABEL_TYPES.has(type) && !USERNAME_TYPES.has(type)) return false;
+    return ariaMentionsPassword(el) || mentionsSecretName(clip(accessibleName(el, roleOf(el)), MAX_NAME));
+  };
+
+  // Os textos do próprio campo falam de outra pessoa ou de um cadastro ("CPF do
+  // favorecido", "Chave Pix (CPF)", "Login do novo usuário"): não é o usuário
+  // (rapa/recorder/sensitivity.py, names_another_party).
+  const OTHER_PARTY_WORDS = /(?:^|[^a-z0-9])(?:favorecid[oa]s?|destinatari[oa]s?|beneficiari[oa]s?|pagador(?:es|as?)?|recebedor(?:es|as?)?|titular(?:es)?|clientes?|contatos?|convidad[oa]s?|nov[oa]s?|cadastr(?:os?|ar|e)|chaves?)(?:[^a-z0-9]|$)/;
+  const namesAnotherParty = (el) =>
+    [labelText(el), accessibleName(el, roleOf(el)), el.getAttribute('title'),
+      el.getAttribute('placeholder'), el.getAttribute('name'), el.id]
+      .some((s) => { const t = plainWords(clip(s, MAX_NAME)); return !!t && OTHER_PARTY_WORDS.test(t); });
+
+  // Usuário só pelo próprio campo (rapa/recorder/sensitivity.py,
+  // username_by_signal): autocomplete de usuário ou e-mail, type=email, ou rótulo,
+  // atributo name, id ou placeholder com uma palavra inteira de usuário. O texto
+  // da página (títulos, parágrafos) não conta; o campo que o nome diz ser senha e o
+  // que fala de outra pessoa não são o usuário.
+  const USERNAME_WORDS = /(?:^|[^a-z0-9])(?:usuario|user|username|login|e-mail|email|cpf|cnpj|matricula|codigo do usuario)(?:[^a-z0-9]|$)/;
+  const isUsernameField = (el) => {
+    if (el.tagName !== 'INPUT' || !USERNAME_TYPES.has(inputType(el))) return false;
+    if (isPassword(el) || isOneTimeCode(el) || isPasswordByName(el) || namesAnotherParty(el)) return false;
     const ac = norm(el.getAttribute('autocomplete')).toLowerCase().split(' ');
-    if (ac.indexOf('username') >= 0 || ac.indexOf('email') >= 0) return false;
-    return mentionsPassword(accessibleName(el, roleOf(el)));
+    if (ac.indexOf('username') >= 0 || ac.indexOf('email') >= 0 || inputType(el) === 'email') return true;
+    return [labelText(el), el.getAttribute('name'), el.id, el.getAttribute('placeholder')]
+      .some((s) => { const t = plainWords(s); return !!t && USERNAME_WORDS.test(t); });
   };
 
-  // Senha de transação (PIN, assinatura eletrônica, senha de pagamento) e verbos
-  // irreversíveis: as mesmas regras de rapa/recorder/sensitivity.py.
-  const TRANSACTION_WORDS = /transac|transfer|assinatura|assinar|autoriza|pagamento|operac|cartao|(?:^|[^a-z0-9])pin(?:[^a-z0-9]|$)/;
-  const IRREVERSIBLE = /\b(emitir|emita|enviar|envie|transmitir|transmita|pagar|pague|confirmar pagamento|confirmar transferencia|transferir|transfira|excluir|exclua|apagar|apague|assinar|assine|finalizar|finalize|concluir|conclua|protocolar|protocole|autorizar|autorize|aprovar|aprove|solicitar|solicite|cancelar|cancele)\b/;
-  const verbText = (s) => norm(s).normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
-
-  const isTransactionSecret = (el) => [
-    labelText(el), accessibleName(el, roleOf(el)), el.getAttribute('placeholder'),
-    el.getAttribute('title'), el.getAttribute('name'), el.id,
-  ].some((s) => { const t = plainWords(s); return !!t && TRANSACTION_WORDS.test(t); });
-
-  // O botão padrão do formulário (o que o Enter aciona) tem verbo irreversível.
-  const irreversibleSubmit = (el) => {
-    const form = formOf(el);
-    if (!form) return false;
-    for (const f of Array.from(form.elements)) {
-      const type = f.tagName === 'BUTTON' ? String(f.type || 'submit').toLowerCase() : inputType(f);
-      if (type !== 'submit' && !(f.tagName === 'INPUT' && type === 'image')) continue;
-      const text = accessibleName(f, roleOf(f)) || norm(f.textContent);
-      return IRREVERSIBLE.test(verbText(text));
-    }
-    return false;
-  };
+  const isSecretField = (el) => isPassword(el) || isOneTimeCode(el) || isPasswordByName(el);
 
   const isTextLike = (el) => (el.tagName === 'INPUT' && TEXT_TYPES.has(inputType(el))) || el.tagName === 'TEXTAREA';
 
@@ -322,20 +424,41 @@
     return all.filter((f) => isTextLike(f) || isPassword(f));
   };
 
-  // 'username': o usuário do login; 'hidden': o campo antes de uma senha de
-  // transação (ou de uma senha num formulário com botão irreversível), que não
-  // vai na gravação mas também não é o usuário; null: campo comum.
+  // Um campo visível de senha ou código nas raízes do documento (o documento e os
+  // shadow roots abertos), fora da raiz ``skip``; ``loose``: só os sem <form>.
+  const secretIn = (el, loose, skip) => {
+    const roots = rootsUnder(el.ownerDocument);
+    if (!roots) return false;
+    for (const root of roots) {
+      if (root === skip) continue;
+      let found;
+      try { found = root.querySelectorAll('input'); } catch (e) { continue; }
+      for (const f of found) {
+        if (f !== el && (!loose || !formOf(f)) && !hiddenForAria(f) && isSecretField(f)) return true;
+      }
+    }
+    return false;
+  };
+
+  // Campo sem <form>: um campo solto e visível de senha ou código noutra raiz do
+  // documento (o documento ou outro shadow root aberto) também conta.
+  const looseSecretElsewhere = (el) => !formOf(el) && secretIn(el, true, rootOf(el));
+
+  // 'username': o usuário pelo próprio campo; 'hidden': outro campo de texto do
+  // grupo, que não vai na gravação mas também não é o usuário; null: campo comum
+  // (o grupo não tem senha nem código). O campo que a página declara como usuário
+  // (autocomplete=username) nunca vai na gravação: é o usuário, a menos que o nome
+  // dele fale de outra pessoa ou de um cadastro. O campo de um shadow root sai da
+  // gravação com qualquer senha ou código visível no documento, em qualquer raiz e
+  // em qualquer <form> (ele nunca é credencial de login: o compilador pede o valor
+  // numa entrada).
   const loginRole = (el) => {
-    if (!isTextLike(el) || el.tagName === 'TEXTAREA' || isOneTimeCode(el)) return null;
+    if (!isTextLike(el) || isSecretField(el)) return null;
     const ac = norm(el.getAttribute('autocomplete')).toLowerCase().split(' ');
-    if (ac.indexOf('username') >= 0) return 'username';
-    const fields = groupFields(el);
-    const firstPassword = fields.findIndex(isPassword);
-    if (firstPassword <= 0 || fields.filter((f) => isTextLike(f) && !isPassword(f)).length > 3) return null;
-    // Só o campo de texto imediatamente antes da primeira senha.
-    if (fields[firstPassword - 1] !== el) return null;
-    const password = fields[firstPassword];
-    return isTransactionSecret(password) || irreversibleSubmit(password) ? 'hidden' : 'username';
+    const declared = ac.indexOf('username') >= 0;
+    if (!declared && !groupFields(el).some((f) => f !== el && isSecretField(f)) &&
+        !looseSecretElsewhere(el) && !(inShadow(el) && secretIn(el, false, null))) return null;
+    return isUsernameField(el) ? 'username' : 'hidden';
   };
 
   // -- seletores ---------------------------------------------------------------
@@ -344,27 +467,81 @@
   const stableId = (id) => !!id && id.length <= 40 && !GENERATED_ID.test(id);
   const cssEscape = (s) => (W.CSS && W.CSS.escape ? W.CSS.escape(s) : s.replace(/[^a-zA-Z0-9_-]/g, '\\$&'));
 
-  const cssPath = (el) => {
-    const root = el.getRootNode ? el.getRootNode() : el.ownerDocument;
+  const MAX_CSS = 1000;
+  // Caminho do elemento dentro da raiz dele. No documento, como sempre: até um id
+  // estável e único, o <body> ou seis níveis. Num shadow root, até o topo dele (o
+  // id estável e único na raiz entra no lugar da etiqueta, mas o caminho continua):
+  // ``anchored`` diz que ele começa no topo do shadow root (ou num id único do
+  // documento, ou no <body>).
+  const segment = (el) => {
+    const root = rootOf(el);
+    const shadow = hostOf(root) !== null;
     const parts = [];
+    let anchored = false;
     let cur = el;
-    while (cur && cur.nodeType === 1 && parts.length < 6) {
+    while (cur && cur.nodeType === 1 && parts.length < (shadow ? 10 : 6)) {
+      let idPart = null;
       if (stableId(cur.id)) {
         let unique = false;
         try { unique = root.querySelectorAll('#' + cssEscape(cur.id)).length === 1; } catch (e) { /* ignora */ }
-        if (unique) { parts.unshift('#' + cssEscape(cur.id)); break; }
+        if (unique) idPart = '#' + cssEscape(cur.id);
       }
-      let part = cur.tagName.toLowerCase();
+      if (idPart && !shadow) { parts.unshift(idPart); anchored = true; break; }
       const parent = cur.parentElement;
-      if (parent) {
-        const same = Array.from(parent.children).filter((c) => c.tagName === cur.tagName);
-        if (same.length > 1) part += ':nth-of-type(' + (same.indexOf(cur) + 1) + ')';
+      const top = !parent && shadow && cur.parentNode === root;
+      let part = idPart;
+      if (!part) {
+        part = cur.tagName.toLowerCase();
+        const siblings = parent || (top ? root : null);
+        if (siblings) {
+          const same = Array.from(siblings.children).filter((c) => c.tagName === cur.tagName);
+          if (same.length > 1) part += ':nth-of-type(' + (same.indexOf(cur) + 1) + ')';
+        }
       }
       parts.unshift(part);
-      if (cur.tagName === 'BODY') break;
+      if (cur.tagName === 'BODY') { anchored = true; break; }
+      if (top) { anchored = true; break; }
       cur = parent;
     }
-    return parts.join(' > ');
+    return { parts, anchored };
+  };
+
+  // Junta os caminhos dos hospedeiros e o do elemento num seletor que atravessa os
+  // shadow roots abertos (o CSS do Playwright passa do hospedeiro para os filhos do
+  // shadow root com ">"); o que não começa no topo do shadow root vai como
+  // descendente. Longo demais: sobram os trechos de dentro (o seletor deixa de ser
+  // único e o executor recusa, em vez de errar o elemento).
+  const joinSegments = (segs) => {
+    let css = '';
+    segs.forEach((seg, i) => {
+      const path = seg.parts.join(' > ');
+      css = i === 0 ? path : css + (seg.anchored ? ' > ' : ' ') + path;
+    });
+    return css;
+  };
+  const fitCss = (segs) => {
+    let rest = segs;
+    let css = joinSegments(rest);
+    while (css.length > MAX_CSS && rest.length > 1) {
+      rest = rest.slice(1);
+      css = joinSegments(rest);
+    }
+    if (css.length > MAX_CSS) {
+      const parts = rest[0].parts.slice();
+      while (parts.length > 1 && parts.join(' > ').length > MAX_CSS) parts.shift();
+      css = parts.join(' > ').slice(0, MAX_CSS);
+    }
+    return css;
+  };
+
+  const cssPath = (el) => fitCss(shadowHosts(el).concat([el]).map(segment));
+
+  // O caminho de cada hospedeiro, cada um dentro da sua raiz, do mais externo ao
+  // mais interno (null fora de shadow roots): a identidade do campo leva isso.
+  const shadowPath = (el) => {
+    const hosts = shadowHosts(el);
+    if (!hosts.length) return null;
+    return hosts.slice(-MAX_SHADOW_DEPTH).map((host) => fitCss([segment(host)]));
   };
 
   const framePath = () => {
@@ -414,9 +591,23 @@
     return all.length > MAX_SCAN ? null : Array.from(all);
   };
 
-  const countRoleName = (root, role, name) => {
+  // O mesmo em várias raízes (os localizadores do Playwright atravessam os shadow
+  // roots abertos); null se alguma for grande demais ou se não há raízes.
+  const scanAll = (roots, selector) => {
+    if (!roots) return null;
+    let out = [];
+    for (const root of roots) {
+      const found = scan(root, selector);
+      if (!found) return null;
+      out = out.concat(found);
+      if (out.length > MAX_SCAN) return null;
+    }
+    return out;
+  };
+
+  const countRoleName = (roots, role, name) => {
     if (!role || !name) return null;
-    const all = scan(root, ROLE_SELECTORS[role]);
+    const all = scanAll(roots, ROLE_SELECTORS[role]);
     if (!all) return null;
     let n = 0;
     for (const el of all) {
@@ -426,25 +617,25 @@
     return n;
   };
 
-  const countLabel = (root, label) => {
+  const countLabel = (roots, label) => {
     if (!label) return null;
-    const all = scan(root, 'input, select, textarea, button, meter, output, progress, [aria-label], [aria-labelledby]');
+    const all = scanAll(roots, 'input, select, textarea, button, meter, output, progress, [aria-label], [aria-labelledby]');
     if (!all) return null;
     let n = 0;
     for (const el of all) if (labelText(el) === label) n++;
     return n;
   };
 
-  const countAttr = (root, attr, value) => {
+  const countAttr = (roots, attr, value) => {
     if (!value) return null;
-    const all = scan(root, '[' + attr + ']');
+    const all = scanAll(roots, '[' + attr + ']');
     if (!all) return null;
     return all.filter((el) => el.getAttribute(attr) === value).length;
   };
 
-  const countText = (root, text) => {
+  const countText = (roots, text) => {
     if (!text) return null;
-    const all = scan(root, '*');
+    const all = scanAll(roots, '*');
     if (!all) return null;
     let n = 0;
     for (const el of all) {
@@ -528,19 +719,22 @@
     return null;
   };
 
+  // A linha também pode estar fora do shadow root do elemento (a caixa de seleção de
+  // um componente numa célula): as contagens dentro dela atravessam os shadow roots.
   const rowInfo = (el, role, name, text) => {
-    const row = el.closest('tr, [role=row]');
+    const row = closestComposed(el, 'tr, [role=row]');
     if (!row) return null;
     const cellElements = Array.from(row.querySelectorAll('td, th, [role=cell], [role=gridcell], [role=rowheader], [role=columnheader]'))
       .slice(0, 20);
     const cells = cellElements.map((c) => clip(c.innerText || c.textContent, 200));
     const key = rowKey(row, cellElements);
+    const inside = rootsUnder(row);
     return {
       text: clip(row.innerText || row.textContent, 500),
       cells,
       key,
-      role_name_count: countRoleName(row, role, name),
-      text_count: countText(row, text),
+      role_name_count: countRoleName(inside, role, name),
+      text_count: countText(inside, text),
     };
   };
 
@@ -551,9 +745,16 @@
     '[role=tab], [role=checkbox], [role=radio], [role=switch], [role=option], [role=treeitem], ' +
     '[onclick], [contenteditable=""], [contenteditable=true]';
 
-  const actionTarget = (event) => {
+  // O elemento em que o evento aconteceu: dentro de um shadow root aberto, o
+  // primeiro do composedPath (o event.target da janela é o hospedeiro).
+  const realTarget = (event) => {
     const path = event.composedPath ? event.composedPath() : [];
-    const raw = path.length && path[0].nodeType === 1 ? path[0] : event.target;
+    const first = path.length ? path[0] : null;
+    return first && first.nodeType === 1 ? first : event.target;
+  };
+
+  const actionTarget = (event) => {
+    const raw = realTarget(event);
     if (!raw || raw.nodeType !== 1) return null;
     return raw.closest(INTERACTIVE) || raw;
   };
@@ -576,6 +777,30 @@
     };
   };
 
+  // Identidade do elemento na gravação: um número por elemento do DOM, o mesmo em
+  // todos os eventos dele (dois elementos nunca têm o mesmo). A parte alta é
+  // sorteada por documento (cada quadro e cada carga da página tem o seu script),
+  // a baixa conta os elementos; passado o limite, o elemento fica sem número (só a
+  // descrição separa os campos, como nas gravações antigas).
+  const ELEMENT_BASE = (() => {
+    try { const a = new Uint32Array(1); W.crypto.getRandomValues(a); return a[0] & 0x7fffffff; } catch (e) {
+      return Math.floor(Math.random() * 0x7fffffff);
+    }
+  })();
+  const MAX_SERIALS = 0x1fffff;
+  const serials = new WeakMap();
+  let serialCount = 0;
+  const serialOf = (el) => {
+    let serial = serials.get(el);
+    if (serial === undefined) {
+      if (serialCount >= MAX_SERIALS) return null;
+      serialCount += 1;
+      serial = ELEMENT_BASE * (MAX_SERIALS + 1) + serialCount;
+      serials.set(el, serial);
+    }
+    return serial;
+  };
+
   const describe = (el) => {
     const role = roleOf(el);
     const name = clip(accessibleName(el, role), MAX_NAME);
@@ -588,13 +813,17 @@
     const type = inputType(el);
     const password = isPassword(el);
     const otp = isOneTimeCode(el);
-    const login = !password && !otp ? loginRole(el) : null;
-    const byName = !password && !otp && login === null && isPasswordByName(el);
+    const byName = isPasswordByName(el);
+    const login = loginRole(el);
     const isControl = tag === 'input' || tag === 'select' || tag === 'textarea';
     let text = '';
     if (!isControl) text = clip(el.innerText || el.textContent, MAX_TEXT);
     else if (tag === 'input' && BUTTON_TYPES.has(type)) text = clip(el.getAttribute('value'), MAX_TEXT);
-    const root = el.getRootNode ? el.getRootNode() : el.ownerDocument;
+    // As contagens valem no documento e nos shadow roots abertos dele, como o
+    // executor procura. Documento grande demais: o do documento conta só nele, como
+    // antes; o de um shadow root fica sem contagem (a conferência do Playwright decide).
+    const shadow = inShadow(el);
+    const root = rootsUnder(el.ownerDocument) || (shadow ? null : [el.ownerDocument]);
     const textForCount = text && text.length <= 100 ? text : null;
     return {
       tag,
@@ -607,6 +836,8 @@
       name_attr: orNull(nameAttr),
       id: orNull(id),
       css: cssPath(el),
+      shadow_path: shadow ? shadowPath(el) : null,
+      serial: serialOf(el),
       text: orNull(text),
       title: orNull(clip(el.getAttribute('title'), MAX_NAME)),
       href: tag === 'a' && el.getAttribute('href') ? clip(el.href, 500) : null,
@@ -616,6 +847,7 @@
       is_one_time_code: otp,
       is_username: login === 'username',
       sensitive: password || otp || login !== null || byName,
+      aria_mentions_password: tag === 'input' && ariaMentionsPassword(el),
       row: rowInfo(el, role, name, textForCount),
       form: formInfo(el),
       counts: {
@@ -632,16 +864,20 @@
 
   // -- máscaras e valores pendentes ---------------------------------------------
 
-  // elemento -> {session, typed, typedKnown, scriptSet, lastSent, since}. Uma "sessão" vai da
-  // primeira tecla até o envio do valor; `typed` só vale se ela começou com o campo
-  // vazio ou com todo o texto selecionado (substituição).
+  // elemento -> {session, typed, typedKnown, scriptSet, lastSent, since, deferred}. Uma
+  // "sessão" vai da primeira tecla até o envio do valor; `typed` só vale se ela começou
+  // com o campo vazio ou com todo o texto selecionado (substituição); `deferred`: o
+  // gravador guardou o campo e decide depois dos ouvintes do componente (deferField).
   const fields = new Map();
   let editing = null;
 
   const fieldState = (el) => {
     let st = fields.get(el);
     if (!st) {
-      st = { session: false, typed: '', typedKnown: true, scriptSet: false, lastSent: undefined, since: null };
+      st = {
+        session: false, typed: '', typedKnown: true, scriptSet: false, lastSent: undefined, since: null,
+        deferred: false,
+      };
       fields.set(el, st);
     }
     return st;
@@ -665,6 +901,8 @@
     st.since = clock();
   };
 
+  // Troca a propriedade value (o getter só repassa ao nativo; o setter marca o
+  // valor que a página muda enquanto a pessoa digita e chama o nativo).
   const hookValueSetter = (proto) => {
     try {
       const desc = Object.getOwnPropertyDescriptor(proto, 'value');
@@ -675,6 +913,10 @@
         get() { return desc.get.call(this); },
         set(v) {
           if (this === editing) { const st = fields.get(this); if (st) st.scriptSet = true; }
+          // Um valor posto por script depois do retrato: o retrato deixa de valer como o
+          // valor do campo (goneDescriptor).
+          const seen = lastSeen.get(this);
+          if (seen) seen.taken = false;
           desc.set.call(this, v);
         },
       });
@@ -688,12 +930,121 @@
     return el.value;
   };
 
-  const sendField = (el) => {
+  // elemento -> {desc, value, fresh, pending}: o retrato do campo, o descritor e o
+  // valor tirados juntos, com o campo na página: depois de cada tecla confiável
+  // (beforeinput ou input, num setTimeout, com a tecla já aplicada) e quando o
+  // gravador guarda o campo para decidir depois (blur, pointerdown, keydown,
+  // beforeinput), nunca só no foco. Na tecla, o valor fica desconhecido até o
+  // retrato seguinte: o campo que sai da página antes dele é esquecido (nunca sai
+  // com um valor de antes da tecla). As marcas de sigilo do retrato só sobem
+  // (raise) até o valor sair; depois do envio, o retrato recomeça (o próximo valor é
+  // outra edição). O retrato só é usado pelo campo que já saiu da página quando o
+  // change, o blur ou o focusout chega (o componente trocou o input antes do ouvinte
+  // do gravador), e então o valor só sai como segredo (goneDescriptor).
+  const lastSeen = new WeakMap();
+  // Campos que eram senha, código ou de um login no foco confiável (onFocusIn): o valor
+  // da edição seguinte só sai como segredo, sem virar outra credencial.
+  const secretAtFocus = new WeakSet();
+  // O último campo em que a pessoa digitou (beforeinput ou input confiável).
+  let lastTyped = null;
+  const SECRET_MARKS = ['is_password', 'is_one_time_code', 'is_username', 'sensitive', 'aria_mentions_password'];
+  // O descritor novo com as marcas de sigilo que o campo já teve nesta edição.
+  const raise = (desc, old) => {
+    if (old) for (const mark of SECRET_MARKS) if (old[mark]) desc[mark] = true;
+    return desc;
+  };
+  const seenOf = (el) => {
+    let seen = lastSeen.get(el);
+    if (!seen) {
+      seen = { desc: null, value: undefined, fresh: false, taken: false, pending: false };
+      lastSeen.set(el, seen);
+    }
+    return seen;
+  };
+  // Retrato do campo na página; se o descritor não sai (exceção), fica o anterior.
+  // ``taken``: o retrato que o gravador tirou ao guardar o campo para decidir depois
+  // (deferField), com o campo na página, depois das teclas da pessoa; uma tecla ou um
+  // valor posto por script depois dele o desfazem.
+  const snapshot = (el, taken) => {
+    const seen = seenOf(el);
+    if (!el.isConnected) return;
+    try {
+      const desc = raise(describe(el), seen.desc);
+      const value = currentValue(el);
+      seen.desc = desc;
+      seen.value = value;
+      seen.fresh = true;
+      seen.taken = taken === true;
+    } catch (e) { /* ignora */ }
+  };
+  // Uma tecla da pessoa: o valor guardado fica desconhecido e o retrato sai depois
+  // da tecla, se o campo ainda estiver na página.
+  const keyPressed = (el) => {
+    const seen = seenOf(el);
+    seen.value = undefined;
+    seen.fresh = false;
+    seen.taken = false;
+    if (seen.pending) return;
+    seen.pending = true;
+    setTimeout(() => { seen.pending = false; if (el.isConnected) snapshot(el); }, 0);
+  };
+
+  // O descritor guardado de um campo que saiu da página antes de o valor sair, com as
+  // marcas de sigilo do retrato. O valor só vale como o que a pessoa digitou quando o
+  // retrato é o que o gravador tirou ao guardar o campo para decidir depois
+  // (``taken``: na próxima ação noutro elemento ou no blur, com o campo na página e
+  // nenhuma tecla nem valor de script depois dele); então o campo leva pelo menos a
+  // marca de sigilo que um envio com o campo na página teria agora (o próprio campo é
+  // senha ou código, ou é o usuário ou outro campo de um login, ou há uma senha ou um
+  // código em qualquer raiz do documento, ou o documento é grande demais para olhar).
+  // Com só o retrato de depois da última tecla (o componente tirou o campo antes de o
+  // gravador guardá-lo), o campo é sempre sigiloso: a página pode tê-lo mudado depois
+  // do retrato (uma máscara que só aparece depois, uma tecla que ela aplica num
+  // temporizador). O valor sigiloso só sai como segredo (para a limpeza dos textos
+  // capturados) e nunca é repetido nem gravado: o robô pede o valor numa entrada, ou
+  // usa a credencial do cofre se o retrato diz que o campo é senha, código ou usuário.
+  const goneDescriptor = (el, seen) => {
+    const out = Object.assign({}, seen.desc);
+    let secret = true;
+    try {
+      if (isPassword(el)) out.is_password = true;
+      if (isOneTimeCode(el)) out.is_one_time_code = true;
+      secret = !seen.taken || out.sensitive || out.is_password || out.is_one_time_code || isSecretField(el) ||
+        loginRole(el) !== null || !rootsUnder(el.ownerDocument) || secretIn(el, false, null);
+    } catch (e) { /* na dúvida, sigiloso */ }
+    if (secret) out.sensitive = true;
+    return out;
+  };
+
+  // ``gone``: o campo pode ter saído da página (change, blur ou focusout dele, ou a
+  // janela perdeu o foco); então o valor sai com o descritor e o valor guardados
+  // (o retrato de depois da última tecla, ou o que o gravador tirou para decidir
+  // depois: ``deferred``), se a pessoa digitou nele desde o último envio. Fora
+  // disso, o campo que saiu da página é esquecido, como antes. Com o campo na
+  // página, o descritor é o de agora, com as marcas de sigilo do retrato.
+  const sendField = (el, gone) => {
     const st = fields.get(el);
-    if (!st || !el.isConnected) { fields.delete(el); return; }
-    const value = currentValue(el);
-    if (value === st.lastSent) return;
-    const desc = describe(el);
+    if (!st) return;
+    const deferred = st.deferred;
+    st.deferred = false;
+    let value;
+    let desc;
+    if (el.isConnected) {
+      value = currentValue(el);
+      if (value === st.lastSent) return;
+      const seen = lastSeen.get(el);
+      desc = raise(describe(el), seen ? seen.desc : null);
+    } else {
+      fields.delete(el);
+      const seen = gone || deferred ? lastSeen.get(el) : null;
+      if (!seen || !seen.desc || !st.session || seen.value === undefined || seen.value === st.lastSent) return;
+      value = seen.value;
+      desc = goneDescriptor(el, seen);
+    }
+    // O campo era senha, código ou de um login quando a pessoa o focou (antes de mostrar
+    // a senha com o "olho", ou antes de a página o reaproveitar): o valor só sai como
+    // segredo e vira uma entrada do robô, nunca outra credencial do cofre.
+    if (secretAtFocus.has(el)) desc.sensitive = true;
     const sensitive = desc.sensitive;
     send({
       kind: 'input',
@@ -713,10 +1064,48 @@
     st.typed = '';
     st.typedKnown = true;
     st.scriptSet = false;
+    // A próxima edição começa outro retrato (as marcas valem para o valor que saiu).
+    const seen = lastSeen.get(el);
+    if (seen) { seen.desc = null; seen.value = undefined; seen.fresh = false; seen.taken = false; }
+    secretAtFocus.delete(el);
   };
 
   const flushPending = (except) => {
     for (const el of Array.from(fields.keys())) if (el !== except) sendField(el);
+  };
+
+  // Guarda o campo (retrato) e decide num setTimeout, depois dos ouvintes do
+  // componente (o blur dele pode trocar o campo por um "chip" ou virar
+  // type=password): o campo na página sai com o descritor de agora (e as marcas de
+  // sigilo do retrato: o que virou senha ou código só sai como segredo); o que saiu
+  // da página sai com o retrato. Antes disso, um clique, um Enter ou um Tab
+  // (flushPending) decidem na hora, do mesmo jeito. Só guarda o campo com um valor
+  // que ainda não saiu; o que já saiu da página antes do evento segue ``gone``.
+  const deferField = (el, gone) => {
+    const st = fields.get(el);
+    if (!st) return;
+    if (!el.isConnected) { sendField(el, gone); return; }
+    let value;
+    try { value = currentValue(el); } catch (e) { return; }
+    if (value === st.lastSent || st.deferred) return;
+    st.deferred = true;
+    snapshot(el, true);
+    setTimeout(() => { if (fields.get(el) === st && st.deferred) sendField(el, true); }, 0);
+  };
+
+  // Antes de uma ação noutro elemento (pointerdown, keydown ou beforeinput), o
+  // valor pendente dos campos de shadow roots sai, na ordem da pessoa: o gravador
+  // guarda o campo e decide depois dos ouvintes de blur do componente (deferField).
+  // Não sai o do próprio campo, nem o do campo que contém o alvo (um trecho de um
+  // contenteditable). Os campos da luz já saem no change da janela.
+  const flushShadowOthers = (event) => {
+    if (!event.isTrusted) return;
+    const target = realTarget(event);
+    const el = target && target.nodeType === 1 ? target : null;
+    for (const f of Array.from(fields.keys())) {
+      if (f === el || (el && f.contains(el)) || !inShadow(f)) continue;
+      deferField(f, false);
+    }
   };
 
   const isEditable = (el) => isTextLike(el) || isPassword(el) || el.isContentEditable ||
@@ -724,22 +1113,42 @@
 
   const onBeforeInput = (event) => {
     if (!event.isTrusted) return;
-    const el = event.target;
+    const el = realTarget(event);
     if (!el || el.nodeType !== 1 || !isEditable(el)) return;
     const st = fieldState(el);
     startSession(el, st, el.isContentEditable ? false : currentValue(el) === '' || allSelected(el));
+    keyPressed(el);
+    lastTyped = el;
+  };
+
+  // O foco confiável de um campo que é senha, código ou de um login: a próxima edição dele
+  // só sai como segredo (o "olho" que mostra a senha troca o type antes da primeira tecla;
+  // a página pode reaproveitar o campo). Não tira retrato: as marcas de credencial (que
+  // escolhem a do cofre) só vêm de depois de uma tecla.
+  const onFocusIn = (event) => {
+    if (!event.isTrusted) return;
+    const el = realTarget(event);
+    if (!el || el.nodeType !== 1 || !isEditable(el)) return;
+    try {
+      if (isSecretField(el) || loginRole(el) !== null) secretAtFocus.add(el);
+    } catch (e) { secretAtFocus.add(el); }
   };
 
   const onInput = (event) => {
-    if (!event.isTrusted) return;
-    const el = event.target;
-    if (!el || el.nodeType !== 1 || !isEditable(el)) return;
+    const el = realTarget(event);
+    if (!el || el.nodeType !== 1) return;
+    // O change não sai do shadow root (não é composed); o input, sim, e o
+    // navegador o dispara antes do change em listas, caixas de seleção e arquivos.
+    if (isChoice(el) && inShadow(el)) { onChoice(el, event); return; }
+    if (!event.isTrusted || !isEditable(el)) return;
     const st = fieldState(el);
     startSession(el, st, false);
     const type = event.inputType || '';
     if (type.indexOf('insert') === 0 && typeof event.data === 'string') st.typed += event.data;
     else st.typedKnown = false;
     editing = el;
+    keyPressed(el);
+    lastTyped = el;
     const before = currentValue(el);
     setTimeout(() => {
       if (editing === el) editing = null;
@@ -748,7 +1157,7 @@
   };
 
   const onKeyFlag = (event) => {
-    const el = event.target;
+    const el = realTarget(event);
     if (el && el.nodeType === 1 && isEditable(el)) {
       editing = el;
       setTimeout(() => { if (editing === el) editing = null; }, 0);
@@ -757,9 +1166,12 @@
   const clearEditing = () => { editing = null; };
 
   const selectSent = new WeakMap();
-  const onChange = (event) => {
-    const el = event.target;
-    if (!el || el.nodeType !== 1) return;
+  // Lista, caixa de seleção, opção ou arquivo: o valor sai na hora (change ou, num
+  // shadow root, input).
+  const isChoice = (el) => el.tagName === 'SELECT' ||
+    (el.tagName === 'INPUT' && ['checkbox', 'radio', 'file'].indexOf(inputType(el)) >= 0);
+
+  const onChoice = (el, event) => {
     const tag = el.tagName;
     const type = inputType(el);
     // Listas e arquivos aceitam eventos sintéticos: é assim que a automação (e a
@@ -790,14 +1202,82 @@
       flushPending(el);
       const names = Array.from(el.files || []).slice(0, 10).map((f) => String(f.name).slice(0, 255));
       send({ kind: 'file', element: describe(el), file_names: names });
-      return;
     }
-    if (isEditable(el)) { fieldState(el); sendField(el); }
   };
 
+  const onChange = (event) => {
+    const el = realTarget(event);
+    if (!el || el.nodeType !== 1) return;
+    if (isChoice(el)) { onChoice(el, event); return; }
+    if (event.isTrusted && isEditable(el)) { fieldState(el); sendField(el, true); }
+  };
+
+  // focusout: o valor sai na hora (depois dos ouvintes de blur do campo).
   const onFocusOut = (event) => {
-    const el = event.target;
-    if (el && fields.has(el)) sendField(el);
+    const el = realTarget(event);
+    if (el && fields.has(el)) sendField(el, event.isTrusted);
+  };
+
+  // O blur confiável de um campo de shadow root, na fase de captura da janela e do
+  // shadow root: chega antes do ouvinte de blur do próprio campo (que pode trocá-lo
+  // por um "chip" ou virar type=password) e não depende de um pointerdown ou keydown
+  // neste documento, que não há quando a pessoa sai para um iframe. O gravador só
+  // guarda o campo e decide depois desses ouvintes (deferField).
+  const onBlurField = (event) => {
+    if (!event.isTrusted) return;
+    const el = realTarget(event);
+    if (el && el.nodeType === 1 && fields.has(el)) deferField(el, true);
+  };
+
+  // O blur na captura da janela vale para os campos de shadow roots (o change de um
+  // campo da luz já chega primeiro ao gravador, na janela; ele continua saindo no
+  // change ou no focusout, como antes). O blur da própria janela (o foco foi para
+  // um iframe ou para fora): o campo de shadow root em que a pessoa digitou por
+  // último, se já saiu da página sem change, blur nem focusout que o gravador visse
+  // (o componente o trocou no próprio change, antes do gravador), sai com o retrato
+  // de depois da última tecla. O campo da luz que saiu assim é esquecido, como antes.
+  const onBlur = (event) => {
+    if (event.target !== W) {
+      const el = realTarget(event);
+      if (el && el.nodeType === 1 && inShadow(el)) onBlurField(event);
+      return;
+    }
+    if (!event.isTrusted) return;
+    const el = lastTyped;
+    if (!el || el.isConnected || !fields.has(el)) return;
+    const seen = lastSeen.get(el);
+    if (seen && seen.desc && seen.desc.shadow_path) sendField(el, true);
+  };
+
+  // O change de um campo de texto num shadow root aberto: ele não sai do shadow
+  // root (não é composed), e o navegador o dispara antes do blur, quando o campo
+  // ainda existe. Listas, caixas de seleção e arquivos de shadow roots já saem
+  // pelo input (onInput).
+  const onShadowChange = (event) => {
+    const el = realTarget(event);
+    if (!el || el.nodeType !== 1 || isChoice(el)) return;
+    if (event.isTrusted && isEditable(el)) { fieldState(el); sendField(el, true); }
+  };
+
+  // Shadow roots abertos: cada um que aparece no composedPath de um evento que
+  // atravessa a fronteira (focusin, pointerdown, mousedown, keydown, beforeinput,
+  // input) ganha, uma vez só, ouvintes de change, blur e focusout na fase de
+  // captura (o blur e o focusout entre dois campos do mesmo shadow root não chegam
+  // à janela). Vale para os shadow roots declarativos e os criados antes deste
+  // script; nenhum método nativo é embrulhado.
+  const watchedRoots = new WeakSet();
+  const watchRoots = (event) => {
+    let path;
+    try { path = event.composedPath(); } catch (e) { return; }
+    for (const node of path) {
+      if (!node || node.nodeType !== 11 || !hostOf(node) || watchedRoots.has(node)) continue;
+      watchedRoots.add(node);
+      try {
+        node.addEventListener('change', onShadowChange, { capture: true, passive: true });
+        node.addEventListener('blur', onBlurField, { capture: true, passive: true });
+        node.addEventListener('focusout', onFocusOut, { capture: true, passive: true });
+      } catch (e) { /* ignora */ }
+    }
   };
 
   const SKIP_CLICK_TYPES = new Set(['checkbox', 'radio', 'file']);
@@ -821,25 +1301,39 @@
   const onKeyDown = (event) => {
     onKeyFlag(event);
     if (!event.isTrusted || event.isComposing || !KEYS.has(event.key)) return;
-    const el = event.target && event.target.nodeType === 1 ? event.target : null;
+    const target = realTarget(event);
+    const el = target && target.nodeType === 1 ? target : null;
     flushPending(null);
     const onPage = !el || el === el.ownerDocument.body || el === el.ownerDocument.documentElement;
     send({ kind: 'key', key: event.key, element: onPage ? null : describe(el) });
   };
 
   const opts = { capture: true, passive: true };
+  // Primeiro os shadow roots do caminho e o valor pendente de outro campo; depois a ação.
+  for (const type of ['focusin', 'pointerdown', 'mousedown', 'keydown', 'beforeinput', 'input']) {
+    W.addEventListener(type, watchRoots, opts);
+  }
+  for (const type of ['pointerdown', 'keydown', 'beforeinput']) {
+    W.addEventListener(type, flushShadowOthers, opts);
+  }
   W.addEventListener('beforeinput', onBeforeInput, opts);
   W.addEventListener('input', onInput, opts);
   W.addEventListener('keyup', onKeyFlag, opts);
   W.addEventListener('keypress', onKeyFlag, opts);
   W.addEventListener('keydown', onKeyDown, opts);
   W.addEventListener('change', onChange, opts);
+  W.addEventListener('blur', onBlur, opts);
+  W.addEventListener('focusin', onFocusIn, opts);
   W.addEventListener('focusout', onFocusOut, opts);
   W.addEventListener('click', onClick, opts);
   // Depois de todos os ouvintes da página: fim da janela em que ela pode mascarar o valor.
   W.addEventListener('input', clearEditing, { capture: false, passive: true });
   W.addEventListener('pagehide', () => flushPending(null), opts);
   W.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushPending(null); }, opts);
+  // Shadow roots: os eventos que atravessam a fronteira chegam à janela com o
+  // composedPath; o change, o blur e o focusout que ficam dentro de um shadow root
+  // aberto chegam pelos ouvintes que watchRoots põe nele. Nenhum método da página é
+  // embrulhado.
 
   Object.defineProperty(W, Symbol.for('rapa.recorder.stop'), {
     configurable: true,

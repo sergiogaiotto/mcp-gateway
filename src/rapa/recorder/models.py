@@ -5,8 +5,9 @@ elemento), navegações, downloads, requisições e o texto visível das página
 É só dado: o compilador (``rapa.compiler``) a transforma num robô sem usar
 modelo de linguagem.
 
-Nenhum evento guarda o valor de campos de senha, de código de uso único ou do
-usuário de login: esses campos chegam marcados como sensíveis e sem valor.
+Nenhum evento guarda o valor de campos de senha, de código de uso único, do
+usuário de login nem dos outros campos de texto de uma página que pede senha ou
+código: esses campos chegam marcados como sensíveis e sem valor.
 """
 
 from datetime import datetime
@@ -122,7 +123,21 @@ class ElementDescriptor(_Model):
     test_id: str | None = Field(default=None, max_length=300)
     name_attr: str | None = Field(default=None, max_length=300)
     id: str | None = Field(default=None, max_length=300)
+    #: Seletor CSS; dentro de shadow roots abertos, ele os atravessa a partir do
+    #: documento ("#hospedeiro > #campo"), como o CSS do Playwright.
     css: str = Field(max_length=1000)
+    #: Hospedeiros dos shadow roots abertos em volta do elemento, do mais externo ao
+    #: mais interno, cada um pelo caminho dentro da sua raiz (None: fora de shadow
+    #: root). Faz parte da identidade do campo: dois componentes iguais (o mesmo id
+    #: por dentro) são campos diferentes.
+    shadow_path: list[Annotated[str, Field(max_length=1000)]] | None = Field(
+        default=None, max_length=16
+    )
+    #: Número que o script dá a cada elemento do DOM, o mesmo em todos os eventos
+    #: dele e nunca o mesmo para dois elementos (None: gravação antiga, ou o script
+    #: não deu). Edições, marcações e escolhas só se juntam num passo com o mesmo
+    #: número.
+    serial: int | None = Field(default=None, ge=0)
     #: Texto visível (nunca o valor digitado num campo).
     text: str | None = Field(default=None, max_length=300)
     title: str | None = Field(default=None, max_length=300)
@@ -134,6 +149,9 @@ class ElementDescriptor(_Model):
     is_one_time_code: bool = False
     is_username: bool = False
     sensitive: bool = False
+    #: O ``aria-label`` ou o texto do ``aria-labelledby`` do campo fala em senha (o
+    #: script olha os dois, mesmo quando o nome acessível vem só de um deles).
+    aria_mentions_password: bool = False
     row: RowInfo | None = None
     form: FormInfo | None = None
     counts: LocatorCounts = Field(default_factory=LocatorCounts)
