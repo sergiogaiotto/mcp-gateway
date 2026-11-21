@@ -1418,6 +1418,31 @@ _HOVER_LABELS = {
         "<script>document.addEventListener('mouseover',(e)=>{const t=e.target.closest('[title]');"
         "if(t){t.dataset.dica=t.title;t.removeAttribute('title')}})</script>",
     ),
+    # Uma dica que põe o title no aria-label e o tira (como a do Bootstrap 5).
+    "rotulo": (
+        "Excluir",
+        f"<button type='button' title='Excluir' onclick=\"{_SAVE_S}\">"
+        "<span aria-hidden='true'>&#128465;</span></button>"
+        "<script>document.addEventListener('mouseover',(e)=>{const t=e.target.closest('[title]');"
+        "if(t){t.setAttribute('aria-label',t.title);t.removeAttribute('title')}})</script>",
+    ),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_HOVER_LABELS))
+async def test_a_tooltip_the_page_puts_when_the_mouse_arrives_is_not_a_refusal(
+    run_robot: RobotRunner, srv: _Server, kind: str
+) -> None:
+    # O vigia vê a chegada do mouse antes dos ouvintes da página: a dica que eles põem nela
+    # (o title que sai, o aria-label que chega) vale.
+    name, body = _HOVER_LABELS[kind]
+    srv.app = _api_app(srv, {"/p": _page(body)})
+    manifest = _manifest([_nav(srv.base, "/p"), _click("salvar", name, effect="write")])
+    outcome = await _run(run_robot, manifest)
+    _wrote(outcome, srv, RunState.SUCCEEDED, "S;")
+
+
+_CHANGED_LABELS = {
     # "Seguindo" que vira "Deixar de seguir" com o mouse em cima.
     "seguir": (
         "Seguindo",
@@ -1436,17 +1461,101 @@ _HOVER_LABELS = {
 }
 
 
-@pytest.mark.parametrize("kind", sorted(_HOVER_LABELS))
-async def test_a_label_the_page_changes_when_the_mouse_arrives_is_not_a_refusal(
+@pytest.mark.parametrize("kind", sorted(_CHANGED_LABELS))
+async def test_a_text_the_page_changes_during_the_click_is_refused(
     run_robot: RobotRunner, srv: _Server, kind: str
 ) -> None:
-    # O vigia vê a chegada do mouse antes dos ouvintes da página: o rótulo que eles põem
-    # nela (e o "Salvando..." do pointerdown, depois do primeiro evento) vale.
-    name, body = _HOVER_LABELS[kind]
+    # O texto que muda com o mouse em cima ou no pointerdown é o mesmo sinal de um nó que a
+    # página reaproveitou para outro item: o passo falha sem o click (perda de
+    # disponibilidade, nunca o item errado).
+    name, body = _CHANGED_LABELS[kind]
     srv.app = _api_app(srv, {"/p": _page(body)})
     manifest = _manifest([_nav(srv.base, "/p"), _click("salvar", name, effect="write")])
     outcome = await _run(run_robot, manifest)
-    _wrote(outcome, srv, RunState.SUCCEEDED, "S;")
+    _wrote(outcome, srv, RunState.FAILED, "")
+    assert outcome.result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+
+
+def _shifting_list(event: str, *, check: bool) -> str:
+    """Uma lista posicional de 10 itens (50 a 59): cada botão (ou caixa, ``check``) mostra
+    o item da posição dele. No primeiro ``event`` do navegador, um ouvinte da página na
+    janela põe a lista 5 itens para trás, e cada nó passa a mostrar outro item."""
+    if check:
+        make = (
+            "const b=document.createElement('input');b.type='checkbox';b.id='c'+k;"
+            "const t=document.createElement('label');t.htmlFor=b.id;b.nome=t;"
+            "b.onchange=()=>fetch('/api',{method:'POST',body:t.textContent+';'});"
+            "const d=document.createElement('div');d.append(b,t);l.appendChild(d);"
+        )
+        draw = "b.nome.textContent='Aprovar Item '+(first+k)"
+    else:
+        make = (
+            "const b=document.createElement('button');b.type='button';"
+            "b.style.cssText='display:block;height:30px';"
+            "b.onclick=()=>fetch('/api',{method:'POST',body:b.getAttribute('aria-label')+';'});"
+            "l.appendChild(b);"
+        )
+        draw = (
+            "b.textContent='Excluir Item '+(first+k);"
+            "b.setAttribute('aria-label','Excluir Item '+(first+k))"
+        )
+    return _page(
+        "<div id='l'></div><script>const l=document.getElementById('l');let first=50;"
+        f"const pool=[];for(let k=0;k<10;k++){{{make}pool.push(b)}}"
+        f"const draw=()=>pool.forEach((b,k)=>{{{draw}}});draw();let feito=false;"
+        f"addEventListener('{event}',(e)=>{{if(feito||!e.isTrusted)return;feito=true;"
+        "first-=5;draw()},true)</script>"
+    )
+
+
+_MOUSE_EVENTS = [
+    "pointerover",
+    "mouseover",
+    "pointermove",
+    "pointerdown",
+    "mousedown",
+    "pointerup",
+    "mouseup",
+]
+
+
+@pytest.mark.parametrize("event", _MOUSE_EVENTS)
+async def test_a_list_the_page_shifts_while_the_mouse_acts_never_deletes_another_item(
+    run_robot: RobotRunner, srv: _Server, event: str
+) -> None:
+    # Um ouvinte da página para a chegada do mouse, para o movimento ou para o botão
+    # apertado reaproveita o nó para outro item: o texto e o aria-label mudam (não é uma
+    # dica), e o vigia recusa o evento seguinte.
+    srv.app = _api_app(srv, {"/p": _shifting_list(event, check=False)})
+    manifest = _manifest(
+        [_nav(srv.base, "/p"), _click("excluir", "Excluir Item 57", effect="write")]
+    )
+    outcome = await _run(run_robot, manifest)
+    _wrote(outcome, srv, RunState.FAILED, "")
+    assert outcome.result.error_code == ErrorCode.ELEMENTO_AMBIGUO
+
+
+@pytest.mark.parametrize("event", ["mouseover", "mousedown"])
+async def test_a_list_the_page_shifts_while_the_mouse_acts_never_checks_another_item(
+    run_robot: RobotRunner, srv: _Server, event: str
+) -> None:
+    # A mesma lista com caixas nomeadas por um <label>: o rótulo que o vigia confere inclui
+    # o texto dele.
+    srv.app = _api_app(srv, {"/p": _shifting_list(event, check=True)})
+    step = {
+        "kind": "check",
+        "id": "aprovar",
+        "title": "Marcar Aprovar Item 57",
+        "effect": "write",
+        "timeout_ms": 3_000,
+        "checked": True,
+        "target": _target(
+            "caixa Aprovar Item 57", {"by": "label", "value": "Aprovar Item 57", "exact": True}
+        ),
+    }
+    outcome = await _run(run_robot, _manifest([_nav(srv.base, "/p"), step]))
+    _wrote(outcome, srv, RunState.FAILED, "")
+    assert outcome.result.error_code == ErrorCode.ELEMENTO_AMBIGUO
 
 
 async def test_a_recycled_list_named_by_another_element_never_deletes_another_item(
@@ -1476,13 +1585,16 @@ async def test_a_recycled_list_named_by_another_element_never_deletes_another_it
     _deleted_57_or_nothing(await _run(run_robot, manifest), srv)
 
 
-async def test_a_list_redrawn_between_the_wait_and_the_guard_never_deletes_another_item(
-    run_robot: RobotRunner, srv: _Server, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("elsewhere", [True, False])
+async def test_a_list_redrawn_before_the_guard_never_deletes_another_item(
+    run_robot: RobotRunner, srv: _Server, monkeypatch: pytest.MonkeyPatch, elsewhere: bool
 ) -> None:
-    # A lista virtual redesenha o nó preso (rolada pela espera) logo antes de o vigia ser
-    # posto, e o vigia guarda o rótulo do outro item. A conferência do elemento único vem
-    # com o vigia já posto e recusa o passo.
-    page = _recycled_list("", "<iframe id='g' src='/obs' style='width:400px;height:80px'></iframe>")
+    # A lista virtual redesenha o nó preso logo antes de o vigia ser posto (rolada pela
+    # espera, com a Obs digitada num iframe; ou sem espera nenhuma, como um feed que põe um
+    # item no topo), e o vigia guarda o rótulo do outro item. A conferência do elemento
+    # único vem com o vigia já posto e recusa o passo.
+    frame = "<iframe id='g' src='/obs' style='width:400px;height:80px'></iframe>"
+    page = _recycled_list("", frame if elsewhere else "")
     srv.app = _api_app(srv, {"/p": page, "/obs": _page("<label for='o'>Obs</label><input id='o'>")})
     original = Interpreter._arm_guard
     redrawn: list[bool] = []
@@ -1496,14 +1608,9 @@ async def test_a_list_redrawn_between_the_wait_and_the_guard_never_deletes_anoth
     monkeypatch.setattr(Interpreter, "_arm_guard", arm_after_a_redraw)
     note = _fill("digitar_obs", "Obs", "observação")
     note["target"]["frames"] = ["#g"]
-    manifest = _manifest(
-        [
-            _nav(srv.base, "/p"),
-            note,
-            _click("excluir", "Excluir Item 57", effect="write", timeout=6_000),
-        ]
-    )
-    outcome = await _run(run_robot, manifest)
+    steps = [_nav(srv.base, "/p"), note] if elsewhere else [_nav(srv.base, "/p")]
+    steps.append(_click("excluir", "Excluir Item 57", effect="write", timeout=6_000))
+    outcome = await _run(run_robot, _manifest(steps))
     assert redrawn
     _wrote(outcome, srv, RunState.FAILED, "")
     assert outcome.result.error_code == ErrorCode.ELEMENTO_AMBIGUO
@@ -1531,6 +1638,40 @@ async def test_a_button_past_the_edge_of_a_shifted_modal_iframe_is_clicked(
     outcome = await _run(run_robot, _manifest([_nav(srv.base, "/host"), save]))
     _wrote(outcome, srv, RunState.SUCCEEDED, "S;")
     assert time.monotonic() - started < 5.5
+
+
+async def test_a_drawer_that_slides_in_never_gives_the_click_to_the_page_over_it(
+    run_robot: RobotRunner, srv: _Server
+) -> None:
+    # A gaveta com o iframe do Salvar entra pela direita, de fora da janela, e a página
+    # mostra por 1,5 s um "Desfazer" que cobre a tela. Fora da janela, o alvo ainda não dá
+    # para clicar: a espera continua até a gaveta entrar e o "Desfazer" sair.
+    # O Salvar fica à direita na gaveta: ele entra na janela depois do resto dela.
+    form = _page(
+        "<div style='height:110px'></div><div style='padding-left:300px'>"
+        f"<button type='button' style='width:90px;height:32px' onclick=\"{_SAVE_S}\">"
+        "Salvar</button></div>"
+    )
+    host = _page(
+        "<button type='button' id='ab'>Abrir</button>"
+        "<div id='dr' style='position:fixed;right:0;top:80px;width:420px;z-index:3;"
+        "transform:translateX(110%);transition:transform 700ms linear;background:#fff;"
+        "border:1px solid'>"
+        "<iframe id='f' src='/form' style='width:400px;height:220px;border:0;display:block'>"
+        "</iframe></div>"
+        "<button id='desfaz' type='button' hidden style='position:fixed;inset:0;z-index:50' "
+        "onclick=\"fetch('/api',{method:'POST',body:'DESFAZ;'})\">Desfazer</button>"
+        "<script>document.getElementById('ab').onclick=()=>{"
+        "document.getElementById('dr').style.transform='translateX(0)';"
+        "const d=document.getElementById('desfaz');d.hidden=false;"
+        "setTimeout(()=>{d.hidden=true},1500)}</script>"
+    )
+    srv.app = _api_app(srv, {"/host": host, "/form": form})
+    save = _click("salvar", "Salvar", effect="write", timeout=6_000)
+    save["target"]["frames"] = ["#f"]
+    manifest = _manifest([_nav(srv.base, "/host"), _click("gaveta", "Abrir", effect="read"), save])
+    outcome = await _run(run_robot, manifest)
+    _wrote(outcome, srv, RunState.SUCCEEDED, "S;")
 
 
 @pytest.mark.parametrize(

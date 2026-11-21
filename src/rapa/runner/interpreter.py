@@ -762,12 +762,13 @@ Object.defineProperty(window, key, {
 # outro item enquanto o Playwright rola até ele troca o rótulo. Vale também o rótulo que os
 # ouvintes da página para a chegada do mouse ao alvo puseram (``pointerover`` e ``mouseover``,
 # que o vigia vê antes deles; o rótulo é lido de novo no ``pointermove`` e no ``mousemove``,
-# depois deles), se ele era o da hora do vigia quando o mouse chegou. Depois do primeiro
-# evento de um clique ou de uma marcação, e até o ``click``, o vigia confere de novo, em cada
-# evento do navegador, o endereço e a linha (os ouvintes da página já receberam os eventos de
-# antes e podem tê-los mudado; o rótulo não: "Salvando..." no ``pointerdown``); se mudaram,
-# ele cancela esse evento e os seguintes (``meio``). Um clique cujos eventos não chegaram à
-# janela do alvo vale ``fora``.
+# depois deles), se ele era o da hora do vigia quando o mouse chegou e se só a dica mudou (o
+# ``title`` que sai ou chega, o ``aria-label`` que chega; o texto, os ``<label>``, o
+# ``aria-labelledby`` e o ``data-testid`` iguais). Depois do primeiro evento de um clique ou
+# de uma marcação, e até o ``click``, o vigia confere de novo, em cada evento do navegador, o
+# endereço, a linha e o rótulo (os ouvintes da página já receberam os eventos de antes e podem
+# tê-los mudado); se mudaram, ele cancela esse evento e os seguintes (``meio``). Um clique
+# cujos eventos não chegaram à janela do alvo vale ``fora``.
 _DISPATCH_GUARD_JS = (
     "(element, [kind, row, key, typed, late]) => {"
     + _FIELD_OF_FN
@@ -843,21 +844,28 @@ const prompt = () => late === null || view.performance.now() - armedAt <= late;
 const named = (ids) => (ids ?? '').split(/\s+/).filter(Boolean)
   .map((id) => target.getRootNode().getElementById?.(id) ?? null)
   .map((node) => (node ? normalize(htmlText(node)) : '')).join(' ');
-const label = () => [target.getAttribute('aria-label') ?? '', target.getAttribute('title') ?? '',
+const parts = () => [target.getAttribute('aria-label') ?? '', target.getAttribute('title') ?? '',
   named(target.getAttribute('aria-labelledby')),
   [...(target.labels ?? [])].map((node) => normalize(htmlText(node))).join(' '),
-  target.getAttribute('data-testid') ?? '', normalize(htmlText(target))].join('\n');
+  target.getAttribute('data-testid') ?? '', normalize(htmlText(target))];
+const label = () => JSON.stringify(parts());
+// Só a dica mudou: o title que sai ou chega, o aria-label que chega; o resto, igual.
+const tooltipOnly = (h, a) => (a[0] === h[0] || h[0] === '')
+  && (a[1] === h[1] || a[1] === '' || h[1] === '')
+  && a[2] === h[2] && a[3] === h[3] && a[4] === h[4] && a[5] === h[5];
 const armedLabel = kind === 'clique' || kind === 'marca' ? label() : null;
 // O rótulo quando o mouse chega ao alvo, antes dos ouvintes da página, e logo depois dos
-// ouvintes dela para a chegada (uma dica que tira o ``title``, um "Seguindo" que vira
-// "Deixar de seguir"): a mudança que a chegada do mouse fez vale.
+// ouvintes dela para a chegada: a mudança que a chegada do mouse fez só vale se for a de
+// uma dica (que tira o ``title`` ou põe o aria-label). Um texto, um ``<label>`` ou um
+// aria-label que muda é o nó reaproveitado para outro item.
 let hovered = null;
 let afterHover = null;
 const sameLabel = () => {
   if (armedLabel === null) return true;
   const now = label();
   return now === armedLabel
-    || (hovered === armedLabel && afterHover !== null && now === afterHover);
+    || (hovered === armedLabel && afterHover !== null && now === afterHover
+      && tooltipOnly(JSON.parse(hovered), JSON.parse(afterHover)));
 };
 const hoverTypes = new Set(['pointerover', 'mouseover']);
 const moveTypes = new Set(['pointermove', 'mousemove']);
@@ -872,7 +880,7 @@ const off = () => {
   else for (const type of types) view.removeEventListener(type, listener, true);
 };
 // Num clique ou numa marcação, depois do primeiro evento e até o ``click``: os ouvintes da
-// página já receberam os eventos de antes e podem ter mudado o endereço ou a linha.
+// página já receberam os eventos de antes e podem ter mudado o endereço, a linha ou o rótulo.
 const pointer = kind === 'clique' || kind === 'marca';
 const done = () => {
   state = 'feito';
@@ -894,7 +902,7 @@ const listener = (event) => {
   }
   if (state === 'passou') {
     if (!event.isTrusted) return;
-    if (!moved() && inRow()) {
+    if (!moved() && inRow() && sameLabel()) {
       if (event.type === 'click') done();
       return;
     }
@@ -1031,7 +1039,8 @@ for (;;) {
   const oy = rect.top + (frame.clientTop + (parseFloat(style.paddingTop) || 0)) * sy;
   box = [Math.max(ox + box[0] * sx, 0), Math.max(oy + box[1] * sy, 0),
     Math.min(ox + box[2] * sx, outer.innerWidth), Math.min(oy + box[3] * sy, outer.innerHeight)];
-  if (box[2] - box[0] < 1 || box[3] - box[1] < 1) return true;
+  // Fora da janela de cima (uma gaveta que ainda entra): ainda não dá para clicar.
+  if (box[2] - box[0] < 1 || box[3] - box[1] < 1) return false;
   x = (box[0] + box[2]) / 2;
   y = (box[1] + box[3]) / 2;
   want = frame;
@@ -4088,26 +4097,23 @@ class Interpreter:
             act = self._row_not_acted_on(step)
         frame = await self._frame_of(ctx.element) if self._typed else None
         elsewhere = any(frame is None or entry.frame is not frame for entry in self._typed)
-        if await self._points_at(step, ctx.element) and (
-            elsewhere or await self._in_transformed_frame(ctx.element)
-        ):
+        points = await self._points_at(step, ctx.element)
+        if points and (elsewhere or await self._in_transformed_frame(ctx.element)):
             # Há campos digitados noutro documento (o vigia não os lê no primeiro evento: a
             # espera pelo alvo livre vem antes da releitura), ou o alvo está num iframe
             # transformado, onde o Playwright não confere o que está por cima dele.
-            scrolled = await self._wait_uncovered(step, ctx, ctx.element, elsewhere=elsewhere)
-        else:
-            scrolled = False
+            await self._wait_uncovered(step, ctx, ctx.element, elsewhere=elsewhere)
         typed = await self._typed_fields_hold(
             step, ctx.element if isinstance(step, FillStep) else None
         )
         ctx.held = _held(typed)
         await self._arm_guard(step, ctx, target, page, typed, frame)
-        if scrolled:
-            # A rolagem da espera pode ter feito a página reaproveitar o nó para outro item
-            # (uma lista virtual que redesenha no quadro seguinte): com o vigia já posto, o
-            # elemento preso ainda precisa ser o único do localizador. O que a página
-            # redesenha antes do vigia falha aqui; o que ela redesenha depois troca o rótulo
-            # que o vigia guardou.
+        if points:
+            # A página pode ter reaproveitado o nó para outro item depois de ele ser preso (a
+            # lista virtual que redesenha no quadro seguinte à rolagem da espera, o feed que
+            # põe um item no topo): com o vigia já posto, o elemento preso ainda precisa ser
+            # o único do localizador. O que a página redesenha antes do vigia falha aqui; o
+            # que ela redesenha depois troca o rótulo que o vigia guardou.
             await self._still_the_only_one(step, ctx, target)
         return act
 
@@ -4281,7 +4287,7 @@ class Interpreter:
 
     async def _wait_uncovered(
         self, step: Step, ctx: _StepCtx, element: ElementHandle, *, elsewhere: bool
-    ) -> bool:
+    ) -> None:
         """Espera, só lendo a página, que um clique no centro do elemento chegue a ele
         (:data:`_UNCOVERED_JS`: nada do documento dele, nem dos documentos da mesma origem
         acima dele, por cima), como o Playwright esperaria antes de clicar.
@@ -4297,9 +4303,9 @@ class Interpreter:
         ou inclinado, onde o ponto não se traduz, deixa a ação para o Playwright se não há
         campos digitados noutro documento; se há, espera como por uma camada (uma animação
         de entrada que gira o modal) e, no fim do prazo, falha sem agir (``acao_falhou``).
-        Se o elemento sai da página, a própria ação decide (devolve ``False``). Senão,
-        devolve ``True``: a página rolou, e o elemento preso ainda precisa ser o único que o
-        localizador encontra (:meth:`_confirm_target` confere, com o vigia já posto).
+        Se o elemento sai da página, a própria ação decide. A página pode ter reaproveitado
+        o nó na rolagem: :meth:`_confirm_target` confere de novo, com o vigia já posto, que
+        o elemento preso é o único que o localizador encontra.
         """
         loop = asyncio.get_running_loop()
         aligns = ("end", "center", "start")
@@ -4310,7 +4316,7 @@ class Interpreter:
             await element.scroll_into_view_if_needed(timeout=ctx.remaining_ms())
             while not (free := await element.evaluate(_UNCOVERED_JS)):
                 if free is None and not elsewhere:
-                    return True  # sem campos digitados noutro documento: como o Playwright
+                    return  # sem campos digitados noutro documento: como o Playwright
                 if (
                     free is None
                     and loop.time() + self._poll_s + _UNCOVERED_MARGIN_S >= ctx.deadline
@@ -4333,8 +4339,7 @@ class Interpreter:
                 await element.evaluate(_SCROLL_INTO_VIEW_JS, aligns[tries % len(aligns)])
                 tries += 1
         except PlaywrightError:
-            return False
-        return True
+            return
 
     async def _act_on(
         self,
@@ -4367,7 +4372,7 @@ class Interpreter:
         ``acao_falhou``. Um clique que o navegador entregou a outro documento por cima do
         alvo (``fora``) falha com ``elemento_ambiguo``, dizendo que ele pode ter feito
         outra coisa; um clique que o vigia interrompeu depois do primeiro evento, porque a
-        página mudou o endereço ou a linha com os eventos de antes (``meio``),
+        página mudou o endereço, a linha ou o rótulo com os eventos de antes (``meio``),
         também, dizendo que esses eventos chegaram à página."""
         failure: Exception | None = None
         try:
@@ -4395,8 +4400,8 @@ class Interpreter:
         if reason == "meio" and isinstance(target, Target):
             raise StepError(
                 ErrorCode.ELEMENTO_AMBIGUO,
-                f"A página mudou durante o clique do passo '{step.title}' (o endereço ou a linha "
-                f"de '{target.intent}'), e o robô o interrompeu antes do fim: os "
+                f"A página mudou durante o clique do passo '{step.title}' (o endereço, a linha ou o "
+                f"rótulo de '{target.intent}'), e o robô o interrompeu antes do fim: os "
                 "primeiros eventos do clique já tinham chegado à página. Confira o sistema de "
                 "destino antes de repetir.",
                 details={"alvo": target.intent},
