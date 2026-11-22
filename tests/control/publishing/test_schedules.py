@@ -3,6 +3,7 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import UUID
 
 import pytest
 from sqlalchemy import text
@@ -397,6 +398,52 @@ async def test_tick_stops_at_its_time_budget_and_says_it_is_behind(
     assert behind == [True, True, False]
     with pytest.raises(ValueError):
         _scheduler(app_db, dispatcher_db, max_tick_s=0)
+
+
+async def test_slow_lookup_does_not_eat_the_time_budget(
+    app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine
+) -> None:
+    world = await _world(app_db, superuser_engine)
+    for index in range(3):
+        await world.schedules.create_schedule(
+            world.a.operator, _spec(world, cron="* * * * *", title=f"A{index}")
+        )
+    clock = {"s": 0.0}
+
+    def monotonic() -> float:
+        clock["s"] += 1
+        return clock["s"]
+
+    scheduler = _scheduler(app_db, dispatcher_db, max_tick_s=2.5, monotonic=monotonic)
+    lookup = scheduler.due
+
+    async def slow_due(now: datetime) -> list[tuple[UUID, UUID]]:
+        found = await lookup(now)
+        clock["s"] += 100  # a busca levou 100 s
+        return found
+
+    scheduler.due = slow_due  # type: ignore[method-assign]
+    # O prazo conta depois da busca: as três cabem e a volta não fica para trás.
+    assert await scheduler.tick(NOW + timedelta(minutes=1)) == 3
+    assert not scheduler.behind
+
+
+async def test_full_batch_already_taken_by_another_dispatcher_is_not_behind(
+    app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine
+) -> None:
+    world = await _world(app_db, superuser_engine)
+    for index in range(2):
+        await world.schedules.create_schedule(
+            world.a.operator, _spec(world, cron="* * * * *", title=f"A{index}")
+        )
+    scheduler = _scheduler(app_db, dispatcher_db, batch_size=2)
+
+    async def taken(company_id: UUID, schedule_id: UUID, now: datetime) -> None:
+        return None  # outro despachante já travou cada uma
+
+    scheduler._fire = taken  # type: ignore[method-assign]
+    assert await scheduler.tick(NOW + timedelta(minutes=1)) == 0
+    assert not scheduler.behind
 
 
 async def test_dispatcher_keeps_claiming_while_the_scheduler_catches_up() -> None:

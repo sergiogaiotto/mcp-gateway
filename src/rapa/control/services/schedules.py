@@ -535,12 +535,14 @@ class Scheduler:
         despachante acusar.
         """
         now = now or self.clock()
-        started = self.monotonic()
         enqueued = 0
         handled = 0
         out_of_time = False
         failure: Exception | None = None
         found = await self.due(now)
+        # O prazo da volta conta a partir daqui: uma busca lenta não faz a volta disparar só
+        # a primeira agenda e girar sem esperar.
+        started = self.monotonic()
         for index, (company_id, schedule_id) in enumerate(found):
             if index and self.monotonic() - started >= self.max_tick_s:
                 out_of_time = True
@@ -556,8 +558,8 @@ class Scheduler:
                 enqueued += created
         # Uma volta cheia em que outro despachante já tinha travado tudo não conta
         # como atraso: a próxima espera o intervalo, sem girar à toa.
-        self.behind = failure is None and (
-            out_of_time or (len(found) >= self.batch_size and handled > 0)
+        self.behind = (
+            failure is None and handled > 0 and (out_of_time or len(found) >= self.batch_size)
         )
         if failure is not None:
             raise failure

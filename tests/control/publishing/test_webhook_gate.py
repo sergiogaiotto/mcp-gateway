@@ -54,8 +54,9 @@ def test_lookups_of_the_whole_process_have_a_bucket() -> None:
 def test_refusals_of_a_client_spend_its_bucket_and_good_deliveries_do_not() -> None:
     clock = Clock()
     gate = WebhookGate(lookups_per_s=1000, failures_per_minute=3, clock=clock)
-    # Quem só entrega certo nunca é limitado aqui.
-    for _ in range(100):
+    # Quem só entrega certo nunca é limitado aqui (e o processo fica apertado: mais da
+    # metade do balde gasta, o único caso em que o endereço que erra espera).
+    for _ in range(1100):
         gate.admit("10.0.0.1")
     for _ in range(3):
         gate.admit("10.0.0.9")
@@ -67,10 +68,34 @@ def test_refusals_of_a_client_spend_its_bucket_and_good_deliveries_do_not() -> N
     clock.now += 20
     gate.admit("10.0.0.9")
     # Sem endereço conhecido, todos dividem o mesmo balde.
+    for _ in range(1100):
+        gate.admit("10.0.0.1")
     for _ in range(3):
         gate.failed(None)
     with pytest.raises(QuotaExceeded):
         gate.admit(None)
+
+
+def test_refusals_from_a_shared_address_do_not_block_it_while_the_process_is_idle() -> None:
+    # Atrás de um proxy (ou de um NAT, ou de uma plataforma de integração), todos os
+    # clientes têm o mesmo endereço: uma recusa por segundo de um deles não pode deixar
+    # os outros sem entregar.
+    clock = Clock()
+    gate = WebhookGate(lookups_per_s=200, failures_per_minute=60, clock=clock)
+    for _ in range(600):  # dois minutos e meio de recusas, quatro por segundo
+        clock.now += 0.25
+        try:
+            gate.admit("10.0.0.1")
+        except QuotaExceeded:
+            continue
+        gate.failed("10.0.0.1")
+    gate.admit("10.0.0.1")  # a entrega certa de outro cliente atrás do mesmo endereço
+    # Uma enxurrada que gasta mais da metade do balde do processo volta a limitar quem erra.
+    for _ in range(250):
+        gate.admit("10.0.0.2")
+    with pytest.raises(QuotaExceeded):
+        gate.admit("10.0.0.1")
+    gate.admit("10.0.0.3")
 
 
 def test_a_slow_process_bucket_still_lets_one_lookup_through() -> None:
@@ -102,3 +127,27 @@ def test_signing_helper_refuses_delivery_ids_out_of_format(delivery: str) -> Non
         sign_delivery("k" * 40, "1700000000", delivery, b"{}")
     with pytest.raises(ValueError):
         sign_delivery("k" * 40, "17.0", "e-1", b"{}")
+
+
+def test_the_client_key_is_normalized() -> None:
+    # A mesma origem escrita de outro jeito, ou o IPv6 da mesma rede /64, gasta o mesmo balde.
+    from rapa.control.services.webhooks import _client_key
+
+    assert _client_key("::ffff:10.0.0.1") == _client_key("10.0.0.1") == "10.0.0.1"
+    assert _client_key("2001:db8::1") == _client_key("2001:db8:0:0:ffff::2")
+    assert _client_key("2001:db8::1") != _client_key("2001:db8:0:1::1")
+    assert _client_key(None) == _client_key("lixo") == "?"
+
+
+def test_a_webhook_over_its_own_limit_is_refused_without_spending_anything() -> None:
+    from rapa.control.services.webhooks import WebhookLimiter
+
+    clock = [0.0]
+    limiter = WebhookLimiter(clock=lambda: clock[0])
+    hook = new_id()
+    limiter.peek(hook)  # sem balde ainda: passa
+    limiter.check(hook, 1)
+    with pytest.raises(QuotaExceeded):
+        limiter.peek(hook)
+    clock[0] += 61
+    limiter.peek(hook)

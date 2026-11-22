@@ -51,6 +51,7 @@ nada, e uma execução que falha fica como falhou.
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import math
 import re
@@ -213,8 +214,12 @@ class WebhookGate:
     - **Por cliente.** Cada endereço de origem tem um balde de fichas gasto pelas
       entregas recusadas na assinatura (webhook desconhecido, assinatura errada,
       horário fora da tolerância): ``failures_per_minute`` por minuto, com a
-      mesma folga. Sem fichas, 429 sem ir ao banco. As entregas certas não gastam
-      nada: um sistema que entrega muito não é limitado aqui.
+      mesma folga. Sem fichas, 429 sem ir ao banco, mas só enquanto o processo
+      está apertado (mais da metade das leituras do balde do processo gastas):
+      quem divide o endereço com quem erra (um proxy sem ``FORWARDED_ALLOW_IPS``,
+      um NAT, uma plataforma de integração) não fica sem entregar por causa de
+      algumas recusas por segundo. As entregas certas não gastam nada: um sistema que
+      entrega muito não é limitado aqui.
     - **No processo.** Um balde de ``lookups_per_s`` leituras por segundo (folga de
       ``2 * lookups_per_s``) para todas as entregas juntas; sem fichas, 429.
 
@@ -273,17 +278,20 @@ class WebhookGate:
 
     def admit(self, client: str | None) -> None:
         """Libera uma leitura do webhook no banco ou levanta :class:`QuotaExceeded`."""
-        key = client or "?"
+        key = _client_key(client)
         now = self._clock()
         with self._lock:
+            _refill(self._lookups, now, self._lookup_rate, self._lookup_burst)
             failures = self._failures.get(key)
             if failures is not None:
                 _refill(failures, now, self._failure_rate, self._failure_burst)
                 self._failures.move_to_end(key)
-                if failures.tokens < 1.0:
+                # Só com o processo apertado: senão, quem erra algumas vezes por segundo
+                # deixaria sem entregar todos os que saem pelo mesmo endereço.
+                busy = self._lookups.tokens < self._lookup_burst / 2
+                if failures.tokens < 1.0 and busy:
                     wait = _wait_s(failures, self._failure_rate)
                     raise QuotaExceeded(_TOO_MANY.format(wait=wait), retry_after_s=wait)
-            _refill(self._lookups, now, self._lookup_rate, self._lookup_burst)
             if self._lookups.tokens < 1.0:
                 wait = _wait_s(self._lookups, self._lookup_rate)
                 raise QuotaExceeded(_TOO_MANY.format(wait=wait), retry_after_s=wait)
@@ -291,7 +299,7 @@ class WebhookGate:
 
     def failed(self, client: str | None) -> None:
         """Gasta uma ficha do cliente por uma entrega recusada na assinatura."""
-        key = client or "?"
+        key = _client_key(client)
         now = self._clock()
         with self._lock:
             bucket = self._failures.get(key)
@@ -306,6 +314,20 @@ class WebhookGate:
             bucket.tokens = max(0.0, bucket.tokens - 1.0)
 
 
+def _client_key(client: str | None) -> str:
+    """A chave do cliente no limite de recusas: o endereço normalizado (um IPv6 conta pela
+    rede /64, que o cliente escolhe por inteiro) ou ``?``."""
+    try:
+        address = ipaddress.ip_address((client or "").strip())
+    except ValueError:
+        return "?"
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.ipv4_mapped is not None:
+            return str(address.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{address}/64", strict=False))
+    return str(address)
+
+
 class WebhookLimiter:
     """Balde de fichas por webhook, com o limite por minuto de cada um (em memória)."""
 
@@ -313,7 +335,27 @@ class WebhookLimiter:
         self._max_keys = max_keys
         self._clock = clock
         self._buckets: OrderedDict[UUID, _Bucket] = OrderedDict()
+        self._rates: dict[UUID, int] = {}
         self._lock = threading.Lock()
+
+    def peek(self, webhook_id: UUID) -> None:
+        """Levanta :class:`QuotaExceeded` se o balde do webhook já está vazio, sem gastar nada:
+        a entrega que o limite do webhook vai recusar não gasta a leitura do processo."""
+        now = self._clock()
+        with self._lock:
+            bucket = self._buckets.get(webhook_id)
+            per_minute = self._rates.get(webhook_id)
+            if bucket is None or per_minute is None:
+                return
+            rate = per_minute / 60.0
+            _refill(bucket, now, rate, float(per_minute))
+            if bucket.tokens >= 1.0:
+                return
+            wait = _wait_s(bucket, rate)
+        raise QuotaExceeded(
+            f"limite de entregas deste webhook excedido; tente de novo em {wait} s",
+            retry_after_s=wait,
+        )
 
     def check(self, webhook_id: UUID, per_minute: int) -> None:
         """Consome uma ficha ou levanta :class:`QuotaExceeded` com a espera."""
@@ -321,12 +363,14 @@ class WebhookLimiter:
         burst = float(per_minute)
         now = self._clock()
         with self._lock:
+            self._rates[webhook_id] = per_minute
             bucket = self._buckets.get(webhook_id)
             if bucket is None:
                 bucket = _Bucket(tokens=burst, updated=now)
                 self._buckets[webhook_id] = bucket
                 while len(self._buckets) > self._max_keys:
-                    self._buckets.popitem(last=False)
+                    old_id, _ = self._buckets.popitem(last=False)
+                    self._rates.pop(old_id, None)
             else:
                 _refill(bucket, now, rate, burst)
                 self._buckets.move_to_end(webhook_id)
@@ -718,6 +762,8 @@ class PgWebhooks(PgService):
         # têm limite (por cliente que erra e no processo).
         if self.gate.known_unknown(webhook_id):
             raise SignatureInvalid(_REJECTED)
+        # O webhook que já passou do próprio limite nem gasta a leitura do processo.
+        self.limiter.peek(webhook_id)
         self.gate.admit(client)
         hook = await self._lookup(webhook_id)
         if hook is None or hook["archived_at"] is not None:

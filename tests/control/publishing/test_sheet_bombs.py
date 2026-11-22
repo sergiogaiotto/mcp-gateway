@@ -179,3 +179,121 @@ def test_many_tabs_on_the_same_sheet_part_are_refused(tmp_path: Path) -> None:
     data = _xlsx(_sheet(_HEADER + _ROW2), {"xl/workbook.xml": workbook})
     outcome = _read_isolated(tmp_path, "a.xlsx", data, memory_mib=1024)
     assert "abas" in str(outcome.get("refused", "")), outcome
+
+
+_SST_TYPE = (
+    '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-'
+    'officedocument.spreadsheetml.sharedStrings+xml"/></Types>'
+)
+
+
+def _with_strings(sst_xml: str) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        archive.writestr("[Content_Types].xml", _CT.replace("</Types>", _SST_TYPE))
+        archive.writestr("_rels/.rels", _RELS)
+        archive.writestr("xl/workbook.xml", _WB)
+        archive.writestr("xl/_rels/workbook.xml.rels", _WB_RELS)
+        archive.writestr("xl/worksheets/sheet1.xml", _sheet(_HEADER + _ROW2))
+        archive.writestr("xl/sharedStrings.xml", sst_xml)
+    return buffer.getvalue()
+
+
+def _one_huge_piece(kind: str) -> bytes:
+    # Cada caso tem um só pedaço que o openpyxl monta inteiro (milhões de elementos ou
+    # de atributos), dentro do limite de 64 MiB descompactados.
+    if kind == "linha":
+        return _xlsx(_sheet(_HEADER + '<row r="2">' + "<c/>" * 15_000_000 + "</row>"))
+    if kind == "texto_na_celula":
+        cell = '<c r="A2" t="inlineStr"><is>' + "<r><t/></r>" * 5_000_000 + "</is></c>"
+        return _xlsx(_sheet(_HEADER + f'<row r="2">{cell}</row>'))
+    if kind == "elemento_solto":
+        rows = f"<sheetData>{_HEADER}{_ROW2}</sheetData>"
+        junk = "<extra>" + "<x/>" * 15_000_000 + "</extra>"
+        return _xlsx(f'<worksheet xmlns="{_NS}">{junk}{rows}</worksheet>')
+    if kind == "celulas_mescladas":
+        merged = "<mergeCells>" + '<mergeCell ref="A1:B2"/>' * 2_500_000 + "</mergeCells>"
+        rows = f"<sheetData>{_HEADER}{_ROW2}</sheetData>"
+        return _xlsx(f'<worksheet xmlns="{_NS}">{merged}{rows}</worksheet>')
+    if kind == "atributos":
+        attrs = " ".join(f'a{i:x}=""' for i in range(2_000_000))
+        return _xlsx(_sheet(_HEADER + f'<row r="2" {attrs}/>'))
+    assert kind == "texto_compartilhado"
+    return _with_strings(f'<sst xmlns="{_NS}"><si>' + "<r><t/></r>" * 5_000_000 + "</si></sst>")
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "linha",
+        "texto_na_celula",
+        "elemento_solto",
+        "celulas_mescladas",
+        "atributos",
+        "texto_compartilhado",
+    ],
+)
+def test_one_huge_piece_of_a_streamed_part_is_refused_before_openpyxl(
+    tmp_path: Path, kind: str
+) -> None:
+    # A aba e os textos são lidos aos poucos, mas cada pedaço deles (uma linha, um texto,
+    # um elemento) o openpyxl monta inteiro: 60 a 150 KB viravam de 0,6 a mais de 3 GB.
+    data = _one_huge_piece(kind)
+    assert len(data) < 5 * 1024 * 1024
+    outcome = _read_isolated(tmp_path, "a.xlsx", data, memory_mib=1024)
+    assert "grande demais" in str(outcome.get("refused", "")), outcome
+    assert int(outcome["maxrss_mib"]) < 200, outcome  # type: ignore[call-overload]
+
+
+def test_largest_ordinary_workbook_is_still_read(tmp_path: Path) -> None:
+    # 1000 linhas de 100 colunas, com estilo em todas as células, células mescladas,
+    # validação, formatação condicional e outra aba: tudo dentro dos limites da leitura.
+    import openpyxl
+    from openpyxl.formatting.rule import CellIsRule
+    from openpyxl.styles import Font
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    assert sheet is not None
+    sheet.append([f"coluna{c}" for c in range(100)])
+    for r in range(1000):
+        sheet.append([f"texto {r} {c} " * 3 if c % 2 else r * c + 0.5 for c in range(100)])
+    bold = Font(bold=True)
+    for row in sheet.iter_rows(min_row=1, max_row=1001, max_col=100):
+        for cell in row:
+            cell.font = bold
+    for i in range(200):
+        sheet.merge_cells(start_row=1002 + i, start_column=1, end_row=1002 + i, end_column=3)
+    validation = DataValidation(type="list", formula1='"a,b,c"')
+    sheet.add_data_validation(validation)
+    validation.add("A2:A1001")
+    sheet.conditional_formatting.add(
+        "B2:B1001", CellIsRule(operator="lessThan", formula=["0"], font=bold)
+    )
+    workbook.create_sheet("outra").append(["x"] * 50)
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    outcome = _read_isolated(tmp_path, "a.xlsx", buffer.getvalue(), memory_mib=1024)
+    assert outcome.get("rows") == 1000, outcome
+
+
+def test_many_small_whole_parts_together_are_refused() -> None:
+    # Cada parte que o openpyxl monta inteira fica abaixo do limite, mas juntas passam
+    # do dobro dele: relações de abas que ninguém lê ainda custam CPU e memória.
+    from rapa.control.services.sheets import SheetLimits, read_sheet
+    from rapa.core.contracts import InvalidInput
+
+    limits = SheetLimits(max_part_bytes=64 * 1024)
+    filler = "<!--" + "x" * (60 * 1024) + "-->"
+    extra = {
+        f"xl/worksheets/_rels/sheet{i}.xml.rels": f"<Relationships xmlns='{_REL}'>{filler}"
+        "</Relationships>"
+        for i in range(2, 5)
+    }
+    data = _xlsx(_sheet(_HEADER + _ROW2), extra)
+    with pytest.raises(InvalidInput):
+        read_sheet("a.xlsx", data, limits)
+    # Com uma só dessas partes a planilha continua legível.
+    one = _xlsx(_sheet(_HEADER + _ROW2), dict(list(extra.items())[:1]))
+    assert read_sheet("a.xlsx", one, limits).rows

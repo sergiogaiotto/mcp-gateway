@@ -97,6 +97,13 @@ SAMPLE_ROWS = 5
 _ZIP_MAGIC = b"PK\x03\x04"
 #: Quantas abas, no máximo, o xlsx pode ter (o openpyxl abre todas).
 _MAX_SHEETS = 64
+#: Elementos e atributos, por coluna do limite, de um pedaço que o openpyxl monta
+#: inteiro (uma linha da aba, um texto compartilhado, um elemento solto da aba).
+_ITEMS_PER_COLUMN = 64
+#: Elementos e atributos, por célula do limite, da aba ou dos textos inteiros.
+_ITEMS_PER_CELL = 8
+#: Bytes, no máximo, sem nenhum elemento completo (uma marcação ou um texto gigante).
+_MAX_TOKEN_BYTES = 1024 * 1024
 _ALLOWED_EXTENSIONS = {".csv": BatchFormat.CSV, ".xlsx": BatchFormat.XLSX}
 _FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
 #: Um começo de fórmula logo depois de um separador de campo ou de linha (de qualquer
@@ -264,7 +271,9 @@ def _read_csv(data: bytes, limits: SheetLimits) -> Sheet:
     return _finish(BatchFormat.CSV, raw, limits)
 
 
-def _check_parts(data: bytes, sizes: Mapping[str, int], limits: SheetLimits) -> None:
+def _check_parts(
+    data: bytes, sizes: Mapping[str, int], limits: SheetLimits
+) -> tuple[str, str | None]:
     """Só as abas e os textos compartilhados, que o openpyxl lê aos poucos, podem ser grandes.
 
     As outras partes (o manifesto, a pasta de trabalho, as relações, os estilos, as
@@ -320,9 +329,97 @@ def _check_parts(data: bytes, sizes: Mapping[str, int], limits: SheetLimits) -> 
     if strings is not None:
         streamed.add(strings.PartName[1:])
     streamed -= {ARC_CONTENT_TYPES, ARC_ROOT_RELS, ARC_STYLE, ARC_CORE, ARC_CUSTOM, workbook}
+    whole = 0
     for name, size in sizes.items():
-        if size > limits.max_part_bytes and (name not in streamed or name.endswith(".rels")):
+        if name not in streamed or name.endswith(".rels"):
+            whole += size
+            if size > limits.max_part_bytes:
+                raise too_big
+    # O openpyxl lê inteiras, também no modo só leitura, as relações de cada aba: muitas
+    # abas pequenas somariam segundos de CPU.
+    if whole > 2 * limits.max_part_bytes:
+        raise too_big
+    if not targets:
+        raise _refuse("a planilha não tem nenhuma aba")
+    # A primeira aba é a que o lote lê; os textos compartilhados são lidos inteiros.
+    return targets[0], strings.PartName[1:] if strings is not None else None
+
+
+def _check_shape(data: bytes, name: str, limits: SheetLimits, *, sheet: bool) -> None:
+    """Percorre uma parte lida aos poucos (a aba ou os textos) sem montar nada.
+
+    O openpyxl lê a aba e os textos compartilhados aos poucos, mas monta inteiro
+    cada pedaço (uma linha, um texto, uma lista de células mescladas, um elemento
+    que ele não conhece e guarda): um arquivo de poucos KB com um pedaço de milhões
+    de elementos vira gigabytes. Antes dele, o expat confere: cada pedaço com até
+    ``64`` elementos e atributos por coluna do limite, a parte inteira com até
+    ``8`` por célula do limite (fora das linhas da aba, ``8`` pedaços) e nada de
+    1 MiB sem um elemento completo.
+    """
+    import xml.parsers.expat
+
+    from openpyxl.xml.constants import SHEET_MAIN_NS
+
+    piece_limit = _ITEMS_PER_COLUMN * (limits.max_columns + 1)
+    cells = (limits.max_rows + 1) * (limits.max_columns + 1) + limits.max_blank_lines
+    total_limit = _ITEMS_PER_CELL * cells
+    rows_tag = f"{SHEET_MAIN_NS} sheetData" if sheet else None
+    too_big = _refuse("a planilha tem uma parte grande demais para ler")
+    # Profundidade atual, a do pedaço em andamento (0: nenhum) e a do sheetData.
+    state = {"depth": 0, "piece": 0, "rows": 0, "items": 0, "total": 0, "outside": 0, "seen": 0}
+    parser = xml.parsers.expat.ParserCreate(namespace_separator=" ")
+
+    def start(tag: str, attrs: dict[str, str]) -> None:
+        state["seen"] = parser.CurrentByteIndex
+        depth = state["depth"] = state["depth"] + 1
+        items = 1 + len(attrs)
+        state["total"] += items
+        if state["total"] > total_limit:
             raise too_big
+        # Fora das linhas da aba (formatação, validações, elementos soltos), o
+        # openpyxl guarda tudo o que montou: no máximo oito pedaços inteiros.
+        if sheet and depth > 1 and not (state["rows"] and depth > state["rows"]):
+            state["outside"] += items
+            if state["outside"] > 8 * piece_limit:
+                raise too_big
+        if state["piece"]:
+            state["items"] += items
+        elif depth == 2 and tag == rows_tag:
+            state["rows"] = depth  # as linhas dentro dele é que são os pedaços
+        elif depth == 2 or (state["rows"] and depth == state["rows"] + 1):
+            state["piece"], state["items"] = depth, items
+        if state["items"] > piece_limit:
+            raise too_big
+
+    def end(tag: str) -> None:
+        state["seen"] = parser.CurrentByteIndex
+        if state["depth"] == state["piece"]:
+            state["piece"] = state["items"] = 0
+        if state["depth"] == state["rows"]:
+            state["rows"] = 0
+        state["depth"] -= 1
+
+    def entity(*_: object) -> None:
+        raise _refuse("a planilha declara entidades XML, o que não é aceito")
+
+    parser.StartElementHandler = start
+    parser.EndElementHandler = end
+    parser.EntityDeclHandler = entity
+    fed = 0
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive, archive.open(name) as stream:
+            while chunk := stream.read(64 * 1024):
+                parser.Parse(chunk, False)
+                fed += len(chunk)
+                # Uma marcação (ou um texto) enorme sem fim à vista: recusa antes de o
+                # expat montá-la (milhões de atributos num elemento, por exemplo).
+                if fed - state["seen"] > _MAX_TOKEN_BYTES:
+                    raise too_big
+            parser.Parse(b"", True)
+    except InvalidInput:
+        raise
+    except Exception:  # XML malformado, parte que falta, zip ruim
+        raise _refuse("não foi possível ler o arquivo .xlsx") from None
 
 
 def _read_xlsx(data: bytes, limits: SheetLimits) -> Sheet:
@@ -335,7 +432,12 @@ def _read_xlsx(data: bytes, limits: SheetLimits) -> Sheet:
         raise _refuse("a planilha descompactada é grande demais")
     if any(member.filename.lower().endswith("vbaproject.bin") for member in members):
         raise _refuse("planilhas com macros não são aceitas; salve como .xlsx sem macros")
-    _check_parts(data, {member.filename: member.file_size for member in members}, limits)
+    first, strings = _check_parts(
+        data, {member.filename: member.file_size for member in members}, limits
+    )
+    _check_shape(data, first, limits, sheet=True)
+    if strings is not None:
+        _check_shape(data, strings, limits, sheet=False)
     import openpyxl  # só aqui: a leitura de CSV não precisa dele
 
     try:

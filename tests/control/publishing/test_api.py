@@ -259,7 +259,9 @@ async def test_webhook_delivery_refusals_per_client_get_429_before_the_database(
     gated = PgWebhooks(
         world.webhooks.db,
         WebhookKeys(SERVER_KEY),
-        gate=WebhookGate(failures_per_minute=2, clock=world.clock.monotonic),
+        # Uma leitura por segundo: as duas primeiras recusas já deixam o processo
+        # apertado, o único caso em que o endereço que erra demais espera.
+        gate=WebhookGate(lookups_per_s=1, failures_per_minute=2, clock=world.clock.monotonic),
         clock=world.clock,
     )
     app = _app(world, PublishingServices(receiver=gated))

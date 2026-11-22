@@ -391,6 +391,10 @@ async def test_unknown_ids_and_refusing_clients_are_answered_before_the_database
     hook, secret = await _create(world)
     gate = WebhookGate(lookups_per_s=1000, failures_per_minute=5, clock=world.clock.monotonic)
     hooks, lookups = _counting(world, gate)
+    # O processo está apertado (mais da metade do balde gasta): só assim o endereço que
+    # erra demais espera (veja o teste seguinte).
+    for _ in range(1001):
+        gate.admit("outros")
     now = world.clock.now
     attacker, partner = "203.0.113.7", "198.51.100.1"
     args = signed(secret, BODY, "e-1", at=now)
@@ -425,6 +429,24 @@ async def test_unknown_ids_and_refusing_clients_are_answered_before_the_database
         == 202
     )
     assert len(await runs_of(superuser_engine, "webhook", world.a.company_id)) == 9
+
+
+async def test_refusals_from_a_shared_address_do_not_block_its_good_deliveries(
+    app_db: Database, superuser_engine: AsyncEngine
+) -> None:
+    # Atrás de um proxy sem FORWARDED_ALLOW_IPS (ou de um NAT), todos chegam do mesmo
+    # endereço: quem manda uma recusa por segundo não deixa os outros sem entregar.
+    world = await _world(app_db, superuser_engine)
+    hook, secret = await _create(world)
+    hooks, lookups = _counting(world, WebhookGate(clock=world.clock.monotonic))
+    now = world.clock.now
+    proxy = "10.0.0.1"
+    for _ in range(120):  # meio minuto, quatro recusas por segundo
+        world.clock.mono += 0.25
+        await _outcome(hooks, new_id(), signed(secret, BODY, "x", at=now), proxy)
+    good = signed(secret, BODY, "e-1", at=now)
+    assert await _outcome(hooks, hook.webhook_id, good, proxy) == 202
+    assert len(lookups) == 121  # o processo segue protegido pelo balde dele
 
 
 async def test_lookups_of_the_process_are_limited_before_the_database(
