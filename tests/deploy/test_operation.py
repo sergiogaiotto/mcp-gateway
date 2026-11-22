@@ -206,6 +206,65 @@ def test_install_requires_a_cni_that_enforces_network_policies() -> None:
     assert "ERRO: abriu" in check and "enableNetworkPolicy" in check
 
 
+def _operation_section(start: str, end: str) -> str:
+    text = (REPO / "docs" / "OPERACAO.md").read_text(encoding="utf-8")
+    return text[text.index(start) : text.index(end)]
+
+
+def test_the_secrets_table_of_the_install_is_one_table() -> None:
+    """Uma linha sem o recuo do item 4 fecha a tabela dos Secrets e o item no meio (o
+    rapa-registro e o rapa-proxy viram texto solto): cada linha dela tem o recuo, e as
+    variáveis do serviço ficam na tabela delas (1.11)."""
+    install = _operation_section("### 1.2 Ordem de instalação", "### 1.3 Atualização")
+    step = install[install.index("4. **") : install.index("5. **")]
+    table = [line for line in step.splitlines() if line.lstrip().startswith("|")]
+    assert table and all(line.startswith("   |") for line in table), table
+    assert not any("RAPA_" in line.split("|")[1] for line in table[2:])
+    variables = _operation_section("### 1.11", "### 1.12")
+    assert "| `RAPA_DOCS_API` | `0` |" in variables
+
+
+def test_the_private_registry_steps_match_the_production_example() -> None:
+    """O exemplo de produção usa um registro privado e deixa o chart criar o namespace das
+    execuções: o passo 4 diz quando criar o rapa-registro nele nesse caso, e não manda criar
+    o namespace antes com createNamespace: true (o helm recusaria o namespace)."""
+    example = yaml.safe_load(
+        (REPO / "deploy/helm/rapa/values-producao-exemplo.yaml").read_text("utf-8")
+    )
+    defaults = yaml.safe_load((REPO / "deploy/helm/rapa/values.yaml").read_text("utf-8"))
+    assert example["images"]["pullSecrets"] == ["rapa-registro"]
+    create = example.get("executions", {}).get(
+        "createNamespace", defaults["executions"]["createNamespace"]
+    )
+    assert create is True
+    install = _operation_section("### 1.2 Ordem de instalação", "### 1.3 Atualização")
+    step = " ".join(install[install.index("4. **") : install.index("5. **")].split())
+    assert "Com `executions.createNamespace: true` (o padrão, e o do exemplo de produção)" in step
+    assert "crie o `rapa-registro` nele logo depois" in step
+    assert "use `executions.createNamespace: false`" in step
+
+
+def test_the_restore_tells_to_move_the_weekly_restore_test() -> None:
+    """Depois da restauração, o teste semanal precisa do nome do Cluster novo: o padrão do
+    script (rapa-banco) lê o ObjectStore que sai com a troca."""
+    script = (REPO / "deploy/banco/testar-restauracao.sh").read_text(encoding="utf-8")
+    assert 'cluster="${CLUSTER:-rapa-banco}"' in script and 'objeto="${cluster}-backup"' in script
+    restore = _operation_section("**Restaurar de verdade**", "### 1.6")
+    assert "CLUSTER=rapa-banco-2 deploy/banco/testar-restauracao.sh" in restore
+
+
+def test_the_egress_check_does_not_promise_what_the_guard_cannot_show() -> None:
+    """O dominio_nao_permitido de um passo vem do route do interpretador, com ou sem a guarda;
+    o que só a guarda recusa (um WebSocket) é uma falha de conexão na página, nunca um erro do
+    passo (tests/runner/test_worker_egress.py espera a execução bem-sucedida)."""
+    check = _operation_section("### 1.9 Conferir a guarda de saída", "### 1.10")
+    assert "também por WebSocket" not in check
+    assert "não confere a guarda dentro do pod" in check
+    assert "tests/runner/test_worker_egress.py" in check
+    worker = (REPO / "tests/runner/test_worker_egress.py").read_text(encoding="utf-8")
+    assert '"fora=erro dentro=aberto webrtc=undefined"' in worker
+
+
 def test_operation_manifests_match_the_schemas() -> None:
     """A RuntimeClass do gVisor e o pod do teste de saída também passam no kubeconform."""
     for name in ("deploy/gvisor/runtimeclass.yaml", "deploy/rede/teste-de-saida.yaml"):
@@ -227,6 +286,11 @@ def test_egress_check_pod_is_a_run_pod() -> None:
     assert spec["serviceAccountName"] == "rapa-executor"
     assert spec["automountServiceAccountToken"] is False
     assert spec["runtimeClassName"] == "gvisor"
+    # A imagem do executor vem do registro privado do exemplo de produção.
+    example = yaml.safe_load(
+        (REPO / "deploy/helm/rapa/values-producao-exemplo.yaml").read_text("utf-8")
+    )
+    assert spec["imagePullSecrets"] == [{"name": example["images"]["pullSecrets"][0]}]
     container = spec["containers"][0]
     assert container["securityContext"]["readOnlyRootFilesystem"] is True
     assert container["securityContext"]["capabilities"] == {"drop": ["ALL"]}

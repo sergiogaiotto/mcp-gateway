@@ -73,6 +73,32 @@ def test_the_guard_is_on_outside_dev_or_with_networks_or_a_proxy(tmp_path: Path)
     assert policy.upstream_proxy.url == "http://proxy.interno:3128"
 
 
+def test_a_browser_proxy_switch_the_guard_removes_is_warned_at_startup(tmp_path: Path) -> None:
+    """Antes da guarda, o --proxy-server de RAPA_ARGS_NAVEGADOR valia para o executor; com
+    ela, sai do navegador sem aviso nenhum, e toda navegação falha. A subida avisa, só com o
+    nome do interruptor (o valor pode levar usuário e senha)."""
+    args = (
+        "--lang=pt-BR --proxy-server=http://ana:Tr0ub4dor@proxy.interno:3128 --proxy-bypass-list=*"
+    )
+    guarded = ServerSettings.from_env(
+        {
+            **_dev(tmp_path),
+            "RAPA_REDES_INTERNAS_PERMITIDAS": "10.20.0.0/16",
+            "RAPA_ARGS_NAVEGADOR": args,
+        }
+    )
+    (warning,) = guarded.startup_warnings()
+    assert "--proxy-bypass-list, --proxy-server" in warning and "RAPA_PROXY_SAIDA" in warning
+    assert "Tr0ub4dor" not in warning and "proxy.interno" not in warning
+    # Sem a guarda (desenvolvimento, sem redes nem proxy), o executor ainda os usa.
+    plain = ServerSettings.from_env({**_dev(tmp_path), "RAPA_ARGS_NAVEGADOR": args})
+    assert not plain.egress_guard and plain.startup_warnings() == []
+    clean = ServerSettings.from_env(
+        {**_dev(tmp_path), "RAPA_PROXY_SAIDA": "http://proxy.interno:3128"}
+    )
+    assert clean.startup_warnings() == []
+
+
 def test_the_kubernetes_names_are_read(tmp_path: Path) -> None:
     settings = ServerSettings.from_env(
         {

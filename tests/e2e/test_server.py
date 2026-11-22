@@ -1187,6 +1187,29 @@ def test_observability_configuration(tmp_path: Path) -> None:
             ServerSettings.from_env({**base, **env})
 
 
+def test_the_manual_capture_does_not_need_the_default_metrics_port() -> None:
+    """A captura do manual escolhe uma porta livre para o serviço; a das métricas (9100, a do
+    node_exporter) ficaria fixa, e sem ela o serviço não sobe: a captura a desliga."""
+    import ast
+
+    source = Path(__file__).parents[2] / "docs" / "manual" / "capturar.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    envs = [
+        {
+            key.value: value
+            for key, value in zip(node.keys, node.values, strict=True)
+            if isinstance(key, ast.Constant)
+        }
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Dict)
+        and any(isinstance(k, ast.Constant) and k.value == "RAPA_PUBLIC_URL" for k in node.keys)
+    ]
+    assert envs, "o ambiente do serviço da captura"
+    for env in envs:
+        metrics = env.get("RAPA_METRICAS_PORTA")
+        assert isinstance(metrics, ast.Constant) and metrics.value == "0"
+
+
 #: Segredos da configuração: nenhum pedaço deles pode aparecer numa recusa.
 KEY = "Kq7vZx93WmPd"
 PASSWORD = "Hj5Rt2Lw9Bnq"

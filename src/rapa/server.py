@@ -132,7 +132,7 @@ from rapa.control.sessions import (
 from rapa.control.sessions.launcher import KubernetesSessionLauncher, KubernetesSessionSettings
 from rapa.core.contracts import Principal
 from rapa.runner.video import ffmpeg_installed
-from rapa.session.egress import EgressPolicy
+from rapa.session.egress import PROXY_SWITCHES, EgressPolicy
 
 __all__ = [
     "AuthenticatorLoginResolver",
@@ -319,6 +319,29 @@ class ServerSettings(BaseModel):
             or self.egress_proxy is not None
             or not self.dev
         )
+
+    def startup_warnings(self) -> list[str]:
+        """O que vale avisar no log da subida (nada que impeça o serviço de subir).
+
+        Com a guarda da saída, os interruptores de proxy de ``RAPA_ARGS_NAVEGADOR`` saem dos
+        argumentos do navegador (a guarda é o proxy dele): quem os usava para o proxy
+        corporativo, antes da guarda, precisa passá-lo para ``RAPA_PROXY_SAIDA``. Só os
+        nomes dos interruptores vão para o aviso, nunca os valores.
+        """
+        warnings: list[str] = []
+        switches = sorted(
+            {
+                arg.split("=", 1)[0]
+                for arg in self.browser_args
+                if arg.split("=", 1)[0].lstrip("-") in PROXY_SWITCHES
+            }
+        )
+        if switches and self.egress_guard:
+            warnings.append(
+                f"RAPA_ARGS_NAVEGADOR tem {', '.join(switches)}, que a guarda da saída tira do "
+                "navegador: o proxy corporativo da internet vai em RAPA_PROXY_SAIDA"
+            )
+        return warnings
 
     def egress_policy(self) -> EgressPolicy:
         """A política da guarda da saída (as redes internas permitidas e o proxy)."""
@@ -1538,6 +1561,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"rapa.server: configuração inválida: {exc}", file=sys.stderr)
         return 2
     configure_logging(json_logs=settings.log_json)
+    for warning in settings.startup_warnings():
+        logger.warning("%s", warning)
     import uvicorn
 
     version = _version()

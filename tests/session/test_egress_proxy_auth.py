@@ -186,6 +186,17 @@ def test_the_pod_worker_gets_the_password_in_the_environment(tmp_path: Path) -> 
     assert _worker_env(tmp_path, options)[PROXY_CREDENTIALS_ENV] == f"usuario:{SENHA}"
 
 
+def test_the_pod_worker_never_gets_what_turns_the_guard_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O Playwright tiraria o loopback do proxy da guarda: o Chromium abriria a máquina direto."""
+    monkeypatch.setenv("PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK", "1")
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/pw-browsers")
+    env = _worker_env(tmp_path, PodOptions.model_validate({"guarda_de_saida": True}))
+    assert "PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK" not in env
+    assert env["PLAYWRIGHT_BROWSERS_PATH"] == "/opt/pw-browsers"
+
+
 def test_the_worker_takes_the_password_out_of_its_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -89,6 +89,26 @@ spec:
         object.spec.containers.all(c, !has(c.envFrom) && (!has(c.env) ||
         c.env.all(v, v.name in ['PYTHONUNBUFFERED', 'TMPDIR'] && !has(v.valueFrom))))
       message: "o pod só tem no ambiente PYTHONUNBUFFERED e TMPDIR"
+    # O que a Pod Security "restricted" pede, conferido aqui também: com
+    # executions.createNamespace=false, o rótulo do namespace é de quem opera, e um rótulo que
+    # falta (ou um "baseline") não pode abrir a rede, os processos e o IPC do nó.
+    - expression: >-
+        !(has(object.spec.hostNetwork) && object.spec.hostNetwork) &&
+        !(has(object.spec.hostPID) && object.spec.hostPID) &&
+        !(has(object.spec.hostIPC) && object.spec.hostIPC) &&
+        has(object.spec.securityContext) && has(object.spec.securityContext.runAsNonRoot) &&
+        object.spec.securityContext.runAsNonRoot == true &&
+        (!has(object.spec.securityContext.runAsUser) || object.spec.securityContext.runAsUser != 0)
+      message: "o pod não usa a rede, os processos nem o IPC do nó e roda como não root (runAsNonRoot)"
+    - expression: >-
+        object.spec.containers.all(c, has(c.securityContext) &&
+        has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation == false &&
+        (!has(c.securityContext.privileged) || c.securityContext.privileged == false) &&
+        (!has(c.securityContext.runAsUser) || c.securityContext.runAsUser != 0) &&
+        has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) &&
+        c.securityContext.capabilities.drop == ['ALL'] && !has(c.securityContext.capabilities.add) &&
+        (!has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0)))
+      message: "o contêiner não é privilegiado, não escala privilégio, não roda como root, tira todas as capacidades e não abre porta no nó"
     - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.secret) || has(v.emptyDir))"
       message: "o pod só monta volumes secret e emptyDir"
     # O Secret do dono só na pasta dele e os emptyDir só em /tmp e /trabalho, sem subPath:

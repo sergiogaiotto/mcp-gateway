@@ -269,6 +269,32 @@ async def test_the_sweep_removes_only_old_secrets_without_a_pod(tmp_path: Path) 
     assert [name for _, _, name in fake.objects] == ["recente"]
 
 
+async def test_the_sweep_removes_a_session_pod_that_never_left_pending(tmp_path: Path) -> None:
+    """A réplica que abriu a sessão caiu no meio da subida, com o pod sem nó: o prazo do pod
+    (activeDeadlineSeconds) só conta depois de agendado, então ele ficaria para sempre, com o
+    Secret do token. Passado o tempo de subida, a varredura o apaga; um recente fica."""
+    fake = FakeKube()
+    labels = {"app.kubernetes.io/name": "rapa-sessao"}
+    now = datetime.now(UTC)
+    for name, age, phase in (
+        ("subindo", 10, "Pending"),
+        ("sem-no", 3600, "Pending"),
+        ("rodando", 3600, "Running"),
+    ):
+        created = (now - timedelta(seconds=age)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        metadata = {"name": name, "labels": labels, "creationTimestamp": created}
+        fake.add("pods", {"metadata": metadata, "status": {"phase": phase}})
+        fake.add("secrets", {"metadata": dict(metadata)})
+    launcher = _launcher(fake, tmp_path)
+    assert await launcher.sweep() == 1
+    assert sorted((plural, name) for _, plural, name in fake.objects) == [
+        ("pods", "rodando"),
+        ("pods", "subindo"),
+        ("secrets", "rodando"),
+        ("secrets", "subindo"),
+    ]
+
+
 def test_the_image_browser_args_come_first() -> None:
     config = HostConfig(
         token="t" * 43, start_url="https://portal.exemplo/", browser_args=("--lang=pt-BR",)

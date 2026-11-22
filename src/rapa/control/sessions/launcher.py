@@ -689,7 +689,10 @@ class KubernetesSessionLauncher:
 
         Um pod de sessão de outra réplica que ainda roda fica: ele termina sozinho (sem
         entrada por ``RAPA_SESSAO_OCIOSA_S`` ou no prazo máximo, com o
-        ``activeDeadlineSeconds``) e sai na varredura seguinte. Um Secret sem pod só sai
+        ``activeDeadlineSeconds``) e sai na varredura seguinte. Um que ainda está em
+        ``Pending`` depois de ``start_timeout_s`` mais um minuto sai: quem o abriu já
+        desistiu dele (ou caiu no meio da subida), e o ``activeDeadlineSeconds`` só conta
+        depois de o pod ser agendado. Um Secret sem pod só sai
         depois de ``start_timeout_s`` mais um minuto da criação: uma sessão que está
         subindo (em qualquer réplica) cria o Secret antes do pod, e apagá-lo nesse
         instante levaria o pod novo junto. As sessões que este processo está abrindo
@@ -707,7 +710,11 @@ class KubernetesSessionLauncher:
             name = (pod.get("metadata") or {}).get("name")
             if not isinstance(name, str) or name in mine:
                 continue
-            if pod_state(pod).finished:
+            phase = (pod.get("status") or {}).get("phase")
+            age = _age_s(pod, now)
+            # Nunca saiu de Pending no tempo de subida: nenhuma réplica espera mais por ele.
+            abandoned = phase in (None, "Pending") and age is not None and age >= young
+            if pod_state(pod).finished or abandoned:
                 await self._remove(name, 0)
                 removed += 1
             else:

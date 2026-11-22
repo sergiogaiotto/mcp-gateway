@@ -138,7 +138,7 @@ from rapa.runner.ports import (
 )
 from rapa.runner.result import RunResult
 from rapa.runner.video import VIDEO_CLOSE_TIMEOUT_S
-from rapa.session.egress import EgressPolicy
+from rapa.session.egress import GUARD_BREAKING_ENV, EgressPolicy
 
 __all__ = [
     "EXECUTOR_NOT_STARTED",
@@ -388,12 +388,13 @@ def child_env() -> dict[str, str]:
     """Ambiente mínimo de um processo filho (executor ou sessão de gravação).
 
     Só o que o Python, o Playwright e as fontes precisam: nada do plano de controle
-    (URL do banco, chaves, tokens) passa para o filho.
+    (URL do banco, chaves, tokens) passa para o filho, nem o que desligaria a guarda da
+    saída do navegador (:data:`rapa.session.egress.GUARD_BREAKING_ENV`).
     """
     return {
         key: value
         for key, value in os.environ.items()
-        if key in _ENV_ALLOWED or key.startswith(_ENV_PREFIXES)
+        if (key in _ENV_ALLOWED or key.startswith(_ENV_PREFIXES)) and key not in GUARD_BREAKING_ENV
     }
 
 

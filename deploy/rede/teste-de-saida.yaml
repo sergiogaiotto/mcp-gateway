@@ -21,6 +21,10 @@ metadata:
 spec:
   restartPolicy: Never
   serviceAccountName: rapa-executor
+  # O registro privado da imagem do executor (o mesmo Secret dos pods de uso único, criado
+  # no namespace das execuções); num registro público, o kubelet só avisa que ele falta.
+  imagePullSecrets:
+    - name: rapa-registro
   automountServiceAccountToken: false
   enableServiceLinks: false
   runtimeClassName: gvisor

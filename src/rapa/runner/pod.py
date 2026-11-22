@@ -61,7 +61,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from rapa.core.contracts import RunnerJob
 from rapa.core.events import RunEvent
 from rapa.runner.ports import ack_path, valid_file_id, waits_for_ack
-from rapa.session.egress import PROXY_CREDENTIALS_ENV, UpstreamProxy
+from rapa.session.egress import GUARD_BREAKING_ENV, PROXY_CREDENTIALS_ENV, UpstreamProxy
 
 __all__ = [
     "ChannelClient",
@@ -561,7 +561,7 @@ def _worker_env(work: Path, options: PodOptions | None = None) -> dict[str, str]
     env = {
         key: value
         for key, value in os.environ.items()
-        if key in _ENV_ALLOWED or key.startswith(_ENV_PREFIXES)
+        if (key in _ENV_ALLOWED or key.startswith(_ENV_PREFIXES)) and key not in GUARD_BREAKING_ENV
     }
     # Os temporários do Chromium (o perfil) vão para o disco do trabalho, não para o tmpfs.
     env["TMPDIR"] = str(work / "tmp")
@@ -908,6 +908,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         stream=sys.stderr,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # O httpx2 registra cada pedido em INFO com a URL inteira (a execução, a tentativa e o
+    # nome de cada arquivo e artefato): o log só leva mensagens fixas.
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
     try:
         return asyncio.run(_main(args.canal, args.trabalho, args.tmp))
     except Exception as exc:

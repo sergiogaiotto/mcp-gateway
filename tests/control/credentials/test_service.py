@@ -87,6 +87,11 @@ async def test_register_only_by_the_area_admin_with_a_custodian(
         ({"not_after": in_days(-1)}, "validade: a data já passou"),
         ({"origin": "https://portal.rapa.test/caminho"}, "origem: a origem da credencial"),
         ({"vault_path": "empresas/../outra"}, "caminho no cofre"),
+        # O que a leitura no cofre recusa já é recusado aqui (o caminho não muda depois).
+        ({"vault_path": "/financeiro/banco"}, "caminho no cofre"),
+        ({"vault_path": "financeiro/banco/"}, "caminho no cofre"),
+        ({"vault_path": "financeiro//banco"}, "caminho no cofre"),
+        ({"vault_path": "financeiro/./banco"}, "caminho no cofre"),
         ({"fingerprint": "123"}, "impressão: use a impressão SHA-256"),
         ({"name": "Certificado"}, "nome: use letras minúsculas"),
     ):

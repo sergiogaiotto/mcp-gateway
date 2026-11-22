@@ -5,8 +5,10 @@ associados de outra execução recusados, chave destruída não abre, e as mesma
 caminho do store local na pasta de passagem.
 """
 
+import asyncio
 import hashlib
 import os
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -443,3 +445,30 @@ async def test_readiness_checks_the_bucket(s3: Any) -> None:
     assert await S3Readiness(s3, BUCKET).ready() is True
     assert await S3Readiness(s3, "outro-bucket").ready() is False
     assert S3Readiness(s3, BUCKET).name == "s3"
+
+
+async def test_a_hanging_bucket_holds_one_thread_however_often_readiness_asks() -> None:
+    """O prazo da prontidão cancela só quem espera: a consulta do boto segue na thread. Com
+    um S3 que aceita e não responde, cada sondagem não deixa mais uma thread presa."""
+    release = threading.Event()
+    calls: list[str] = []
+
+    class Hanging:
+        def head_bucket(self, *, Bucket: str) -> None:
+            calls.append(Bucket)
+            release.wait(10)
+
+    check = S3Readiness(Hanging(), BUCKET)
+    try:
+        for _ in range(5):
+            with pytest.raises(TimeoutError):
+                async with asyncio.timeout(0.05):
+                    await check.ready()
+        assert calls == [BUCKET]
+    finally:
+        release.set()
+    # Terminada a consulta, a próxima sondagem faz outra.
+    assert await check.ready() is True
+    before = len(calls)
+    assert await check.ready() is True
+    assert len(calls) == before + 1

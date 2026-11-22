@@ -65,7 +65,7 @@ import re
 import shutil
 import stat
 from collections.abc import AsyncIterator, Callable, Collection, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, Protocol
@@ -1001,17 +1001,37 @@ class S3ArtifactStore:
         await asyncio.to_thread(_discard_entry, self.staging_root, [part])
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class S3Readiness:
-    """Pronto só se o bucket dos artefatos existe e responde."""
+    """Pronto só se o bucket dos artefatos existe e responde.
+
+    Uma consulta ao bucket por vez: o prazo da prontidão só cancela quem espera, não a
+    thread do boto, que segue até o prazo dele (dezenas de segundos com um S3 que aceita a
+    conexão e não responde). Sem isso, cada sondagem deixaria mais uma thread presa no
+    executor padrão do loop, o mesmo da resolução de nomes e dos passos do lançador; com
+    isso, uma sondagem que chega com a consulta ainda em andamento espera a mesma.
+    """
 
     client: Any
     bucket: str
     name: str = "s3"
+    _pending: asyncio.Future[Any] | None = field(default=None, init=False, repr=False)
 
     async def ready(self) -> bool:
+        pending = self._pending
+        if (
+            pending is None
+            or pending.done()
+            or pending.get_loop() is not asyncio.get_running_loop()
+        ):
+            pending = asyncio.ensure_future(
+                asyncio.to_thread(self.client.head_bucket, Bucket=self.bucket)
+            )
+            # O erro de uma consulta que ninguém esperou até o fim não vira aviso no log.
+            pending.add_done_callback(lambda done: done.cancelled() or done.exception())
+            self._pending = pending
         try:
-            await asyncio.to_thread(self.client.head_bucket, Bucket=self.bucket)
+            await asyncio.shield(pending)
         except Exception as exc:
             logger.warning("o bucket dos artefatos não respondeu: %s", type(exc).__name__)
             return False

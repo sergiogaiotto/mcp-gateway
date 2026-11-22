@@ -17,7 +17,7 @@ O chart `deploy/helm/rapa` instala, no namespace `rapa` (o plano de controle):
 - O modelo do pod da operação (o `PodTemplate` `rapa-operacao`, com a conta de serviço e o papel do OpenBao da operação): nada roda sozinho; quem opera cria um pod dele para congelar, exportar e apagar uma empresa (1.10).
 - As NetworkPolicies, o RBAC, as contas de serviço, a `ValidatingAdmissionPolicy` dos pods de uso único e as `HTTPRoute`.
 
-No namespace `rapa-execucoes` (criado pelo chart com a Pod Security `restricted`) rodam os pods de uso único de cada execução (`app.kubernetes.io/name=rapa-executor`) e de cada sessão de gravação (`rapa-sessao`), com a imagem do executor e a RuntimeClass `gvisor`, sem token de conta de serviço e sem permissão nenhuma. O despachante e a web têm ali uma Role para criar, ler e apagar pods e Secrets, e o que elas criam passa pela `ValidatingAdmissionPolicy` `rapa-execucoes-pods-de-uso-unico`: só a imagem do executor (pelo digest), a conta `rapa-executor` sem token, a RuntimeClass `gvisor`, o rótulo de cada conta (o despachante só cria pods de execução, e a web, só de sessão), o comando exato de execução ou de sessão, sem ganchos (`lifecycle`) nem sondas além da prontidão `tcpSocket` da sessão, só `PYTHONUNBUFFERED` e `TMPDIR` no ambiente e volumes `secret` e `emptyDir` montados só nas pastas do lançador (o Secret na dele, os `emptyDir` em `/tmp` e `/trabalho`, sem `subPath`). Com o token de uma dessas contas, ninguém cria ali um pod no runc, com outra imagem ou que rode outro código, e o da web não cria o pod com o rótulo que abre o canal. A Role lê os Secrets do namespace (o lançador lista os das tentativas): o `rapa-registro` dali só com permissão de baixar imagens.
+No namespace `rapa-execucoes` (criado pelo chart com a Pod Security `restricted`) rodam os pods de uso único de cada execução (`app.kubernetes.io/name=rapa-executor`) e de cada sessão de gravação (`rapa-sessao`), com a imagem do executor e a RuntimeClass `gvisor`, sem token de conta de serviço e sem permissão nenhuma. O despachante e a web têm ali uma Role para criar, ler e apagar pods e Secrets, e o que elas criam passa pela `ValidatingAdmissionPolicy` `rapa-execucoes-pods-de-uso-unico`: só a imagem do executor (pelo digest), a conta `rapa-executor` sem token, a RuntimeClass `gvisor`, o rótulo de cada conta (o despachante só cria pods de execução, e a web, só de sessão), o comando exato de execução ou de sessão, sem ganchos (`lifecycle`) nem sondas além da prontidão `tcpSocket` da sessão, só `PYTHONUNBUFFERED` e `TMPDIR` no ambiente e volumes `secret` e `emptyDir` montados só nas pastas do lançador (o Secret na dele, os `emptyDir` em `/tmp` e `/trabalho`, sem `subPath`), e o que a Pod Security `restricted` pede (sem a rede, os processos e o IPC do nó, não root, sem privilégio nem capacidades, sem porta no nó) conferido também pela política, para não depender do rótulo do namespace (com `executions.createNamespace: false`, ele é de quem opera). Com o token de uma dessas contas, ninguém cria ali um pod no runc, com outra imagem ou que rode outro código, e o da web não cria o pod com o rótulo que abre o canal. A Role lê os Secrets do namespace (o lançador lista os das tentativas): o `rapa-registro` dali só com permissão de baixar imagens.
 
 O banco (CloudNativePG) vem de outra release do mesmo chart (`rapa-banco`, com `values-banco.yaml`), instalada antes: o Job de migração roda antes de qualquer recurso da release da aplicação, então o banco não pode estar nela (o chart recusa).
 
@@ -48,7 +48,6 @@ Rede (NetworkPolicies, os dois namespaces negam tudo por padrão):
    | `rapa-webhooks` | `chave` | `RAPA_CHAVE_WEBHOOKS` (32 caracteres ou mais) |
    | `rapa-hub` | `api-key` | `RAPA_LLM_API_KEY` |
    | `rapa-glitchtip` | `dsn` | `RAPA_GLITCHTIP_DSN` |
-| `RAPA_DOCS_API` | `0` | `1` serve a documentação da API REST em `/v1/docs` e `/v1/openapi.json` (1.13); no chart, `apiDocs` |
    | `rapa-registro` | `.dockerconfigjson` | o registro das imagens, nos dois namespaces (só com permissão de baixar: a Role da web e do despachante lê os Secrets do namespace das execuções) |
    | `rapa-proxy` (opcional) | `url` | `RAPA_PROXY_SAIDA` com usuário e senha (`http://usuario:senha@host:porta`, os caracteres reservados com `%`; `executions.egress.proxy.existingSecret`); a URL nunca vai nos valores |
 
@@ -60,7 +59,7 @@ Rede (NetworkPolicies, os dois namespaces negam tudo por padrão):
    shred -u /tmp/senha
    ```
 
-   Com um registro privado, crie o namespace `rapa-execucoes` antes (com os rótulos `pod-security.kubernetes.io/enforce=restricted`), o `rapa-registro` nele também, e use `executions.createNamespace: false`.
+   Com um registro privado, o `rapa-registro` precisa estar também no namespace `rapa-execucoes`. Com `executions.createNamespace: true` (o padrão, e o do exemplo de produção), o chart cria o namespace na instalação da aplicação (passo 6): crie o `rapa-registro` nele logo depois, antes da primeira execução ou sessão (os únicos pods dali). Para criar o namespace antes, com os rótulos `pod-security.kubernetes.io/enforce=restricted`, use `executions.createNamespace: false` (com o `helm`, um namespace que já existe e não é da release faz a instalação falhar).
 5. **Banco**: a release `rapa-banco` e a espera pelo Cluster pronto.
 
    ```bash
@@ -114,6 +113,7 @@ Os nomes do serviço que cada valor preenche (o resto está nos comentários de 
 |---|---|---|
 | `images.control`, `images.executor` | `RAPA_K8S_IMAGEM_EXECUTOR` | as imagens (o digest vale no lugar da tag); a do executor é também a dos pods de sessão |
 | `images.pullSecrets` | `RAPA_K8S_PULL_SECRET` | o registro (o primeiro também nos pods de uso único) |
+| `images.executor.previousDigests` | (só a política de admissão) | na atualização, os digests do executor que está rodando, que a política ainda aceita até os pods antigos saírem (1.3) |
 | `publicUrl` | `RAPA_PUBLIC_URL` | o endereço público (OpenAPI dos robôs, metadados do MCP, origem da visão ao vivo) |
 | `auth.jwt.*` | `RAPA_JWT_ISSUER`, `RAPA_JWT_AUDIENCE`, `RAPA_JWKS_URL` | os tokens do Keycloak |
 | `auth.oidc.*` | `RAPA_OIDC_CLIENT_ID`, `RAPA_OIDC_REDIRECT_URI`, `RAPA_OIDC_CLIENT_SECRET` | o login da interface (só na web) |
@@ -204,6 +204,7 @@ kubectl -n rapa get cluster rapa-banco -o jsonpath='{.status.conditions}'
    argocd app set rapa-raiz --sync-policy automated --self-heal
    ```
 5. Confira o que as execuções em andamento na hora da perda deixaram: as que tinham começado um passo que grava ficam para uma pessoa conferir o sistema de destino.
+6. No cron do teste de restauração semanal, passe o nome novo (`CLUSTER=rapa-banco-2 deploy/banco/testar-restauracao.sh`): o padrão do script é `rapa-banco`, cujo `ObjectStore` sai com a troca (com o Argo CD, que não o apaga, o teste continuaria conferindo os backups do Cluster antigo).
 
 ### 1.6 Cofre (OpenBao)
 
@@ -250,7 +251,7 @@ kubectl -n rapa-execucoes logs -f teste-de-saida
 kubectl -n rapa-execucoes delete pod teste-de-saida
 ```
 
-Cada alvo interno (o metadata da nuvem em IPv4, em IPv6 e pelo NAT64, a API do Kubernetes, o banco, a web, uma rede privada também pelo NAT64) precisa sair como `ok: fechado`, e os externos como `ok: abriu` (sem internet direta, os externos só abrem pelo proxy). Um interno com `ERRO: abriu` (sobretudo o banco, a web ou a API do Kubernetes, que nenhuma regra do chart abre) é quase sempre o CNI que não aplica as NetworkPolicies (no EKS, o VPC CNI sem `enableNetworkPolicy`, 1.2 passo 1): nenhuma empresa usa o RaPA até o teste passar. Some aos internos, em `ALVOS_DO_AMBIENTE`, os portais que não estão em `RAPA_REDES_INTERNAS_PERMITIDAS`; num cluster IPv6, também o endereço IPv6 de um pod do plano de controle (`kubectl -n rapa get pod -o wide`) e um da VPC, e em `ALVOS_EXTERNOS_IPV6` um destino da internet em IPv6. O pod de teste é criado por quem opera, não pelas contas do RaPA: a política de admissão dos pods de uso único não vale para ele. Ele leva o rótulo dos pods de execução sem uma tentativa: a varredura de órfãos do despachante o apaga 15 minutos depois de criado (antes disso, ele fica para a conferência). A guarda dentro do pod (a do navegador) se confere com um robô de teste cujo passo abre um domínio fora de `allowed_domains`: o passo falha com `dominio_nao_permitido`, também por WebSocket.
+Cada alvo interno (o metadata da nuvem em IPv4, em IPv6 e pelo NAT64, a API do Kubernetes, o banco, a web, uma rede privada também pelo NAT64) precisa sair como `ok: fechado`, e os externos como `ok: abriu` (sem internet direta, os externos só abrem pelo proxy). Um interno com `ERRO: abriu` (sobretudo o banco, a web ou a API do Kubernetes, que nenhuma regra do chart abre) é quase sempre o CNI que não aplica as NetworkPolicies (no EKS, o VPC CNI sem `enableNetworkPolicy`, 1.2 passo 1): nenhuma empresa usa o RaPA até o teste passar. Some aos internos, em `ALVOS_DO_AMBIENTE`, os portais que não estão em `RAPA_REDES_INTERNAS_PERMITIDAS`; num cluster IPv6, também o endereço IPv6 de um pod do plano de controle (`kubectl -n rapa get pod -o wide`) e um da VPC, e em `ALVOS_EXTERNOS_IPV6` um destino da internet em IPv6. O pod de teste é criado por quem opera, não pelas contas do RaPA: a política de admissão dos pods de uso único não vale para ele. Ele leva o rótulo dos pods de execução sem uma tentativa: a varredura de órfãos do despachante o apaga 15 minutos depois de criado (antes disso, ele fica para a conferência). Um robô de teste cujo passo abre um domínio fora de `allowed_domains` falha com `dominio_nao_permitido`: quem dá esse erro é o `route` do interpretador, antes de qualquer conexão, então ele não confere a guarda dentro do pod (a do navegador). O que só a guarda recusa (um WebSocket, um salto de redirecionamento ou um nome que resolve para dentro) não vira erro do passo: a página recebe uma falha de conexão. A guarda em si é conferida pelos testes (`tests/runner/test_worker_egress.py`, com o navegador), e o agente do pod sempre a liga (`--guarda-de-saida`).
 
 ### 1.10 O CLI no cluster
 
@@ -319,6 +320,7 @@ As variáveis de `python -m rapa.server` que o deploy no Kubernetes acrescentou 
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | (nenhum: nada de traços) | liga os traços OpenTelemetry por OTLP/HTTP (o extra `observability`); `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` troca só o dos traços |
 | `OTEL_SERVICE_NAME` | `rapa` | o nome do serviço nos traços (no chart, o do componente) |
 | `RAPA_GLITCHTIP_DSN` | (nenhum) | as exceções não tratadas, limpas, no GlitchTip (o extra `observability`); o DSN tem a chave do projeto: de um Secret |
+| `RAPA_DOCS_API` | `0` | `1` serve a documentação da API REST em `/v1/docs` e `/v1/openapi.json` (1.13); no chart, `apiDocs` |
 
 No cluster, a pasta dos arquivos de entrada (`RAPA_PASTA_ARQUIVOS`) não é montada no despachante (o disco de um pod não chega aos outros): um robô com passo de envio falha com "nenhum diretório de arquivos de entrada foi configurado".
 

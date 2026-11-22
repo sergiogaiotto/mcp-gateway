@@ -230,7 +230,8 @@ executions:
   # Porta do WebSocket do host de sessão num pod (o relay da web conecta nela). Fixa no
   # host de sessão (rapa.control.sessions.launcher): o chart recusa outra.
   sessionPort: 8765
-  # Rótulos dos pods que o despachante e a web criam (app.kubernetes.io/name).
+  # Rótulos dos pods que o despachante e a web criam (app.kubernetes.io/name). Fixos no
+  # código (rapa.control.kube): o chart recusa outros.
   podLabels:
     run: rapa-executor
     session: rapa-sessao

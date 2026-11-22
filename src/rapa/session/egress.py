@@ -81,6 +81,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 __all__ = [
     "BROWSER_NETWORK_ARGS",
+    "GUARD_BREAKING_ENV",
     "MAX_CONNECTIONS",
     "PROXY_CREDENTIALS_ENV",
     "PROXY_SWITCHES",
@@ -193,6 +194,10 @@ _NAME = re.compile(r"^[a-z0-9_](?:[a-z0-9_.-]{0,252})$")
 #: comando de um processo é legível por qualquer outro da máquina ou do pod; o ambiente,
 #: só pelo mesmo usuário. O worker a tira do ambiente antes de abrir o navegador.
 PROXY_CREDENTIALS_ENV = "RAPA_PROXY_SAIDA_CREDENCIAIS"
+#: Variáveis do Playwright que tirariam o loopback do proxy da guarda (o ``<-loopback>``
+#: do ``--proxy-bypass-list``): com elas, o Chromium abriria a própria máquina (e o
+#: link-local) direto, sem passar pela guarda. Nunca vão para o executor nem para a sessão.
+GUARD_BREAKING_ENV = frozenset({"PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK"})
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 

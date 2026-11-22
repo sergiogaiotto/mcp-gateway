@@ -3,6 +3,7 @@ resultado e SIGTERM, contra o canal de verdade e sem navegador."""
 
 import asyncio
 import json
+import logging
 import os
 import signal
 import sys
@@ -537,6 +538,26 @@ async def test_a_sigterm_after_the_attempt_does_not_kill_the_agent_on_its_way_ou
         os.kill(os.getpid(), signal.SIGTERM)  # ignorado
     finally:
         signal.signal(signal.SIGTERM, previous)
+
+
+def test_the_agent_log_does_not_carry_the_channel_urls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cada pedido do httpx2 sairia em INFO com a URL (a execução, a tentativa e o nome de
+    cada arquivo de entrada e artefato); o agente só deixa os avisos dele."""
+    from rapa.runner import pod
+
+    async def no_channel(*_: Any) -> int:
+        return 0
+
+    quiet = logging.getLogger("httpx2")
+    previous = quiet.level
+    monkeypatch.setattr(pod, "_main", no_channel)
+    try:
+        assert pod.main([f"--canal={tmp_path}", f"--trabalho={tmp_path}", f"--tmp={tmp_path}"]) == 0
+        assert not quiet.isEnabledFor(logging.INFO) and quiet.isEnabledFor(logging.WARNING)
+    finally:
+        quiet.setLevel(previous)
 
 
 async def test_a_slow_request_answered_with_408_is_sent_again(tmp_path: Path) -> None:

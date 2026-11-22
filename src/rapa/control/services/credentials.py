@@ -100,16 +100,32 @@ __all__ = [
     "CredentialAlerts",
     "PgCredentials",
     "normalize_fingerprint",
+    "valid_vault_path",
 ]
 
 #: Maior prazo aceito na consulta de vencimentos, em dias.
 MAX_WARN_DAYS = 3650
 #: Quantos lotes, no máximo, uma volta do aviso de vencimento trata.
 MAX_ALERT_BATCHES = 200
-_VAULT_PATH = re.compile(r"^[A-Za-z0-9_.:/-]{1,500}$")
+#: A regra do caminho no cofre na hora de ler (``rapa.control.vault.company_secret_path``):
+#: segmentos ``[A-Za-z0-9_.:-]+`` separados por uma barra, até 500 caracteres, sem ``.``
+#: nem ``..``. Conferida já no registro: o caminho não muda depois, e um caminho que a leitura
+#: recusa faria toda execução falhar com ``segredo_indisponivel``.
+_VAULT_PATH = re.compile(r"^[A-Za-z0-9_.:-]+(?:/[A-Za-z0-9_.:-]+)*$")
+_MAX_VAULT_PATH = 500
 _FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
 _NAME = re.compile(NAME_PATTERN)
 _PFX = CredentialKind.PFX_A1.value
+
+
+def valid_vault_path(path: str) -> bool:
+    """Se ``path`` é um caminho no cofre que a leitura aceita (ver :data:`_VAULT_PATH`)."""
+    return (
+        isinstance(path, str)
+        and len(path) <= _MAX_VAULT_PATH
+        and _VAULT_PATH.fullmatch(path) is not None
+        and not any(part in {".", ".."} for part in path.split("/"))
+    )
 
 
 def normalize_fingerprint(value: str | None) -> str | None:
@@ -345,8 +361,11 @@ class PgCredentials(PgService):
             origin = normalize_origin(origin)
         except ValueError as exc:
             errors.append(f"origem: {exc}")
-        if not _VAULT_PATH.fullmatch(vault_path) or ".." in vault_path.split("/"):
-            errors.append("caminho no cofre: use letras, números e _ . : / - (até 500), sem '..'")
+        if not valid_vault_path(vault_path):
+            errors.append(
+                "caminho no cofre: use letras, números e _ . : - em partes separadas por uma "
+                "barra (até 500), sem '.' nem '..' e sem barra no começo ou no fim"
+            )
         try:
             fingerprint = normalize_fingerprint(fingerprint)
         except ValueError as exc:

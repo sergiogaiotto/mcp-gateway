@@ -11,6 +11,7 @@ import re
 from typing import Any
 
 import pytest
+import yaml
 
 from tests.deploy.support import (
     CHART,
@@ -930,6 +931,21 @@ def test_the_dispatcher_ports_never_cross() -> None:
     assert "8765" in error
 
 
+def test_the_single_use_pod_labels_are_the_ones_the_code_uses() -> None:
+    """Os lançadores rotulam os pods com rapa-executor e rapa-sessao (rapa.control.kube): com
+    outro rótulo, a política de admissão recusaria todo pod e as NetworkPolicies não
+    escolheriam nenhum."""
+    from rapa.control.kube import EXECUTOR_APP, SESSION_APP
+
+    values = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
+    assert values["executions"]["podLabels"] == {"run": EXECUTOR_APP, "session": SESSION_APP}
+    for key in ("run", "session"):
+        error = template_error(
+            "values-producao-exemplo.yaml", sets={f"executions.podLabels.{key}": "executor-x"}
+        )
+        assert "executions.podLabels" in error and EXECUTOR_APP in error
+
+
 @pytest.mark.parametrize("component", ["web", "api"])
 def test_http_probes(component: str) -> None:
     container = deployment_pod(rendered("producao"), f"rapa-{component}")["containers"][0]
@@ -1187,6 +1203,28 @@ def test_each_account_only_creates_its_own_pods_and_they_only_run_the_command(
     assert "!has(m.subPath) && !has(m.subPathExpr)" in text
     assert "m.mountPath in [variables.secretDir, '/tmp', '/trabalho']" in text
     assert "(m.name in variables.secretVolumes) == (m.mountPath == variables.secretDir)" in text
+
+
+@pytest.mark.parametrize("variant", APP_VARIANTS)
+def test_the_admission_policy_does_not_rely_on_the_namespace_label(variant: str) -> None:
+    """Com executions.createNamespace=false, a Pod Security "restricted" é um rótulo de quem
+    opera: a política confere ela mesma a rede, os processos e o IPC do nó, o usuário e o
+    contexto de segurança do contêiner (um rótulo que falta não abre a rede do nó)."""
+    sets = {"executions.createNamespace": "false"} if variant == "producao" else {}
+    render = template(*VARIANTS[variant], sets=sets) if sets else rendered(variant)
+    text = " ".join(" ".join(v["expression"].split()) for v in _admission(render)["validations"])
+    for field in ("hostNetwork", "hostPID", "hostIPC"):
+        assert f"!(has(object.spec.{field}) && object.spec.{field})" in text
+    assert "object.spec.securityContext.runAsNonRoot == true" in text
+    assert "object.spec.securityContext.runAsUser != 0" in text
+    for rule in (
+        "c.securityContext.allowPrivilegeEscalation == false",
+        "(!has(c.securityContext.privileged) || c.securityContext.privileged == false)",
+        "c.securityContext.runAsUser != 0",
+        "c.securityContext.capabilities.drop == ['ALL'] && !has(c.securityContext.capabilities.add)",
+        "c.ports.all(p, !has(p.hostPort) || p.hostPort == 0)",
+    ):
+        assert rule in text, rule
 
 
 def _admitted_images(render: Render) -> list[str]:

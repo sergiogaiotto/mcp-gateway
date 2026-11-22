@@ -284,11 +284,19 @@ def _admitted(policy: Mapping[str, Any], pod: Mapping[str, Any], app: str, creat
         assert "subPath" not in mount and "subPathExpr" not in mount
         assert mount["mountPath"] in paths, mount
         assert (mount["name"] in secret_volumes) == (mount["mountPath"] == directory), mount
-    # E a Pod Security "restricted" do namespace.
+    # E a Pod Security "restricted" do namespace, que a política também confere.
+    for field in ("hostNetwork", "hostPID", "hostIPC"):
+        assert f"!(has(object.spec.{field}) && object.spec.{field})" in rules
+        assert not spec.get(field)
+    assert spec["securityContext"]["runAsNonRoot"] is True
+    assert spec["securityContext"].get("runAsUser") != 0
     security = container["securityContext"]
     assert security["allowPrivilegeEscalation"] is False
+    assert security.get("privileged") is not True and security.get("runAsUser") != 0
     assert security["capabilities"] == {"drop": ["ALL"]}
+    assert "c.securityContext.capabilities.drop == ['ALL']" in rules
     assert security["runAsNonRoot"] is True
+    assert not any(port.get("hostPort") for port in container.get("ports", []))
     assert spec["securityContext"]["seccompProfile"] == {"type": "RuntimeDefault"}
 
 

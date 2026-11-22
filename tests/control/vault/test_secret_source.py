@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from rapa.control.db import Database
 from rapa.control.launcher import SecretsUnavailable
 from rapa.control.services import PgPlatform, PgProvisioning
+from rapa.control.services.credentials import valid_vault_path
 from rapa.control.vault import (
     BaoSettings,
     OpenBaoClient,
@@ -158,6 +159,36 @@ async def test_the_company_prefix_is_always_put_by_the_code(
     assert company_secret_path(tenant.company_id, "x:y/z.1") == (
         f"empresas/{tenant.company_id}/x%3Ay/z.1"
     )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "portal/acesso",
+        "x:y/z.1",
+        "a..b/c",
+        "a" * 500,
+        "a" * 501,
+        "/financeiro/banco",
+        "financeiro/banco/",
+        "financeiro//banco",
+        "financeiro/./banco",
+        "a/../b",
+        ".",
+        "",
+        "a b",
+    ],
+)
+def test_registration_accepts_exactly_the_paths_the_vault_reads(path: str) -> None:
+    """O registro (REST e interface) confere o caminho com a mesma regra da leitura: um caminho
+    que a leitura recusa, aceito no registro, faria toda execução falhar (e não muda depois)."""
+    try:
+        company_secret_path(UUID(int=1), path)
+    except ValueError:
+        readable = False
+    else:
+        readable = True
+    assert valid_vault_path(path) is readable
 
 
 async def test_registration_rules_before_reading_the_vault(

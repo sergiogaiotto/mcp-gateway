@@ -719,6 +719,19 @@ def _write_atomic(path: Path, data: bytes) -> None:
         raise
 
 
+class _EmbeddedConfig(uvicorn.Config):
+    """A configuração do uvicorn do canal, que não mexe nos loggers do processo.
+
+    O ``uvicorn.Config`` de sempre aplica o ``LOGGING_CONFIG`` dele e o ``log_level`` em
+    todos os loggers ``uvicorn.*`` do processo: no despachante, desfaria o JSON do serviço
+    (``RAPA_LOG_JSON``) e baixaria o nível do servidor principal. Aqui os loggers ficam como
+    o serviço os configurou; o log de acesso fica desligado só neste servidor.
+    """
+
+    def configure_logging(self) -> None:
+        logging.addLevelName(5, "TRACE")  # o que o uvicorn faz além dos loggers
+
+
 class _EmbeddedServer(uvicorn.Server):
     """O uvicorn do canal, dentro do processo do serviço: os sinais ficam com o serviço."""
 
@@ -769,11 +782,10 @@ class ChannelServer:
             sock.close()
             raise
         port = int(sock.getsockname()[1])
-        config = uvicorn.Config(
+        config = _EmbeddedConfig(
             self.channel.app,
             lifespan="off",
             access_log=False,
-            log_level="warning",
             proxy_headers=False,
             server_header=False,
             date_header=False,

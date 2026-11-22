@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from typing import Any, TextIO
 
 __all__ = [
+    "QUIET_LOGGERS",
     "TEXT_FORMAT",
     "JsonFormatter",
     "configure_logging",
@@ -69,6 +70,12 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 
+#: Loggers de bibliotecas que só falam a partir de WARNING: o ``httpx2`` registra cada pedido
+#: em INFO com a URL inteira (o UUID da empresa e o caminho no cofre, no OpenBao; a execução
+#: e o nome dos arquivos, no canal; a sondagem de cada pod a cada 2 s, na API do Kubernetes).
+QUIET_LOGGERS = ("httpx2",)
+
+
 def configure_logging(
     *, json_logs: bool, level: int = logging.INFO, stream: TextIO | None = None
 ) -> None:
@@ -76,6 +83,8 @@ def configure_logging(
     handler = logging.StreamHandler(stream or sys.stderr)
     handler.setFormatter(JsonFormatter() if json_logs else logging.Formatter(TEXT_FORMAT))
     logging.basicConfig(level=level, handlers=[handler])
+    for name in QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(max(level, logging.WARNING))
 
 
 def uvicorn_log_config(*, json_logs: bool) -> dict[str, Any] | None:

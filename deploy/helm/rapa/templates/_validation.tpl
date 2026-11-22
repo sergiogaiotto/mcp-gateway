@@ -252,6 +252,11 @@ e a das métricas. A do host de sessão é fixa no código (o relay conecta nela
 {{- if ne (int $v.executions.sessionPort) 8765 -}}
 {{- fail "executions.sessionPort é a porta fixa do host de sessão (8765): o chart não a troca" -}}
 {{- end -}}
+{{- /* Os rótulos dos pods de uso único são fixos no código (rapa.control.kube): outro valor
+deixaria a política de admissão e as NetworkPolicies sem os pods que os lançadores criam. */ -}}
+{{- if or (ne $v.executions.podLabels.run "rapa-executor") (ne $v.executions.podLabels.session "rapa-sessao") -}}
+{{- fail "executions.podLabels são os rótulos fixos dos pods de uso único (run: rapa-executor, session: rapa-sessao, de rapa.control.kube): o chart não os troca" -}}
+{{- end -}}
 
 {{/* Em produção, as imagens pelo digest. */}}
 {{- if $v.images.requireDigest -}}

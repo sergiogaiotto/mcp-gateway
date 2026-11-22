@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import socket
 import stat
 import threading
@@ -280,6 +281,38 @@ def test_an_attempt_opens_once(tmp_path: Path) -> None:
     channel.close(job.run_id, job.attempt)
     channel.close(job.run_id, job.attempt)  # fechar de novo não faz nada
     assert len(channel) == 0 and channel.get(job.run_id, job.attempt) is None
+
+
+def _uvicorn_loggers() -> dict[str, tuple[int, list[logging.Handler], bool]]:
+    loggers = {
+        name: logging.getLogger(name) for name in ("uvicorn", "uvicorn.error", "uvicorn.access")
+    }
+    return {
+        name: (logger.level, list(logger.handlers), logger.propagate)
+        for name, logger in loggers.items()
+    }
+
+
+async def test_the_channel_server_leaves_the_service_logging_alone() -> None:
+    """O canal roda dentro do despachante: os loggers do uvicorn ficam como o serviço os
+    configurou (no RAPA_LOG_JSON, sem handler próprio, saindo pelo raiz em JSON), em vez de
+    ganharem o formato de texto e o nível do uvicorn."""
+    saved = _uvicorn_loggers()
+    try:
+        # Como o serviço os deixa no JSON (uvicorn_log_config devolve None).
+        for name in saved:
+            logger = logging.getLogger(name)
+            logger.handlers, logger.propagate = [], True
+            logger.setLevel(logging.NOTSET)
+        before = _uvicorn_loggers()
+        async with ChannelServer(Channel(), host="127.0.0.1", port=0).running():
+            assert _uvicorn_loggers() == before
+        assert _uvicorn_loggers() == before
+    finally:
+        for name, (level, handlers, propagate) in saved.items():
+            logger = logging.getLogger(name)
+            logger.setLevel(level)
+            logger.handlers, logger.propagate = handlers, propagate
 
 
 async def test_the_channel_server_serves_on_its_own_port(tmp_path: Path) -> None:

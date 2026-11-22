@@ -105,6 +105,24 @@ def test_configure_logging_writes_json_or_the_old_text() -> None:
     assert stream.getvalue().strip().endswith("INFO rapa.server: uma linha")
 
 
+def test_the_http_client_does_not_log_every_url() -> None:
+    """O httpx2 registra cada pedido em INFO com a URL inteira (o UUID da empresa e o caminho
+    no cofre, a sondagem dos pods): só os avisos dele vão para o log."""
+    quiet = logging.getLogger("httpx2")
+    previous = quiet.level
+    stream = io.StringIO()
+    try:
+        with _bare_root():
+            configure_logging(json_logs=True, stream=stream)
+            quiet.info('HTTP Request: GET https://bao/v1/rapa/data/empresas/x/portal "200 OK"')
+            logging.getLogger("rapa.server").info("uma linha")
+            quiet.warning("um aviso")
+    finally:
+        quiet.setLevel(previous)
+    lines = [json.loads(line)["mensagem"] for line in stream.getvalue().splitlines()]
+    assert lines == ["uma linha", "um aviso"]
+
+
 def test_uvicorn_logs_go_through_the_root_logger_only_in_json() -> None:
     from uvicorn.config import LOGGING_CONFIG
 
