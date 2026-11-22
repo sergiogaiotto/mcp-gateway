@@ -1,0 +1,204 @@
+{
+  "descricao": "Capturas de tela do RaPA para o manual, geradas por docs/manual/capturar.py sobre a 'Empresa Demonstração' (dados inventados), em 1440x900 com escala 2.",
+  "capturas": [
+    {
+      "arquivo": "01-entrar.png",
+      "legenda": "Tela de entrada no modo de desenvolvimento: um perfil por pessoa do arquivo de tokens (em produção, o login é pelo Keycloak).",
+      "persona": "ninguém (antes do login)",
+      "url": "/entrar",
+      "pagina_inteira": false
+    },
+    {
+      "arquivo": "02-catalogo.png",
+      "legenda": "Catálogo: os robôs publicados que a pessoa pode usar, com o efeito, a versão e os botões Executar e Ver passos.",
+      "persona": "Eduarda Martins (operação na empresa inteira) · eduarda.martins@demonstracao.example",
+      "url": "/catalogo",
+      "pagina_inteira": true
+    },
+    {
+      "arquivo": "03-robos.png",
+      "legenda": "Robôs: os robôs das áreas da pessoa, com a situação e a versão publicada, e o cartão para criar uma versão a partir do manifesto em JSON.",
+      "persona": "Bruno Reis (criação de robôs no Fiscal e no Financeiro) · bruno.reis@demonstracao.example",
+      "url": "/robos",
+      "pagina_inteira": true
+    },
+    {
+      "arquivo": "04-robo-versoes-aprovacoes.png",
+      "legenda": "Tela do robô com certificado A1: versões, 1 de 2 aprovações, o cartão do A1 com a autorização da custodiante, os passos, as entradas e as credenciais.",
+      "persona": "Daniel Rocha (aprovação no Fiscal e no Financeiro) · daniel.rocha@demonstracao.example",
+      "url": "/robos/{robo}",
+      "pagina_inteira": true
+    },
+    {
+      "arquivo": "05-gravar-ao-vivo.png",
+      "legenda": "Gravação ao vivo: o navegador da nuvem mostra o portal de teste v1 e a pessoa preenche o formulário com o próprio mouse e teclado.",
+      "persona": "Bruno Reis (criação de robôs no Fiscal e no Financeiro) · bruno.reis@demonstracao.example",
+      "url": "/gravar/{sessao}",
+      "pagina_inteira": true,
+      "nota": "A visão ao vivo não começou sozinha no serviço de verdade: com o NiceGUI 4, o <script> da configuração entra depois da resposta e não roda; a captura reexecutou os scripts da própria página (veja _START_LIVE_VIEW em capturar.py)."
+    },
+    {
+      "arquivo": "06-revisao-gravacao.png",
+      "legenda": "Revisão da gravação: os dados do robô, as entradas propostas pelas regras (aceitas aqui) e os nomes dos passos, para conferir antes de criar o rascunho; sem o hub de LLM, um aviso no topo.",
+      "persona": "Bruno Reis (criação de robôs no Fiscal e no Financeiro) · bruno.reis@demonstracao.example",
+      "url": "/gravar/{sessao}/revisar",
+      "pagina_inteira": true
+    },
+    {
+      "arquivo": "07-execucoes.png",
+      "legenda": "Execuções: as mais recentes das áreas da pessoa, de todas as origens (interface, API REST, MCP, agenda, webhook e lote).",
+      "persona": "Eduarda Martins (operação na empresa inteira) · eduarda.martins@demonstracao.example",
+      "url": "/execucoes",
+      "pagina_inteira": true
+    },
+    {
+      "arquivo": "08-execucao-evidencias.png",
+      "legenda": "Execução que falhou: o erro, o vídeo da falha, as telas guardadas e o botão Consertar este passo.",
+      "persona": "Eduarda Martins (operação na empresa inteira) · eduarda.martins@demonstracao.example",
+      "url": "/execucoes/{execucao}",
+      "pagina_inteira": true
+    },
+    {
+      "arquivo": "09-conserto.png",
+      "legenda": "Consertar este passo: o passo que quebrou, a sugestão do modelo (desligada sem o hub de LLM) e os elementos candidatos da página na hora da falha.",
+      "persona": "Bruno Reis (criação de robôs no Fiscal e no Financeiro) · bruno.reis@demonstracao.example",
+      "url": "/execucoes/{execucao}/conserto",
+      "pagina_inteira": true
+    },
+    {
+      "arquivo": "10-agendas.png",
+      "legenda": "Agendas: as agendas cron (ligada e desligada) e o formulário de uma nova, com atalhos e o fuso de Brasília.",
+      "persona": "Eduarda Martins (operação na empresa inteira) · eduarda.martins@demonstracao.example",
+      "url": "/agendas",
+      "pagina_inteira": true
+    },
+    {
+      "arquivo": "11-webhooks.png",
+      "legenda": "Webhooks: o endereço de cada um, o limite por minuto e a última entrega; a chave de assinatura só aparece uma vez, ao criar ou trocar.",
+      "persona": "Eduarda Martins (operação na empresa inteira) · eduarda.martins@demonstracao.example",
+      "url": "/webhooks",
+      "pagina_inteira": true
+    },
+    {
+      "arquivo": "12-lotes.png",
+      "legenda": "Lotes: os lotes enviados, com o andamento, e o envio de uma planilha .xlsx ou .csv (conferida linha a linha antes de criar).",
+      "persona": "Eduarda Martins (operação na empresa inteira) · eduarda.martins@demonstracao.example",
+      "url": "/lotes",
+      "pagina_inteira": false
+    },
+    {
+      "arquivo": "13-credenciais-a1.png",
+      "legenda": "Credenciais: só a referência ao cofre e os metadados; o certificado A1 com custodiante, validade e impressão, e o registro de uma credencial nova.",
+      "persona": "Ana Lima (administração da empresa) · ana.lima@demonstracao.example",
+      "url": "/credenciais",
+      "pagina_inteira": true
+    },
+    {
+      "arquivo": "14-empresa-usuarios.png",
+      "legenda": "Empresa (administração): as pessoas com os papéis por área ou na empresa inteira, as áreas e o consumo do mês.",
+      "persona": "Ana Lima (administração da empresa) · ana.lima@demonstracao.example",
+      "url": "/empresa",
+      "pagina_inteira": true
+    },
+    {
+      "arquivo": "15-empresa-consumo.png",
+      "legenda": "Empresa (auditoria): o consumo do mês por área e por origem, em execuções, minutos de navegador, sessões de gravação e lotes.",
+      "persona": "Fábio Nunes (auditoria na empresa inteira) · fabio.nunes@demonstracao.example",
+      "url": "/empresa",
+      "pagina_inteira": false
+    },
+    {
+      "arquivo": "16-gravar.png",
+      "legenda": "Gravar: a área, o endereço inicial e o nome da tarefa para abrir o navegador da nuvem, e as gravações anteriores da pessoa.",
+      "persona": "Bruno Reis (criação de robôs no Fiscal e no Financeiro) · bruno.reis@demonstracao.example",
+      "url": "/gravar",
+      "pagina_inteira": false
+    },
+    {
+      "arquivo": "17-executar.png",
+      "legenda": "Executar pela interface: o formulário das entradas, a confirmação do passo irreversível e o resultado da execução, atualizado até terminar.",
+      "persona": "Eduarda Martins (operação na empresa inteira) · eduarda.martins@demonstracao.example",
+      "url": "/executar/emitir_protocolo",
+      "pagina_inteira": true
+    },
+    {
+      "arquivo": "18-execucao-sucesso.png",
+      "legenda": "Execução que deu certo: os detalhes, a tabela lida no portal e os arquivos baixados, com tamanho e data.",
+      "persona": "Eduarda Martins (operação na empresa inteira) · eduarda.martins@demonstracao.example",
+      "url": "/execucoes/{execucao}",
+      "pagina_inteira": true
+    },
+    {
+      "arquivo": "19-agenda-detalhe.png",
+      "legenda": "Uma agenda: o robô, a expressão, a próxima ocorrência e o que aconteceu com cada ocorrência.",
+      "persona": "Eduarda Martins (operação na empresa inteira) · eduarda.martins@demonstracao.example",
+      "url": "/agendas/{agenda}",
+      "pagina_inteira": false
+    },
+    {
+      "arquivo": "20-lote-detalhe.png",
+      "legenda": "Um lote: o andamento, cada linha com a execução e o resultado, e o resultado para baixar em CSV ou xlsx.",
+      "persona": "Eduarda Martins (operação na empresa inteira) · eduarda.martins@demonstracao.example",
+      "url": "/lotes/{lote}",
+      "pagina_inteira": false
+    },
+    {
+      "arquivo": "21-robo-conserto-versao-nova.png",
+      "legenda": "A versão consertada pronta para publicar: só o alvo do passo que quebrou mudou, e outra pessoa, com o papel de aprovação, publica.",
+      "persona": "Carla Souza (aprovação no Fiscal e no Financeiro) · carla.souza@demonstracao.example",
+      "url": "/robos/{robo}?versao=2",
+      "pagina_inteira": true
+    },
+    {
+      "arquivo": "22-saude.png",
+      "legenda": "GET /saude: 200 com a versão enquanto o despachante do processo está de pé (503 quando ele para).",
+      "persona": "ninguém (sem token)",
+      "url": "/saude",
+      "pagina_inteira": false
+    },
+    {
+      "arquivo": "23-openapi-robos.png",
+      "legenda": "GET /v1/openapi-robos.json: o OpenAPI dos robôs publicados que a pessoa do token pode chamar pelo REST (o começo do documento).",
+      "persona": "Eduarda Martins (operação na empresa inteira) · eduarda.martins@demonstracao.example (token no cabeçalho Authorization)",
+      "url": "/v1/openapi-robos.json",
+      "pagina_inteira": false
+    }
+  ],
+  "pessoas": [
+    {
+      "nome": "Ana Lima",
+      "sujeito": "ana.lima@demonstracao.example",
+      "papeis": "administração da empresa"
+    },
+    {
+      "nome": "Bruno Reis",
+      "sujeito": "bruno.reis@demonstracao.example",
+      "papeis": "criação de robôs no Fiscal e no Financeiro"
+    },
+    {
+      "nome": "Carla Souza",
+      "sujeito": "carla.souza@demonstracao.example",
+      "papeis": "aprovação no Fiscal e no Financeiro"
+    },
+    {
+      "nome": "Daniel Rocha",
+      "sujeito": "daniel.rocha@demonstracao.example",
+      "papeis": "aprovação no Fiscal e no Financeiro"
+    },
+    {
+      "nome": "Eduarda Martins",
+      "sujeito": "eduarda.martins@demonstracao.example",
+      "papeis": "operação na empresa inteira"
+    },
+    {
+      "nome": "Fábio Nunes",
+      "sujeito": "fabio.nunes@demonstracao.example",
+      "papeis": "auditoria na empresa inteira"
+    },
+    {
+      "nome": "Gabriela Prado",
+      "sujeito": "gabriela.prado@demonstracao.example",
+      "papeis": "custódia do certificado A1 no Financeiro"
+    }
+  ]
+}
