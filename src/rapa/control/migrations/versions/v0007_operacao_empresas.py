@@ -34,7 +34,9 @@ Anterior: 0006
   ``company_admin`` ativo, recusa. Toma a trava das mudanças de papéis da empresa
   (classe 7131, a mesma do serviço), então duas transações tirando ao mesmo tempo os
   dois últimos administradores não passam juntas. A saída da empresa (dono com a marca
-  ``rapa.purge_company``) passa.
+  ``rapa.purge_company``) passa. Como as consultas dele passam pelo isolamento por linha,
+  a transação de quem não passa por cima do isolamento precisa terminar fixada na empresa
+  da linha (trocar ``rapa.company_id`` antes do fim é recusado).
 - ``platform_events``: registros da plataforma sem empresa (hoje, ``empresa.apagada``,
   gravado antes de apagar uma empresa, com o SHA-256 do nome e as contagens por
   tabela). Sem isolamento por empresa e sem permissão para os papéis da aplicação e
@@ -450,13 +452,6 @@ def _company_admin_guard() -> list[str]:
                         RETURN NULL;
                     END IF;
                 END IF;
-                IF NOT EXISTS (
-                    SELECT 1 FROM public.memberships m
-                     WHERE m.company_id = company AND m.user_id = OLD.id
-                       AND m.role = 'company_admin' AND m.area_id IS NULL
-                ) THEN
-                    RETURN NULL;  -- sem o papel (ou o vínculo saiu junto: o gatilho dele confere)
-                END IF;
             ELSIF TG_OP = 'UPDATE' THEN
                 IF NEW.role = 'company_admin' AND NEW.area_id IS NULL
                     AND NEW.company_id = OLD.company_id AND NEW.user_id = OLD.user_id
@@ -464,10 +459,31 @@ def _company_admin_guard() -> list[str]:
                     RETURN NULL;  -- o mesmo papel, da mesma pessoa
                 END IF;
             END IF;
-            -- A saída da empresa (o dono com a marca) e a empresa que já não existe passam.
+            -- A saída da empresa (o dono com a marca) passa.
             IF public.rapa_purge_allowed(TG_RELID, company) THEN
                 RETURN NULL;
             END IF;
+            -- As consultas abaixo passam pelo isolamento por linha da transação, que no fim
+            -- (o gatilho é adiado) pode estar fixada noutra empresa ou em nenhuma: aí elas não
+            -- veriam a empresa, o vínculo nem os administradores desta, e tudo passaria. Quem
+            -- não passa por cima do isolamento precisa terminar fixado na empresa da linha.
+            IF nullif(current_setting('rapa.company_id', true), '')::uuid IS DISTINCT FROM company
+                AND NOT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_roles r
+                     WHERE r.rolname = current_user AND (r.rolsuper OR r.rolbypassrls)
+                )
+            THEN
+                RAISE EXCEPTION USING ERRCODE = 'check_violation',
+                    MESSAGE = 'a conferência do administrador precisa da transação fixada na empresa';
+            END IF;
+            IF TG_TABLE_NAME = 'users' AND NOT EXISTS (
+                SELECT 1 FROM public.memberships m
+                 WHERE m.company_id = company AND m.user_id = OLD.id
+                   AND m.role = 'company_admin' AND m.area_id IS NULL
+            ) THEN
+                RETURN NULL;  -- sem o papel (ou o vínculo saiu junto: o gatilho dele confere)
+            END IF;
+            -- A empresa que já não existe passa.
             IF NOT EXISTS (SELECT 1 FROM public.companies c WHERE c.id = company) THEN
                 RETURN NULL;
             END IF;

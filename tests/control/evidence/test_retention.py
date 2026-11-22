@@ -23,6 +23,7 @@ from rapa.control.services import (
     RetentionPolicy,
     verify_chain,
 )
+from rapa.control.services.a1 import ensure_a1_ready
 from rapa.core.contracts import ArtifactStatus, Gone, RunTrigger
 from tests.control.db.support import (
     PROTOCOLO_INPUTS,
@@ -550,3 +551,168 @@ def test_policy_has_a_minimum_of_one_day(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
     with pytest.raises(ValueError):
         Retention(None, store, max_tick_s=0)  # type: ignore[arg-type]
+
+
+async def test_legacy_download_name_with_repeated_dots_stays_for_the_long_deadline(
+    world: EvidenceWorld, app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine
+) -> None:
+    """Um download gravado antes do PR D pode ter ``..`` no nome (o saneador de antes
+    deixava pontos seguidos): no prazo curto ele fica, como qualquer download."""
+    tenant = await _tenant(world, app_db, "Nome antigo")
+    run_id = await world.run(tenant, state="succeeded")
+    folder = attempt_dir(world.store.root, tenant.company_id, run_id, 1)
+    legacy = "nota..fiscal.pdf"
+    (folder / "nota-001.pdf").rename(folder / legacy)
+    # A forma de ``runs.artifacts`` depois da 0008 numa execução de antes (sem caminho,
+    # sem tentativa e sem data), com o nome que o saneador de antes deixava.
+    async with superuser_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE runs SET artifacts = (SELECT jsonb_agg(CASE WHEN a->>'kind' = 'download' "
+                "THEN jsonb_set(a - 'attempt' - 'created_at', '{name}', to_jsonb(CAST(:name AS text))) "
+                "ELSE a - 'attempt' - 'created_at' END) FROM jsonb_array_elements(artifacts) AS a) "
+                "WHERE id = :id"
+            ),
+            {"name": legacy, "id": run_id},
+        )
+    await age_run(superuser_engine, run_id, 10)
+
+    report = await _retention(world, dispatcher_db).tick()
+
+    assert run_id in report.captures and report.failed == []
+    assert [path.name for path in _files(world, tenant, run_id)] == [legacy]
+    row = await run_row(superuser_engine, run_id)
+    assert row["captures_expired_at"] is not None and row["artifacts_expired_at"] is None
+    # Passado o prazo das evidências, sai também.
+    await age_run(superuser_engine, run_id, 91)
+    later = await _retention(world, dispatcher_db).tick()
+    assert run_id in later.artifacts
+    assert _files(world, tenant, run_id) == []
+
+
+async def test_dropping_a_partition_never_holds_run_events_while_checking_the_next(
+    world: EvidenceWorld,
+    dispatcher_db: Database,
+    owner_engine: AsyncEngine,
+    superuser_engine: AsyncEngine,
+) -> None:
+    """O DROP de uma partição trava ``run_events`` (exclusiva) até o fim da transação; a
+    conferência da partição seguinte (que pode ler a partição inteira) não pode rodar
+    com essa trava, ou a ingestão e a leitura de eventos param. Uma partição por vez."""
+    olds = (
+        ("run_events_2002_01", "2002-01-01", "2002-02-01"),
+        ("run_events_2002_02", "2002-02-01", "2002-03-01"),
+    )
+    async with owner_engine.begin() as conn:
+        for name, start, end in olds:
+            await conn.execute(
+                text(
+                    f"CREATE TABLE {name} PARTITION OF run_events "
+                    f"FOR VALUES FROM ('{start}') TO ('{end}')"
+                )
+            )
+    retention = _retention(world, dispatcher_db, lock_timeout=timedelta(seconds=30))
+    # A conferência da segunda partição fica presa numa trava dela (como uma leitura longa).
+    holder = await superuser_engine.connect()
+    await holder.begin()
+    await holder.execute(text("LOCK TABLE run_events_2002_02 IN ACCESS EXCLUSIVE MODE"))
+    tick = asyncio.create_task(retention.tick())
+    try:
+        for _ in range(200):
+            async with superuser_engine.connect() as conn:
+                waiting = await conn.scalar(
+                    text(
+                        "SELECT count(*) FROM pg_locks WHERE NOT granted "
+                        "AND relation = 'run_events_2002_02'::regclass"
+                    )
+                )
+            if waiting:
+                break
+            await asyncio.sleep(0.05)
+        assert waiting, "a retenção não chegou à segunda partição"
+        # Enquanto isso, os eventos de agora continuam sendo lidos (e gravados). O limite
+        # vai como constante: a consulta só abre (e trava) as partições de agora.
+        since = f"{datetime.now(UTC) - timedelta(days=1):%Y-%m-%d %H:%M:%S}+00"
+        async with superuser_engine.connect() as probe:
+            await probe.execute(text("SET lock_timeout = '1s'"))
+            query = f"SELECT count(*) FROM run_events WHERE at >= '{since}'"  # noqa: S608
+            await probe.execute(text(query))
+    finally:
+        await holder.rollback()
+        await holder.close()
+        report = await tick
+    assert report.partitions == 2
+    assert not {name for name, *_ in olds} & set(await _partitions(superuser_engine))
+
+
+async def test_expired_key_renewed_while_the_purge_waits_stays(
+    world: EvidenceWorld,
+    app_db: Database,
+    dispatcher_db: Database,
+    superuser_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant = await _tenant(world, app_db, "Chave renovada")
+    first = await world.platform.start(
+        tenant.operator, "emitir_protocolo", PROTOCOLO_INPUTS, RunTrigger.REST, "chave"
+    )
+    async with superuser_engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE idempotency_keys SET expires_at = now() - interval '1 hour'")
+        )
+    # O mesmo pedido depois do prazo: enqueue_run trava a chave vencida e a renova.
+    locked = asyncio.Event()
+    release = asyncio.Event()
+
+    async def paused(*args: Any, **kwargs: Any) -> Any:
+        locked.set()
+        await release.wait()
+        return await ensure_a1_ready(*args, **kwargs)
+
+    monkeypatch.setattr("rapa.control.services.runs.ensure_a1_ready", paused)
+    renewing = asyncio.create_task(
+        world.platform.start(
+            tenant.operator, "emitir_protocolo", PROTOCOLO_INPUTS, RunTrigger.REST, "chave"
+        )
+    )
+    await locked.wait()
+    purging = asyncio.create_task(_retention(world, dispatcher_db).tick())
+    waiting = 0
+    for _ in range(100):
+        await asyncio.sleep(0.02)
+        async with superuser_engine.connect() as conn:
+            waiting = int(
+                await conn.scalar(
+                    text(
+                        "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                        "AND query LIKE 'SELECT rapa_purge_idempotency_keys%'"
+                    )
+                )
+                or 0
+            )
+        if waiting:
+            break
+    assert waiting, "a exclusão das chaves vencidas não chegou a esperar a trava"
+    release.set()
+    second = await renewing
+    await purging
+    monkeypatch.undo()
+
+    # A chave renovada vale de novo: a exclusão que esperava a trava não a apaga, e a
+    # repetição do pedido devolve a mesma execução (nada roda duas vezes).
+    assert second.run_id != first.run_id
+    async with superuser_engine.connect() as conn:
+        keys = (
+            await conn.execute(
+                text(
+                    "SELECT run_id, expires_at > now() AS live FROM idempotency_keys "
+                    "WHERE company_id = :company"
+                ),
+                {"company": tenant.company_id},
+            )
+        ).all()
+    assert [(row.run_id, row.live) for row in keys] == [(second.run_id, True)]
+    retry = await world.platform.start(
+        tenant.operator, "emitir_protocolo", PROTOCOLO_INPUTS, RunTrigger.REST, "chave"
+    )
+    assert retry.run_id == second.run_id

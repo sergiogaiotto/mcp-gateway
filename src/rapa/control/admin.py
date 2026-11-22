@@ -300,7 +300,10 @@ async def _owner_command(args: argparse.Namespace, url: str) -> str:
             files_dir=files,
             artifacts_dir=artifacts,
         )
-        return f"empresa apagada: {sum(purged.tables.values())} linhas"
+        removed = ", ".join(str(folder) for folder in purged.folders) or "nenhuma"
+        if purged.resumed:
+            return f"a empresa já tinha saído do banco; pastas apagadas: {removed}"
+        return f"empresa apagada: {sum(purged.tables.values())} linhas; pastas apagadas: {removed}"
     finally:
         await engine.dispose()
 

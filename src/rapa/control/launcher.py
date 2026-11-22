@@ -312,9 +312,12 @@ class LocalProcessLauncher:
         return grace
 
     def _paths(self, job: RunnerJob) -> tuple[Path, Path]:
-        work = self.settings.work_dir / f"{job.run_id}-{job.attempt}"
+        # Caminhos absolutos: o worker roda com a pasta da tentativa como diretório atual,
+        # e uma pasta relativa da configuração seria lida a partir dela (os artefatos
+        # iriam para dentro da pasta de trabalho, que some no fim).
+        work = self.settings.work_dir.absolute() / f"{job.run_id}-{job.attempt}"
         artifacts = attempt_dir(
-            self.settings.artifacts_dir, job.company_id, job.run_id, job.attempt
+            self.settings.artifacts_dir.absolute(), job.company_id, job.run_id, job.attempt
         )
         return work, artifacts
 
@@ -348,7 +351,7 @@ class LocalProcessLauncher:
         if settings.files_dir is not None:
             # Só a pasta da empresa da tarefa: a execução de uma empresa nunca vê os
             # arquivos de outra, seja qual for o identificador pedido nas entradas.
-            command += ["--files-dir", str(settings.files_dir / str(job.company_id))]
+            command += ["--files-dir", str(settings.files_dir.absolute() / str(job.company_id))]
         command += [f"--browser-arg={arg}" for arg in settings.browser_args]
         return command
 

@@ -26,6 +26,7 @@ __all__ = [
     "artifact_headers",
     "is_capture",
     "media_type_for",
+    "recorded_artifact_name",
     "valid_artifact_name",
 ]
 
@@ -58,6 +59,18 @@ _OCTET_STREAM = "application/octet-stream"
 def valid_artifact_name(name: str) -> bool:
     """Se ``name`` pode ser o nome de um artefato: sem barras, sem ``..`` e só ``[A-Za-z0-9._-]``."""
     return bool(_NAME.fullmatch(name)) and ".." not in name
+
+
+def recorded_artifact_name(name: str) -> bool:
+    """Se ``name`` pode ser o nome de um artefato já registrado: a regra de
+    :func:`valid_artifact_name` sem a proibição de ``..``.
+
+    O saneador do executor de antes da revisão 0008 deixava pontos seguidos
+    (``nota..fiscal.pdf``), e esses nomes ficaram em ``runs.artifacts``. Serve só para
+    comparar com o que está na pasta da tentativa (a retenção, ao deixar os arquivos
+    baixados no prazo curto), nunca para montar um caminho.
+    """
+    return bool(_NAME.fullmatch(name))
 
 
 def is_capture(kind: str) -> bool:

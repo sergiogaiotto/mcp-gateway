@@ -10,7 +10,8 @@ Os prazos são da plataforma (``ServerSettings``, mínimo de 1 dia) e ainda est�
   falhas (``run_snapshots``): ``RAPA_RETENCAO_FALHAS_DIAS`` (90 dias);
 - chaves de idempotência vencidas: apagadas (uma chave vencida já não vale);
 - partições mensais de ``run_events`` que terminaram há mais de
-  ``RAPA_RETENCAO_EVENTOS_DIAS`` (400 dias, para o consumo mensal e a auditoria).
+  ``RAPA_RETENCAO_EVENTOS_DIAS`` (400 dias, para o consumo mensal e a auditoria), uma
+  por transação (o ``DROP`` trava ``run_events`` até o fim dela).
 
 O prazo conta do fim da execução (``finished_at``) e, nos retratos, da gravação.
 
@@ -65,7 +66,7 @@ from rapa.control.services.queue import (
     DEFAULT_MAINTENANCE_STATEMENT_TIMEOUT,
     DISPATCHER_ACTOR,
 )
-from rapa.core.artifacts import is_capture, valid_artifact_name
+from rapa.core.artifacts import is_capture, recorded_artifact_name
 from rapa.core.contracts import CompanyStatus, RunState
 
 __all__ = [
@@ -212,7 +213,8 @@ class Retention:
                 batches[stage] += 1
                 if await stages[stage]() < policy.batch_size:
                     active.remove(stage)
-        report.partitions = await self._drop_event_partitions()
+        report.partitions, more = await self._drop_event_partitions(give_up)
+        report.behind = report.behind or more
         if report.partitions:
             logger.info(
                 "retenção: %d partição(ões) de eventos com mais de %d dias removida(s)",
@@ -349,21 +351,39 @@ class Retention:
             )
         return int(deleted or 0)
 
-    async def _drop_event_partitions(self) -> int:
-        async with self.db.dispatcher_session() as session:
-            await self._limit(session)
-            dropped = await session.scalar(
-                text("SELECT rapa_drop_event_partitions(:days)"),
-                {"days": self.policy.events_days},
-            )
-        return int(dropped or 0)
+    async def _drop_event_partitions(self, give_up: float) -> tuple[int, bool]:
+        """Remove as partições vencidas, uma por transação, até o limite de tempo.
+
+        A função do banco remove no máximo uma por chamada: o ``DROP`` trava
+        ``run_events`` (exclusiva) até o fim da transação, e a conferência da partição
+        seguinte não pode rodar com ela. Devolve quantas saíram e se pode haver mais.
+        """
+        loop = asyncio.get_running_loop()
+        dropped = 0
+        for _ in range(self.max_batches):
+            async with self.db.dispatcher_session() as session:
+                await self._limit(session)
+                one = int(
+                    await session.scalar(
+                        text("SELECT rapa_drop_event_partitions(:days)"),
+                        {"days": self.policy.events_days},
+                    )
+                    or 0
+                )
+            dropped += one
+            if not one:
+                return dropped, False
+            if loop.time() >= give_up:
+                break
+        return dropped, True
 
 
 def _downloads(row: RowMapping) -> list[tuple[int, str]]:
     """Os arquivos baixados da execução, como ``(tentativa, nome)``: o que fica no prazo curto.
 
     Lê a lista crua de ``runs.artifacts``: um item que diz ser um download fica, mesmo
-    fora do formato de hoje (na dúvida, a evidência fica para o prazo longo).
+    fora do formato de hoje (na dúvida, a evidência fica para o prazo longo), também
+    com o nome de antes da regra do ``..`` (:func:`rapa.core.artifacts.recorded_artifact_name`).
     """
     kept: list[tuple[int, str]] = []
     for item in row["artifacts"] or []:
@@ -373,6 +393,6 @@ def _downloads(row: RowMapping) -> list[tuple[int, str]]:
         attempt = item.get("attempt")
         if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
             attempt = max(1, int(row["attempt"] or 1))
-        if isinstance(name, str) and valid_artifact_name(name):
+        if isinstance(name, str) and recorded_artifact_name(name):
             kept.append((attempt, name))
     return kept

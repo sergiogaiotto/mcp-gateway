@@ -12,6 +12,7 @@ from uuid import UUID
 
 import pytest
 
+from rapa.control.artifacts import LocalArtifactStore
 from rapa.control.launcher import (
     LocalLauncherSettings,
     LocalProcessLauncher,
@@ -460,3 +461,50 @@ def test_video_on_failure_goes_to_the_worker_and_into_the_end_budget(tmp_path: P
     # A pasta do vídeo fica dentro da pasta da tentativa, que some no fim.
     assert command[command.index("--video-dir") + 1] == str(work / "video")
     assert plain.grace_s == 15.0 and filmed.grace_s == 25.0
+
+
+@pytest.mark.browser
+async def test_relative_folders_are_read_from_the_server_not_the_worker(
+    portal_v1: RunningPortal,
+    chromium_path: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pastas relativas valem a partir do servidor, não da pasta de trabalho do worker.
+
+    O worker roda com a pasta da tentativa como diretório atual; uma pasta de artefatos
+    relativa lida a partir dela levaria as telas para dentro da pasta de trabalho (que
+    some no fim), e o store as recusaria.
+    """
+    monkeypatch.chdir(tmp_path)
+    job = _job(portal_v1)
+    launcher = LocalProcessLauncher(
+        RecordingIngestor(),
+        LocalLauncherSettings(
+            work_dir=Path("trabalho"),
+            artifacts_dir=Path("dados") / "artefatos",
+            files_dir=Path("dados") / "arquivos",
+            chromium=chromium_path,
+            browser_args=(HOST_RESOLVER_ARG,),
+        ),
+        StaticSecretSource({job.company_id: SECRETS}),
+    )
+    work, artifacts = launcher._paths(job)
+    command = launcher._command(job, work, artifacts, with_secrets=False)
+    for flag in ("--job", "--artifacts", "--files-dir"):
+        assert Path(command[command.index(flag) + 1]).is_absolute(), flag
+
+    result = await launcher(job)
+
+    assert result["state"] == RunState.SUCCEEDED, result["error_message"]
+    assert not (tmp_path / "trabalho" / f"{job.run_id}-1").exists()
+    store = LocalArtifactStore(Path("dados") / "artefatos")
+    shots = [a for a in result["artifacts"] if a["kind"] == "screenshot"]
+    assert shots
+    for shot in shots:
+        info = await store.put(
+            job.company_id, job.run_id, job.attempt, shot["name"], shot["kind"], Path(shot["path"])
+        )
+        assert info.size > 0
+    folder = tmp_path / "dados" / "artefatos" / str(job.company_id) / str(job.run_id) / "1"
+    assert {shot["name"] for shot in shots} <= {p.name for p in folder.iterdir()}

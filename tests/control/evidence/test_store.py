@@ -283,3 +283,18 @@ def test_headers_never_allow_sniffing_or_caching() -> None:
     assert artifact_headers("nota.pdf", inline=False)["Content-Disposition"] == (
         'attachment; filename="nota.pdf"'
     )
+
+
+async def test_delete_run_keeps_a_legacy_download_name(tmp_path: Path) -> None:
+    """Um download de antes da regra do ``..`` (``nota..fiscal.pdf``) também fica no
+    prazo curto: o nome de ``keep`` só é comparado com o que está na pasta."""
+    store = LocalArtifactStore(tmp_path / "artefatos")
+    _write(store, "tela-001.png")
+    _write(store, "nota..fiscal.pdf")
+    await store.delete_run(COMPANY, RUN, keep=[(1, "nota..fiscal.pdf")])
+    folder = attempt_dir(store.root, COMPANY, RUN, 1)
+    assert sorted(path.name for path in folder.iterdir()) == ["nota..fiscal.pdf"]
+    for bad in ("..", "../nota..fiscal.pdf", ".nota..pdf"):
+        with pytest.raises(ValueError):
+            await store.delete_run(COMPANY, RUN, keep=[(1, bad)])
+    assert sorted(path.name for path in folder.iterdir()) == ["nota..fiscal.pdf"]

@@ -4,6 +4,7 @@ import asyncio
 import secrets
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from uuid import UUID
 
 import pytest
 from sqlalchemy import text
@@ -328,3 +329,55 @@ async def test_frozen_company_only_reduces_access(
         await service.reactivate_user(a.admin, operator.user_id)
     await unfreeze_company(owner_engine, a.company_id, requested_by="teste")
     assert (await service.reactivate_user(a.admin, operator.user_id)).active
+
+
+async def test_database_guard_reads_the_company_of_the_row(
+    people: People, app_db: Database
+) -> None:
+    """O gatilho é adiado: trocar a empresa da transação antes do fim não o engana."""
+    a, b = people.a, people.b
+
+    async def attempt(company: UUID, statement: str, user: UUID | None, then: str) -> str | None:
+        try:
+            async with app_db.tenant_session(company) as session:
+                await session.execute(text(statement), {"u": user})
+                await session.execute(
+                    text("SELECT set_config('rapa.company_id', :c, true)"), {"c": then}
+                )
+        except DBAPIError as exc:
+            return getattr(exc.orig, "sqlstate", None)
+        return None
+
+    take = "DELETE FROM memberships WHERE user_id = :u AND role = 'company_admin'"
+    off = "UPDATE users SET active = false WHERE id = :u"
+    for tenant, other in ((a, b), (b, a)):
+        for statement in (take, off):
+            for then in ("", str(other.company_id)):
+                outcome = await attempt(tenant.company_id, statement, tenant.admin.user_id, then)
+                assert outcome == "23514", (statement, then)
+    resolver = PgPrincipalResolver(app_db)
+    for tenant in (a, b):
+        resolved = await resolver.resolve(tenant.admin.subject, tenant.company_id)
+        assert resolved is not None and resolved.company_roles == {Role.COMPANY_ADMIN}
+    # Quem não administra continua saindo, com a empresa da transação até o fim.
+    assert await attempt(a.company_id, off, a.operator.user_id, str(a.company_id)) is None
+
+
+async def test_area_admin_gives_roles_in_a_company_without_company_admin(
+    app_db: Database,
+) -> None:
+    """Empresa dos comandos antigos (sem company_admin): a área continua administrada."""
+    provisioning = PgProvisioning(app_db)
+    company = await provisioning.create_company(f"Antiga {secrets.token_hex(3)}")
+    area = await provisioning.create_area(company, "Fiscal")
+    tag = secrets.token_hex(4)
+    chief = await person(app_db, company, f"chefe-{tag}@antiga", (Role.AREA_ADMIN, area))
+    newcomer = await person(app_db, company, f"nova-{tag}@antiga")
+    assert newcomer.user_id is not None
+    service = PgCompanyAdmin(app_db)
+    given = await service.set_roles(
+        chief, newcomer.user_id, [RoleGrant(role=Role.OPERATOR, area_id=area)]
+    )
+    assert _grants(given) == {(Role.OPERATOR, area)}
+    taken = await service.set_roles(chief, newcomer.user_id, [])
+    assert _grants(taken) == set()

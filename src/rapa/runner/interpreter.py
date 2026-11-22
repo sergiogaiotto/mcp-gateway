@@ -3546,8 +3546,10 @@ class Interpreter:
                 else:
                     await handle.fill(secret, timeout=ctx.remaining_ms())
             finally:
-                await self._check_video_field(handle, watch)
-                await self._dispose(handle)
+                try:
+                    await self._check_video_field(handle, watch)
+                finally:
+                    await self._dispose(handle)
             return {"origem": "segredo", "tamanho": len(secret)}
 
         return act_secret
@@ -3586,6 +3588,7 @@ class Interpreter:
         """
         if watch is None:
             return
+        is_password: object = False
         try:
             is_password = await asyncio.wait_for(
                 watch.evaluate(_STILL_MASKED_FIELD_JS, handle), timeout=_VIDEO_FIELD_CHECK_S
@@ -3593,10 +3596,12 @@ class Interpreter:
         except Exception:  # documento que acabou, prazo, página que quebra a leitura
             is_password = False
         finally:
+            # Antes de qualquer outra espera: a conferência que o prazo do passo
+            # interrompe (CancelledError) não conferiu nada, e na dúvida o vídeo fica fora.
+            if is_password is not True:
+                self._video_unsafe = True
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self._dispose(watch), timeout=_VIDEO_FIELD_CHECK_S)
-        if is_password is not True:
-            self._video_unsafe = True
 
     async def _type(self, step: FillStep, ctx: _StepCtx, locator: PwLocator, text: str) -> None:
         """Digita ``text`` no campo, no lugar do que houver nele.

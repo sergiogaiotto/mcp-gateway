@@ -32,7 +32,9 @@
     todas as linhas da empresa em todas as tabelas, das filhas para as mães, e por fim a
     linha de ``companies``, numa transação só que marca ``rapa.purge_company`` (as travas
     de "só inclusões" aceitam a exclusão só assim, e só do dono). Em seguida apaga os
-    arquivos e os artefatos da empresa e chama o :class:`KeyDestroyer`.
+    arquivos e os artefatos da empresa e chama o :class:`KeyDestroyer`. Se parar depois
+    das linhas (uma pasta que não sai, as chaves), rodar de novo com o mesmo nome confere
+    o ``empresa.apagada`` (pelo SHA-256 do nome) e termina as pastas e as chaves.
 
 Congelar e apagar tomam primeiro a trava da situação da empresa, exclusiva: esperam as
 escritas em andamento terminarem, e as que chegam depois já veem a empresa congelada (ou
@@ -762,7 +764,8 @@ class KeyDestroyer(Protocol):
     """Destrói as chaves próprias de uma empresa apagada (no fim de :func:`purge_company`).
 
     A parte E liga o OpenBao (o namespace e as chaves da empresa). Os sais dos webhooks
-    somem com as linhas, então as chaves derivadas deles não voltam.
+    somem com as linhas, então as chaves derivadas deles não voltam. Pode ser chamado de
+    novo para a mesma empresa (a volta que termina uma exclusão interrompida).
     """
 
     async def destroy(self, company_id: UUID) -> None: ...
@@ -783,6 +786,8 @@ class PurgeReport:
     tables: dict[str, int]
     #: Pastas da empresa apagadas (arquivos e artefatos).
     folders: list[Path] = field(default_factory=list)
+    #: As linhas já tinham saído numa volta anterior; esta só terminou pastas e chaves.
+    resumed: bool = False
 
 
 def _remove_company_folder(base: Path | None, company_id: UUID) -> Path | None:
@@ -800,6 +805,41 @@ def _remove_company_folder(base: Path | None, company_id: UUID) -> Path | None:
     return root
 
 
+async def _purged_before(owner_engine: AsyncEngine, company_id: UUID, confirm_name: str) -> bool:
+    """A empresa já saiu do banco com este nome (o registro ``empresa.apagada``)."""
+    async with tenant_session(owner_engine, company_id) as session:
+        await _require_owner(session)
+        await _lock_exclusive(session, company_id)
+        if await session.scalar(select(companies.c.id).where(companies.c.id == company_id)):
+            return False
+        recorded = await session.scalar(
+            select(func.count())
+            .select_from(platform_events)
+            .where(
+                platform_events.c.action == "empresa.apagada",
+                platform_events.c.target == f"empresa:{company_id}",
+                platform_events.c.data["nome_sha256"].astext
+                == hashlib.sha256(confirm_name.encode()).hexdigest(),
+            )
+        )
+        return bool(recorded)
+
+
+async def _remove_files_and_keys(
+    company_id: UUID,
+    files_dir: Path | None,
+    artifacts_dir: Path | None,
+    key_destroyer: KeyDestroyer | None,
+) -> list[Path]:
+    folders = [
+        removed
+        for base in (files_dir, artifacts_dir)
+        if (removed := _remove_company_folder(base, company_id)) is not None
+    ]
+    await (key_destroyer or LocalKeyDestroyer()).destroy(company_id)
+    return folders
+
+
 async def purge_company(
     owner_engine: AsyncEngine,
     company_id: UUID,
@@ -812,6 +852,11 @@ async def purge_company(
 ) -> PurgeReport:
     """Apaga a empresa congelada inteira (dono das tabelas); veja o início do módulo."""
     actor = _actor(requested_by)
+    # As linhas saem antes das pastas e das chaves: uma volta que parou depois delas (uma
+    # pasta que não saiu, o cofre fora do ar) termina quando o comando roda de novo.
+    if await _purged_before(owner_engine, company_id, confirm_name):
+        folders = await _remove_files_and_keys(company_id, files_dir, artifacts_dir, key_destroyer)
+        return PurgeReport(tables={}, folders=folders, resumed=True)
     async with tenant_session(owner_engine, company_id) as session:
         await _require_owner(session)
         await _lock_exclusive(session, company_id)
@@ -885,10 +930,5 @@ async def purge_company(
         await session.execute(
             text("DELETE FROM public.companies WHERE id = :company"), {"company": company_id}
         )
-    folders = [
-        removed
-        for base in (files_dir, artifacts_dir)
-        if (removed := _remove_company_folder(base, company_id)) is not None
-    ]
-    await (key_destroyer or LocalKeyDestroyer()).destroy(company_id)
+    folders = await _remove_files_and_keys(company_id, files_dir, artifacts_dir, key_destroyer)
     return PurgeReport(tables=counts, folders=folders)

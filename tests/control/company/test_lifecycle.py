@@ -7,6 +7,7 @@ import io
 import json
 import os
 import secrets
+import shutil
 import stat
 import tarfile
 from collections.abc import Iterator
@@ -33,6 +34,7 @@ from tests.control.db.support import (
     PROTOCOLO_INPUTS,
     PgDatabase,
     failed_run,
+    make_tenant,
     result,
 )
 from tests.control.publishing.support import World, build_world
@@ -436,11 +438,15 @@ async def test_purge_leaves_nothing_and_only_for_a_frozen_company(
     # A outra empresa continua funcionando.
     run = await PgPlatform(app_db).start(b.operator, SLUG, PROTOCOLO_INPUTS, RunTrigger.REST)
     assert run.run_id
-    # Apagar de novo: a empresa não existe mais.
+    # Apagar de novo, com o mesmo nome: as linhas já saíram; só termina pastas e chaves.
     from rapa.core.contracts import NotFound
 
+    again = await purge(owner_engine)
+    assert again.resumed and again.tables == {} and again.folders == []
+    assert destroyer.destroyed == [a.company_id, a.company_id]
+    # Com outro nome, a empresa não existe mais.
     with pytest.raises(NotFound):
-        await purge(owner_engine)
+        await purge(owner_engine, "Empresa B")
     with pytest.raises(NotFound):
         await unfreeze_company(owner_engine, a.company_id)
 
@@ -583,3 +589,50 @@ async def test_cli_export_and_purge(
     with tarfile.open(output, "r:gz") as tar:
         manifest = json.load(io.BytesIO(tar.extractfile("manifesto.json").read()))  # type: ignore[union-attr]
     assert manifest["formato"] == 1
+
+
+async def test_purge_stopped_after_the_rows_finishes_when_run_again(
+    app_db: Database,
+    owner_engine: AsyncEngine,
+    superuser_engine: AsyncEngine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Uma pasta que não sai depois das linhas: rodar de novo termina pastas e chaves."""
+    a = await make_tenant(app_db, "Empresa A")
+    files, artifacts = _folders(tmp_path, a.company_id)
+    await freeze(owner_engine, a.company_id)
+    destroyer = FakeDestroyer()
+
+    def denied(path: Any, *args: Any, **kwargs: Any) -> None:
+        raise PermissionError(13, "Permission denied", str(path))
+
+    def purge(confirm: str = "Empresa A") -> Any:
+        return purge_company(
+            owner_engine,
+            a.company_id,
+            confirm_name=confirm,
+            files_dir=files,
+            artifacts_dir=artifacts,
+            key_destroyer=destroyer,
+        )
+
+    monkeypatch.setattr(shutil, "rmtree", denied)
+    with pytest.raises(PermissionError):
+        await purge()
+    assert set((await company_counts(superuser_engine, a.company_id)).values()) == {0}
+    assert (artifacts / str(a.company_id) / "execucao" / "tela-001.png").exists()
+    assert destroyer.destroyed == []
+    monkeypatch.undo()
+    from rapa.core.contracts import NotFound
+
+    # Outro nome não termina nada; o mesmo nome termina.
+    with pytest.raises(NotFound):
+        await purge("Empresa a")
+    assert destroyer.destroyed == []
+    report = await purge()
+    assert report.resumed and report.tables == {}
+    assert report.folders == [files / str(a.company_id), artifacts / str(a.company_id)]
+    assert not (files / str(a.company_id)).exists()
+    assert not (artifacts / str(a.company_id)).exists()
+    assert destroyer.destroyed == [a.company_id]

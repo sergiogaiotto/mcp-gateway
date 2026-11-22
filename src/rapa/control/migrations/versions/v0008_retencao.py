@@ -21,8 +21,12 @@ Anterior: 0007
     há mais de ``dias`` (no mínimo 1) e devolve a empresa, a execução e a
     tentativa de cada um (para a auditoria);
   - ``rapa_purge_idempotency_keys(lote)`` apaga chaves de idempotência vencidas;
-  - ``rapa_drop_event_partitions(dias)`` remove as partições mensais de
-    ``run_events`` que terminaram há mais de ``dias`` (no mínimo 1).
+  - ``rapa_drop_event_partitions(dias)`` remove a partição mensal mais antiga de
+    ``run_events`` que terminou há mais de ``dias`` (no mínimo 1) e devolve quantas
+    removeu (0 ou 1). Uma por chamada: o ``DROP`` trava ``run_events`` (exclusiva)
+    até o fim da transação, e a conferência da partição seguinte (que pode ler a
+    partição inteira) não roda com essa trava; quem chama repete, uma transação por
+    partição.
 
 - As funções rodam como o dono, que também está sujeito ao isolamento por linha
   (``FORCE``). Cada uma marca ``rapa.retention`` (``SET LOCAL`` logo antes de apagar,
@@ -325,6 +329,9 @@ def _functions() -> list[str]:
             END IF;
             PERFORM set_config('rapa.retention', 'idempotency_keys', true);
             BEGIN
+                -- O prazo é conferido de novo na linha apagada: uma chave vencida que a
+                -- aplicação renova (enqueue_run, com a linha travada) enquanto esta
+                -- exclusão espera a trava volta a valer, e a nova versão dela fica.
                 DELETE FROM public.idempotency_keys AS k
                  WHERE (k.company_id, k.scope, k.key) IN (
                        SELECT o.company_id, o.scope, o.key
@@ -332,7 +339,8 @@ def _functions() -> list[str]:
                         WHERE o.expires_at < now()
                           AND NOT {_FROZEN}
                         ORDER BY o.expires_at
-                        LIMIT batch_size);
+                        LIMIT batch_size)
+                   AND k.expires_at < now();
                 GET DIAGNOSTICS deleted = ROW_COUNT;
             EXCEPTION WHEN OTHERS THEN
                 PERFORM set_config('rapa.retention', '', true);
@@ -384,6 +392,9 @@ def _functions() -> list[str]:
                     THEN
                         EXECUTE format('DROP TABLE public.%I', part);
                         dropped := dropped + 1;
+                        -- Uma por transação: o DROP trava run_events (exclusiva) até o
+                        -- fim dela, e a conferência da próxima não roda com essa trava.
+                        EXIT;
                     END IF;
                 END LOOP;
             EXCEPTION WHEN OTHERS THEN

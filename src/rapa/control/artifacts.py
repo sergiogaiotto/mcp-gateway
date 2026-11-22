@@ -42,7 +42,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from rapa.core.artifacts import valid_artifact_name
+from rapa.core.artifacts import recorded_artifact_name, valid_artifact_name
 
 __all__ = [
     "ArtifactInfo",
@@ -155,6 +155,17 @@ def _attempt(attempt: int) -> int:
 
 def _checked_name(name: str) -> str:
     if not isinstance(name, str) or not valid_artifact_name(name):
+        raise ValueError("nome de artefato inválido")
+    return name
+
+
+def _kept_name(name: str) -> str:
+    """Um nome de ``keep``: só comparado com o que está na pasta, nunca um caminho.
+
+    Aceita o nome de um artefato de antes da regra do ``..`` (um download de uma
+    execução antiga fica no prazo curto como os outros).
+    """
+    if not isinstance(name, str) or not recorded_artifact_name(name):
         raise ValueError("nome de artefato inválido")
     return name
 
@@ -308,7 +319,7 @@ class LocalArtifactStore:
         company, run = _parts(company_id, run_id)
         kept: dict[str, set[str]] = {}
         for attempt, name in keep:
-            kept.setdefault(str(_attempt(attempt)), set()).add(_checked_name(name))
+            kept.setdefault(str(_attempt(attempt)), set()).add(_kept_name(name))
         try:
             # A pasta da empresa é aberta sem seguir atalho: um atalho para a pasta de
             # outra empresa levanta OSError, e nada é apagado (a retenção tenta depois).

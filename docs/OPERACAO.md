@@ -68,7 +68,7 @@ Só uma empresa congelada, sem execuções rodando nem sessões de gravação ab
 uv run python -m rapa.control.admin empresa apagar ID_DA_EMPRESA --confirmar "Nome da empresa"
 ```
 
-Antes de apagar, o comando grava em `platform_events` o registro `empresa.apagada` (o id, o SHA-256 do nome, as contagens por tabela, quem pediu e quando). Depois apaga todas as linhas da empresa, das tabelas filhas para as mães (inclusive as do certificado A1 e as das evidências), e por fim a empresa, numa transação só; em seguida os arquivos e os artefatos dela, e as chaves próprias (o `KeyDestroyer`; sem o cofre, só registra). Não tem volta: a exportação é a única cópia.
+Antes de apagar, o comando grava em `platform_events` o registro `empresa.apagada` (o id, o SHA-256 do nome, as contagens por tabela, quem pediu e quando). Depois apaga todas as linhas da empresa, das tabelas filhas para as mães (inclusive as do certificado A1 e as das evidências), e por fim a empresa, numa transação só; em seguida os arquivos e os artefatos dela, e as chaves próprias (o `KeyDestroyer`; sem o cofre, só registra). A mensagem final diz quais pastas saíram (confira que são as do servidor). Se o comando parar depois de apagar as linhas (uma pasta que não sai, por exemplo por permissão, ou as chaves), corrija e rode o mesmo comando de novo, com o mesmo nome: ele confere o registro `empresa.apagada` e termina as pastas e as chaves. Não tem volta: a exportação é a única cópia.
 
 Para conferir depois:
 

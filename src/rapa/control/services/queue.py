@@ -98,7 +98,7 @@ from rapa.control.db.schema import (
 )
 from rapa.control.db.session import Database
 from rapa.control.services import audit
-from rapa.control.services._common import INTERACTIVE_PRIORITY, now_utc
+from rapa.control.services._common import INTERACTIVE_PRIORITY, lock_company_status, now_utc
 from rapa.control.services.a1 import launch_block
 from rapa.control.services.admission import Capacity, CompanyLoad, plan
 from rapa.core.contracts import (
@@ -922,7 +922,16 @@ async def reap_expired(
         .all()
     )
     report = ReapReport()
-    frozen = await frozen_companies(session, {row["company_id"] for row in expired})
+    # A situação lida sob a trava da situação da empresa (compartilhada; congelar a toma
+    # exclusiva): um congelamento em andamento termina antes, e o que começa depois espera
+    # esta transação e já acha a execução de volta na fila (e a cancela). Sem a trava, um
+    # congelamento confirmado entre a leitura e o fim desta transação deixaria a execução
+    # na fila da empresa congelada, para rodar quando ela fosse descongelada.
+    frozen = {
+        company
+        for company in sorted({row["company_id"] for row in expired})
+        if await lock_company_status(session, company) is CompanyStatus.FROZEN
+    }
     for row in expired:
         run_id: UUID = row["id"]
         if row["irreversible_started_at"] is not None:

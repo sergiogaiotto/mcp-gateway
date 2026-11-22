@@ -6,7 +6,7 @@ import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from playwright.async_api import Browser
@@ -462,3 +462,64 @@ async def test_a_password_field_that_is_plain_while_typing_marks_the_video_unsaf
     # O mesmo campo, sem a página mexer no tipo dele, deixa o vídeo ser guardado.
     result, interpreter = await interpreted(manifest, record_video=True)
     assert result.state is RunState.SUCCEEDED and not interpreter.video_unsafe
+
+
+_BUSY_AFTER_INPUT = """
+document.addEventListener('DOMContentLoaded', () => {
+    const field = document.getElementById('usuario');
+    field.addEventListener('input', () => {
+        const until = Date.now() + 5000;
+        while (Date.now() < until) {}
+    });
+});
+"""
+
+
+@pytest.mark.browser
+async def test_a_field_check_cut_by_the_step_timeout_marks_the_video_unsafe(
+    interpreted: Any, portal_v1: RunningPortal
+) -> None:
+    """A conferência de depois que o prazo do passo interrompe não conferiu nada: na
+    dúvida, o vídeo não é guardado (a senha foi para um campo comum)."""
+    fill = {**_fill_password("Usuário"), "timeout_ms": 1000}
+    manifest = _robot(portal_v1, fill, _READ)
+    result, interpreter = await interpreted(
+        manifest, record_video=True, page_script=_BUSY_AFTER_INPUT
+    )
+    assert result.state is RunState.FAILED, result.error_message
+    assert result.error_code == "tempo_do_passo_esgotado"
+    assert interpreter.video_unsafe
+
+
+class _HungWatch:
+    """A vigia de um campo numa página presa: a conferência de depois nunca volta."""
+
+    async def evaluate(self, *args: Any) -> Any:
+        await asyncio.Event().wait()
+
+    async def dispose(self) -> None:
+        return None
+
+
+async def test_a_cancelled_field_check_marks_the_video_unsafe(
+    portal_v1: RunningPortal, tmp_path: Path
+) -> None:
+    interpreter = Interpreter(
+        _robot(portal_v1, _READ),
+        {},
+        secrets=DictSecretProvider(SECRETS),
+        files=Files(None),
+        artifacts=DirectoryArtifactSink(tmp_path / "artefatos"),
+        events=ListEventSink(),
+        run_id=new_id(),
+        attempt=1,
+        record_video=True,
+    )
+    check = asyncio.create_task(
+        interpreter._check_video_field(cast(Any, None), cast(Any, _HungWatch()))
+    )
+    await asyncio.sleep(0.05)
+    check.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await check
+    assert interpreter.video_unsafe

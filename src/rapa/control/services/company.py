@@ -634,7 +634,11 @@ class PgCompanyAdmin(PgService):
                     ],
                 )
             if removed or added:
-                await self._check_admins_left(session, company_id)
+                # Só tirar um company_admin diminui os administradores: numa empresa que
+                # ainda não tem nenhum (cadastrada pelos comandos antigos), quem administra
+                # uma área continua dando e tirando os papéis dela.
+                if any(g.role is Role.COMPANY_ADMIN and g.area_id is None for g in removed):
+                    await self._check_admins_left(session, company_id)
                 await audit.append(
                     session,
                     company_id=company_id,
