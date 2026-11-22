@@ -22,7 +22,13 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from rapa.control.admin import main
 from rapa.control.db import Database
-from rapa.control.services import PgPlatform, PgPrincipalResolver, PgRunQueue, lifecycle
+from rapa.control.services import (
+    PgPlatform,
+    PgPrincipalResolver,
+    PgProvisioning,
+    PgRunQueue,
+    lifecycle,
+)
 from rapa.control.services.lifecycle import (
     export_company,
     purge_company,
@@ -30,6 +36,7 @@ from rapa.control.services.lifecycle import (
 )
 from rapa.core.contracts import Conflict, Forbidden, InvalidInput, Role, RunTrigger, WebhookSpec
 from rapa.core.ids import new_id
+from rapa.core.robot import CredentialKind, CredentialRef
 from tests.control.db.support import (
     PROTOCOLO_INPUTS,
     PgDatabase,
@@ -208,12 +215,19 @@ async def _rich_company(world: World, dispatcher_db: Database, app_db: Database)
     return {"run_id": run_id, "webhook_id": hook.webhook.webhook_id}
 
 
+#: A execução dos artefatos de exemplo (a disposição do store local: execução e tentativa).
+_RUN_FOLDER = "5d2e8f43-7b1a-4c9e-9f0a-1b2c3d4e5f60"
+_ARTIFACT = f"artefatos/{_RUN_FOLDER}/1/tela-001.png"
+
+
 def _folders(base: Path, company: UUID) -> tuple[Path, Path]:
     files, artifacts = base / "arquivos", base / "artefatos"
     (files / str(company) / "sub").mkdir(parents=True)
     (files / str(company) / "sub" / "nota.pdf").write_bytes(b"%PDF-1.4 nota")
-    (artifacts / str(company) / "execucao").mkdir(parents=True)
-    (artifacts / str(company) / "execucao" / "tela-001.png").write_bytes(b"\x89PNG tela")
+    (artifacts / str(company) / _RUN_FOLDER / "1").mkdir(parents=True)
+    (artifacts / str(company) / _RUN_FOLDER / "1" / "tela-001.png").write_bytes(b"\x89PNG tela")
+    # Fora da disposição do store (sem execução e tentativa): não é artefato e não sai.
+    (artifacts / str(company) / "solto.png").write_bytes(b"\x89PNG solto")
     # Um link para fora da pasta da empresa nunca entra na exportação.
     (files / str(company) / "fora").symlink_to(base)
     return files, artifacts
@@ -278,7 +292,7 @@ async def test_export_has_every_table_a_checked_manifest_and_no_key_material(
     # Os arquivos da empresa, conferidos pelo manifesto; o link para fora ficou de fora.
     assert {f["arquivo"] for f in manifest["arquivos"]} == {
         "arquivos/sub/nota.pdf",
-        "artefatos/execucao/tela-001.png",
+        _ARTIFACT,
     }
     for entry in manifest["arquivos"]:
         assert hashlib.sha256(contents[entry["arquivo"]]).hexdigest() == entry["sha256"]
@@ -339,7 +353,7 @@ async def test_export_never_follows_a_file_swapped_for_a_link(
         assert (len(body), hashlib.sha256(body).hexdigest()) == (entry["bytes"], entry["sha256"])
     assert {entry["arquivo"] for entry in manifest["arquivos"]} == {
         "arquivos/sub/nota.pdf",
-        "artefatos/execucao/tela-001.png",
+        _ARTIFACT,
     }
     assert not any(b"de fora" in body for body in contents.values())
 
@@ -349,6 +363,11 @@ def _is_dir(path: Path) -> bool:
 
 
 class FakeDestroyer:
+    """Um destruidor que alcança tudo (os segredos e a chave transit)."""
+
+    destroys_secrets = True
+    destroys_transit_keys = True
+
     def __init__(self) -> None:
         self.destroyed: list[UUID] = []
 
@@ -581,8 +600,22 @@ async def test_cli_export_and_purge(
     assert code == 1 and "já existe" in err
     code, _, err = await _cli(capsys, ["empresa", "apagar", company, "--confirmar", "Empresa A"])
     assert code == 1 and "congelada" in err
+    # Uma credencial registrada, e o Job sem o cofre configurado (RAPA_COFRE): recusado,
+    # sem apagar nada, até quem pede dizer que os segredos não estão no OpenBao.
+    for name in ("RAPA_COFRE", "RAPA_CHAVES", "RAPA_ARMAZENAMENTO", "RAPA_DEV"):
+        monkeypatch.delenv(name, raising=False)
+    await PgProvisioning(app_db).register_credential(
+        a.company_id,
+        a.area_id,
+        CredentialRef(name="portal", kind=CredentialKind.PASSWORD, origin="https://portal.test"),
+        "portal/acesso",
+    )
     assert (await _cli(capsys, ["empresa", "congelar", company, "--motivo", "saída"]))[0] == 0
-    code, out, err = await _cli(capsys, ["empresa", "apagar", company, "--confirmar", "Empresa A"])
+    purge = ["empresa", "apagar", company, "--confirmar", "Empresa A"]
+    code, _, err = await _cli(capsys, purge)
+    assert code == 1 and "nada foi apagado" in err and "--segredos-fora-do-openbao" in err
+    assert (await company_counts(superuser_engine, a.company_id))["credentials"] == 1
+    code, out, err = await _cli(capsys, [*purge, "--segredos-fora-do-openbao"])
     assert code == 0, err
     assert out.startswith("empresa apagada")
     assert set((await company_counts(superuser_engine, a.company_id)).values()) == {0}
@@ -598,14 +631,24 @@ async def test_purge_stopped_after_the_rows_finishes_when_run_again(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Uma pasta que não sai depois das linhas: rodar de novo termina pastas e chaves."""
+    """Os artefatos e as chaves saem dentro da transação das linhas (uma falha ali não
+    apaga nada do banco); a pasta dos arquivos de entrada, depois: se ela não sai, rodar
+    de novo com o mesmo nome termina a pasta, os artefatos e as chaves."""
     a = await make_tenant(app_db, "Empresa A")
     files, artifacts = _folders(tmp_path, a.company_id)
     await freeze(owner_engine, a.company_id)
     destroyer = FakeDestroyer()
+    before = await company_counts(superuser_engine, a.company_id)
+    rmtree = shutil.rmtree
+    blocked: list[Path] = []
 
     def denied(path: Any, *args: Any, **kwargs: Any) -> None:
-        raise PermissionError(13, "Permission denied", str(path))
+        # O store local apaga pela pasta aberta (dir_fd); a pasta dos arquivos de entrada,
+        # pelo caminho inteiro.
+        target = Path(path) if kwargs.get("dir_fd") is None else artifacts / str(path)
+        if any(target == folder / str(a.company_id) for folder in blocked):
+            raise PermissionError(13, "Permission denied", str(path))
+        rmtree(path, *args, **kwargs)
 
     def purge(confirm: str = "Empresa A") -> Any:
         return purge_company(
@@ -618,21 +661,31 @@ async def test_purge_stopped_after_the_rows_finishes_when_run_again(
         )
 
     monkeypatch.setattr(shutil, "rmtree", denied)
+    # Os artefatos não saem: nada do banco sai, e as chaves não são destruídas.
+    blocked[:] = [artifacts]
+    with pytest.raises(PermissionError):
+        await purge()
+    assert await company_counts(superuser_engine, a.company_id) == before
+    assert (artifacts / str(a.company_id) / _RUN_FOLDER / "1" / "tela-001.png").exists()
+    assert destroyer.destroyed == []
+    # A pasta dos arquivos de entrada não sai: as linhas, os artefatos e as chaves saíram.
+    blocked[:] = [files]
     with pytest.raises(PermissionError):
         await purge()
     assert set((await company_counts(superuser_engine, a.company_id)).values()) == {0}
-    assert (artifacts / str(a.company_id) / "execucao" / "tela-001.png").exists()
-    assert destroyer.destroyed == []
+    assert (files / str(a.company_id) / "sub" / "nota.pdf").exists()
+    assert not (artifacts / str(a.company_id)).exists()
+    assert destroyer.destroyed == [a.company_id]
     monkeypatch.undo()
     from rapa.core.contracts import NotFound
 
     # Outro nome não termina nada; o mesmo nome termina.
     with pytest.raises(NotFound):
         await purge("Empresa a")
-    assert destroyer.destroyed == []
+    assert destroyer.destroyed == [a.company_id]
     report = await purge()
-    assert report.resumed and report.tables == {}
-    assert report.folders == [files / str(a.company_id), artifacts / str(a.company_id)]
+    assert report.resumed and report.tables == {} and report.artifacts == 0
+    assert report.folders == [files / str(a.company_id)]
     assert not (files / str(a.company_id)).exists()
     assert not (artifacts / str(a.company_id)).exists()
-    assert destroyer.destroyed == [a.company_id]
+    assert destroyer.destroyed == [a.company_id, a.company_id]

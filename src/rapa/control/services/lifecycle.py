@@ -18,23 +18,41 @@
   - :func:`export_company` grava um ``.tar.gz`` (permissão 0600) com um JSONL por tabela
     da empresa (toda tabela com ``company_id``, mais a linha de ``companies``, em ordem
     estável: das tabelas-mãe para as filhas e, dentro de cada uma, pela chave primária),
-    um ``manifesto.json`` com o SHA-256 e o número de linhas de cada arquivo, e os
-    arquivos da empresa (``RAPA_PASTA_ARQUIVOS/<empresa>`` e
-    ``RAPA_PASTA_ARTEFATOS/<empresa>``, sem seguir links: cada um é aberto uma vez, com
-    ``O_NOFOLLOW``, e copiado para a pasta de trabalho, de onde sai o ``.tar.gz``, então o
-    SHA-256 do manifesto é sempre o dos bytes guardados). Nunca exporta material de
-    chave: o sal dos webhooks (e qualquer coluna ``bytea``) sai como ``null``. Exporta
+    um ``manifesto.json`` com o SHA-256 e o número de linhas de cada arquivo, os arquivos
+    de entrada da empresa (``RAPA_PASTA_ARQUIVOS/<empresa>``, sem seguir links: cada um é
+    aberto uma vez, com ``O_NOFOLLOW``) e os artefatos dela, pelo
+    :class:`rapa.control.artifacts.ArtifactStore` (``list_company`` e ``open``: no store
+    de objetos, decifrados, como a pessoa os vê pela API). Tudo é copiado para a pasta de
+    trabalho, de onde sai o ``.tar.gz``, então o SHA-256 do manifesto é sempre o dos
+    bytes guardados. Nunca exporta material de chave: o sal dos webhooks e as chaves
+    embrulhadas das execuções (e qualquer coluna ``bytea``) saem como ``null``. Exporta
     empresa ativa ou congelada, numa leitura consistente (``REPEATABLE READ``, só
     leitura).
   - :func:`purge_company` apaga uma empresa congelada (o nome confirmado), sem execuções
-    rodando nem sessões abertas: antes, grava ``empresa.apagada`` em ``platform_events``
-    (o id, o SHA-256 do nome, as contagens por tabela, quem pediu e quando); depois apaga
-    todas as linhas da empresa em todas as tabelas, das filhas para as mães, e por fim a
-    linha de ``companies``, numa transação só que marca ``rapa.purge_company`` (as travas
-    de "só inclusões" aceitam a exclusão só assim, e só do dono). Em seguida apaga os
-    arquivos e os artefatos da empresa e chama o :class:`KeyDestroyer`. Se parar depois
-    das linhas (uma pasta que não sai, as chaves), rodar de novo com o mesmo nome confere
-    o ``empresa.apagada`` (pelo SHA-256 do nome) e termina as pastas e as chaves.
+    rodando nem sessões abertas, numa transação só que marca ``rapa.purge_company`` (as
+    travas de "só inclusões" aceitam a exclusão só assim, e só do dono): apaga todas as
+    linhas da empresa em todas as tabelas, das filhas para as mães, e por fim a linha de
+    ``companies``; ainda dentro da transação, apaga os artefatos da empresa pelo store
+    (``delete_company``) e chama o :class:`KeyDestroyer` (no OpenBao: os segredos do KV,
+    a chave transit e os objetos da empresa); e por fim grava ``empresa.apagada`` em
+    ``platform_events`` (o id, o SHA-256 do nome, as contagens por tabela, quantos
+    artefatos e o que o destruidor de chaves apagou, só contagens, quem pediu e quando).
+    Se o store ou o cofre falharem, nada do banco é apagado e o comando pode ser
+    repetido (o que já saiu do cofre não volta, e a repetição conta zero). Depois de
+    confirmada a transação, apaga a pasta dos arquivos de entrada da empresa. Se
+    parar depois das linhas (essa pasta que não sai), rodar de novo com o mesmo nome
+    confere o ``empresa.apagada`` (pelo SHA-256 do nome) e termina as pastas, os
+    artefatos e as chaves (o store e o destruidor de novo: o que já saiu conta zero).
+
+    Falha fechada na configuração: antes de apagar qualquer linha, confere que o que a
+    empresa tem fora do banco vai junto. Com artefatos no store de objetos (linhas em
+    ``run_keys``), o store precisa ser o de objetos; com chaves embrulhadas pelo transit
+    do OpenBao, o destruidor precisa apagar a chave transit; com credenciais
+    registradas, o destruidor precisa apagar os segredos do KV, a não ser que quem pede
+    diga que eles não estão no OpenBao (``secrets_outside_vault``: o arquivo de
+    desenvolvimento), e então ``empresa.apagada`` diz quantas credenciais ficaram com o
+    segredo fora (``segredos_fora_do_openbao``). Senão, :class:`InvalidInput` com o que
+    falta configurar, e nada sai.
 
 Congelar e apagar tomam primeiro a trava da situação da empresa, exclusiva: esperam as
 escritas em andamento terminarem, e as que chegam depois já veem a empresa congelada (ou
@@ -51,7 +69,7 @@ import shutil
 import stat
 import tarfile
 import tempfile
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -64,6 +82,12 @@ from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+from rapa.control.artifacts import (
+    ArtifactCorrupted,
+    ArtifactMissing,
+    ArtifactStore,
+    LocalArtifactStore,
+)
 from rapa.control.db.schema import (
     areas,
     companies,
@@ -635,6 +659,62 @@ def _company_files(
     return found
 
 
+def _store_for(artifacts: ArtifactStore | None, artifacts_dir: Path | None) -> ArtifactStore | None:
+    """O store dos artefatos: o dado, ou o local de ``artifacts_dir`` (a disposição de sempre)."""
+    if artifacts is not None:
+        return artifacts
+    return LocalArtifactStore(artifacts_dir) if artifacts_dir is not None else None
+
+
+async def _store_files(
+    store: ArtifactStore | None, company_id: UUID, work: Path
+) -> tuple[list[_CopiedFile], int]:
+    """Copia os artefatos da empresa, como o store os entrega (decifrados), para ``work``.
+
+    Devolve as cópias e quantos não puderam ser lidos (sumiram entre a listagem e a
+    leitura, perderam a chave, ou não conferem, já na abertura ou no meio: ficam de
+    fora, com um aviso no log e a contagem no manifesto).
+    """
+    if store is None:
+        return [], 0
+    target_dir = work / "artefatos"
+    target_dir.mkdir(mode=0o700)
+    found: list[_CopiedFile] = []
+    unreadable = 0
+    async for item in store.list_company(company_id):
+        try:
+            reader = await store.open(company_id, item.run_id, item.attempt, item.name)
+        except ArtifactMissing, ArtifactCorrupted:
+            # Sumiu, ficou sem a chave, ou o objeto está danificado (o cabeçalho, o
+            # tamanho): fica de fora, contado. O cofre ou o S3 fora do ar
+            # (ArtifactUnavailable) param a exportação: o comando é repetido.
+            unreadable += 1
+            continue
+        copy = target_dir / f"{len(found):08d}"
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with copy.open("xb") as out:
+                async for chunk in reader.chunks():
+                    digest.update(chunk)
+                    out.write(chunk)
+                    size += len(chunk)
+        except ArtifactCorrupted:
+            copy.unlink(missing_ok=True)
+            unreadable += 1
+            continue
+        finally:
+            await reader.aclose()
+        name = f"artefatos/{item.run_id}/{item.attempt}/{item.name}"
+        found.append(_CopiedFile(name, copy, size, digest.hexdigest()))
+    if unreadable:
+        logger.warning(
+            "exportação: %d artefato(s) da empresa não puderam ser lidos e ficaram de fora",
+            unreadable,
+        )
+    return found, unreadable
+
+
 def _member(name: str, size: int, mtime: datetime) -> tarfile.TarInfo:
     info = tarfile.TarInfo(name)
     info.size = size
@@ -675,8 +755,13 @@ async def export_company(
     *,
     files_dir: Path | None = None,
     artifacts_dir: Path | None = None,
+    artifacts: ArtifactStore | None = None,
 ) -> ExportReport:
-    """Exporta tudo da empresa para ``output`` (``.tar.gz``, 0600; recusa se já existe)."""
+    """Exporta tudo da empresa para ``output`` (``.tar.gz``, 0600; recusa se já existe).
+
+    Os artefatos vêm de ``artifacts`` (o store configurado) ou, sem ele, do store local
+    de ``artifacts_dir``.
+    """
     _check_output(output)
     exported_at = now_utc()
     work = Path(tempfile.mkdtemp(prefix="rapa-exportacao-"))
@@ -714,11 +799,10 @@ async def export_company(
                         "colunas_sem_valor": list(table.redacted),
                     }
                 )
-        files = [
-            copied
-            for prefix, base in (("arquivos", files_dir), ("artefatos", artifacts_dir))
-            for copied in _company_files(base, company_id, prefix, work)
-        ]
+        stored, unreadable = await _store_files(
+            _store_for(artifacts, artifacts_dir), company_id, work
+        )
+        files = [*_company_files(files_dir, company_id, "arquivos", work), *stored]
         file_entries: list[dict[str, Any]] = [
             {"arquivo": copied.name, "bytes": copied.size, "sha256": copied.sha256}
             for copied in files
@@ -729,7 +813,11 @@ async def export_company(
             "gerado_em": exported_at.isoformat(),
             "tabelas": entries,
             "arquivos": file_entries,
-            "sem_valor": "material de chave (o sal dos webhooks e colunas binárias) sai como null",
+            "artefatos_ilegiveis": unreadable,
+            "sem_valor": (
+                "material de chave (o sal dos webhooks, as chaves embrulhadas das execuções e "
+                "colunas binárias) sai como null"
+            ),
         }
         manifest_bytes = (
             json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
@@ -761,33 +849,48 @@ async def export_company(
 
 
 class KeyDestroyer(Protocol):
-    """Destrói as chaves próprias de uma empresa apagada (no fim de :func:`purge_company`).
+    """Destrói as chaves próprias de uma empresa apagada (dentro de :func:`purge_company`).
 
-    A parte E liga o OpenBao (o namespace e as chaves da empresa). Os sais dos webhooks
-    somem com as linhas, então as chaves derivadas deles não voltam. Pode ser chamado de
-    novo para a mesma empresa (a volta que termina uma exclusão interrompida).
+    Devolve o que apagou, só como contagens (vão para o registro ``empresa.apagada``),
+    ou ``None``. :class:`rapa.control.vault.OpenBaoKeyDestroyer` apaga os segredos do KV,
+    a chave transit e os objetos da empresa. Os sais dos webhooks e as chaves embrulhadas
+    das execuções somem com as linhas, então as chaves derivadas deles não voltam.
+
+    ``destroys_secrets`` e ``destroys_transit_keys`` (opcionais; sem eles, falso) dizem o
+    que ele alcança: :func:`purge_company` recusa apagar uma empresa com credenciais ou
+    chaves do transit que o destruidor não alcança.
+    Pode ser chamado de novo para a mesma empresa (a volta que termina uma exclusão
+    interrompida).
     """
 
-    async def destroy(self, company_id: UUID) -> None: ...
+    async def destroy(self, company_id: UUID) -> Mapping[str, int] | None: ...
 
 
 class LocalKeyDestroyer:
     """Sem cofre: a empresa não tem chave própria; só registra."""
 
-    async def destroy(self, company_id: UUID) -> None:
+    destroys_secrets = False
+    destroys_transit_keys = False
+
+    async def destroy(self, company_id: UUID) -> Mapping[str, int] | None:
         logger.info(
             "empresa %s apagada: nenhuma chave própria para destruir sem o cofre", company_id
         )
+        return {}
 
 
 @dataclass(frozen=True, slots=True)
 class PurgeReport:
     #: Linhas apagadas por tabela (inclusive ``companies``).
     tables: dict[str, int]
-    #: Pastas da empresa apagadas (arquivos e artefatos).
+    #: Pastas da empresa apagadas (a dos arquivos de entrada).
     folders: list[Path] = field(default_factory=list)
     #: As linhas já tinham saído numa volta anterior; esta só terminou pastas e chaves.
     resumed: bool = False
+    #: Artefatos (arquivos ou objetos) apagados pelo store.
+    artifacts: int = 0
+    #: O que o destruidor de chaves apagou (contagens).
+    keys: dict[str, int] = field(default_factory=dict)
 
 
 def _remove_company_folder(base: Path | None, company_id: UUID) -> Path | None:
@@ -825,19 +928,86 @@ async def _purged_before(owner_engine: AsyncEngine, company_id: UUID, confirm_na
         return bool(recorded)
 
 
-async def _remove_files_and_keys(
+async def _finish_purge(
     company_id: UUID,
     files_dir: Path | None,
-    artifacts_dir: Path | None,
-    key_destroyer: KeyDestroyer | None,
-) -> list[Path]:
-    folders = [
-        removed
-        for base in (files_dir, artifacts_dir)
-        if (removed := _remove_company_folder(base, company_id)) is not None
-    ]
-    await (key_destroyer or LocalKeyDestroyer()).destroy(company_id)
-    return folders
+    store: ArtifactStore | None,
+    destroyer: KeyDestroyer,
+) -> PurgeReport:
+    """A volta que termina uma exclusão cujas linhas já saíram (o mesmo nome confirmado).
+
+    O store e o destruidor rodam de novo (o que já saiu conta zero) e a pasta dos
+    arquivos de entrada sai.
+    """
+    removed = await store.delete_company(company_id) if store is not None else 0
+    destroyed = {
+        str(what): int(count) for what, count in (await destroyer.destroy(company_id) or {}).items()
+    }
+    folder = _remove_company_folder(files_dir, company_id)
+    return PurgeReport(
+        tables={},
+        folders=[folder] if folder is not None else [],
+        artifacts=removed,
+        keys=destroyed,
+        resumed=True,
+    )
+
+
+async def _outside_problems(
+    session: AsyncSession,
+    company_id: UUID,
+    store: ArtifactStore | None,
+    destroyer: KeyDestroyer,
+    *,
+    secrets_outside_vault: bool,
+) -> tuple[list[str], int]:
+    """O que a empresa tem fora do banco e a configuração não alcança (nada, se tudo vai).
+
+    Devolve os problemas e quantas credenciais ficam com o segredo fora do OpenBao (o
+    pedido disse que não estão lá).
+    """
+    keys = (
+        await session.execute(
+            text(
+                "SELECT count(*) AS total, count(*) FILTER "
+                "(WHERE substring(wrapped_key FROM 1 FOR 6) = 'vault:'::bytea) AS transit "
+                "FROM run_keys WHERE company_id = :company"
+            ),
+            {"company": company_id},
+        )
+    ).one()
+    registered = int(
+        await session.scalar(
+            text("SELECT count(*) FROM credentials WHERE company_id = :company"),
+            {"company": company_id},
+        )
+        or 0
+    )
+    problems: list[str] = []
+    if keys.total and (store is None or isinstance(store, LocalArtifactStore)):
+        problems.append(
+            f"a empresa tem artefatos cifrados no S3 ({keys.total} execução(ões) com chave), "
+            "mas o armazenamento configurado é o local: configure RAPA_ARMAZENAMENTO=s3 e "
+            "RAPA_S3_* (os mesmos do servidor)"
+        )
+    if keys.transit and not getattr(destroyer, "destroys_transit_keys", False):
+        problems.append(
+            "as chaves das execuções da empresa são do transit do OpenBao, mas a configuração "
+            "não alcança a chave dela: configure RAPA_CHAVES=openbao e RAPA_BAO_* (papel "
+            "rapa-operacao)"
+        )
+    outside = 0
+    if registered and not getattr(destroyer, "destroys_secrets", False):
+        if secrets_outside_vault:
+            outside = registered
+        else:
+            problems.append(
+                f"a empresa tem {registered} credencial(is) registrada(s), mas o cofre não está "
+                "configurado: os segredos ficariam no OpenBao. Configure RAPA_COFRE=openbao e "
+                "RAPA_BAO_* (papel rapa-operacao) ou, se os segredos não estão no OpenBao "
+                "(o arquivo de desenvolvimento), diga com --segredos-fora-do-openbao"
+            )
+    return problems, outside
 
 
 async def purge_company(
@@ -848,15 +1018,25 @@ async def purge_company(
     requested_by: str = "cli",
     files_dir: Path | None = None,
     artifacts_dir: Path | None = None,
+    artifacts: ArtifactStore | None = None,
     key_destroyer: KeyDestroyer | None = None,
+    secrets_outside_vault: bool = False,
 ) -> PurgeReport:
-    """Apaga a empresa congelada inteira (dono das tabelas); veja o início do módulo."""
+    """Apaga a empresa congelada inteira (dono das tabelas); veja o início do módulo.
+
+    Os artefatos saem por ``artifacts`` (o store configurado) ou, sem ele, pelo store
+    local de ``artifacts_dir``. Com ``secrets_outside_vault``, quem pede diz que os
+    segredos das credenciais não estão no OpenBao (o arquivo de desenvolvimento): a
+    empresa sai mesmo sem um destruidor que apague segredos.
+    """
     actor = _actor(requested_by)
-    # As linhas saem antes das pastas e das chaves: uma volta que parou depois delas (uma
-    # pasta que não saiu, o cofre fora do ar) termina quando o comando roda de novo.
+    store = _store_for(artifacts, artifacts_dir)
+    destroyer: KeyDestroyer = key_destroyer or LocalKeyDestroyer()
+    # As linhas saem antes da pasta dos arquivos de entrada (o store e as chaves saem
+    # dentro da transação): uma volta que parou depois delas (a pasta que não saiu)
+    # termina quando o comando roda de novo com o mesmo nome.
     if await _purged_before(owner_engine, company_id, confirm_name):
-        folders = await _remove_files_and_keys(company_id, files_dir, artifacts_dir, key_destroyer)
-        return PurgeReport(tables={}, folders=folders, resumed=True)
+        return await _finish_purge(company_id, files_dir, store, destroyer)
     async with tenant_session(owner_engine, company_id) as session:
         await _require_owner(session)
         await _lock_exclusive(session, company_id)
@@ -885,6 +1065,15 @@ async def purge_company(
         )
         if live:
             raise Conflict("a empresa ainda tem sessões de gravação abertas")
+        problems, secrets_left = await _outside_problems(
+            session, company_id, store, destroyer, secrets_outside_vault=secrets_outside_vault
+        )
+        if problems:
+            raise InvalidInput(
+                "a configuração não alcança tudo o que a empresa tem fora do banco; "
+                "nada foi apagado",
+                problems,
+            )
         tables = await tenant_tables(session)
         counts: dict[str, int] = {}
         for table in tables:
@@ -899,20 +1088,6 @@ async def purge_company(
                 or 0
             )
         counts["companies"] = 1
-        await session.execute(
-            insert(platform_events).values(
-                action="empresa.apagada",
-                actor=actor,
-                target=f"empresa:{company_id}",
-                data={
-                    "empresa": str(company_id),
-                    "nome_sha256": hashlib.sha256(row.name.encode()).hexdigest(),
-                    "linhas": counts,
-                    "pedido_por": actor,
-                    "em": now_utc().isoformat(),
-                },
-            )
-        )
         # Só nesta transação, do dono, as travas de "só inclusões" aceitam apagar.
         await session.execute(
             text("SELECT set_config('rapa.purge_company', :company, true)"),
@@ -930,5 +1105,41 @@ async def purge_company(
         await session.execute(
             text("DELETE FROM public.companies WHERE id = :company"), {"company": company_id}
         )
-    folders = await _remove_files_and_keys(company_id, files_dir, artifacts_dir, key_destroyer)
-    return PurgeReport(tables=counts, folders=folders)
+        # Ainda dentro da transação: se o store ou o cofre falharem, nada do banco sai e o
+        # comando pode ser repetido.
+        removed = await store.delete_company(company_id) if store is not None else 0
+        destroyed = {
+            str(what): int(count)
+            for what, count in (await destroyer.destroy(company_id) or {}).items()
+        }
+        await session.execute(
+            insert(platform_events).values(
+                action="empresa.apagada",
+                actor=actor,
+                target=f"empresa:{company_id}",
+                data={
+                    "empresa": str(company_id),
+                    "nome_sha256": hashlib.sha256(row.name.encode()).hexdigest(),
+                    "linhas": counts,
+                    "artefatos": removed,
+                    "chaves": destroyed,
+                    **({"segredos_fora_do_openbao": secrets_left} if secrets_left else {}),
+                    "pedido_por": actor,
+                    "em": now_utc().isoformat(),
+                },
+            )
+        )
+    if secrets_left:
+        logger.warning(
+            "empresa %s apagada: o segredo de %d credencial(is) não estava no OpenBao e "
+            "não foi apagado pelo RaPA",
+            company_id,
+            secrets_left,
+        )
+    folder = _remove_company_folder(files_dir, company_id)
+    return PurgeReport(
+        tables=counts,
+        folders=[folder] if folder is not None else [],
+        artifacts=removed,
+        keys=destroyed,
+    )

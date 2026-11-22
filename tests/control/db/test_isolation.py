@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from rapa.control.db import Database
 from rapa.control.db.schema import TENANT_TABLES
+from rapa.control.keys import PgRunKeys, WrappedKey
 from rapa.control.services import (
     CredentialAlerts,
     PgBatches,
@@ -118,6 +119,10 @@ async def _world(app_db: Database, dispatcher_db: Database, superuser: AsyncEngi
         )
         await PgRepairs(app_db).create_repair(tenant.creator, run_id, "c1")
         repaired[tenant.company_id] = run_id
+        # A chave embrulhada da execução (revisão 0009), como o despachante a guarda.
+        await PgRunKeys(dispatcher_db).add(
+            tenant.company_id, run_id, WrappedKey(b"local1:" + b"\x00" * 60, 1)
+        )
     a1 = {}
     for tenant in (a, b):
         a1[tenant.company_id] = await _a1_rows(app_db, tenant)
@@ -315,8 +320,9 @@ async def test_company_b_sees_nothing_of_company_a(
         await PgRepairs(app_db).get_repair(admin_b, world.a_repaired_run)
     with pytest.raises(NotFound):
         await PgRepairs(app_db).create_repair(world.b.creator, world.a_repaired_run, "c1")
+    assert await PgRunKeys(app_db).get(world.b.company_id, world.a_repaired_run) is None
     async with app_db.tenant_session(world.b.company_id) as session:
-        for table in ("run_snapshots", "repair_proposals"):
+        for table in ("run_snapshots", "repair_proposals", "run_keys"):
             count = await session.scalar(
                 text(f"SELECT count(*) FROM {table} WHERE run_id = :id"),  # noqa: S608
                 {"id": world.a_repaired_run},

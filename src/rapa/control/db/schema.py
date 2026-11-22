@@ -47,6 +47,7 @@ __all__ = [
     "robot_versions",
     "robots",
     "run_events",
+    "run_keys",
     "run_snapshots",
     "runs",
     "schedule_occurrences",
@@ -460,6 +461,18 @@ credential_alerts = Table(
     _ts("created_at", nullable=False, server_default=True),
 )
 
+#: A chave de dados de cada execução, embrulhada pela chave da empresa (revisão 0009):
+#: só inclusões; sai pela retenção (a chave destruída) e pela saída da empresa.
+run_keys = Table(
+    "run_keys",
+    metadata,
+    Column("company_id", Uuid, primary_key=True),
+    Column("run_id", Uuid, primary_key=True),
+    Column("wrapped_key", LargeBinary, nullable=False),
+    Column("key_version", Integer, nullable=False),
+    _ts("created_at", nullable=False, server_default=True),
+)
+
 #: Registros da plataforma sem empresa (revisão 0007): só o dono lê e escreve.
 platform_events = Table(
     "platform_events",
@@ -499,4 +512,5 @@ TENANT_TABLES: tuple[Table, ...] = (
     a1_authorizations,
     version_approvals,
     credential_alerts,
+    run_keys,
 )

@@ -377,7 +377,7 @@ async def test_dispatcher_supervisor_waits_longer_after_each_crash() -> None:
 async def test_health_reports_a_stopped_dispatcher(monkeypatch: pytest.MonkeyPatch) -> None:
     fakes: list[FakeDispatcher] = []
 
-    def build(settings: ServerSettings, db: Any) -> FakeDispatcher:
+    def build(settings: ServerSettings, db: Any, *_: Any) -> FakeDispatcher:
         fakes.append(FakeDispatcher(crashes=1000 if len(fakes) == 0 else 0))
         return fakes[-1]
 
@@ -502,7 +502,7 @@ def _record_closing(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 async def test_service_starts_only_once(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeDispatcher(crashes=0)
-    monkeypatch.setattr("rapa.server.build_dispatcher", lambda settings, db: fake)
+    monkeypatch.setattr("rapa.server.build_dispatcher", lambda settings, db, *_: fake)
     closed = _record_closing(monkeypatch)
     app = _full_service()
     async with running(app), asgi_client(app) as client:
@@ -584,7 +584,7 @@ async def test_full_service_health_follows_the_dispatcher(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake = ScriptedDispatcher()
-    monkeypatch.setattr("rapa.server.build_dispatcher", lambda settings, db: fake)
+    monkeypatch.setattr("rapa.server.build_dispatcher", lambda settings, db, *_: fake)
     closed = _record_closing(monkeypatch)
     app = _full_service()
     supervisor: DispatcherSupervisor = app.state.dispatcher_supervisor
@@ -654,7 +654,7 @@ async def test_service_with_ui_starts_only_once_and_closes_databases_last(
 ) -> None:
     events = _record_closing(monkeypatch)
     fake = _RecordingDispatcher(events)
-    monkeypatch.setattr("rapa.server.build_dispatcher", lambda settings, db: fake)
+    monkeypatch.setattr("rapa.server.build_dispatcher", lambda settings, db, *_: fake)
     app = _service_with_ui(monkeypatch, events)
     async with running(app), asgi_client(app) as client:
         await fake.running.wait()
@@ -809,7 +809,7 @@ async def test_full_service_shutdown_drains_runs_before_closing_databases(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dispatcher = _CrashingDispatcher(Fatal())
-    monkeypatch.setattr("rapa.server.build_dispatcher", lambda settings, db: dispatcher)
+    monkeypatch.setattr("rapa.server.build_dispatcher", lambda settings, db, *_: dispatcher)
     closed = _record_closing(monkeypatch)
     app = _full_service()
     supervisor: DispatcherSupervisor = app.state.dispatcher_supervisor

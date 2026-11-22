@@ -32,8 +32,15 @@ do token, nunca das entradas). Assim o identificador de arquivo escolhido por
 quem chama nunca alcança os arquivos de outra empresa. A pasta da empresa não é
 criada aqui: se não existir, o passo de envio falha com "arquivo não encontrado".
 
-Os segredos vêm de uma :class:`SecretSource`. Em produção ela consulta o OpenBao;
-aqui há uma versão estática, para desenvolvimento e testes.
+Os segredos vêm de uma :class:`SecretSource`. Em produção ela consulta o OpenBao
+(:class:`rapa.control.vault.OpenBaoSecretSource`); aqui há uma versão estática, para
+desenvolvimento e testes. Quando a fonte diz que um segredo falta
+(:class:`SecretsUnavailable`: a credencial não registrada, o segredo ou um campo fora do
+cofre), o worker nem é iniciado e a execução termina ``failed`` com o código
+``segredo_indisponivel`` e a mensagem da fonte (só nomes, nunca valores). O certificado
+A1 chega da fonte como ``pfx_base64``: o lançador o grava num arquivo 0600 na pasta de
+trabalho da tentativa (o ``pfx_path`` que o worker espera) e o apaga no fim, junto com o
+SECRETS.json.
 
 Com ``egress`` (``LocalLauncherSettings.egress``), o worker recebe
 ``--guarda-de-saida`` e o navegador da execução sai pela guarda da saída (só os
@@ -79,6 +86,7 @@ de execução sem uma tentativa legível.
 
 import asyncio
 import base64
+import binascii
 import contextlib
 import json
 import logging
@@ -132,6 +140,7 @@ from rapa.session.egress import EgressPolicy
 __all__ = [
     "EXECUTOR_NOT_STARTED",
     "AttemptRegistry",
+    "SOURCE_SECRET_FIELDS",
     "EventIngestor",
     "KubernetesLauncher",
     "KubernetesLauncherSettings",
@@ -139,8 +148,10 @@ __all__ = [
     "LocalProcessLauncher",
     "NoSecrets",
     "SecretSource",
+    "SecretsUnavailable",
     "StaticSecretSource",
     "child_env",
+    "materialize_certificates",
 ]
 
 logger = logging.getLogger("rapa.control.launcher")
@@ -152,8 +163,23 @@ _ENV_PREFIXES = ("PLAYWRIGHT_", "XDG_", "FONTCONFIG_")
 _MAX_EVENT_LINE = 1024 * 1024
 #: Código da falha de um pod de execução que nunca subiu ou nunca buscou o trabalho.
 EXECUTOR_NOT_STARTED = "executor_nao_iniciou"
-#: Tamanho máximo do certificado A1 que vai pelo canal.
+#: Campos que uma fonte de segredos pode entregar: os do SECRETS.json e o certificado A1
+#: em base64 (``pfx_base64``), que o lançador grava num arquivo antes de lançar.
+SOURCE_SECRET_FIELDS = SECRET_FIELDS | {"pfx_base64"}
+#: Maior certificado A1 aceito (um PFX tem poucos KiB).
 _MAX_PFX_BYTES = 1024 * 1024
+_SECRETS_CODE = "segredo_indisponivel"
+
+
+class SecretsUnavailable(Exception):
+    """Falta um segredo da execução: o executor nem é lançado.
+
+    A mensagem diz o que falta pelo nome da credencial e do campo, nunca com valores.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
 
 
 class EventIngestor(Protocol):
@@ -210,7 +236,7 @@ def _check_credentials(company_id: UUID, credentials: object) -> dict[str, dict[
             )
         if not all(isinstance(key, str) for key in fields):
             raise _SecretsFormatError(f"a credencial '{name}' precisa ter nomes de campo de texto")
-        unknown = sorted(key for key in fields if key not in SECRET_FIELDS)
+        unknown = sorted(key for key in fields if key not in SOURCE_SECRET_FIELDS)
         if unknown:
             raise _SecretsFormatError(
                 f"campos desconhecidos na credencial '{name}': {', '.join(unknown)}"
@@ -363,6 +389,45 @@ def _write_private(path: Path, text: str) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(text)
+
+
+def _write_private_bytes(path: Path, data: bytes) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+
+
+def _pfx_bytes(name: str, encoded: str) -> bytes:
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except binascii.Error, ValueError:
+        raise SecretsUnavailable(
+            f"o certificado da credencial '{name}' não é um PFX em base64 válido"
+        ) from None
+    if not data or len(data) > _MAX_PFX_BYTES:
+        raise SecretsUnavailable(f"o certificado da credencial '{name}' tem tamanho inválido")
+    return data
+
+
+def materialize_certificates(
+    secrets: Mapping[str, Mapping[str, str]], directory: Path
+) -> dict[str, dict[str, str]]:
+    """Troca cada ``pfx_base64`` por um arquivo 0600 em ``directory`` (o ``pfx_path``).
+
+    Devolve os segredos no formato do SECRETS.json. Um ``pfx_base64`` inválido levanta
+    :class:`SecretsUnavailable` (sem o valor na mensagem). Os arquivos se chamam
+    ``certificado-<n>.pfx``: o nome da credencial não vai para o disco.
+    """
+    out: dict[str, dict[str, str]] = {}
+    for index, (name, fields) in enumerate(sorted(secrets.items()), start=1):
+        entry = {key: value for key, value in fields.items() if key != "pfx_base64"}
+        encoded = fields.get("pfx_base64")
+        if encoded is not None:
+            path = directory / f"certificado-{index}.pfx"
+            _write_private_bytes(path, _pfx_bytes(name, encoded))
+            entry["pfx_path"] = str(path)
+        out[name] = entry
+    return out
 
 
 def _write_ack(directory: Path, seq: int) -> None:
@@ -536,10 +601,22 @@ class LocalProcessLauncher(_Follower):
         try:
             try:
                 await asyncio.to_thread(self._prepare, job, work, artifacts)
-                secrets = await self.secrets.secrets_for(job)
-                if secrets:
-                    payload = json.dumps({name: dict(fields) for name, fields in secrets.items()})
+                try:
+                    secrets = await self.secrets.secrets_for(job)
+                    prepared = await asyncio.to_thread(materialize_certificates, secrets, work)
+                except SecretsUnavailable as exc:
+                    # Sem o segredo, nada abre: o worker nem é iniciado.
+                    logger.warning("execução %s sem os segredos; não lançada", job.run_id)
+                    return failure_result(
+                        job,
+                        _SECRETS_CODE,
+                        f"Os segredos da execução não estão disponíveis: {exc.message}.",
+                        started=False,
+                    )
+                if prepared:
+                    payload = json.dumps(prepared)
                     await asyncio.to_thread(_write_private, work / "secrets.json", payload)
+                secrets = prepared
                 process = await asyncio.create_subprocess_exec(
                     *self._command(job, work, artifacts, with_secrets=bool(secrets)),
                     stdin=asyncio.subprocess.DEVNULL,
@@ -635,6 +712,10 @@ class LocalProcessLauncher(_Follower):
         secrets = work / "secrets.json"
         with contextlib.suppress(FileNotFoundError, NotADirectoryError):
             secrets.unlink()
+        # Os certificados A1 saem sempre, mesmo quando a pasta fica para depuração.
+        with contextlib.suppress(OSError):
+            for certificate in work.glob("certificado-*.pfx"):
+                certificate.unlink(missing_ok=True)
         if not self.settings.keep_work_dir:
             shutil.rmtree(work, ignore_errors=True)
 

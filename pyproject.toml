@@ -42,6 +42,10 @@ control = [
     "openpyxl>=3.1.5",
     "defusedxml>=0.7.1",
     "tzdata>=2026.1",
+    # Armazenamento dos artefatos em S3 (SeaweedFS) com cifra por execução: boto3 em
+    # threads e a cifra (AES-256-GCM, HKDF) do cryptography.
+    "boto3>=1.40",
+    "cryptography>=46",
 ]
 # Interface web em Python.
 ui = [
@@ -63,6 +67,8 @@ dev = [
     "pytest-asyncio>=1.5",
     "ruff>=0.17",
     "mypy>=2.4",
+    # S3 falso dos testes do store de objetos.
+    "moto[s3]>=5.1",
 ]
 
 [build-system]
@@ -110,6 +116,9 @@ module = [
     "jsonschema_rs.*",
     "openpyxl.*",
     "defusedxml.*",
+    "boto3.*",
+    "botocore.*",
+    "moto.*",
 ]
 ignore_missing_imports = true
 

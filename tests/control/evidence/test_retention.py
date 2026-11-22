@@ -207,6 +207,21 @@ class _FlakyStore:
             raise PermissionError("sem permissão na pasta")
         await self.inner.delete_run(company_id, run_id, keep=keep)
 
+    def list_company(self, company_id: UUID) -> Any:  # pragma: no cover - não é usado aqui
+        return self.inner.list_company(company_id)
+
+    async def delete_company(self, company_id: UUID) -> int:  # pragma: no cover
+        return await self.inner.delete_company(company_id)
+
+    async def release_attempt(self, *args: Any) -> None:  # pragma: no cover
+        await self.inner.release_attempt(*args)
+
+    async def staging_companies(self) -> list[UUID]:
+        return await self.inner.staging_companies()
+
+    async def discard_staged_company(self, company_id: UUID) -> None:  # pragma: no cover
+        await self.inner.discard_staged_company(company_id)
+
 
 class _CountingStore:
     """O store de verdade, anotando cada execução que a retenção mandou apagar."""

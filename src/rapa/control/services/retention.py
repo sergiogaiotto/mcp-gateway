@@ -12,7 +12,13 @@ delas) e ainda estão **a validar com o jurídico**:
 - chaves de idempotência vencidas: apagadas (uma chave vencida já não vale);
 - partições mensais de ``run_events`` que terminaram há mais de
   ``RAPA_RETENCAO_EVENTOS_DIAS`` (400 dias, para o consumo mensal e a auditoria), uma
-  por transação (o ``DROP`` trava ``run_events`` até o fim dela).
+  por transação (o ``DROP`` trava ``run_events`` até o fim dela);
+- as chaves das execuções (``run_keys``, o store de objetos cifrado): saem logo depois
+  de a execução perder todos os artefatos (``artifacts_expired_at``), pela função
+  ``rapa_purge_run_keys`` da migração 0009. Destruir a chave é o que garante que o que
+  sobrar dos objetos (num backup do S3, por exemplo) não abre mais;
+- a pasta de passagem do store de objetos: a de cada execução sai com os artefatos
+  dela (``delete_run``), e a de uma empresa que não existe mais sai inteira.
 
 O prazo conta do fim da execução (``finished_at``) e, nos retratos, da gravação.
 
@@ -140,7 +146,11 @@ class RetentionReport:
     empty: list[UUID] = field(default_factory=list)
     snapshots: int = 0
     idempotency_keys: int = 0
+    #: Chaves de execuções destruídas (as execuções que já perderam todos os artefatos).
+    run_keys: int = 0
     partitions: int = 0
+    #: Empresas que não existem mais cuja pasta de passagem (no S3) foi apagada.
+    staged_companies: int = 0
     #: A volta parou no limite de tempo (ou de lotes) com mais coisa para apagar.
     behind: bool = False
 
@@ -220,6 +230,7 @@ class Retention:
             captures,
             lambda: self._purge_snapshots(report),
             keys,
+            lambda: self._purge_run_keys(report),
         ]
         batches = dict.fromkeys(range(len(stages)), 0)
         active = list(range(len(stages)))
@@ -235,6 +246,7 @@ class Retention:
                     active.remove(stage)
         report.partitions, more = await self._drop_event_partitions(give_up)
         report.behind = report.behind or more
+        report.staged_companies = await self._sweep_staging()
         if report.partitions:
             logger.info(
                 "retenção: %d partição(ões) de eventos com mais de %d dias removida(s)",
@@ -249,6 +261,27 @@ class Retention:
             )
         self._behind = report.behind
         return report
+
+    async def _sweep_staging(self) -> int:
+        """Apaga a pasta de passagem (no S3) de empresa que não existe mais.
+
+        A saída da empresa costuma rodar noutro pod (o comando da operação), longe da
+        passagem deste despachante: o que tenha sobrado ali em claro de uma empresa
+        apagada sai aqui. No store local não há passagem (nada a fazer).
+        """
+        staged = await self.store.staging_companies()
+        if not staged:
+            return 0
+        async with self.db.dispatcher_session() as session:
+            alive = set(
+                await session.scalars(select(companies.c.id).where(companies.c.id.in_(staged)))
+            )
+        gone = [company for company in staged if company not in alive]
+        for company in gone:
+            await self.store.discard_staged_company(company)
+        if gone:
+            logger.info("retenção: a passagem de %d empresa(s) apagada(s) saiu", len(gone))
+        return len(gone)
 
     async def _expire_artifacts(
         self,
@@ -372,6 +405,32 @@ class Retention:
                     payload={"tentativa": row["attempt"], "prazo_dias": self.policy.failure_days},
                 )
         report.snapshots += len(rows)
+        return len(rows)
+
+    async def _purge_run_keys(self, report: RetentionReport) -> int:
+        """Destrói as chaves das execuções que já perderam todos os artefatos (um lote)."""
+        async with self.db.dispatcher_session() as session:
+            await self._limit(session)
+            rows = (
+                (
+                    await session.execute(
+                        text("SELECT company_id, run_id FROM rapa_purge_run_keys(:batch)"),
+                        {"batch": self.policy.batch_size},
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            for row in rows:
+                await audit.append(
+                    session,
+                    company_id=row["company_id"],
+                    actor=DISPATCHER_ACTOR,
+                    action="execucao.chave_destruida",
+                    target=f"execucao:{row['run_id']}",
+                    payload={"prazo_dias": self.policy.failure_days},
+                )
+        report.run_keys += len(rows)
         return len(rows)
 
     async def _purge_idempotency_keys(self) -> int:

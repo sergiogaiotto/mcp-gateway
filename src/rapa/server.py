@@ -36,7 +36,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from rapa.control.api.publishing import PublishingServices
-from rapa.control.artifacts import ArtifactStore, LocalArtifactStore
+from rapa.control.artifacts import ArtifactStore
 from rapa.control.auth import (
     Authenticator,
     AuthError,
@@ -46,6 +46,7 @@ from rapa.control.auth import (
     JwtSettings,
     TokenVerifier,
 )
+from rapa.control.backends import Backends, BackendSettings, VaultKind
 from rapa.control.channel import Channel, ChannelServer
 from rapa.control.db import Database
 from rapa.control.http_app import HttpSettings, create_http_app
@@ -62,9 +63,6 @@ from rapa.control.launcher import (
     KubernetesLauncherSettings,
     LocalLauncherSettings,
     LocalProcessLauncher,
-    NoSecrets,
-    SecretSource,
-    StaticSecretSource,
 )
 from rapa.control.services import (
     CredentialAlerts,
@@ -297,6 +295,18 @@ class ServerSettings(BaseModel):
             tolerations=tuple(self.k8s_tolerations),
         )
 
+    #: O cofre, o armazenamento dos artefatos e as chaves (``RAPA_COFRE``,
+    #: ``RAPA_ARMAZENAMENTO``, ``RAPA_CHAVES`` e os seus; :mod:`rapa.control.backends`).
+    backends: BackendSettings = Field(default_factory=BackendSettings)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _backends_dev(cls, data: Any) -> Any:
+        # Sem a configuração do cofre dada, ela segue o modo de desenvolvimento do serviço.
+        if isinstance(data, dict) and "backends" not in data:
+            return {**data, "backends": BackendSettings(dev=bool(data.get("dev", False)))}
+        return data
+
     @model_validator(mode="after")
     def _check(self) -> ServerSettings:
         if not self.http and self.dispatcher_database_url is None:
@@ -311,6 +321,15 @@ class ServerSettings(BaseModel):
             )
         if (self.dev_tokens_file or self.dev_secrets_file) and not self.dev:
             raise ValueError("tokens e segredos em arquivo só valem com RAPA_DEV=1")
+        if self.backends.dev != self.dev:
+            raise ValueError("a configuração do cofre e a do serviço discordam sobre RAPA_DEV")
+        if self.dev_secrets_file is not None and self.backends.vault not in (
+            None,
+            VaultKind.DEV,
+        ):
+            raise ValueError("RAPA_SEGREDOS_DEV só vale com RAPA_COFRE=dev")
+        if self.backends.vault is VaultKind.DEV and self.dev_secrets_file is None:
+            raise ValueError("RAPA_COFRE=dev precisa do arquivo RAPA_SEGREDOS_DEV")
         llm = (self.llm_base_url, self.llm_model)
         if any(llm) and not all(llm):
             raise ValueError("para o hub de LLM, informe o endereço e o modelo (RAPA_LLM_*)")
@@ -430,6 +449,11 @@ class ServerSettings(BaseModel):
           para a internet, ``http://host:porta``, sem usuário e senha). A guarda (só os
           domínios do robô, a rede interna fechada) vale sempre nos pods e, no lançador
           local, quando uma das duas está definida e sempre fora de ``RAPA_DEV``.
+        - cofre, armazenamento e chaves (:mod:`rapa.control.backends`): ``RAPA_COFRE``
+          (``nenhum``, ``dev`` ou ``openbao``), ``RAPA_BAO_*``, ``RAPA_ARMAZENAMENTO``
+          (``local`` ou ``s3``), ``RAPA_S3_*`` com ``AWS_ACCESS_KEY_ID`` e
+          ``AWS_SECRET_ACCESS_KEY``, ``RAPA_CHAVES`` (``openbao`` ou ``local``) e
+          ``RAPA_CHAVE_ARTEFATOS``, conferidos na partida.
         """
         env = os.environ if env is None else env
         data: dict[str, Any] = {
@@ -473,6 +497,7 @@ class ServerSettings(BaseModel):
                 for n in env.get("RAPA_REDES_INTERNAS_PERMITIDAS", "").split(",")
                 if n.strip()
             ),
+            "backends": BackendSettings.from_env(env),
         }
         for key, name in (
             ("k8s_namespace", "RAPA_K8S_NAMESPACE_EXECUCOES"),
@@ -582,13 +607,6 @@ async def _dev_profiles(
         return out
     finally:
         await db.dispose()
-
-
-def _secret_source(settings: ServerSettings) -> SecretSource:
-    if settings.dev_secrets_file is not None:
-        return StaticSecretSource.from_file(settings.dev_secrets_file)
-    # O cofre (OpenBao) entra na Fase 1; até lá, robôs com credenciais falham sem digitar nada.
-    return NoSecrets()
 
 
 def _verifier(settings: ServerSettings, db: Database) -> BearerVerifier:
@@ -868,24 +886,36 @@ class _DispatcherHealth:
         await self.app(scope, receive, send)
 
 
-def build_artifact_store(settings: ServerSettings) -> ArtifactStore:
-    """Onde ficam os artefatos: a pasta local de ``RAPA_PASTA_ARTEFATOS`` (a parte E troca)."""
-    return LocalArtifactStore(settings.artifacts_dir)
+def build_artifact_store(
+    settings: ServerSettings, db: Database, backends: Backends | None = None
+) -> ArtifactStore:
+    """Onde ficam os artefatos: a pasta local de ``RAPA_PASTA_ARTEFATOS`` ou, com
+    ``RAPA_ARMAZENAMENTO=s3``, o bucket cifrado (a pasta vira só a de passagem).
+
+    ``db`` é o banco de quem usa o store (as chaves das execuções ficam nele).
+    """
+    return (backends or Backends(settings.backends)).artifact_store(settings.artifacts_dir, db)
 
 
-def build_artifacts(settings: ServerSettings, db: Database) -> PgArtifacts:
+def build_artifacts(
+    settings: ServerSettings, db: Database, backends: Backends | None = None
+) -> PgArtifacts:
     """As evidências das execuções (REST e interface), lidas pelo store dos artefatos."""
-    return PgArtifacts(db, build_artifact_store(settings))
+    return PgArtifacts(db, build_artifact_store(settings, db, backends))
 
 
-def build_dispatcher(settings: ServerSettings, db: Database) -> Dispatcher:
+def build_dispatcher(
+    settings: ServerSettings, db: Database, backends: Backends | None = None
+) -> Dispatcher:
     """Despachante com o lançador local, sobre o banco do papel do despachante.
 
     Registra os artefatos de cada resultado pelo store e roda a retenção uma vez por
-    hora, com os prazos de ``RAPA_RETENCAO_*``.
+    hora, com os prazos de ``RAPA_RETENCAO_*``. Os segredos vêm do cofre configurado
+    (``RAPA_COFRE``).
     """
+    backends = backends or Backends(settings.backends)
     queue = PgRunQueue(db)
-    store = build_artifact_store(settings)
+    store = build_artifact_store(settings, db, backends)
     if settings.executor == "local" and settings.video_on_failure and ffmpeg_installed() is False:
         # O worker roda sem vídeo quando ele não abre; sem este aviso, só a falta dos
         # vídeos de falha mostraria que nada está sendo filmado.
@@ -896,7 +926,7 @@ def build_dispatcher(settings: ServerSettings, db: Database) -> Dispatcher:
         )
     launcher: LocalProcessLauncher | KubernetesLauncher
     if settings.executor == "kubernetes":
-        launcher = build_pod_launcher(settings, queue)
+        launcher = build_pod_launcher(settings, queue, db, backends)
     else:
         launcher = LocalProcessLauncher(
             queue,
@@ -909,7 +939,7 @@ def build_dispatcher(settings: ServerSettings, db: Database) -> Dispatcher:
                 video_on_failure=settings.video_on_failure,
                 egress=settings.local_egress(),
             ),
-            _secret_source(settings),
+            backends.secret_source(db, settings.dev_secrets_file),
         )
     retention = Retention(
         db,
@@ -930,12 +960,20 @@ def build_dispatcher(settings: ServerSettings, db: Database) -> Dispatcher:
     )
 
 
-def build_pod_launcher(settings: ServerSettings, queue: PgRunQueue) -> KubernetesLauncher:
+def build_pod_launcher(
+    settings: ServerSettings,
+    queue: PgRunQueue,
+    db: Database | None = None,
+    backends: Backends | None = None,
+) -> KubernetesLauncher:
     """O lançador de pods (``RAPA_EXECUTOR=kubernetes``) com o canal e a API do cluster.
 
     O canal só abre a porta na subida do serviço (:func:`create_server_app`); o
-    endereço que vai para os pods leva o IP deste pod (``{ip}``) por padrão.
+    endereço que vai para os pods leva o IP deste pod (``{ip}``) por padrão. Os segredos
+    vêm do cofre configurado (``RAPA_COFRE``), lidos com o banco ``db`` (o do despachante).
     """
+    backends = backends or Backends(settings.backends)
+    secrets = backends.secret_source(db or queue.db, settings.dev_secrets_file)
     return KubernetesLauncher(
         queue,
         KubernetesLauncherSettings(
@@ -950,7 +988,7 @@ def build_pod_launcher(settings: ServerSettings, queue: PgRunQueue) -> Kubernete
         ),
         api=KubeApi(KubeConfig.in_cluster()),
         channel=Channel(),
-        secrets=_secret_source(settings),
+        secrets=secrets,
         attempts=queue,
     )
 
@@ -1149,7 +1187,8 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
     publishing = build_publishing(settings, db)
     repairs = build_repairs(settings, db)
     credentials = build_credentials(settings, db)
-    artifacts = build_artifacts(settings, db)
+    backends = Backends(settings.backends)
+    artifacts = build_artifacts(settings, db, backends)
     if verifier is not None:
         app = create_http_app(
             catalog=platform,
@@ -1180,7 +1219,7 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
         async def health() -> dict[str, str]:
             return {"estado": "ok"}
 
-    dispatcher = build_dispatcher(settings, dispatcher_db) if dispatcher_db else None
+    dispatcher = build_dispatcher(settings, dispatcher_db, backends) if dispatcher_db else None
     if isinstance(dispatcher, Dispatcher) and dispatcher_db is not None:
         if dispatcher.scheduler is None:
             # As agendas vencidas viram execuções numa etapa do mesmo laço.
@@ -1199,6 +1238,9 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
     app.state.repairs = repairs
     app.state.credentials = credentials
     app.state.artifacts = artifacts
+    app.state.backends = backends
+    # As checagens de prontidão do cofre e do S3 (as que estiverem configuradas).
+    app.state.readiness_checks = backends.readiness_checks()
     if settings.http and settings.ui:
         # Antes de envolver o lifespan: o NiceGUI (ui.run_with) envolve o que encontrar
         # com a subida e o encerramento dele, e esse conjunto fica dentro do nosso.
@@ -1233,6 +1275,7 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
         async with contextlib.AsyncExitStack() as stack:
             # Fechados por último e sempre, mesmo se a subida falhar no meio.
             stack.push_async_callback(db.dispose)
+            stack.push_async_callback(backends.aclose)
             if dispatcher_db is not None:
                 stack.push_async_callback(dispatcher_db.dispose)
             if isinstance(verifier, TokenVerifier):
