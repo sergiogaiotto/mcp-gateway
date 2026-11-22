@@ -23,6 +23,11 @@
     const t = norm(s);
     return t.length > n ? t.slice(0, n) : t;
   };
+  // O texto devolvido vai até SLACK caracteres além de cada limite: o Python tira os
+  // valores sigilosos antes de cortar (rapa.runner.snapshot), e um valor que cai no
+  // limite nunca fica pela metade no retrato.
+  const SLACK = 200;
+  const wide = (s, n) => clip(s, n + SLACK);
   const orNull = (s) => (s ? s : null);
   const styleOf = (el) => {
     try { return el.ownerDocument.defaultView.getComputedStyle(el); } catch (e) { return null; }
@@ -60,6 +65,8 @@
     for (const child of node.childNodes) {
       if (child.nodeType === 3) { out += child.data; continue; }
       if (child.nodeType !== 1 || child === skip) continue;
+      // O texto de um elemento editável é o valor digitado nele.
+      if (child.isContentEditable === true) continue;
       const tag = child.tagName;
       if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'TEMPLATE' || tag === 'NOSCRIPT') continue;
       if (child.getAttribute('aria-hidden') === 'true') continue;
@@ -74,6 +81,15 @@
       out += inline ? inner : ' ' + inner + ' ';
     }
     return out;
+  };
+  // O texto mostrado de um elemento, sem nenhum valor de campo: nem o de um elemento
+  // editável (que o innerText traz), nem o de um <textarea> (que o textContent traz).
+  const hasField = (el) => {
+    try { return !!el.querySelector('input, select, textarea, [contenteditable]'); } catch (e) { return true; }
+  };
+  const shownText = (el) => {
+    if (el.isContentEditable === true) return '';
+    return hasField(el) ? contentText(el, null, 0) : (el.innerText || el.textContent);
   };
 
   // -- papéis e nomes (os mesmos de capture.js) -----------------------------------
@@ -324,6 +340,8 @@
         inside.set(r, all);
       }
       for (const cell of cells) {
+        // Uma célula com campo dentro nunca é a chave (o texto dela traria o valor).
+        if (cell.isContentEditable === true || hasField(cell)) continue;
         const candidate = rowText(cell);
         if (candidate.length < 2 || candidate.length >= 200) continue;
         let hits = 0;
@@ -367,8 +385,8 @@
       }
     }
     return {
-      text: clip(row.innerText || row.textContent, 500),
-      cells: cellElements.map((c) => clip(c.innerText || c.textContent, 200)),
+      text: wide(shownText(row), 500),
+      cells: cellElements.map((c) => wide(shownText(c), 200)),
       key: rowKey(row, cellElements),
       role_name_count: roleNameCount,
       text_count: textCount,
@@ -389,32 +407,35 @@
     const testId = el.getAttribute('data-testid');
     if (!(role && ROLES.has(role)) && !(config.testIds && testId)) continue;
     if (hiddenForAria(el)) continue;
+    // O que está dentro de um elemento editável é o valor digitado nele.
+    if (el.isContentEditable === true && el.parentElement && el.parentElement.isContentEditable === true) continue;
     if (elements.length >= MAX_ELEMENTS) { truncated = true; break; }
     const tag = el.tagName.toLowerCase();
     const type = inputType(el);
-    const name = clip(accessibleName(el, role), MAX_TEXT);
-    const label = clip(labelText(el), MAX_TEXT);
+    const fullName = accessibleName(el, role);
+    const fullLabel = labelText(el);
+    const name = clip(fullName, MAX_TEXT);
+    const label = clip(fullLabel, MAX_TEXT);
     const placeholder = clip(el.getAttribute('placeholder'), MAX_TEXT);
     const isControl = tag === 'input' || tag === 'select' || tag === 'textarea';
-    let text = '';
-    if (!isControl) text = clip(el.innerText || el.textContent, MAX_TEXT);
-    else if (tag === 'input' && BUTTON_TYPES.has(type)) text = clip(el.getAttribute('value'), MAX_TEXT);
-    const nameAttr = clip(el.getAttribute('name'), MAX_TEXT);
-    const id = clip(el.getAttribute('id'), MAX_TEXT);
+    let fullText = '';
+    if (!isControl) fullText = shownText(el);
+    else if (tag === 'input' && BUTTON_TYPES.has(type)) fullText = el.getAttribute('value');
+    const text = clip(fullText, MAX_TEXT);
     const textForCount = text && text.length <= 100 ? text : null;
     elements.push({
       tag,
       input_type: type,
       role: orNull(role),
-      name: orNull(name),
-      label: orNull(label),
-      placeholder: orNull(placeholder),
-      test_id: orNull(clip(testId, MAX_TEXT)),
-      name_attr: orNull(nameAttr),
-      id: orNull(id),
-      title: orNull(clip(el.getAttribute('title'), MAX_TEXT)),
-      text: orNull(text),
-      autocomplete: orNull(clip(el.getAttribute('autocomplete'), 100)),
+      name: orNull(wide(fullName, MAX_TEXT)),
+      label: orNull(wide(fullLabel, MAX_TEXT)),
+      placeholder: orNull(wide(el.getAttribute('placeholder'), MAX_TEXT)),
+      test_id: orNull(wide(testId, MAX_TEXT)),
+      name_attr: orNull(wide(el.getAttribute('name'), MAX_TEXT)),
+      id: orNull(wide(el.getAttribute('id'), MAX_TEXT)),
+      title: orNull(wide(el.getAttribute('title'), MAX_TEXT)),
+      text: orNull(wide(fullText, MAX_TEXT)),
+      autocomplete: orNull(wide(el.getAttribute('autocomplete'), 100)),
       in_shadow: hostOf(rootOf(el)) !== null,
       enabled: !disabled(el),
       is_password: isPassword(el),
@@ -432,6 +453,6 @@
     });
   }
   let title = '';
-  try { title = clip(document.title, MAX_TEXT); } catch (e) { title = ''; }
+  try { title = wide(document.title, MAX_TEXT); } catch (e) { title = ''; }
   return { title, elements, truncated, url: String(W.location.origin || '') + String(W.location.pathname || '') };
 }

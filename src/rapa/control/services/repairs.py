@@ -16,7 +16,8 @@ Regras:
 - **O modelo propõe, o código decide, a pessoa escolhe.** Os candidatos saem do
   retrato (``rapa.repair.enumerate_candidates``), sem executar nada de novo. O
   modelo (``rapa.llm.repair``) só escolhe um deles, ou nenhum, validado por esquema;
-  com o hub fora do ar, sem hub ou com uma resposta inválida, a tela mostra os
+  com o hub fora do ar, lento demais (a espera é limitada, para caber no tempo da
+  tela e do REST), sem hub ou com uma resposta inválida, a tela mostra os
   candidatos do mesmo jeito e a pessoa escolhe sozinha. A sugestão fica na memória do
   processo por uma hora (por execução e retrato), para não perguntar de novo a cada
   abertura da tela; cada pergunta ao modelo entra na auditoria.
@@ -37,6 +38,7 @@ Regras:
   custodiante (as regras do A1 chegam com a operação por empresa).
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -111,6 +113,8 @@ A1_DISABLED = (
 )
 _VIEW_ROLES = (Role.CREATOR, Role.APPROVER)
 _SUGGESTION_TTL_S = 3600.0
+#: Espera máxima pela sugestão do modelo: a tela monta em até 20 s e o REST espera 15 s.
+SUGGESTION_TIMEOUT_S = 8.0
 
 
 class RepairAssistantUnavailable(RuntimeError):
@@ -222,11 +226,13 @@ class PgRepairs(PgService):
         assistant: RepairAssistant | None = None,
         candidates: int = DEFAULT_CANDIDATES,
         suggestion_cache_size: int = 256,
+        suggestion_timeout_s: float = SUGGESTION_TIMEOUT_S,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__(db)
         self.assistant = assistant
         self.limit = candidates
+        self.suggestion_timeout_s = suggestion_timeout_s
         self._cache: OrderedDict[tuple[UUID, UUID, str], tuple[float, RepairSuggestion]] = (
             OrderedDict()
         )
@@ -417,14 +423,21 @@ class PgRepairs(PgService):
         if cached is not None:
             return cached, False
         try:
-            answer = await self.assistant.choose(
-                context.step,
-                context.candidates,
-                page_url=context.snapshot.url,
-                page_title=context.snapshot.title,
-                error_code=context.snapshot.error_code,
-            )
-        except RepairAssistantUnavailable:
+            # O hub pode não responder (pacotes descartados, fila cheia, Retry-After longo):
+            # a tela não espera por ele mais do que cabe no tempo dela.
+            async with asyncio.timeout(self.suggestion_timeout_s):
+                answer = await self.assistant.choose(
+                    context.step,
+                    context.candidates,
+                    page_url=context.snapshot.url,
+                    page_title=context.snapshot.title,
+                    error_code=context.snapshot.error_code,
+                )
+        except (RepairAssistantUnavailable, TimeoutError) as exc:
+            if isinstance(exc, TimeoutError):
+                logger.warning(
+                    "o modelo não sugeriu um candidato em %.0f s", self.suggestion_timeout_s
+                )
             # Não fica guardada: na próxima abertura da tela, o modelo é perguntado de novo.
             return (
                 RepairSuggestion(

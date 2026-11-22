@@ -1,11 +1,13 @@
 """Candidatos do conserto: só do retrato, pelo tipo do passo, com localizadores do compilador."""
 
 import pytest
+from playwright.async_api import Browser
 
 from rapa.core import policy
-from rapa.core.robot import DownloadStep, ForEachStep, LocatorBy
+from rapa.core.robot import DownloadStep, ForEachStep, LocatorBy, Manifest
 from rapa.core.snapshot import REDACTED
 from rapa.repair import NotRepairable, apply_candidate, enumerate_candidates, step_info
+from rapa.runner.snapshot import capture
 from tests.repair.support import BASE, element, login_page, notas, protocolo, snapshot
 
 
@@ -177,3 +179,136 @@ def test_apply_changes_only_that_target() -> None:
     assert before == after
     info = step_info(_step("entrar"))
     assert info.intent == "botão Entrar" and info.kind == "click"
+
+
+def test_targets_that_depend_on_a_run_value_are_not_repaired() -> None:
+    # Na repetição, o link de cada nota vem de item.numero: um alvo tirado do retrato
+    # ("0001") faria todas as voltas agirem na mesma nota.
+    data = notas().model_dump(mode="json")
+    loop = next(s for s in data["steps"] if s["id"] == "cada_nota")
+    loop["steps"] = [
+        {
+            "kind": "click",
+            "id": "abrir_nota",
+            "title": "Abrir a nota",
+            "target": {
+                "intent": "link da nota",
+                "locators": [{"by": "role", "value": "link", "name": "{{ item.numero }}"}],
+            },
+        },
+        {
+            "kind": "click",
+            "id": "cancelar_nota",
+            "title": "Cancelar a nota",
+            "effect": "irreversible",
+            "target": {
+                "intent": "botão Cancelar nota",
+                "locators": [{"by": "role", "value": "button", "name": "Cancelar nota"}],
+            },
+        },
+    ]
+    manifest = Manifest.model_validate(data)
+    assert policy.check(manifest) == []
+    step = manifest.step_by_id("abrir_nota")
+    assert step is not None
+    page = snapshot(
+        "abrir_nota",
+        "click",
+        *(
+            element(tag="button", role="button", name=n, text=n, counts={"role_name": 1, "text": 1})
+            for n in ("0001", "0002", "0003")
+        ),
+    )
+    with pytest.raises(NotRepairable, match="depende de um valor da execução"):
+        enumerate_candidates(page, step)
+    with pytest.raises(NotRepairable, match="depende de um valor da execução"):
+        step_info(step)
+    # O mesmo para uma entrada curta demais para ser mascarada no retrato ("SP").
+    uf = protocolo().model_dump(mode="json")
+    escolher = next(s for s in uf["steps"] if s["id"] == "escolher_uf")
+    escolher.update(
+        kind="click",
+        target={
+            "intent": "link da UF",
+            "locators": [{"by": "role", "value": "link", "name": "{{ inputs.uf }}"}],
+        },
+    )
+    escolher.pop("option")
+    clicar = Manifest.model_validate(uf).step_by_id("escolher_uf")
+    assert clicar is not None
+    page = snapshot(
+        "escolher_uf", "click", element(tag="a", role="link", name="SP", counts={"role_name": 1})
+    )
+    with pytest.raises(NotRepairable, match="depende de um valor da execução"):
+        enumerate_candidates(page, clicar)
+
+
+def test_only_an_irreversible_step_goes_to_a_button_with_an_irreversible_verb() -> None:
+    # "Confirmar" (leitura) virou "Concluir", que o compilador faria irreversível: o
+    # conserto não muda o efeito, então o passo de leitura não pode ir para ele.
+    page = snapshot(
+        "confirmar_codigo",
+        "click",
+        element(
+            tag="button",
+            role="button",
+            name="Concluir",
+            text="Concluir",
+            counts={"role_name": 1, "text": 1},
+        ),
+        element(
+            tag="a",
+            role="link",
+            name="Excluir conta",
+            text="Excluir conta",
+            counts={"role_name": 1},
+        ),
+        element(tag="button", role="button", name="Continuar", counts={"role_name": 1}),
+    )
+    candidates = enumerate_candidates(page, _step("confirmar_codigo"))
+    assert [c.name for c in candidates] == ["Continuar"]
+    # O passo irreversível continua aceitando o botão irreversível.
+    emitir = snapshot(
+        "emitir",
+        "click",
+        element(tag="button", role="button", name="Concluir", counts={"role_name": 1}),
+    )
+    assert [c.name for c in enumerate_candidates(emitir, _step("emitir"))] == ["Concluir"]
+
+
+@pytest.mark.browser
+async def test_frames_found_only_by_their_address_still_match_the_live_iframe(
+    browser: Browser,
+) -> None:
+    # O retrato guarda o endereço do iframe sem a consulta; o iframe da página ainda a tem.
+    context = await browser.new_context()
+    page = await context.new_page()
+    try:
+        await page.set_content(
+            '<iframe src="/conteudo?sessao=1" srcdoc="<button>Acessar</button>"></iframe>'
+            '<iframe src="/outro" srcdoc="<button>Voltar</button>"></iframe>'
+        )
+        await page.wait_for_timeout(200)
+        shot = await capture(
+            page, step_id="entrar", step_kind="click", error_code="elemento_nao_encontrado"
+        )
+        assert shot is not None
+        assert [f.path[0].src for f in shot.frames[1:]] == ["/conteudo", "/outro"]
+        candidates = {c.name: c for c in enumerate_candidates(shot, _step("entrar"))}
+        for name in ("Acessar", "Voltar"):
+            frames = candidates[name].target.frames
+            assert len(frames) == 1
+            button = page.frame_locator(frames[0]).get_by_role("button", name=name, exact=True)
+            assert await button.count() == 1
+    finally:
+        await context.close()
+
+
+def test_a_frame_address_with_a_removed_value_does_not_identify_the_frame() -> None:
+    page = snapshot(
+        "entrar",
+        "click",
+        element(frame=1, tag="button", role="button", name="Acessar", counts={"role_name": 1}),
+        frames=[{}, {"path": [{"src": f"/conteudo/{REDACTED}"}], "url": BASE}],
+    )
+    assert enumerate_candidates(page, _step("entrar")) == []

@@ -1,5 +1,6 @@
 """Conserto assistido no PostgreSQL: permissões, modelo, rascunho novo e aprovação por outra pessoa."""
 
+import asyncio
 import json
 from collections.abc import Sequence
 from pathlib import Path
@@ -364,3 +365,82 @@ async def test_snapshots_are_append_only_and_written_only_by_the_dispatcher(
         with pytest.raises(DBAPIError):
             async with app_db.tenant_session(tenant.company_id) as session:
                 await session.execute(text(statement))
+
+
+async def test_a_snapshot_the_database_refuses_is_left_out_and_the_result_is_kept(
+    app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine
+) -> None:
+    tenant, _ = await _world(app_db, superuser_engine)
+    # Um \u0000 no texto da página (o jsonb não guarda) e um retrato que, compacto, cabe
+    # no limite, mas na forma de texto do jsonb (com espaços) passa dele.
+    nul = login_page().model_dump(mode="json")
+    nul["elements"][-1]["name"] = "Acessar\x00"
+    big = login_page().model_dump(mode="json")
+    row = {"text": "r" * 500, "cells": ["c" * 300] * 20, "key": "k" * 200}
+    big["elements"] = [
+        {"tag": "a", "role": "link", "name": f"{'n' * 290}{i:03d}", "text": "x" * 300, "row": row}
+        | {key: key[0] * 300 for key in ("label", "placeholder", "test_id", "name_attr", "id")}
+        for i in range(150)
+    ]
+
+    def compact(data: dict[str, Any]) -> int:
+        return len(json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+
+    while compact(big) > 1024 * 1024 - 100:
+        big["elements"].pop()
+    assert len(json.dumps(big, sort_keys=True, ensure_ascii=False)) > 1024 * 1024
+    repairs = PgRepairs(app_db)
+    for refused in (nul, big):
+        run_id = await _failed(app_db, dispatcher_db, tenant, snapshot=refused)
+        with pytest.raises(Conflict, match="retrato"):
+            await repairs.get_repair(tenant.creator, run_id)
+        async with app_db.tenant_session(tenant.company_id) as session:
+            stored = (
+                await session.execute(
+                    text("SELECT state, error_code, failed_step_id FROM runs WHERE id = :r"),
+                    {"r": run_id},
+                )
+            ).one()
+        assert tuple(stored) == ("failed", "elemento_nao_encontrado", "entrar")
+
+
+class HangingAssistant:
+    """Um hub que aceita a pergunta e nunca responde (pacotes descartados, fila cheia)."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def choose(
+        self,
+        step: RepairStepInfo,
+        candidates: Sequence[RepairCandidate],
+        *,
+        page_url: str,
+        page_title: str,
+        error_code: str,
+    ) -> RepairAnswer:
+        self.calls += 1
+        await asyncio.Event().wait()
+        raise AssertionError("inalcançável")
+
+
+async def test_a_slow_model_never_holds_the_repair_page(
+    app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine
+) -> None:
+    tenant, _ = await _world(app_db, superuser_engine)
+    run_id = await _failed(app_db, dispatcher_db, tenant)
+    # A espera padrão cabe com folga no tempo da página (20 s) e no do REST (15 s).
+    assert 0 < PgRepairs(app_db).suggestion_timeout_s <= 10
+    assistant = HangingAssistant()
+    repairs = PgRepairs(app_db, assistant=assistant)
+    repairs.suggestion_timeout_s = 0.2
+    view = await asyncio.wait_for(repairs.get_repair(tenant.creator, run_id), timeout=10)
+    assert view.suggestion.status is RepairSuggestionStatus.UNAVAILABLE
+    assert len(view.candidates) == 3
+    # Não fica guardada: a próxima abertura pergunta de novo, e de novo não espera demais.
+    again = await asyncio.wait_for(repairs.get_repair(tenant.creator, run_id), timeout=10)
+    assert again.suggestion.status is RepairSuggestionStatus.UNAVAILABLE
+    assert assistant.calls == 2
+    # A pessoa escolhe sozinha.
+    proposal = await repairs.create_repair(tenant.creator, run_id, "c1")
+    assert proposal.model_candidate_id is None

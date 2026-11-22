@@ -1,8 +1,11 @@
 """Retrato da página no passo que falhou: só leitura, sem valores de campos nem segredos."""
 
 import json
+import time
+from urllib.parse import quote
 
 import pytest
+from playwright.async_api import Browser
 
 from rapa.core.contracts import RunState
 from rapa.core.robot import Manifest
@@ -12,7 +15,7 @@ from rapa.fixtures.robots import baixar_notas, emitir_protocolo
 from rapa.fixtures.server import RunningPortal
 from rapa.repair import enumerate_candidates
 from rapa.runner.errors import ErrorCode
-from rapa.runner.snapshot import Masker, fit, flatten_strings, page_path
+from rapa.runner.snapshot import Masker, capture, fit, flatten_strings, page_path
 from tests.repair.support import element, snapshot
 from tests.runner.support import (
     PROTOCOLO_INPUTS,
@@ -41,7 +44,12 @@ def test_masker_and_helpers_drop_values_and_queries() -> None:
     assert masker.text("abc") == "abc"
     assert page_path("https://u:p@portal.test:8443/a/b?token=1#x") == "https://portal.test:8443/a/b"
     assert page_path("about:blank") == "about:"
-    assert flatten_strings({"a": "x", "b": [{"c": "y"}, 3], "d": 1}) == ["x", "y"]
+    assert flatten_strings({"a": "x", "b": [{"c": "y"}, 3], "d": 1.5, "e": True}) == [
+        "x",
+        "y",
+        "3",
+        "1.5",
+    ]
 
 
 def test_big_snapshots_lose_the_last_elements() -> None:
@@ -212,3 +220,145 @@ async def test_snapshot_reaches_into_iframes_and_candidates_keep_the_frame(
     best = enumerate_candidates(snapshot, step)[0]
     assert best.name == "Confirmar consulta"
     assert best.frames == ["#quadro-consulta"]
+
+
+def test_frame_src_with_a_credential_or_a_whole_page_is_left_out() -> None:
+    from rapa.runner.snapshot import _frame_src
+
+    assert _frame_src("https://relatorio:Tok3n@reports.test/x?y=1") is None
+    assert _frame_src("data:text/html,<input value=segredo>") is None
+    assert _frame_src("javascript:alert(1)") is None
+    assert _frame_src("/relatorios/mensal?mes=11#topo") == "/relatorios/mensal"
+    assert _frame_src("https://reports.test/x?y=1") == "https://reports.test/x"
+
+
+async def test_editable_elements_and_textareas_leave_no_value_in_the_snapshot(
+    browser: Browser,
+) -> None:
+    # Um editor de texto (contenteditable) com o que foi digitado, um link digitado dentro
+    # de outro e um <textarea> com o valor vindo do servidor, numa célula de tabela.
+    context = await browser.new_context()
+    try:
+        page = await context.new_page()
+        await page.set_content(
+            "<div contenteditable=true role=textbox aria-label=Descricao>Texto antigo</div>"
+            "<div contenteditable=true role=textbox aria-label=Corpo>"
+            "<a href='/x'>Link digitado</a></div>"
+            "<table><tr><td>Obs</td><td><textarea aria-label=Obs>Nota guardada</textarea></td>"
+            "<td><div contenteditable=true role=textbox aria-label=Resumo>Resumo salvo guardado</div>"
+            "</td><td><a href='/y'>Abrir</a></td></tr></table>"
+        )
+        await page.get_by_role("textbox", name="Descricao").fill("Linha um\nLinha dois")
+        snapshots = {
+            kind: await capture(
+                page, step_id="passo", step_kind=kind, error_code="elemento_nao_encontrado"
+            )
+            for kind in ("fill", "click", "extract_text")
+        }
+    finally:
+        await context.close()
+    for kind, taken in snapshots.items():
+        assert taken is not None, kind
+        dump = taken.model_dump_json()
+        for value in ("Linha", "Texto antigo", "Link digitado", "Nota guardada", "guardado"):
+            assert value not in dump, (kind, value)
+    fields = {e.name: e for e in snapshots["fill"].elements}
+    assert {"Descricao", "Corpo", "Obs"} <= set(fields)
+    assert fields["Descricao"].text is None
+    # O que não é valor de campo continua no retrato.
+    opened = next(e for e in snapshots["click"].elements if e.name == "Abrir")
+    assert opened.row is not None and opened.row.cells[:2] == ["Obs", ""]
+
+
+async def test_numeric_inputs_are_masked_in_texts_and_in_the_path(
+    browser: Browser, portal_v1: RunningPortal
+) -> None:
+    inputs = {"matricula": 482913, "contrato": {"numero": 77120045}}
+    context = await browser.new_context()
+    try:
+        page = await context.new_page()
+        await page.goto(f"{portal_v1.base_url}/contratos/77120045")
+        await page.set_content("<button>Matricula 482913</button>")
+        taken = await capture(
+            page,
+            step_id="passo",
+            step_kind="click",
+            error_code="elemento_nao_encontrado",
+            mask_values=flatten_strings(inputs),
+        )
+    finally:
+        await context.close()
+    assert taken is not None
+    dump = taken.model_dump_json()
+    assert "482913" not in dump and "77120045" not in dump
+    assert [e.name for e in taken.elements] == [f"Matricula {REDACTED}"]
+    assert taken.url.endswith(f"/contratos/{REDACTED}")
+
+
+def test_masker_drops_values_in_the_forms_the_snapshot_keeps() -> None:
+    masker = Masker(["Linha um\nLinha  dois ", "Maria Silva", "João Souza"])
+    # O texto da página chega com os brancos juntados; o endereço, codificado.
+    assert masker.text("Obs: Linha um Linha dois.") == f"Obs: {REDACTED}."
+    assert masker.text("https://portal.test/clientes/Maria%20Silva/notas") == (
+        f"https://portal.test/clientes/{REDACTED}/notas"
+    )
+    assert masker.text("/c/jo%c3%a3o%20souza") == f"/c/{REDACTED}"
+
+
+async def test_values_at_the_limit_and_in_the_path_are_masked(
+    browser: Browser, portal_v1: RunningPortal
+) -> None:
+    login = "ana.souza@empresa.com.br"
+    values = [login, "Maria Silva", "Linha um\nLinha dois"]
+    context = await browser.new_context()
+    try:
+        page = await context.new_page()
+        await page.goto(f"{portal_v1.base_url}/clientes/{quote('Maria Silva', safe='')}/notas")
+        await page.set_content(
+            f"<a href='/x'>{'a' * 292} {login}</a><button>Linha um\nLinha dois</button>"
+        )
+        taken = await capture(
+            page,
+            step_id="passo",
+            step_kind="click",
+            error_code="elemento_nao_encontrado",
+            mask_values=values,
+        )
+    finally:
+        await context.close()
+    assert taken is not None
+    dump = taken.model_dump_json()
+    # Nem o começo do usuário no limite do texto, nem o nome no caminho, nem o texto
+    # de várias linhas.
+    for leaked in ("ana.sou", "Maria", "Linha"):
+        assert leaked not in dump, leaked
+    assert taken.url.endswith(f"/clientes/{REDACTED}/notas")
+    link = next(e for e in taken.elements if e.role == "link")
+    assert link.name is not None and len(link.name) == 300
+
+
+async def test_masking_many_inputs_stays_within_the_snapshot_deadline(browser: Browser) -> None:
+    # Uma lista grande nas entradas (30 000 textos) e uma tabela de linhas longas: a
+    # limpeza dos textos passaria muito do prazo, sem nenhum await para interrompê-la.
+    values = [f"item-{i:05d}-{j}-valor" for i in range(5_000) for j in range(6)]
+    cells = "".join(f"<td>{'item-0 do item-1 ' * 12}</td>" for _ in range(20))
+    rows = "".join(f"<tr><td><a href='/n/{i}'>Abrir {i}</a></td>{cells}</tr>" for i in range(40))
+    context = await browser.new_context()
+    try:
+        page = await context.new_page()
+        await page.set_content(f"<table>{rows}</table>")
+        started = time.monotonic()
+        taken = await capture(
+            page,
+            step_id="passo",
+            step_kind="click",
+            error_code="elemento_nao_encontrado",
+            mask_values=values,
+            timeout_s=0.5,
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        await context.close()
+    # Sem tempo para limpar tudo, o retrato fica de fora (nunca vai sem a limpeza).
+    assert elapsed < 3, elapsed
+    assert taken is None

@@ -22,15 +22,17 @@ sem retrato, nunca muda o resultado dela.
 
 import asyncio
 import re
+import time
 from collections.abc import Iterable, Mapping
 from importlib.resources import files
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, quote_plus, urlsplit
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Frame, Page
 from pydantic import ValidationError
 
+from rapa.core import templates
 from rapa.core.snapshot import (
     MAX_SNAPSHOT_BYTES,
     MAX_SNAPSHOT_ELEMENTS,
@@ -53,6 +55,10 @@ CAPTURE_TIMEOUT_S = 4.0
 _MAX_FRAME_DEPTH = 4
 #: Valores mais curtos que isto mascarariam texto comum demais.
 _MIN_MASKED = 4
+#: Quanto o script devolve além de cada limite (``SLACK`` em snapshot.js): os valores
+#: saem antes do corte, e um valor que cai no limite nunca fica pela metade. Um valor
+#: mais longo que isto também sai pelo começo dele.
+_SLACK = 200
 _FIELD_TAGS = frozenset({"input", "textarea", "select"})
 #: Tipos de passo em que o alvo pode ser um elemento só pelo ``data-testid`` (um texto).
 _TEXT_KINDS = frozenset({"extract_text", "wait_for"})
@@ -65,6 +71,8 @@ _FRAME_INFO_JS = """(el) => ({
   title: el.getAttribute('title'),
   src: el.getAttribute('src'),
 })"""
+#: Limites de :class:`~rapa.core.snapshot.SnapshotFrameInfo`, aplicados de novo depois da
+#: máscara (``REMOVIDO`` pode ser mais longo que o valor que troca).
 _TEXT_FIELDS = (
     "name",
     "label",
@@ -78,19 +86,55 @@ _TEXT_FIELDS = (
 )
 
 
-class Masker:
-    """Troca valores sigilosos por ``REMOVIDO`` em qualquer texto, sem distinguir caixa."""
+def _forms(value: str) -> set[str]:
+    """O valor como ele pode aparecer no retrato: como veio, com os brancos juntados (como
+    fica todo texto da página) e codificado num endereço (como o executor e o navegador o
+    põem no caminho)."""
+    forms = {value, " ".join(value.split())}
+    for safe in ("", "/", "!~*'()"):
+        try:
+            forms.add(quote(value, safe=safe))
+        except UnicodeError:
+            pass
+    try:
+        forms.add(quote_plus(value))
+    except UnicodeError:
+        pass
+    return forms
 
-    def __init__(self, values: Iterable[str]) -> None:
-        unique = sorted({v for v in values if len(v) >= _MIN_MASKED}, key=len, reverse=True)
+
+class Masker:
+    """Troca valores sigilosos por ``REMOVIDO`` em qualquer texto, sem distinguir caixa.
+
+    Com ``deadline`` (``time.monotonic()``), um texto limpo depois dele levanta
+    :class:`TimeoutError`: a limpeza roda sem nenhum ``await`` e, com muitas entradas,
+    passaria do prazo do retrato sem que ninguém a interrompesse.
+    """
+
+    def __init__(self, values: Iterable[str], *, deadline: float | None = None) -> None:
+        masked: set[str] = set()
+        for value in values:
+            for form in _forms(value):
+                if len(form) >= _MIN_MASKED:
+                    masked.add(form)
+                    masked.add(form[:_SLACK])
+        unique = sorted(masked, key=len, reverse=True)
         self._pattern = (
             re.compile("|".join(re.escape(v) for v in unique), re.IGNORECASE) if unique else None
         )
+        self._deadline = deadline
 
     def text(self, value: str) -> str:
         if self._pattern is None:
             return value
+        if self._deadline is not None and time.monotonic() > self._deadline:
+            raise TimeoutError("o prazo do retrato acabou")
         return self._pattern.sub(REDACTED, value)
+
+    def clip(self, value: Any, limit: int) -> str | None:
+        """O texto sem os valores, cortado em ``limit`` só depois da limpeza."""
+        text = _clip(value, limit + _SLACK)
+        return (self.text(text)[:limit] or None) if text else None
 
     def value(self, value: Any) -> Any:
         if isinstance(value, str):
@@ -103,16 +147,43 @@ class Masker:
 
 
 def flatten_strings(value: Any, *, depth: int = 0) -> list[str]:
-    """Todos os textos de uma entrada (também os de listas e dos itens delas)."""
+    """Todos os textos de uma entrada (também os de listas e dos itens delas).
+
+    Um número entra como o executor o digita e o põe num endereço
+    (:func:`rapa.core.templates.format_value`).
+    """
     if depth > 8:
         return []
     if isinstance(value, str):
         return [value]
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return [templates.format_value(value)]
+        except templates.TemplateError:
+            return []
     if isinstance(value, Mapping):
         return [s for item in value.values() for s in flatten_strings(item, depth=depth + 1)]
     if isinstance(value, (list, tuple)):
         return [s for item in value for s in flatten_strings(item, depth=depth + 1)]
     return []
+
+
+def _frame_src(src: str) -> str | None:
+    """O ``src`` de um iframe como o seletor do quadro o usa: sem consulta nem fragmento.
+
+    Um endereço com usuário ou senha e um que não é http(s) (``data:``, ``blob:``...)
+    ficam de fora: o primeiro guarda uma credencial, o outro guarda a própria página.
+    """
+    try:
+        parts = urlsplit(src)
+        has_userinfo = parts.username is not None or parts.password is not None
+    except ValueError:
+        return None
+    if parts.scheme and parts.scheme not in ("http", "https"):
+        return None
+    if has_userinfo:
+        return None
+    return parts._replace(query="", fragment="").geturl() or None
 
 
 def page_path(url: str | None) -> str:
@@ -130,7 +201,7 @@ def page_path(url: str | None) -> str:
         port = f":{parts.port}" if parts.port else ""
     except ValueError:
         port = ""
-    return f"{parts.scheme}://{host}{port}{parts.path}"[:500]
+    return f"{parts.scheme}://{host}{port}{parts.path}"
 
 
 def _clip(value: Any, limit: int) -> str | None:
@@ -140,7 +211,7 @@ def _clip(value: Any, limit: int) -> str | None:
     return text[:limit] or None
 
 
-async def _frame_info(frame: Frame) -> SnapshotFrameInfo | None:
+async def _frame_info(frame: Frame, masker: Masker) -> SnapshotFrameInfo | None:
     try:
         handle = await frame.frame_element()
     except PlaywrightError:
@@ -161,18 +232,18 @@ async def _frame_info(frame: Frame) -> SnapshotFrameInfo | None:
     try:
         return SnapshotFrameInfo(
             tag=tag if tag in ("iframe", "frame") else "iframe",
-            id=_clip(raw.get("id"), 300),
-            name=_clip(raw.get("name"), 300),
-            title=_clip(raw.get("title"), 300),
-            src=(urlsplit(src)._replace(query="", fragment="").geturl()[:500] or None)
-            if src
-            else None,
+            id=masker.clip(raw.get("id"), 300),
+            name=masker.clip(raw.get("name"), 300),
+            title=masker.clip(raw.get("title"), 300),
+            src=masker.clip(_frame_src(src), 500) if src else None,
         )
     except ValidationError, ValueError:
         return None
 
 
-async def _frames(page: Page) -> tuple[list[tuple[Frame, list[SnapshotFrameInfo]]], bool]:
+async def _frames(
+    page: Page, masker: Masker
+) -> tuple[list[tuple[Frame, list[SnapshotFrameInfo]]], bool]:
     """Os quadros da página, do principal para dentro, com o caminho dos iframes."""
     found: list[tuple[Frame, list[SnapshotFrameInfo]]] = [(page.main_frame, [])]
     truncated = False
@@ -186,7 +257,7 @@ async def _frames(page: Page) -> tuple[list[tuple[Frame, list[SnapshotFrameInfo]
             if len(found) >= MAX_SNAPSHOT_FRAMES or len(path) >= _MAX_FRAME_DEPTH:
                 truncated = True
                 continue
-            info = await _frame_info(child)
+            info = await _frame_info(child, masker)
             if info is None:
                 truncated = True
                 continue
@@ -236,9 +307,7 @@ def _element(raw: Any, frame: int, masker: Masker) -> SnapshotElement | None:
         "is_one_time_code": bool(raw.get("is_one_time_code")),
     }
     for key in _TEXT_FIELDS:
-        limit = 100 if key == "autocomplete" else 300
-        value = _clip(raw.get(key), limit)
-        data[key] = masker.text(value)[:limit] if value else None
+        data[key] = masker.clip(raw.get(key), 100 if key == "autocomplete" else 300)
     # As marcas de sigilo olham os textos já limpos (os mesmos do retrato).
     data["sensitive"] = _sensitive(data)
     counts = raw.get("counts")
@@ -252,12 +321,12 @@ def _element(raw: Any, frame: int, masker: Masker) -> SnapshotElement | None:
     if isinstance(row, Mapping):
         cells = row.get("cells")
         data["row"] = {
-            "text": masker.text(_clip(row.get("text"), 500) or ""),
+            "text": masker.clip(row.get("text"), 500) or "",
             "cells": [
-                masker.text(_clip(cell, 200) or "")[:300]
+                masker.clip(cell, 200) or ""
                 for cell in (cells if isinstance(cells, list) else [])[:20]
             ],
-            "key": masker.text(row_key)[:200] if (row_key := _clip(row.get("key"), 200)) else None,
+            "key": masker.clip(row.get("key"), 200),
             "role_name_count": row.get("role_name_count")
             if isinstance(row.get("role_name_count"), int)
             else None,
@@ -278,7 +347,7 @@ async def _capture(
     masker: Masker,
     max_elements: int,
 ) -> PageSnapshot | None:
-    frames, truncated = await _frames(page)
+    frames, truncated = await _frames(page, masker)
     config = {
         "roles": sorted(snapshot_roles(step_kind)),
         "testIds": step_kind in _TEXT_KINDS,
@@ -302,22 +371,13 @@ async def _capture(
         if not isinstance(raw, Mapping):
             continue
         frame_index = len(snapshot_frames)
-        clean_path = [
-            info.model_copy(
-                update={
-                    key: masker.text(text)[:500] if (text := getattr(info, key)) else None
-                    for key in ("id", "name", "title", "src")
-                }
-            )
-            for info in path
-        ]
         snapshot_frames.append(
             SnapshotFrame(
-                path=clean_path, url=masker.text(page_path(_clip(raw.get("url"), 2000)))[:500]
+                path=path, url=masker.clip(page_path(_clip(raw.get("url"), 2000)), 500) or ""
             )
         )
         if position == 0:
-            title = masker.text(_clip(raw.get("title"), 300) or "")
+            title = masker.clip(raw.get("title"), 300) or ""
         if raw.get("truncated"):
             truncated = True
         items = raw.get("elements")
@@ -327,6 +387,9 @@ async def _capture(
                 elements.append(element)
             if len(elements) >= max_elements:
                 break
+            # Deixa o laço de eventos andar (o prazo e os sinais do executor) entre um
+            # elemento e outro.
+            await asyncio.sleep(0)
     if not snapshot_frames:
         return None
     try:
@@ -334,7 +397,7 @@ async def _capture(
             step_id=step_id,
             step_kind=step_kind,
             error_code=error_code,
-            url=masker.text(page_path(page.url)),
+            url=masker.clip(page_path(page.url), 500) or "",
             title=title[:300],
             frames=snapshot_frames,
             elements=elements,
@@ -368,7 +431,7 @@ async def capture(
     """Retrato só de leitura dos elementos que podem ser o alvo do passo (ou ``None``)."""
     if page.is_closed():
         return None
-    masker = Masker(mask_values)
+    masker = Masker(mask_values, deadline=time.monotonic() + timeout_s)
     try:
         async with asyncio.timeout(timeout_s):
             return await _capture(

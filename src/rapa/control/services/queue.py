@@ -72,6 +72,7 @@ from sqlalchemy import (
     text,
     update,
 )
+from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rapa.control.db.schema import (
@@ -812,11 +813,21 @@ async def finish(
     await session.execute(update(runs).where(runs.c.id == run_id).values(**values))
     snapshot = _snapshot_row(outcome, state)
     if snapshot is not None:
-        await session.execute(
-            insert(run_snapshots).values(
-                company_id=run["company_id"], run_id=run_id, attempt=attempt, **snapshot
+        try:
+            # Num ponto de salvamento: o que o banco recusar no retrato (um \u0000 num
+            # texto, o tamanho na forma do jsonb) fica de fora, e o resultado é gravado igual.
+            async with session.begin_nested():
+                await session.execute(
+                    insert(run_snapshots).values(
+                        company_id=run["company_id"], run_id=run_id, attempt=attempt, **snapshot
+                    )
+                )
+        except (DataError, IntegrityError) as exc:
+            logger.warning(
+                "retrato recusado pelo banco no resultado de %s (%s); fica de fora",
+                run_id,
+                type(exc.orig).__name__,
             )
-        )
     await audit.append(
         session,
         company_id=run["company_id"],

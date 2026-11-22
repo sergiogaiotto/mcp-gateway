@@ -9,7 +9,8 @@ Regras (todas determinísticas, sem navegador e sem modelo de linguagem):
   opções e caixas; digitar, só campos de texto (nunca caixas, arquivos ou botões);
   escolher, só ``<select>``; marcar, só caixas e opções; anexar, só
   ``<input type=file>``; ler uma tabela, só tabelas. Passos que agem pedem elementos
-  habilitados.
+  habilitados, e só um passo irreversível aceita um botão ou link com verbo
+  irreversível (emitir, enviar, concluir, excluir...): o efeito do passo não muda.
 - **Credenciais só no lugar certo.** O passo que digita a senha do cofre só aceita um
   campo que o gravador reconheceria como a senha de um login (``credential_kind``:
   ``type=password`` de verdade, que não é senha nova nem de uma operação); o usuário,
@@ -55,6 +56,7 @@ from rapa.core.robot import (
     CheckStep,
     ClickStep,
     DownloadStep,
+    Effect,
     ExtractTableStep,
     ExtractTextStep,
     FillStep,
@@ -69,9 +71,15 @@ from rapa.core.robot import (
     UploadStep,
     WaitForStep,
 )
-from rapa.core.snapshot import KIND_ROLES, REDACTED, PageSnapshot, SnapshotElement
+from rapa.core.snapshot import (
+    KIND_ROLES,
+    REDACTED,
+    PageSnapshot,
+    SnapshotElement,
+    SnapshotFrameInfo,
+)
 from rapa.recorder.models import ElementDescriptor, FrameInfo, LocatorCounts, RowInfo
-from rapa.recorder.sensitivity import credential_kind
+from rapa.recorder.sensitivity import credential_kind, irreversible_click
 
 __all__ = [
     "DEFAULT_CANDIDATES",
@@ -177,12 +185,29 @@ class NotRepairable(ValueError):
 
 
 def repair_target(step: Step) -> Target:
-    """O alvo do passo (que o conserto troca); ``NotRepairable`` se ele não tem um."""
+    """O alvo do passo (que o conserto troca); ``NotRepairable`` se ele não tem um.
+
+    Um alvo cujos localizadores dependem de um valor da execução (``{{ item.numero }}``,
+    ``{{ inputs.uf }}``) também fica de fora: os candidatos saem dos textos do
+    retrato, que são os de um valor só, e o passo passaria a agir sempre naquele.
+    """
     target = getattr(step, "target", None)
     if not isinstance(target, Target):
         raise NotRepairable(
             f"o passo '{step.id}' ({step.kind}) não tem um elemento-alvo para consertar"
         )
+    for locator in target.locators:
+        for text in (locator.value, locator.name):
+            try:
+                dynamic = bool(text) and templates.has_references(text or "")
+            except templates.TemplateError:
+                dynamic = True
+            if dynamic:
+                raise NotRepairable(
+                    f"o alvo do passo '{step.id}' depende de um valor da execução (entrada, "
+                    "variável ou item da repetição); um alvo tirado do retrato serviria só "
+                    "para o valor daquela execução: grave o passo de novo"
+                )
     return target
 
 
@@ -322,6 +347,30 @@ def _score(element: SnapshotElement, old: Target, frames: list[str]) -> tuple[in
 # ---------------------------------------------------------------------------
 
 
+def _css_quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _frame_info(info: SnapshotFrameInfo) -> FrameInfo:
+    """O iframe do retrato, para os seletores do compilador.
+
+    O endereço do retrato perdeu a consulta e o fragmento, e o iframe da página ainda os
+    tem: o seletor pelo endereço aceita o caminho sozinho ou seguido deles. Um endereço
+    com um valor removido (``REMOVIDO``) não identifica o iframe.
+    """
+    src = info.src if info.src and REDACTED not in info.src else None
+    tag = info.tag if info.tag in ("iframe", "frame") else "iframe"
+    css = (
+        ",".join(
+            f"{tag}[src{op}{_css_quote(value)}]"
+            for op, value in (("=", src), ("^=", f"{src}?"), ("^=", f"{src}#"))
+        )
+        if src
+        else None
+    )
+    return FrameInfo(tag=info.tag, id=info.id, name=info.name, title=info.title, src=src, css=css)
+
+
 def _descriptor(element: SnapshotElement, snapshot: PageSnapshot) -> ElementDescriptor | None:
     if element.frame >= len(snapshot.frames):
         return None
@@ -343,10 +392,7 @@ def _descriptor(element: SnapshotElement, snapshot: PageSnapshot) -> ElementDesc
             text=element.text,
             title=element.title,
             autocomplete=element.autocomplete,
-            frame_path=[
-                FrameInfo(tag=i.tag, id=i.id, name=i.name, title=i.title, src=i.src)
-                for i in frame.path
-            ],
+            frame_path=[_frame_info(i) for i in frame.path],
             shadow_path=["(componente)"] if element.in_shadow else None,
             is_password=element.is_password,
             is_one_time_code=element.is_one_time_code,
@@ -369,6 +415,14 @@ def _descriptor(element: SnapshotElement, snapshot: PageSnapshot) -> ElementDesc
 def _fits(step: Step, element: SnapshotElement, descriptor: ElementDescriptor) -> bool:
     role = element.role or ""
     if isinstance(step, _ACTION_STEPS) and not element.enabled:
+        return False
+    if (
+        isinstance(step, _ACTION_STEPS)
+        and step.effect is not Effect.IRREVERSIBLE
+        and irreversible_click(descriptor)
+    ):
+        # O compilador faria deste clique um passo irreversível, e o conserto não muda o
+        # efeito: um passo que não é irreversível nunca passa para esse botão.
         return False
     match step:
         case ClickStep():
