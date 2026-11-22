@@ -161,7 +161,7 @@ jobs:
         run: deploy/ci/testar-executor.sh rapa-executor:ci rapa-controle:ci
       - name: Trivy na imagem de controle (informativo)
         continue-on-error: true
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0, fixada pelo commit
         with:
           image-ref: rapa-controle:ci
           severity: HIGH,CRITICAL
@@ -169,7 +169,7 @@ jobs:
           exit-code: "0"
       - name: Trivy na imagem do executor (informativo)
         continue-on-error: true
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0, fixada pelo commit
         with:
           image-ref: rapa-executor:ci
           severity: HIGH,CRITICAL
