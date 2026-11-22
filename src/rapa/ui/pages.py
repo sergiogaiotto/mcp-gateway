@@ -266,6 +266,11 @@ async def _login(
                 ui.label(
                     "Só para desenvolvimento e testes: escolha um dos perfis configurados no servidor."
                 ).classes("text-caption")
+                if not dev.profiles:
+                    ui.label(
+                        "Nenhum perfil ainda: os tokens de RAPA_TOKENS_DEV não têm um usuário "
+                        "ativo no banco. Crie os usuários e reinicie o serviço."
+                    ).classes("text-caption").mark("login-dev-vazio")
                 for profile in dev.profiles.values():
                     with ui.row().classes("w-full items-center justify-between"):
                         with ui.column().classes("gap-0"):

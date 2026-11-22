@@ -751,6 +751,11 @@ def _mount_ui(
         profiles = _run_sync(
             _dev_profiles(settings.database_url, load_dev_tokens(settings.dev_tokens_file))
         )
+        if not profiles:
+            logger.warning(
+                "nenhum token de desenvolvimento tem usuário ativo no banco; a tela de entrada "
+                "fica sem perfis até o serviço reiniciar"
+            )
         dev_login = DevLogin(
             DevProfile(
                 key=f"perfil{index}",

@@ -37,6 +37,17 @@ async def test_login_required_and_dev_login(world: World) -> None:
         await user.should_see(marker="pagina-login")
 
 
+async def test_dev_login_without_profiles_says_what_is_missing(world: World) -> None:
+    # Logo depois de instalar, os tokens de desenvolvimento ainda não têm usuário no banco:
+    # a interface sobe e a tela de entrada diz o que falta.
+    world.principals = {}
+    async with world.user() as user:
+        await user.open("/catalogo")
+        await user.should_see(marker="pagina-login")
+        await user.should_see(marker="login-dev-vazio")
+        await user.should_not_see(marker="usuario-logado")
+
+
 async def test_catalog_shows_only_own_company(world: World) -> None:
     async with world.user() as user:
         await login(user, "operador")
