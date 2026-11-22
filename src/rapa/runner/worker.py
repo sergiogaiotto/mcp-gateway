@@ -5,7 +5,8 @@ Uso::
     python -m rapa.runner.worker --job JOB.json --result RESULT.json \\
         --events EVENTS.jsonl --artifacts DIR [--secrets SECRETS.json] \\
         [--chromium CAMINHO] [--browser-arg=ARG ...] [--files-dir DIR] \\
-        [--ack-dir DIR [--ack-timeout SEGUNDOS]] [--video-dir DIR]
+        [--ack-dir DIR [--ack-timeout SEGUNDOS]] [--video-dir DIR] \\
+        [--guarda-de-saida [--rede-interna-permitida CIDR ...] [--proxy-saida URL]]
 
 - ``JOB.json`` é um :class:`rapa.core.contracts.RunnerJob` em JSON.
 - ``SECRETS.json`` associa o nome de cada credencial a um objeto com os campos
@@ -25,6 +26,19 @@ Uso::
   robô não digitar credencial fora de um campo de senha (ver
   :mod:`rapa.runner.video`). A gravação nunca muda a execução: sem vídeo
   disponível, o robô roda sem ele, e fechar o vídeo tem limite próprio.
+- Com ``--guarda-de-saida``, o Chromium da execução sai por uma
+  :class:`rapa.session.egress.EgressGuard` local (a mesma do hospedeiro da sessão:
+  QUIC desligado, WebRTC sem UDP fora do proxy e fora das páginas, interruptores de
+  proxy do operador removidos) que só deixa passar os ``allowed_domains`` do manifesto
+  e recusa a própria máquina, o link-local, o metadata da nuvem e toda rede que não é
+  da internet, menos as de ``--rede-interna-permitida``
+  (``RAPA_REDES_INTERNAS_PERMITIDAS``). Com ``--proxy-saida`` (``RAPA_PROXY_SAIDA``,
+  um proxy HTTP CONNECT), a internet sai por ele. O ``route`` do interpretador
+  continua: é ele que dá o erro ``dominio_nao_permitido`` claro no passo; a guarda
+  cobre o que ele não vê (websockets, os saltos de um redirecionamento, um nome que
+  resolve para a rede interna). O lançador sempre passa a guarda nos pods; no
+  lançador local, quando há redes internas permitidas ou proxy de saída, e sempre
+  fora do modo de desenvolvimento.
 
 O código de saída é 0 sempre que o RESULT.json foi escrito, qualquer que seja o
 estado da execução; diferente de 0 só quando o próprio worker quebra. Argumentos
@@ -40,7 +54,8 @@ import shutil
 import signal
 import sys
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
@@ -74,6 +89,12 @@ from rapa.runner.video import (
     VIDEO_NAME,
     VIDEO_PROBE_TIMEOUT_S,
     video_allowed,
+)
+from rapa.session.egress import (
+    BROWSER_NETWORK_ARGS,
+    EgressGuard,
+    EgressPolicy,
+    without_proxy_switches,
 )
 
 __all__ = ["build_parser", "main", "run_job", "write_result"]
@@ -131,6 +152,27 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="pasta temporária do vídeo da execução (guardado só se ela não der certo)",
+    )
+    parser.add_argument(
+        "--guarda-de-saida",
+        dest="egress_guard",
+        action="store_true",
+        help="o navegador sai pela guarda da saída (só os domínios do robô, sem rede interna)",
+    )
+    parser.add_argument(
+        "--rede-interna-permitida",
+        dest="internal_networks",
+        action="append",
+        default=[],
+        metavar="CIDR",
+        help="rede interna que o robô pode acessar (com --guarda-de-saida)",
+    )
+    parser.add_argument(
+        "--proxy-saida",
+        dest="egress_proxy",
+        default=None,
+        metavar="URL",
+        help="proxy HTTP CONNECT de saída para a internet (com --guarda-de-saida)",
     )
     return parser
 
@@ -237,7 +279,11 @@ class _Video:
 
 
 async def _video_context(
-    browser: Browser, certificates: Sequence[ClientCertificate], directory: Path
+    browser: Browser,
+    certificates: Sequence[ClientCertificate],
+    directory: Path,
+    *,
+    webrtc_off: bool = False,
 ) -> BrowserContext | None:
     """Contexto filmado, ou ``None`` se o vídeo não abre (sem o ``ffmpeg``, por exemplo).
 
@@ -247,7 +293,10 @@ async def _video_context(
     try:
         await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=True, mode=0o700)
         context = await new_run_context(
-            browser, client_certificates=certificates, record_video_dir=directory
+            browser,
+            client_certificates=certificates,
+            record_video_dir=directory,
+            webrtc_off=webrtc_off,
         )
     except Exception:
         return None
@@ -276,12 +325,14 @@ async def run_job(
     cancel: asyncio.Event | None = None,
     secrets_error: str | None = None,
     video_dir: Path | None = None,
+    egress: EgressPolicy | None = None,
 ) -> RunResult:
     """Roda o trabalho num Chromium novo e devolve o resultado.
 
     Não levanta exceção por falhas da execução: navegador que não abre ou
     segredos inválidos também viram um resultado "falhou". Com ``video_dir``, a
-    página do robô é filmada (ver :mod:`rapa.runner.video`).
+    página do robô é filmada (ver :mod:`rapa.runner.video`). Com ``egress``, o
+    navegador sai pela guarda da saída (:func:`_guarded_network`).
     """
     provider = secrets if secrets is not None else DictSecretProvider({})
     sink = DirectoryArtifactSink(artifacts_dir)
@@ -311,30 +362,80 @@ async def run_job(
         return await interpreter.fail_without_browser(
             ErrorCode.SEGREDO_INDISPONIVEL, f"O certificado A1 não está disponível: {exc}"
         )
-    if video_dir is not None and video_allowed(job.manifest):
-        return await _run_filmed(
-            interpreter,
-            interpreter_for,
-            sink,
-            certificates,
-            video_dir,
-            chromium=chromium,
-            browser_args=browser_args,
-        )
-    async with contextlib.AsyncExitStack() as stack:
+    async with contextlib.AsyncExitStack() as outer:
         try:
-            browser = await stack.enter_async_context(
-                open_browser(executable_path=chromium, args=browser_args)
-            )
-            context = await stack.enter_async_context(
-                run_context(browser, client_certificates=certificates)
-            )
+            network = await outer.enter_async_context(_guarded_network(job, browser_args, egress))
         except Exception as exc:
             return await interpreter.fail_without_browser(
                 ErrorCode.NAVEGADOR_INDISPONIVEL,
-                f"Não consegui abrir o navegador ({type(exc).__name__}).",
+                f"Não consegui abrir a guarda da saída do navegador ({type(exc).__name__}).",
             )
-        return await interpreter.run(context)
+        if video_dir is not None and video_allowed(job.manifest):
+            return await _run_filmed(
+                interpreter,
+                interpreter_for,
+                sink,
+                certificates,
+                video_dir,
+                chromium=chromium,
+                network=network,
+            )
+        async with contextlib.AsyncExitStack() as stack:
+            try:
+                browser = await stack.enter_async_context(
+                    open_browser(executable_path=chromium, args=network.args, proxy=network.proxy)
+                )
+                context = await stack.enter_async_context(
+                    run_context(
+                        browser,
+                        client_certificates=certificates,
+                        webrtc_off=network.webrtc_off,
+                    )
+                )
+            except Exception as exc:
+                return await interpreter.fail_without_browser(
+                    ErrorCode.NAVEGADOR_INDISPONIVEL,
+                    f"Não consegui abrir o navegador ({type(exc).__name__}).",
+                )
+            return await interpreter.run(context)
+
+
+@dataclass(frozen=True, slots=True)
+class _Network:
+    """Como o navegador da execução sai: os argumentos, o proxy da guarda e o WebRTC."""
+
+    args: tuple[str, ...]
+    proxy: str | None = None
+    webrtc_off: bool = False
+
+
+@contextlib.asynccontextmanager
+async def _guarded_network(
+    job: RunnerJob, browser_args: Sequence[str], egress: EgressPolicy | None
+) -> AsyncIterator[_Network]:
+    """A guarda da saída da execução, aberta até o fim do bloco (o navegador fecha antes).
+
+    Sem ``egress``, o navegador sai direto, como sempre (só o ``route`` do
+    interpretador). Com ele, só os ``allowed_domains`` do manifesto passam, e a rede
+    interna fica fechada, menos as redes permitidas da política (ver
+    :mod:`rapa.session.egress`). Os interruptores de proxy do operador saem dos
+    argumentos; os que tiram o UDP do caminho vêm por último, para não serem desfeitos.
+    """
+    if egress is None:
+        yield _Network(args=tuple(browser_args))
+        return
+    guard = EgressGuard.from_browser_args(
+        browser_args, allowed_hosts=job.manifest.allowed_domains, policy=egress
+    )
+    port = await guard.start()
+    try:
+        yield _Network(
+            args=(*without_proxy_switches(browser_args), *BROWSER_NETWORK_ARGS),
+            proxy=f"socks5://127.0.0.1:{port}",
+            webrtc_off=True,
+        )
+    finally:
+        await guard.close()
 
 
 async def _run_filmed(
@@ -345,7 +446,7 @@ async def _run_filmed(
     video_dir: Path,
     *,
     chromium: str | None,
-    browser_args: Sequence[str],
+    network: _Network,
 ) -> RunResult:
     """Como o caminho de sempre de :func:`run_job`, com o contexto filmado.
 
@@ -356,19 +457,25 @@ async def _run_filmed(
     async with contextlib.AsyncExitStack() as stack:
         try:
             playwright = await stack.enter_async_context(async_playwright())
-            browser = await launch_browser(playwright, executable_path=chromium, args=browser_args)
+            browser = await launch_browser(
+                playwright, executable_path=chromium, args=network.args, proxy=network.proxy
+            )
         except Exception as exc:
             return await interpreter.fail_without_browser(
                 ErrorCode.NAVEGADOR_INDISPONIVEL,
                 f"Não consegui abrir o navegador ({type(exc).__name__}).",
             )
         stack.push_async_callback(_close_browser, browser)
-        filmed = await _video_context(browser, certificates, video_dir)
+        filmed = await _video_context(
+            browser, certificates, video_dir, webrtc_off=network.webrtc_off
+        )
         if filmed is None:
             await asyncio.to_thread(_remove, video_dir)
             try:
                 context = await stack.enter_async_context(
-                    run_context(browser, client_certificates=certificates)
+                    run_context(
+                        browser, client_certificates=certificates, webrtc_off=network.webrtc_off
+                    )
                 )
             except Exception as exc:
                 return await interpreter.fail_without_browser(
@@ -407,6 +514,7 @@ async def _main_async(
     job: RunnerJob,
     secrets: DictSecretProvider | None,
     secrets_error: str | None,
+    egress: EgressPolicy | None = None,
 ) -> RunResult:
     # SIGTERM e SIGINT cancelam a execução entre dois passos; o resultado sai mesmo assim.
     cancel = asyncio.Event()
@@ -430,6 +538,7 @@ async def _main_async(
             screenshot_every_step=args.screenshot_every_step,
             cancel=cancel,
             video_dir=args.video_dir,
+            egress=egress,
         )
 
 
@@ -438,6 +547,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not args.ack_timeout > 0:
         parser.error("--ack-timeout precisa ser maior que zero")
+    egress: EgressPolicy | None = None
+    if args.egress_guard:
+        try:
+            egress = EgressPolicy.parse(args.internal_networks, args.egress_proxy)
+        except ValueError as exc:
+            parser.error(str(exc))
+    elif args.internal_networks or args.egress_proxy:
+        parser.error("--rede-interna-permitida e --proxy-saida só valem com --guarda-de-saida")
     # Os segredos saem do disco antes de qualquer outra coisa.
     secrets, secrets_error = _load_secrets(args.secrets)
     try:
@@ -446,7 +563,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         detail = type(exc).__name__ if isinstance(exc, OSError) else f"{exc.error_count()} erro(s)"
         print(f"rapa.runner.worker: trabalho inválido em {args.job} ({detail})", file=sys.stderr)
         return EXIT_BAD_JOB
-    result = asyncio.run(_main_async(args, job, secrets, secrets_error))
+    result = asyncio.run(_main_async(args, job, secrets, secrets_error, egress))
     write_result(args.result, result)
     return EXIT_OK
 

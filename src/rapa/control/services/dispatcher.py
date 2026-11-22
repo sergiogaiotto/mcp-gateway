@@ -167,7 +167,22 @@ class WorkerNotStarted(Exception):
     Por exemplo: cofre de segredos fora do ar, pasta da tentativa que não pôde
     ser criada ou programa do executor que não abriu. Nenhum passo pode ter
     rodado, então a execução é uma falha comum, nunca um indeterminado.
+
+    ``code`` e ``public_message`` vão para o resultado (nunca um segredo nem o texto de
+    um erro de fora): o lançador local usa o padrão (``executor_nao_iniciado``); o de
+    pods, ``executor_nao_iniciou`` com o motivo do Kubernetes.
     """
+
+    def __init__(
+        self,
+        message: str = "o executor não pôde ser iniciado",
+        *,
+        code: str = "executor_nao_iniciado",
+        public_message: str = "O executor não pôde ser iniciado; nenhum passo foi executado.",
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.public_message = public_message
 
 
 def failure_result(
@@ -588,12 +603,7 @@ class Dispatcher:
                 return
             except WorkerNotStarted as exc:
                 logger.error("o executor não foi iniciado: %s", _error_name(exc.__cause__ or exc))
-                result = failure_result(
-                    job,
-                    "executor_nao_iniciado",
-                    "O executor não pôde ser iniciado; nenhum passo foi executado.",
-                    started=False,
-                )
+                result = failure_result(job, exc.code, exc.public_message, started=False)
             except Exception as exc:  # o lançador falhou sem entregar resultado
                 logger.error("o lançador falhou: %s", type(exc).__name__)
                 result = failure_result(

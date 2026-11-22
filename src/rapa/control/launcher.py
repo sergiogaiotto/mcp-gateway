@@ -1,7 +1,10 @@
-"""Lançador local: roda cada execução num processo ``python -m rapa.runner.worker``.
+"""Lançadores das execuções: o local (um processo) e o do Kubernetes (um pod).
 
-Serve à Fase 0 e ao desenvolvimento; em produção o mesmo papel cabe a um pod de
-uso único com gVisor. Para cada tentativa, o lançador:
+O despachante escolhe pelo ``RAPA_EXECUTOR``: ``local`` (o padrão, para a Fase 0 e
+o desenvolvimento) roda cada tentativa num processo ``python -m rapa.runner.worker``
+(:class:`LocalProcessLauncher`); ``kubernetes`` roda cada uma num pod de uso único
+com gVisor (:class:`KubernetesLauncher`, mais abaixo). Para cada tentativa, o
+lançador local:
 
 1. cria uma pasta só da tentativa (permissão 0700) com JOB.json e, se o robô usa
    credenciais, SECRETS.json (0600, apagado pelo worker logo depois de ler);
@@ -31,9 +34,51 @@ criada aqui: se não existir, o passo de envio falha com "arquivo não encontrad
 
 Os segredos vêm de uma :class:`SecretSource`. Em produção ela consulta o OpenBao;
 aqui há uma versão estática, para desenvolvimento e testes.
+
+Com ``egress`` (``LocalLauncherSettings.egress``), o worker recebe
+``--guarda-de-saida`` e o navegador da execução sai pela guarda da saída (só os
+domínios do robô, sem a rede interna; ver :mod:`rapa.runner.worker`). O servidor liga
+a guarda quando há redes internas permitidas ou proxy de saída e sempre fora do modo
+de desenvolvimento.
+
+:class:`KubernetesLauncher` (``RAPA_EXECUTOR=kubernetes``) tem a mesma interface e o
+mesmo seguimento: a pasta de trabalho da tentativa continua no despachante (com
+EVENTS.jsonl, ``ack/`` e RESULT.json, sem JOB.json nem SECRETS.json), e quem a enche é
+o canal do despachante (:mod:`rapa.control.channel`), por onde o pod fala. Para cada
+tentativa ele:
+
+1. abre a tentativa no canal (o trabalho, os segredos só em memória e as opções do
+   worker; o bilhete aleatório só vai para o pod) e cria um Secret (o endereço do
+   canal da tentativa e o bilhete) e um Pod (:func:`rapa.control.kube.pod_manifest`) no
+   ``RAPA_K8S_NAMESPACE_EXECUCOES``, com o Secret como dono (apagar um apaga os dois);
+   um certificado A1 em arquivo (``pfx_path`` do arquivo de dev) vai como
+   ``pfx_base64``, e os arquivos de entrada que as entradas de arquivo citam (os da
+   pasta da empresa em ``files_dir``, com as regras do lançador local) ficam
+   disponíveis para o pod buscar pelo canal. Se a API recusa o Secret ou o pod (a cota,
+   a RuntimeClass, a permissão), a falha é ``executor_nao_iniciou``, com o motivo do
+   Kubernetes;
+2. segue os eventos como o lançador local e acompanha a fase do pod: um pod que não
+   sobe (``ImagePullBackOff`` e os outros motivos que não passam sozinhos, ou
+   ``Pending``/``Unschedulable`` além de ``start_timeout_s``) ou que nunca buscou o
+   trabalho vira falha ``executor_nao_iniciou`` (nada rodou: "falhou", nunca
+   indeterminado); um pod que termina sem resultado, ``executor_sem_resultado``;
+3. no prazo (com a mesma folga do local), apaga o pod (o SIGTERM, e o SIGKILL do
+   kubelet depois da tolerância: o SIGTERM/SIGKILL de hoje) e ainda espera o
+   resultado que o agente entrega nesse tempo;
+4. no fim, fecha a tentativa no canal **antes** de decidir (o pod não busca mais o
+   trabalho, e os envios dele que estavam no meio acabam sem deixar arquivo), troca o
+   caminho de cada artefato do RESULT.json pelo da pasta local da tentativa (onde o
+   canal o gravou), apaga o que o resultado não cita (tudo, sem resultado) e apaga o
+   Secret e o Pod.
+
+Na volta do despachante, e a cada minuto, :meth:`KubernetesLauncher.sweep` apaga os
+pods e Secrets de execução (pelo rótulo) cuja tentativa não está viva no banco nem
+neste processo (os que uma réplica que caiu deixou para trás) e os que têm o rótulo
+de execução sem uma tentativa legível.
 """
 
 import asyncio
+import base64
 import contextlib
 import json
 import logging
@@ -41,7 +86,7 @@ import os
 import shutil
 import signal
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -51,16 +96,45 @@ from uuid import UUID
 from pydantic import ValidationError
 
 from rapa.control.artifacts import attempt_dir
+from rapa.control.channel import Channel, ChannelAttempt
+from rapa.control.kube import (
+    EXECUTOR_APP,
+    LABEL_APP,
+    LABEL_ATTEMPT,
+    LABEL_COMPANY,
+    LABEL_RUN,
+    KubeApi,
+    KubeError,
+    PodSettings,
+    PodState,
+    pod_manifest,
+    pod_state,
+    secret_manifest,
+)
 from rapa.control.services.dispatcher import WorkerNotStarted, failure_result
 from rapa.control.services.queue import StaleAttempt
+from rapa.core.artifacts import valid_artifact_name
 from rapa.core.contracts import RunnerJob
 from rapa.core.events import RunEvent
-from rapa.runner.ports import SECRET_FIELDS, ack_path, waits_for_ack
+from rapa.core.robot import FieldType
+from rapa.runner.pod import PodOptions
+from rapa.runner.ports import (
+    SECRET_FIELDS,
+    FileUnavailable,
+    LocalFileProvider,
+    ack_path,
+    waits_for_ack,
+)
 from rapa.runner.result import RunResult
 from rapa.runner.video import VIDEO_CLOSE_TIMEOUT_S
+from rapa.session.egress import EgressPolicy
 
 __all__ = [
+    "EXECUTOR_NOT_STARTED",
+    "AttemptRegistry",
     "EventIngestor",
+    "KubernetesLauncher",
+    "KubernetesLauncherSettings",
     "LocalLauncherSettings",
     "LocalProcessLauncher",
     "NoSecrets",
@@ -76,6 +150,10 @@ _ENV_ALLOWED = frozenset({"PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR", "SYS
 _ENV_PREFIXES = ("PLAYWRIGHT_", "XDG_", "FONTCONFIG_")
 #: Tamanho máximo de uma linha de evento lida do worker.
 _MAX_EVENT_LINE = 1024 * 1024
+#: Código da falha de um pod de execução que nunca subiu ou nunca buscou o trabalho.
+EXECUTOR_NOT_STARTED = "executor_nao_iniciou"
+#: Tamanho máximo do certificado A1 que vai pelo canal.
+_MAX_PFX_BYTES = 1024 * 1024
 
 
 class EventIngestor(Protocol):
@@ -84,6 +162,14 @@ class EventIngestor(Protocol):
     async def ingest_events(
         self, run_id: UUID, attempt: int, events: Sequence[RunEvent | Mapping[str, Any]]
     ) -> int: ...
+
+
+class AttemptRegistry(Protocol):
+    """Quem sabe que tentativas estão vivas (:meth:`rapa.control.services.PgRunQueue.live_attempts`)."""
+
+    async def live_attempts(
+        self, attempts: Collection[tuple[UUID, int]]
+    ) -> set[tuple[UUID, int]]: ...
 
 
 class SecretSource(Protocol):
@@ -215,6 +301,8 @@ class LocalLauncherSettings:
     video_on_failure: bool = False
     #: Limite para o worker fechar e guardar o vídeo, somado à folga depois do prazo.
     video_close_s: float = VIDEO_CLOSE_TIMEOUT_S
+    #: A guarda da saída do navegador (``--guarda-de-saida``); ``None``, sem guarda.
+    egress: EgressPolicy | None = None
 
 
 class _EventTail:
@@ -284,7 +372,91 @@ def _write_ack(directory: Path, seq: int) -> None:
     os.replace(temp, target)
 
 
-class LocalProcessLauncher:
+class _Follower:
+    """O que os dois lançadores fazem igual: gravar os eventos, confirmar e ler o resultado."""
+
+    events: EventIngestor
+
+    async def __call__(self, job: RunnerJob) -> dict[str, Any]:
+        return await self.launch(job)
+
+    async def launch(self, job: RunnerJob) -> dict[str, Any]:  # pragma: no cover - abstrato
+        raise NotImplementedError
+
+    async def _forward(
+        self,
+        job: RunnerJob,
+        tail: _EventTail,
+        work: Path,
+        pending: list[dict[str, Any]],
+        *,
+        final: bool = False,
+    ) -> None:
+        """Grava os eventos novos e confirma o início dos passos que gravam.
+
+        Gravar é idempotente (``seq``), então uma falha passageira do banco só
+        adia a entrega para a próxima leitura; no fim, tenta mais algumas vezes.
+        Só o que foi gravado é confirmado: o worker não começa um passo que grava
+        antes de o banco saber dele. Uma tentativa antiga (:class:`StaleAttempt`)
+        interrompe o lançamento.
+        """
+        pending.extend(await asyncio.to_thread(tail.read_new))
+        if not pending:
+            return
+        tries = 4 if final else 1
+        for attempt in range(1, tries + 1):
+            try:
+                await self.events.ingest_events(job.run_id, job.attempt, list(pending))
+                break
+            except StaleAttempt:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "falha ao gravar eventos de %s (tentativa %d): %s",
+                    job.run_id,
+                    attempt,
+                    type(exc).__name__,
+                )
+                if attempt == tries:
+                    return
+                await asyncio.sleep(0.25 * attempt)
+        delivered, pending[:] = list(pending), []
+        for raw in delivered:
+            try:
+                event = RunEvent.model_validate(raw)
+            except ValidationError:
+                continue
+            if waits_for_ack(event):
+                await asyncio.to_thread(_write_ack, work / "ack", event.seq)
+                self._acknowledged(job)
+
+    def _acknowledged(self, job: RunnerJob) -> None:
+        """Uma confirmação acabou de ser escrita (o lançador de pods acorda o canal)."""
+
+    @staticmethod
+    def _read_result(job: RunnerJob, work: Path, returncode: int | None) -> dict[str, Any]:
+        path = work / "result.json"
+        try:
+            result = RunResult.model_validate_json(path.read_bytes())
+        except FileNotFoundError:
+            logger.error("o worker de %s saiu (código %s) sem resultado", job.run_id, returncode)
+            return failure_result(
+                job, "executor_sem_resultado", "O executor terminou sem entregar o resultado."
+            )
+        except ValidationError:
+            logger.error("o worker de %s entregou um resultado inválido", job.run_id)
+            return failure_result(
+                job, "resultado_invalido", "O executor devolveu um resultado inválido."
+            )
+        if result.run_id != job.run_id or result.attempt != job.attempt:
+            logger.error("o resultado do worker não é desta tentativa de %s", job.run_id)
+            return failure_result(
+                job, "resultado_invalido", "O executor devolveu o resultado de outra tentativa."
+            )
+        return result.model_dump(mode="json")
+
+
+class LocalProcessLauncher(_Follower):
     """Lançador do despachante (``launch(job) -> dict``) com processos locais."""
 
     def __init__(
@@ -296,9 +468,6 @@ class LocalProcessLauncher:
         self.events = events
         self.settings = settings
         self.secrets: SecretSource = secrets or NoSecrets()
-
-    async def __call__(self, job: RunnerJob) -> dict[str, Any]:
-        return await self.launch(job)
 
     @property
     def grace_s(self) -> float:
@@ -352,6 +521,8 @@ class LocalProcessLauncher:
             # Só a pasta da empresa da tarefa: a execução de uma empresa nunca vê os
             # arquivos de outra, seja qual for o identificador pedido nas entradas.
             command += ["--files-dir", str(settings.files_dir.absolute() / str(job.company_id))]
+        if settings.egress is not None:
+            command += ["--guarda-de-saida", *settings.egress.worker_args()]
         command += [f"--browser-arg={arg}" for arg in settings.browser_args]
         return command
 
@@ -437,52 +608,6 @@ class LocalProcessLauncher:
             else:  # pragma: no cover - _stop sempre espera o processo sair
                 stderr.cancel()
 
-    async def _forward(
-        self,
-        job: RunnerJob,
-        tail: _EventTail,
-        work: Path,
-        pending: list[dict[str, Any]],
-        *,
-        final: bool = False,
-    ) -> None:
-        """Grava os eventos novos e confirma o início dos passos que gravam.
-
-        Gravar é idempotente (``seq``), então uma falha passageira do banco só
-        adia a entrega para a próxima leitura; no fim, tenta mais algumas vezes.
-        Só o que foi gravado é confirmado: o worker não começa um passo que grava
-        antes de o banco saber dele. Uma tentativa antiga (:class:`StaleAttempt`)
-        interrompe o lançamento.
-        """
-        pending.extend(await asyncio.to_thread(tail.read_new))
-        if not pending:
-            return
-        tries = 4 if final else 1
-        for attempt in range(1, tries + 1):
-            try:
-                await self.events.ingest_events(job.run_id, job.attempt, list(pending))
-                break
-            except StaleAttempt:
-                raise
-            except Exception as exc:
-                logger.warning(
-                    "falha ao gravar eventos de %s (tentativa %d): %s",
-                    job.run_id,
-                    attempt,
-                    type(exc).__name__,
-                )
-                if attempt == tries:
-                    return
-                await asyncio.sleep(0.25 * attempt)
-        delivered, pending[:] = list(pending), []
-        for raw in delivered:
-            try:
-                event = RunEvent.model_validate(raw)
-            except ValidationError:
-                continue
-            if waits_for_ack(event):
-                await asyncio.to_thread(_write_ack, work / "ack", event.seq)
-
     @staticmethod
     async def _drain_stderr(process: asyncio.subprocess.Process) -> None:
         """Lê a saída de erro só para não travar o worker; registra apenas o tamanho."""
@@ -506,31 +631,508 @@ class LocalProcessLauncher:
                 os.killpg(process.pid, signal.SIGKILL)
             await process.wait()
 
-    @staticmethod
-    def _read_result(job: RunnerJob, work: Path, returncode: int | None) -> dict[str, Any]:
-        path = work / "result.json"
-        try:
-            result = RunResult.model_validate_json(path.read_bytes())
-        except FileNotFoundError:
-            logger.error("o worker de %s saiu (código %s) sem resultado", job.run_id, returncode)
-            return failure_result(
-                job, "executor_sem_resultado", "O executor terminou sem entregar o resultado."
-            )
-        except ValidationError:
-            logger.error("o worker de %s entregou um resultado inválido", job.run_id)
-            return failure_result(
-                job, "resultado_invalido", "O executor devolveu um resultado inválido."
-            )
-        if result.run_id != job.run_id or result.attempt != job.attempt:
-            logger.error("o resultado do worker não é desta tentativa de %s", job.run_id)
-            return failure_result(
-                job, "resultado_invalido", "O executor devolveu o resultado de outra tentativa."
-            )
-        return result.model_dump(mode="json")
-
     def _cleanup(self, work: Path) -> None:
         secrets = work / "secrets.json"
         with contextlib.suppress(FileNotFoundError, NotADirectoryError):
             secrets.unlink()
         if not self.settings.keep_work_dir:
             shutil.rmtree(work, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Pods de uso único no Kubernetes
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class KubernetesLauncherSettings:
+    """Configuração do lançador de pods (``RAPA_EXECUTOR=kubernetes``)."""
+
+    #: Pasta local (no despachante) das pastas de trabalho das tentativas.
+    work_dir: Path
+    #: Pasta local dos artefatos, a mesma do store (``RAPA_PASTA_ARTEFATOS``).
+    artifacts_dir: Path
+    #: Como os pods rodam (``RAPA_K8S_*``).
+    pod: PodSettings
+    #: O endereço do canal que os pods usam, já com o IP deste despachante
+    #: (:func:`rapa.control.kube.channel_address`).
+    channel_address: str
+    browser_args: tuple[str, ...] = ()
+    #: Pasta dos arquivos de entrada, com uma subpasta por empresa (como no lançador
+    #: local): os que as entradas de arquivo da tentativa citam vão para o pod pelo canal.
+    files_dir: Path | None = None
+    #: A guarda da saída, que no pod sempre vale (as redes internas e o proxy de saída).
+    egress: EgressPolicy = field(default_factory=EgressPolicy)
+    video_on_failure: bool = False
+    video_close_s: float = VIDEO_CLOSE_TIMEOUT_S
+    #: Intervalo de leitura dos eventos que o canal grava.
+    poll_s: float = 0.1
+    #: Intervalo entre duas consultas da fase do pod.
+    status_interval_s: float = 2.0
+    ack_timeout_s: float = 30.0
+    #: Tempo entre o SIGTERM e o SIGKILL do worker (dentro do pod).
+    kill_grace_s: float = 10.0
+    #: Folga além do prazo da execução antes de apagar o pod.
+    deadline_grace_s: float = 15.0
+    #: Tempo para o agente entregar o resultado depois que o worker para.
+    upload_grace_s: float = 20.0
+    #: Quanto um pod pode ficar sem subir (agendamento, imagem) ou sem buscar o trabalho.
+    start_timeout_s: float = 120.0
+    #: Intervalo da varredura dos pods e Secrets órfãos.
+    sweep_interval_s: float = 60.0
+    keep_work_dir: bool = False
+
+
+def pod_name(job: RunnerJob) -> str:
+    """O nome do Secret e do Pod de uma tentativa (o mesmo para os dois)."""
+    return f"rapa-execucao-{job.run_id}-{job.attempt}"
+
+
+def executor_labels(job: RunnerJob) -> dict[str, str]:
+    return {
+        LABEL_APP: EXECUTOR_APP,
+        "app.kubernetes.io/part-of": "rapa",
+        LABEL_RUN: str(job.run_id),
+        LABEL_COMPANY: str(job.company_id),
+        LABEL_ATTEMPT: str(job.attempt),
+    }
+
+
+def _labelled_attempt(item: Mapping[str, Any]) -> tuple[str, tuple[UUID, int]] | None:
+    """O nome e a tentativa de um pod ou Secret de execução, pelos rótulos."""
+    metadata = item.get("metadata") or {}
+    labels = metadata.get("labels") or {}
+    name = metadata.get("name")
+    try:
+        run_id = UUID(str(labels.get(LABEL_RUN)))
+        attempt = int(str(labels.get(LABEL_ATTEMPT)))
+    except ValueError:
+        return None
+    if not isinstance(name, str) or attempt < 1:
+        return None
+    return name, (run_id, attempt)
+
+
+def _read_pfx(path: str) -> bytes | None:
+    try:
+        with Path(path).open("rb") as handle:
+            data = handle.read(_MAX_PFX_BYTES + 1)
+    except OSError:
+        return None
+    return data if 0 < len(data) <= _MAX_PFX_BYTES else None
+
+
+def _pod_secrets(secrets: Mapping[str, Mapping[str, str]]) -> dict[str, dict[str, str]]:
+    """Os segredos no formato do canal: o certificado A1 vai em ``pfx_base64``.
+
+    Um ``pfx_path`` (o arquivo de desenvolvimento) é um caminho desta máquina: o arquivo
+    é lido aqui e vai inteiro. Se não puder ser lido, o certificado fica de fora e o
+    worker falha com ``segredo_indisponivel`` claro, sem abrir o navegador.
+    """
+    out: dict[str, dict[str, str]] = {}
+    for name, fields in secrets.items():
+        converted = {key: value for key, value in fields.items() if key != "pfx_path"}
+        path = fields.get("pfx_path")
+        if path and "pfx_base64" not in converted:
+            data = _read_pfx(path)
+            if data is None:
+                logger.warning("o certificado A1 de uma credencial não pôde ser lido")
+            else:
+                converted["pfx_base64"] = base64.b64encode(data).decode("ascii")
+        out[name] = converted
+    return out
+
+
+@dataclass
+class _Outcome:
+    """Como terminou o seguimento do pod: com um problema na subida, ou não."""
+
+    problem: tuple[str, str] | None = None
+
+
+class KubernetesLauncher(_Follower):
+    """Lançador do despachante com um pod de uso único por tentativa (ver o módulo)."""
+
+    def __init__(
+        self,
+        events: EventIngestor,
+        settings: KubernetesLauncherSettings,
+        *,
+        api: KubeApi,
+        channel: Channel,
+        secrets: SecretSource | None = None,
+        attempts: AttemptRegistry | None = None,
+    ) -> None:
+        self.events = events
+        self.settings = settings
+        self.api = api
+        self.channel = channel
+        self.secrets: SecretSource = secrets or NoSecrets()
+        self.attempts = attempts
+        #: Tentativas que este processo lançou e ainda acompanha (a varredura não as toca).
+        self._live: set[tuple[UUID, int]] = set()
+
+    def __repr__(self) -> str:
+        return f"KubernetesLauncher(namespace={self.settings.pod.namespace!r})"
+
+    @property
+    def grace_s(self) -> float:
+        """Folga além do prazo da execução antes de apagar o pod (com o vídeo, mais)."""
+        grace = self.settings.deadline_grace_s
+        if self.settings.video_on_failure:
+            grace += self.settings.video_close_s
+        return grace
+
+    def _paths(self, job: RunnerJob) -> tuple[Path, Path]:
+        work = self.settings.work_dir / f"{job.run_id}-{job.attempt}"
+        artifacts = attempt_dir(
+            self.settings.artifacts_dir, job.company_id, job.run_id, job.attempt
+        )
+        return work, artifacts
+
+    def _options(self, files: Mapping[str, Path] | None = None) -> PodOptions:
+        settings = self.settings
+        proxy = settings.egress.upstream_proxy
+        return PodOptions(
+            egress_guard=True,
+            internal_networks=tuple(str(net) for net in settings.egress.allowed_networks),
+            egress_proxy=proxy.url if proxy is not None else None,
+            video=settings.video_on_failure,
+            ack_timeout_s=settings.ack_timeout_s,
+            browser_args=settings.browser_args,
+            grace_s=self.grace_s,
+            files=tuple(files) if files is not None else None,
+        )
+
+    def _input_files(self, job: RunnerJob) -> dict[str, Path] | None:
+        """Os arquivos de entrada que o pod pode buscar: os das entradas de arquivo.
+
+        Só os da pasta da empresa da tarefa, com as regras do lançador local
+        (:class:`rapa.runner.ports.LocalFileProvider`): um identificador inválido, de fora
+        da pasta ou que não existe fica de fora, e o passo de envio falha com "arquivo
+        não encontrado", como no local. Sem ``files_dir``, ``None`` (o worker fica sem
+        pasta de arquivos, como no local).
+        """
+        if self.settings.files_dir is None:
+            return None
+        provider = LocalFileProvider(self.settings.files_dir / str(job.company_id))
+        found: dict[str, Path] = {}
+        for spec in job.manifest.inputs:
+            value = job.inputs.get(spec.name)
+            if spec.type is not FieldType.FILE or not isinstance(value, str) or value in found:
+                continue
+            try:
+                found[value] = provider.resolve(value)
+            except FileUnavailable:
+                continue
+        return found
+
+    def _manifests(
+        self, job: RunnerJob, ticket: str
+    ) -> tuple[dict[str, Any], Callable[[Mapping[str, Any]], dict[str, Any]]]:
+        settings = self.settings
+        name = pod_name(job)
+        labels = executor_labels(job)
+        address = f"{settings.channel_address}/canal/{job.run_id}/{job.attempt}"
+        secret = secret_manifest(
+            settings.pod,
+            name=name,
+            labels=labels,
+            data={"endereco": address.encode(), "bilhete": ticket.encode()},
+        )
+        remaining = (job.deadline - datetime.now(UTC)).total_seconds()
+        stop_grace = settings.kill_grace_s + settings.upload_grace_s
+
+        def pod(owner: Mapping[str, Any]) -> dict[str, Any]:
+            return pod_manifest(
+                settings.pod,
+                name=name,
+                labels=labels,
+                owner=owner,
+                args=["python", "-m", "rapa.runner.pod"],
+                mount_path="/var/run/rapa/canal",
+                # Mesmo sem o despachante, o pod não passa do prazo da execução.
+                active_deadline_s=max(remaining, 1.0) + self.grace_s + stop_grace,
+                termination_grace_s=stop_grace,
+            )
+
+        return secret, pod
+
+    async def launch(self, job: RunnerJob) -> dict[str, Any]:
+        """Roda a tentativa num pod e devolve o RESULT.json (ver o módulo).
+
+        Falhas antes de o pod existir (pasta, segredos, a API do Kubernetes) levantam
+        :class:`WorkerNotStarted` com o código ``executor_nao_iniciou``: nada pode ter
+        rodado. Antes de decidir o resultado, a tentativa fecha no canal e os pedidos do
+        pod que estavam no meio terminam: nada do pod chega depois da decisão.
+        """
+        work, artifacts = self._paths(job)
+        name = pod_name(job)
+        namespace = self.settings.pod.namespace
+        key = (job.run_id, job.attempt)
+        self._live.add(key)
+        attempt: ChannelAttempt | None = None
+        created = False
+        try:
+            try:
+                await asyncio.to_thread(self._prepare, work, artifacts)
+                secrets = await asyncio.to_thread(_pod_secrets, await self.secrets.secrets_for(job))
+                files = await asyncio.to_thread(self._input_files, job)
+                attempt, ticket = self.channel.open(
+                    job,
+                    work_dir=work,
+                    artifacts_dir=artifacts,
+                    secrets=secrets,
+                    options=self._options(files).wire(),
+                    files=files,
+                )
+                del secrets
+                secret_body, pod_body = self._manifests(job, ticket)
+                del ticket
+                secret = await self.api.create(namespace, "secrets", secret_body)
+                created = True
+                await self.api.create(namespace, "pods", pod_body(secret))
+            except KubeError as exc:
+                raise WorkerNotStarted(
+                    "o Kubernetes recusou o pod do executor",
+                    code=EXECUTOR_NOT_STARTED,
+                    public_message=(
+                        f"O Kubernetes recusou o pod do executor ({exc.reason}, {exc.status}); "
+                        "nenhum passo foi executado."
+                    ),
+                ) from exc
+            except Exception as exc:
+                raise WorkerNotStarted(
+                    "o pod do executor não pôde ser criado",
+                    code=EXECUTOR_NOT_STARTED,
+                    public_message="O pod do executor não pôde ser criado; nenhum passo foi executado.",
+                ) from exc
+            outcome = await self._follow(job, attempt, work, name)
+            # Fecha antes de decidir (sem espera no meio desde o seguimento): o pod não
+            # busca mais o trabalho, e o que ele ainda enviava acaba antes de o resultado
+            # ser lido e de o que ele não cita ser apagado.
+            await self._close(attempt)
+            return await asyncio.to_thread(self._result, job, work, artifacts, attempt, outcome)
+        finally:
+            if attempt is not None and not attempt.closed:
+                await asyncio.shield(self._close(attempt))
+            if created:
+                await asyncio.shield(self._remove(name))
+            await asyncio.to_thread(self._cleanup, work)
+            self._live.discard(key)
+
+    async def _close(self, attempt: ChannelAttempt) -> None:
+        self.channel.close(attempt.run_id, attempt.attempt)
+        if not await self.channel.drain(attempt):
+            logger.warning("um envio do pod de %s não terminou a tempo", attempt.run_id)
+
+    def _acknowledged(self, job: RunnerJob) -> None:
+        attempt = self.channel.get(job.run_id, job.attempt)
+        if attempt is not None:
+            attempt.wake_acks()
+
+    def _prepare(self, work: Path, artifacts: Path) -> None:
+        self.settings.work_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if work.exists():
+            shutil.rmtree(work)
+        work.mkdir(mode=0o700)
+        (work / "ack").mkdir(mode=0o700)
+        artifacts.mkdir(parents=True, exist_ok=True)
+
+    async def _pod(self, name: str) -> PodState | None:
+        """A situação do pod; ``None`` se a API não respondeu agora (tenta na próxima)."""
+        try:
+            return pod_state(await self.api.get(self.settings.pod.namespace, "pods", name))
+        except Exception as exc:
+            logger.warning("a API do Kubernetes não respondeu: %s", type(exc).__name__)
+            return None
+
+    async def _delete_pod(self, name: str, grace_s: float) -> None:
+        try:
+            await self.api.delete(
+                self.settings.pod.namespace, "pods", name, grace_s=int(grace_s + 0.999)
+            )
+        except Exception as exc:
+            logger.warning("o pod de uma execução não foi apagado: %s", type(exc).__name__)
+
+    async def _remove(self, name: str) -> None:
+        """Apaga o Secret (o coletor apaga o pod com ele) e o pod, sem esperar."""
+        namespace = self.settings.pod.namespace
+        for plural in ("secrets", "pods"):
+            try:
+                await self.api.delete(namespace, plural, name)
+            except Exception as exc:
+                # A varredura apaga depois o que ficar para trás.
+                logger.warning("falha ao apagar %s de uma execução: %s", plural, type(exc).__name__)
+
+    def _not_started(
+        self, state: PodState, attempt: ChannelAttempt, overdue: bool
+    ) -> tuple[str, str] | None:
+        """O problema de um pod que não subiu (ou nunca buscou o trabalho), se houver."""
+        if attempt.fetched:
+            return None
+        if state.stuck:
+            return (
+                EXECUTOR_NOT_STARTED,
+                f"O pod do executor não iniciou ({state.reason}); nenhum passo foi executado.",
+            )
+        if not overdue:
+            return None
+        if state.phase in ("Pending", "Unknown"):
+            reason = state.reason or state.phase
+            return (
+                EXECUTOR_NOT_STARTED,
+                f"O pod do executor não iniciou a tempo ({reason}); nenhum passo foi executado.",
+            )
+        return (
+            EXECUTOR_NOT_STARTED,
+            "O pod do executor não falou com o despachante a tempo; nenhum passo foi executado.",
+        )
+
+    async def _follow(
+        self, job: RunnerJob, attempt: ChannelAttempt, work: Path, name: str
+    ) -> _Outcome:
+        settings = self.settings
+        tail = _EventTail(work / "events.jsonl")
+        pending: list[dict[str, Any]] = []
+        loop = asyncio.get_running_loop()
+        limit = (job.deadline - datetime.now(UTC)).total_seconds() + self.grace_s
+        give_up = loop.time() + max(limit, 1.0)
+        start_by = loop.time() + settings.start_timeout_s
+        next_status = loop.time() + settings.status_interval_s
+        stop_grace = settings.kill_grace_s + settings.upload_grace_s
+        try:
+            while True:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(attempt.result_received.wait(), settings.poll_s)
+                await self._forward(job, tail, work, pending)
+                if attempt.result_received.is_set():
+                    await self._forward(job, tail, work, pending, final=True)
+                    return _Outcome()
+                now = loop.time()
+                if now >= next_status:
+                    next_status = now + settings.status_interval_s
+                    state = await self._pod(name)
+                    if state is not None:
+                        if state.finished:
+                            # Sem resultado: o agente entrega antes de sair. O que chegou fica.
+                            await self._forward(job, tail, work, pending, final=True)
+                            return _Outcome()
+                        problem = self._not_started(state, attempt, now >= start_by)
+                        if problem is not None:
+                            logger.error("o pod da execução %s não iniciou", job.run_id)
+                            return _Outcome(problem)
+                if now >= give_up:
+                    logger.warning("execução %s passou do prazo; apagando o pod", job.run_id)
+                    await self._delete_pod(name, stop_grace)
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(attempt.result_received.wait(), stop_grace + 5.0)
+                    await self._forward(job, tail, work, pending, final=True)
+                    return _Outcome()
+        except BaseException:
+            # Cancelamento (tentativa antiga, encerramento) ou erro ao gravar eventos: o pod
+            # sai já (o canal fecha logo em seguida, e nada mais dele é aceito).
+            await asyncio.shield(self._delete_pod(name, settings.kill_grace_s))
+            raise
+
+    def _result(
+        self,
+        job: RunnerJob,
+        work: Path,
+        artifacts: Path,
+        attempt: ChannelAttempt,
+        outcome: _Outcome,
+    ) -> dict[str, Any]:
+        # A tentativa já fechou no canal: nada disto muda mais.
+        received = attempt.result_received.is_set()
+        if not received and not attempt.fetched:
+            if outcome.problem is not None:
+                code, message = outcome.problem
+                return failure_result(job, code, message, started=False)
+            return failure_result(
+                job,
+                EXECUTOR_NOT_STARTED,
+                "O pod do executor terminou sem buscar o trabalho; nenhum passo foi executado.",
+                started=False,
+            )
+        if not received:
+            # Só vale o resultado que o canal recebeu inteiro antes de fechar.
+            logger.error("o pod de %s terminou sem resultado", job.run_id)
+            self._discard_unlisted(artifacts, ())
+            return failure_result(
+                job, "executor_sem_resultado", "O executor terminou sem entregar o resultado."
+            )
+        result = self._read_result(job, work, None)
+        listed: set[str] = set()
+        for item in result.get("artifacts") or []:
+            name = item.get("name") if isinstance(item, dict) else None
+            if isinstance(name, str) and valid_artifact_name(name):
+                # O caminho do pod não vale aqui: o arquivo é o que o canal gravou.
+                item["path"] = str(artifacts / name)
+                listed.add(name)
+        self._discard_unlisted(artifacts, listed)
+        return result
+
+    @staticmethod
+    def _discard_unlisted(artifacts: Path, listed: Collection[str]) -> None:
+        """Apaga o que o pod mandou e o resultado não cita (nunca vira evidência)."""
+        with contextlib.suppress(FileNotFoundError):
+            for entry in artifacts.iterdir():
+                if entry.name not in listed:
+                    with contextlib.suppress(OSError):
+                        entry.unlink()
+
+    def _cleanup(self, work: Path) -> None:
+        if not self.settings.keep_work_dir:
+            shutil.rmtree(work, ignore_errors=True)
+
+    # -- órfãos --------------------------------------------------------------------
+
+    async def sweep(self) -> int:
+        """Apaga os pods e Secrets de execução sem tentativa viva; devolve quantos nomes.
+
+        Viva é a tentativa que este processo acompanha ou que o banco tem como a atual
+        de uma execução rodando (de qualquer réplica). Sem o banco (``attempts``),
+        nada que não seja deste processo é apagado.
+        """
+        namespace = self.settings.pod.namespace
+        selector = f"{LABEL_APP}={EXECUTOR_APP}"
+        found: dict[str, tuple[UUID, int]] = {}
+        unlabelled: set[str] = set()
+        for plural in ("pods", "secrets"):
+            for item in await self.api.list(namespace, plural, label_selector=selector):
+                name = (item.get("metadata") or {}).get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                labelled = _labelled_attempt(item)
+                if labelled is None:
+                    # Rótulo de execução sem uma tentativa legível: nenhum lançador cria
+                    # isso, então nunca é de uma tentativa viva (e não fica para sempre).
+                    unlabelled.add(name)
+                elif labelled[1] not in self._live:
+                    found[labelled[0]] = labelled[1]
+        if (not found and not unlabelled) or self.attempts is None:
+            return 0
+        live = await self.attempts.live_attempts(set(found.values())) if found else set()
+        removed = 0
+        for name in sorted(unlabelled - set(found)):
+            await self._remove(name)
+            removed += 1
+        for name, key in found.items():
+            if key in live or key in self._live:
+                continue
+            await self._remove(name)
+            removed += 1
+        if removed:
+            logger.warning("%d pod(s) de execução órfão(s) apagado(s)", removed)
+        return removed
+
+    async def run_sweeper(self, stop: asyncio.Event) -> None:
+        """Varre na subida e a cada ``sweep_interval_s`` até ``stop``."""
+        while not stop.is_set():
+            try:
+                await self.sweep()
+            except Exception as exc:
+                logger.warning("falha na varredura dos pods de execução: %s", type(exc).__name__)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=self.settings.sweep_interval_s)

@@ -3,11 +3,14 @@
 Uso (pelo lançador do plano de controle, nunca à mão)::
 
     python -m rapa.session.host < config.json
+    python -m rapa.session.host --config /var/run/rapa/sessao/config.json
 
-A configuração (:class:`HostConfig`) chega numa linha JSON pela entrada padrão,
-com o token da sessão: nada sensível vai na linha de comando, que outros
-processos da máquina enxergam. Quando o canal está pronto, o hospedeiro escreve
-uma única linha na saída padrão, ``{"pronto": true, "porta": N}``.
+A configuração (:class:`HostConfig`) chega numa linha JSON pela entrada padrão
+(o lançador local) ou num arquivo (o Secret montado no pod da sessão), com o token
+da sessão: nada sensível vai na linha de comando, que outros processos da máquina
+enxergam. Quando o canal está pronto, o hospedeiro escreve uma única linha na saída
+padrão, ``{"pronto": true, "porta": N}``; no pod, quem sabe que ele está pronto é a
+prontidão TCP da porta do canal.
 
 O hospedeiro:
 
@@ -41,6 +44,7 @@ quadros nem segredos em disco ou no log: o log só leva mensagens fixas e nomes 
 tipos de erro.
 """
 
+import argparse
 import asyncio
 import base64
 import contextlib
@@ -48,12 +52,13 @@ import hmac
 import json
 import logging
 import os
+import shlex
 import shutil
 import signal
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -68,14 +73,21 @@ from playwright.async_api import (
     async_playwright,
 )
 from playwright.async_api import Error as PlaywrightError
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 
 from rapa.recorder.recorder import Recorder, RecorderError, redact_url
 from rapa.runner.browser import LOCALE, TIMEZONE, resolve_executable
-from rapa.session.egress import BROWSER_NETWORK_ARGS, WEBRTC_OFF_SCRIPT, EgressGuard
+from rapa.session.egress import (
+    BROWSER_NETWORK_ARGS,
+    PROXY_SWITCHES,
+    WEBRTC_OFF_SCRIPT,
+    EgressGuard,
+    EgressPolicy,
+    without_proxy_switches,
+)
 from rapa.session.keys import MouseState, key_commands, text_commands, wheel_commands
 from rapa.session.protocol import (
     MAX_CLIENT_MESSAGE,
@@ -117,23 +129,19 @@ _WEB_SCHEMES = frozenset({"http", "https", "about", "blob", "data", "chrome-erro
 _REFUSAL_WINDOW_S = 3.0
 #: Intervalo mínimo entre dois avisos de endereço interno recusado.
 _REFUSAL_WARNING_S = 10.0
-#: Os argumentos do operador que decidem por onde o navegador sai valem para o executor
-#: (``RAPA_ARGS_NAVEGADOR`` é o mesmo), nunca para a sessão: o Chromium obedece ao último
-#: ``--proxy-server`` e ao último ``--proxy-bypass-list`` (que desfaz o ``<-loopback>``), e
-#: ``--no-proxy-server`` vence os dois; qualquer um deles tiraria a guarda do caminho.
-_PROXY_SWITCHES = frozenset(
-    {"proxy-server", "no-proxy-server", "proxy-pac-url", "proxy-auto-detect", "proxy-bypass-list"}
-)
+#: Os argumentos do operador que decidem por onde o navegador sai nunca valem para a
+#: sessão (:data:`rapa.session.egress.PROXY_SWITCHES`): tirariam a guarda do caminho.
+_PROXY_SWITCHES = PROXY_SWITCHES
 
 
 def _session_args(args: tuple[str, ...]) -> list[str]:
     """Os argumentos do operador sem os que mudam o proxy do navegador."""
-    return [a for a in args if a.split("=", 1)[0].lstrip("-") not in _PROXY_SWITCHES]
+    return without_proxy_switches(args)
 
 
 _REFUSED_TEXT = (
-    "O navegador da gravação não abre endereços internos do servidor (a própria máquina e o "
-    "metadata da nuvem). Use o endereço público do portal."
+    "O navegador da gravação não abre endereços internos do servidor (a própria máquina, o "
+    "metadata da nuvem e as redes internas não permitidas). Use o endereço público do portal."
 )
 
 
@@ -166,11 +174,31 @@ class HostConfig(BaseModel):
     jpeg_quality: int = Field(default=60, ge=20, le=95)
     #: Onde criar a pasta temporária do perfil (padrão: a pasta temporária do sistema).
     profile_parent: str | None = None
+    #: Rede interna fechada (menos ``allowed_networks``) e o proxy de saída; sem ela, só a
+    #: própria máquina, o link-local e o metadata ficam fechados (ver :mod:`rapa.session.egress`).
+    egress_policy: bool = False
+    #: Redes internas que o navegador alcança, com ``egress_policy`` (``10.20.0.0/16``).
+    allowed_networks: tuple[str, ...] = Field(default=(), max_length=256)
+    #: Proxy HTTP CONNECT de saída, com ``egress_policy`` (``http://proxy.interno:3128``).
+    upstream_proxy: str | None = Field(default=None, max_length=2000)
 
     @field_validator("start_url")
     @classmethod
     def _check_url(cls, value: str) -> str:
         return check_web_url(value)
+
+    @model_validator(mode="after")
+    def _check_egress(self) -> HostConfig:
+        if (self.allowed_networks or self.upstream_proxy) and not self.egress_policy:
+            raise ValueError("as redes internas e o proxy de saída só valem com egress_policy")
+        self.policy()  # redes e proxy no formato certo (ValueError, sem repetir segredo)
+        return self
+
+    def policy(self) -> EgressPolicy | None:
+        """A política da guarda da saída, se houver."""
+        if not self.egress_policy:
+            return None
+        return EgressPolicy.parse(self.allowed_networks, self.upstream_proxy)
 
 
 type _Factory = Callable[[], Coroutine[Any, Any, None]]
@@ -242,7 +270,9 @@ class SessionHost:
     async def _run(self, ready: Callable[[int], None]) -> EndReason:
         if self._ended is None or self.profile_dir is None:  # pragma: no cover - só por run()
             raise RuntimeError("a sessão não foi iniciada por run()")
-        egress = EgressGuard.from_browser_args(self.config.browser_args, on_refused=self._refused)
+        egress = EgressGuard.from_browser_args(
+            self.config.browser_args, on_refused=self._refused, policy=self.config.policy()
+        )
         egress_port = await egress.start()
         try:
             return await self._run_browser(ready, egress_port, self.profile_dir, self._ended)
@@ -728,23 +758,64 @@ def _port(server: Server) -> int:
     raise RuntimeError("o canal da sessão não abriu porta")
 
 
-def _read_config(stream: Any) -> HostConfig:
-    line = stream.readline(64 * 1024)
+#: Tamanho máximo da configuração (pela entrada padrão ou pelo arquivo).
+_MAX_CONFIG = 64 * 1024
+
+
+def _parse_config(raw: str | bytes) -> HostConfig:
     try:
-        return HostConfig.model_validate(json.loads(line))
+        return HostConfig.model_validate(json.loads(raw))
     except ValueError, ValidationError:
         # Nunca repetir a configuração: ela tem o token da sessão.
-        raise SystemExit("rapa.session.host: configuração inválida na entrada padrão") from None
+        raise SystemExit("rapa.session.host: configuração inválida") from None
 
 
-def main() -> int:
-    """Lê a configuração, roda a sessão e devolve o código de saída."""
+def _read_config(stream: Any) -> HostConfig:
+    return _parse_config(stream.readline(_MAX_CONFIG))
+
+
+def _read_config_file(path: Path) -> HostConfig:
+    """A configuração num arquivo (o Secret montado no pod da sessão)."""
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(_MAX_CONFIG + 1)
+    except OSError:
+        raise SystemExit("rapa.session.host: o arquivo de configuração não pôde ser lido") from None
+    if len(raw) > _MAX_CONFIG:
+        raise SystemExit("rapa.session.host: configuração grande demais")
+    return _parse_config(raw)
+
+
+def _with_image_args(config: HostConfig, env: Mapping[str, str]) -> HostConfig:
+    """Os argumentos do navegador da imagem (``RAPA_ARGS_NAVEGADOR`` do pod) antes dos da sessão.
+
+    O lançador local passa só o ambiente mínimo (sem ``RAPA_*``), então isto só vale no
+    pod da sessão, onde a imagem do executor diz como o Chromium roda nela.
+    """
+    image = tuple(shlex.split(env.get("RAPA_ARGS_NAVEGADOR", "")))
+    if not image:
+        return config
+    return config.model_copy(update={"browser_args": (*image, *config.browser_args)})
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Lê a configuração, roda a sessão e devolve o código de saída.
+
+    A configuração chega pela entrada padrão (o lançador local) ou, com ``--config``,
+    de um arquivo (o Secret montado no pod da sessão, :mod:`rapa.control.sessions.launcher`).
+    No pod, o lançador sabe que o hospedeiro está pronto quando a porta do canal aceita
+    conexões (a prontidão TCP do pod); a linha de pronto sai do mesmo jeito.
+    """
+    parser = argparse.ArgumentParser(prog="python -m rapa.session.host")
+    parser.add_argument("--config", type=Path, default=None, help="arquivo da configuração")
+    args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.WARNING,
         stream=sys.stderr,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    config = _read_config(sys.stdin)
+    config = _read_config(sys.stdin) if args.config is None else _read_config_file(args.config)
+    config = _with_image_args(config, os.environ)
     host = SessionHost(config)
 
     def ready(port: int) -> None:

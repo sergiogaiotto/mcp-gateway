@@ -5,9 +5,10 @@ Uso::
     python -m rapa.server
 
 A configuração vem de variáveis de ambiente (veja :meth:`ServerSettings.from_env`).
-Em produção, o despachante roda em réplicas próprias (``RAPA_DESPACHANTE=1`` e
-``RAPA_HTTP=0``) e o lançador local dá lugar aos pods de uso único; na Fase 0 e
-em desenvolvimento, tudo cabe num processo.
+Em produção, o despachante roda em réplicas próprias (``RAPA_HTTP=0``, com
+``RAPA_DISPATCHER_DATABASE_URL``) e o lançador local dá lugar aos pods de uso único
+(``RAPA_EXECUTOR=kubernetes``, com o canal do despachante na ``RAPA_CANAL_PORTA``); na
+Fase 0 e em desenvolvimento, tudo cabe num processo.
 
 O esquema do banco é criado antes, com ``python -m rapa.control.db.migrate``.
 """
@@ -26,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import FastAPI
@@ -45,9 +46,20 @@ from rapa.control.auth import (
     JwtSettings,
     TokenVerifier,
 )
+from rapa.control.channel import Channel, ChannelServer
 from rapa.control.db import Database
 from rapa.control.http_app import HttpSettings, create_http_app
+from rapa.control.kube import (
+    KubeApi,
+    KubeConfig,
+    PodSettings,
+    channel_address,
+    parse_node_selector,
+    parse_tolerations,
+)
 from rapa.control.launcher import (
+    KubernetesLauncher,
+    KubernetesLauncherSettings,
     LocalLauncherSettings,
     LocalProcessLauncher,
     NoSecrets,
@@ -87,8 +99,10 @@ from rapa.control.sessions import (
     RecordingSessions,
     SessionLimits,
 )
+from rapa.control.sessions.launcher import KubernetesSessionLauncher, KubernetesSessionSettings
 from rapa.core.contracts import Principal
 from rapa.runner.video import ffmpeg_installed
+from rapa.session.egress import EgressPolicy
 
 __all__ = [
     "AuthenticatorLoginResolver",
@@ -97,6 +111,7 @@ __all__ = [
     "build_artifact_store",
     "build_artifacts",
     "build_credentials",
+    "build_pod_launcher",
     "build_publishing",
     "build_repairs",
     "build_scheduler",
@@ -127,6 +142,20 @@ def _flag(env: Mapping[str, str], name: str, default: bool) -> bool:
 def _path(env: Mapping[str, str], name: str) -> Path | None:
     raw = env.get(name, "").strip()
     return Path(raw) if raw else None
+
+
+def _json(env: Mapping[str, str], name: str) -> Any:
+    raw = env.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        # Sem repetir o valor: só o nome da variável.
+        raise ValueError(f"{name} precisa ser um JSON válido") from None
+
+
+type Executor = Literal["local", "kubernetes"]
 
 
 class ServerSettings(BaseModel):
@@ -207,6 +236,66 @@ class ServerSettings(BaseModel):
     retention_success_days: int = Field(default=7, ge=1, le=36_500)
     retention_failure_days: int = Field(default=90, ge=1, le=36_500)
     retention_events_days: int = Field(default=400, ge=1, le=36_500)
+    #: Onde rodam as execuções: ``local`` (um processo) ou ``kubernetes`` (um pod cada).
+    executor: Executor = "local"
+    #: Onde rodam as sessões de gravação; ``None``: o mesmo das execuções.
+    sessions_executor: Executor | None = None
+    k8s_namespace: str = "rapa-execucoes"
+    k8s_image: str | None = None
+    #: ``None`` (``RAPA_K8S_RUNTIME_CLASS`` vazia) só para kind e desenvolvimento.
+    k8s_runtime_class: str | None = "gvisor"
+    k8s_cpu: str = "1"
+    k8s_memory: str = "2Gi"
+    k8s_service_account: str | None = None
+    k8s_pull_secret: str | None = None
+    k8s_node_selector: dict[str, str] = Field(default_factory=dict)
+    k8s_tolerations: tuple[dict[str, Any], ...] = ()
+    #: Endereço do canal que os pods usam (``{ip}`` vira o IP deste pod).
+    channel_address: str | None = None
+    channel_port: int = Field(default=8081, ge=1, le=65535)
+    #: Proxy HTTP CONNECT de saída para a internet dos navegadores.
+    egress_proxy: str | None = Field(default=None, max_length=2000)
+    #: Redes internas (CIDR) que os navegadores alcançam além da internet.
+    internal_networks: tuple[str, ...] = ()
+
+    @property
+    def sessions_runner(self) -> Executor:
+        """Onde rodam as sessões de gravação (``RAPA_SESSOES_EXECUTOR``, ou o das execuções)."""
+        return self.sessions_executor or self.executor
+
+    @property
+    def egress_guard(self) -> bool:
+        """Se o navegador das execuções (e das sessões) sai pela guarda com a rede interna
+        fechada: nos pods, com redes internas permitidas ou proxy de saída, e sempre fora
+        do modo de desenvolvimento."""
+        return (
+            self.executor == "kubernetes"
+            or bool(self.internal_networks)
+            or self.egress_proxy is not None
+            or not self.dev
+        )
+
+    def egress_policy(self) -> EgressPolicy:
+        """A política da guarda da saída (as redes internas permitidas e o proxy)."""
+        return EgressPolicy.parse(self.internal_networks, self.egress_proxy)
+
+    def local_egress(self) -> EgressPolicy | None:
+        """A guarda dos navegadores locais: ``None`` só no desenvolvimento sem redes nem proxy."""
+        return self.egress_policy() if self.egress_guard else None
+
+    def pod_settings(self) -> PodSettings:
+        """Como rodam os pods de execução e de sessão (``RAPA_K8S_*``)."""
+        return PodSettings(
+            image=self.k8s_image or "",
+            namespace=self.k8s_namespace,
+            runtime_class=self.k8s_runtime_class,
+            cpu=self.k8s_cpu,
+            memory=self.k8s_memory,
+            service_account=self.k8s_service_account,
+            pull_secret=self.k8s_pull_secret,
+            node_selector=dict(self.k8s_node_selector),
+            tolerations=tuple(self.k8s_tolerations),
+        )
 
     @model_validator(mode="after")
     def _check(self) -> ServerSettings:
@@ -238,6 +327,19 @@ class ServerSettings(BaseModel):
             raise ValueError("para o login OIDC, informe o cliente e o endereço de retorno")
         if self.ui and self.http and self.oidc_client_id and not self.jwt_issuer:
             raise ValueError("o login OIDC da interface precisa do emissor (RAPA_JWT_ISSUER)")
+        try:
+            self.egress_policy()
+        except ValueError as exc:
+            raise ValueError(f"RAPA_REDES_INTERNAS_PERMITIDAS ou RAPA_PROXY_SAIDA: {exc}") from None
+        if "kubernetes" in (self.executor, self.sessions_runner):
+            if not self.k8s_image:
+                raise ValueError(
+                    "no modo kubernetes, informe a imagem do executor (RAPA_K8S_IMAGEM_EXECUTOR)"
+                )
+            self.pod_settings()  # nomes, quantidades e rótulos no formato do Kubernetes
+        if self.executor == "kubernetes":
+            # Só o formato: o IP deste pod é descoberto ao montar o despachante.
+            channel_address(self.channel_address, self.channel_port, resolve_ip=lambda: "10.0.0.1")
         return self
 
     @classmethod
@@ -306,7 +408,28 @@ class ServerSettings(BaseModel):
           deram certo, e os retratos das falhas; padrão 90) e
           ``RAPA_RETENCAO_EVENTOS_DIAS`` (partições de eventos; padrão 400). Todos têm
           no mínimo 1 dia, e ``RAPA_RETENCAO_SUCESSO_DIAS`` não passa de
-          ``RAPA_RETENCAO_FALHAS_DIAS`` (o servidor não sobe).
+          ``RAPA_RETENCAO_FALHAS_DIAS`` (o servidor não sobe);
+        - execuções e sessões em pods: ``RAPA_EXECUTOR`` (``local``, o padrão, ou
+          ``kubernetes``: cada tentativa num pod de uso único, ver
+          :class:`rapa.control.launcher.KubernetesLauncher`) e ``RAPA_SESSOES_EXECUTOR``
+          (o mesmo para as sessões de gravação; padrão igual a ``RAPA_EXECUTOR``), com
+          ``RAPA_K8S_NAMESPACE_EXECUCOES`` (padrão ``rapa-execucoes``),
+          ``RAPA_K8S_IMAGEM_EXECUTOR`` (obrigatória no modo kubernetes),
+          ``RAPA_K8S_RUNTIME_CLASS`` (padrão ``gvisor``; vazia, sem RuntimeClass, só para
+          kind e desenvolvimento), ``RAPA_K8S_CPU`` (padrão 1), ``RAPA_K8S_MEMORIA``
+          (padrão 2Gi), ``RAPA_K8S_SA_EXECUTOR`` (a conta de serviço dos pods, sem token
+          montado), ``RAPA_K8S_PULL_SECRET``, ``RAPA_K8S_NODE_SELECTOR`` e
+          ``RAPA_K8S_TOLERATIONS`` (JSON); o canal do despachante:
+          ``RAPA_CANAL_PORTA`` (padrão 8081, onde ele escuta) e ``RAPA_CANAL_ENDERECO``
+          (o endereço que os pods usam; padrão ``http://{ip}:<porta>``, e ``{ip}`` vira
+          o IP do pod do despachante: cada réplica recebe os pods que lançou, então um
+          endereço sem ``{ip}``, como o nome de um Service, é recusado na partida);
+        - a guarda da saída dos navegadores: ``RAPA_REDES_INTERNAS_PERMITIDAS`` (CIDRs
+          separados por vírgula que os robôs e as sessões alcançam além da internet, para
+          portais internos; padrão nenhuma) e ``RAPA_PROXY_SAIDA`` (proxy HTTP CONNECT
+          para a internet, ``http://host:porta``, sem usuário e senha). A guarda (só os
+          domínios do robô, a rede interna fechada) vale sempre nos pods e, no lançador
+          local, quando uma das duas está definida e sempre fora de ``RAPA_DEV``.
         """
         env = os.environ if env is None else env
         data: dict[str, Any] = {
@@ -336,7 +459,33 @@ class ServerSettings(BaseModel):
             "llm_capabilities_file": _path(env, "RAPA_LLM_CAPACIDADES"),
             "webhook_key": env.get("RAPA_CHAVE_WEBHOOKS") or None,
             "video_on_failure": _flag(env, "RAPA_VIDEO_EM_FALHAS", True),
+            "executor": env.get("RAPA_EXECUTOR", "").strip().lower() or "local",
+            "sessions_executor": env.get("RAPA_SESSOES_EXECUTOR", "").strip().lower() or None,
+            "k8s_image": env.get("RAPA_K8S_IMAGEM_EXECUTOR", "").strip() or None,
+            "k8s_service_account": env.get("RAPA_K8S_SA_EXECUTOR", "").strip() or None,
+            "k8s_pull_secret": env.get("RAPA_K8S_PULL_SECRET", "").strip() or None,
+            "k8s_node_selector": parse_node_selector(_json(env, "RAPA_K8S_NODE_SELECTOR")),
+            "k8s_tolerations": parse_tolerations(_json(env, "RAPA_K8S_TOLERATIONS")),
+            "channel_address": env.get("RAPA_CANAL_ENDERECO", "").strip() or None,
+            "egress_proxy": env.get("RAPA_PROXY_SAIDA", "").strip() or None,
+            "internal_networks": tuple(
+                n.strip()
+                for n in env.get("RAPA_REDES_INTERNAS_PERMITIDAS", "").split(",")
+                if n.strip()
+            ),
         }
+        for key, name in (
+            ("k8s_namespace", "RAPA_K8S_NAMESPACE_EXECUCOES"),
+            ("k8s_cpu", "RAPA_K8S_CPU"),
+            ("k8s_memory", "RAPA_K8S_MEMORIA"),
+        ):
+            if raw := env.get(name, "").strip():
+                data[key] = raw
+        if (runtime := env.get("RAPA_K8S_RUNTIME_CLASS")) is not None:
+            # Vazia: sem RuntimeClass (só kind e desenvolvimento, sem o gVisor).
+            data["k8s_runtime_class"] = runtime.strip() or None
+        if raw_port := env.get("RAPA_CANAL_PORTA", "").strip():
+            data["channel_port"] = int(raw_port)
         for key, name, kind in (
             ("sessions_per_company", "RAPA_SESSOES_POR_EMPRESA", int),
             ("sessions_max", "RAPA_SESSOES_MAX", int),
@@ -737,7 +886,7 @@ def build_dispatcher(settings: ServerSettings, db: Database) -> Dispatcher:
     """
     queue = PgRunQueue(db)
     store = build_artifact_store(settings)
-    if settings.video_on_failure and ffmpeg_installed() is False:
+    if settings.executor == "local" and settings.video_on_failure and ffmpeg_installed() is False:
         # O worker roda sem vídeo quando ele não abre; sem este aviso, só a falta dos
         # vídeos de falha mostraria que nada está sendo filmado.
         logger.warning(
@@ -745,18 +894,23 @@ def build_dispatcher(settings: ServerSettings, db: Database) -> Dispatcher:
             "instalado: as execuções rodam sem vídeo (instale com 'playwright install "
             "ffmpeg', ou desligue com RAPA_VIDEO_EM_FALHAS=0)"
         )
-    launcher = LocalProcessLauncher(
-        queue,
-        LocalLauncherSettings(
-            work_dir=settings.work_dir,
-            artifacts_dir=settings.artifacts_dir,
-            chromium=settings.chromium,
-            browser_args=settings.browser_args,
-            files_dir=settings.files_dir,
-            video_on_failure=settings.video_on_failure,
-        ),
-        _secret_source(settings),
-    )
+    launcher: LocalProcessLauncher | KubernetesLauncher
+    if settings.executor == "kubernetes":
+        launcher = build_pod_launcher(settings, queue)
+    else:
+        launcher = LocalProcessLauncher(
+            queue,
+            LocalLauncherSettings(
+                work_dir=settings.work_dir,
+                artifacts_dir=settings.artifacts_dir,
+                chromium=settings.chromium,
+                browser_args=settings.browser_args,
+                files_dir=settings.files_dir,
+                video_on_failure=settings.video_on_failure,
+                egress=settings.local_egress(),
+            ),
+            _secret_source(settings),
+        )
     retention = Retention(
         db,
         store,
@@ -773,6 +927,31 @@ def build_dispatcher(settings: ServerSettings, db: Database) -> Dispatcher:
         poll_interval=settings.poll_interval_s,
         artifacts=store,
         retention=retention,
+    )
+
+
+def build_pod_launcher(settings: ServerSettings, queue: PgRunQueue) -> KubernetesLauncher:
+    """O lançador de pods (``RAPA_EXECUTOR=kubernetes``) com o canal e a API do cluster.
+
+    O canal só abre a porta na subida do serviço (:func:`create_server_app`); o
+    endereço que vai para os pods leva o IP deste pod (``{ip}``) por padrão.
+    """
+    return KubernetesLauncher(
+        queue,
+        KubernetesLauncherSettings(
+            work_dir=settings.work_dir,
+            artifacts_dir=settings.artifacts_dir,
+            pod=settings.pod_settings(),
+            channel_address=channel_address(settings.channel_address, settings.channel_port),
+            browser_args=settings.browser_args,
+            files_dir=settings.files_dir,
+            egress=settings.egress_policy(),
+            video_on_failure=settings.video_on_failure,
+        ),
+        api=KubeApi(KubeConfig.in_cluster()),
+        channel=Channel(),
+        secrets=_secret_source(settings),
+        attempts=queue,
     )
 
 
@@ -847,20 +1026,33 @@ def build_sessions(
     db: Database,
     platform: PgPlatform,
     fleet: Database | None = None,
-) -> tuple[RecordingSessions, LocalSessionLauncher]:
-    """Serviço das sessões de gravação com o lançador local (um processo por sessão).
+) -> tuple[RecordingSessions, LocalSessionLauncher | KubernetesSessionLauncher]:
+    """Serviço das sessões de gravação com o lançador local (um processo por sessão) ou,
+    com ``RAPA_SESSOES_EXECUTOR=kubernetes``, com um pod de uso único por sessão.
 
     ``fleet`` é o banco do papel do despachante, se este processo o tiver: com ele, as
     vagas contam as sessões e as validações de toda a plataforma, e a varredura encerra
     as sessões que nenhum processo segura (a API caiu).
     """
-    launcher = LocalSessionLauncher(
-        LocalSessionSettings(
-            chromium=settings.chromium,
-            browser_args=settings.browser_args,
-            profile_dir=settings.sessions_dir,
+    launcher: LocalSessionLauncher | KubernetesSessionLauncher
+    if settings.sessions_runner == "kubernetes":
+        launcher = KubernetesSessionLauncher(
+            KubernetesSessionSettings(
+                pod=settings.pod_settings(),
+                browser_args=settings.browser_args,
+                egress=settings.egress_policy(),
+            ),
+            api=KubeApi(KubeConfig.in_cluster()),
         )
-    )
+    else:
+        launcher = LocalSessionLauncher(
+            LocalSessionSettings(
+                chromium=settings.chromium,
+                browser_args=settings.browser_args,
+                profile_dir=settings.sessions_dir,
+                egress=settings.local_egress(),
+            )
+        )
     service = RecordingSessions(
         PgSessionStore(db, fleet=fleet),
         launcher,
@@ -894,7 +1086,7 @@ async def _sweep_sessions(sessions: RecordingSessions, stop: asyncio.Event) -> N
 
 async def _close_sessions(
     sessions: RecordingSessions,
-    launcher: LocalSessionLauncher,
+    launcher: LocalSessionLauncher | KubernetesSessionLauncher,
     stop: asyncio.Event,
     task: asyncio.Task[None],
 ) -> None:
@@ -903,6 +1095,26 @@ async def _close_sessions(
     with contextlib.suppress(Exception):
         await sessions.aclose()
     await launcher.aclose()
+    if isinstance(launcher, KubernetesSessionLauncher):
+        await launcher.api.aclose()
+
+
+async def _stop_task(stop: asyncio.Event, task: asyncio.Task[None]) -> None:
+    stop.set()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def _start_pod_launcher(
+    stack: contextlib.AsyncExitStack, launcher: KubernetesLauncher, port: int
+) -> None:
+    """Abre o canal do despachante e a varredura dos órfãos; fecham depois do despachante."""
+    server = ChannelServer(launcher.channel, port=port)
+    stack.push_async_callback(launcher.api.aclose)
+    await server.start()
+    stack.push_async_callback(server.close)
+    stop = asyncio.Event()
+    sweeper = asyncio.create_task(launcher.run_sweeper(stop), name="pods-orfaos")
+    stack.push_async_callback(_stop_task, stop, sweeper)
 
 
 def create_server_app(settings: ServerSettings) -> FastAPI:
@@ -1027,6 +1239,10 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
                 stack.push_async_callback(verifier.aclose)
             # A interface (se houver) e o gateway MCP: encerram antes de fechar os bancos.
             state = await stack.enter_async_context(inner(application))
+            pod_launcher = getattr(dispatcher, "launch", None)
+            if isinstance(pod_launcher, KubernetesLauncher):
+                # Antes do despachante: o canal fica aberto até as tentativas terminarem.
+                await _start_pod_launcher(stack, pod_launcher, settings.channel_port)
             if sessions is not None and session_launcher is not None:
                 # Os navegadores das sessões fecham antes dos bancos (a situação é gravada).
                 sweep_stop = asyncio.Event()
@@ -1036,6 +1252,12 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
                 stack.push_async_callback(
                     _close_sessions, sessions, session_launcher, sweep_stop, sweep
                 )
+                if isinstance(session_launcher, KubernetesSessionLauncher):
+                    pods_stop = asyncio.Event()
+                    pods = asyncio.create_task(
+                        session_launcher.run_sweeper(pods_stop), name="pods-de-sessao"
+                    )
+                    stack.push_async_callback(_stop_task, pods_stop, pods)
             if supervisor is not None:
                 stop = asyncio.Event()
                 stack.push_async_callback(

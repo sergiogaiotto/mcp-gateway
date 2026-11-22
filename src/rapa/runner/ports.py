@@ -41,6 +41,7 @@ __all__ = [
     "ack_path",
     "needs_ack",
     "sanitize_filename",
+    "valid_file_id",
     "waits_for_ack",
 ]
 
@@ -207,16 +208,22 @@ class DictSecretProvider:
 _FILE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
 
 
+def valid_file_id(file_id: str) -> bool:
+    """O identificador de um arquivo de entrada é só um nome, sem pastas nem ``..``?"""
+    return bool(_FILE_ID.fullmatch(file_id)) and ".." not in file_id
+
+
 class LocalFileProvider:
     """Arquivos de entrada num diretório local: o identificador é o nome do arquivo."""
 
     def __init__(self, directory: Path | str | None) -> None:
         self.directory = Path(directory) if directory is not None else None
 
-    def _resolve(self, file_id: str) -> Path:
+    def resolve(self, file_id: str) -> Path:
+        """O caminho do arquivo (sem sair da pasta); :class:`FileUnavailable` se não houver."""
         if self.directory is None:
             raise FileUnavailable("nenhum diretório de arquivos de entrada foi configurado")
-        if not _FILE_ID.fullmatch(file_id) or ".." in file_id:
+        if not valid_file_id(file_id):
             raise FileUnavailable("identificador de arquivo inválido")
         base = self.directory.resolve()
         path = (base / file_id).resolve()
@@ -225,7 +232,7 @@ class LocalFileProvider:
         return path
 
     async def path_for(self, file_id: str) -> Path:
-        return await asyncio.to_thread(self._resolve, file_id)
+        return await asyncio.to_thread(self.resolve, file_id)
 
 
 # ---------------------------------------------------------------------------

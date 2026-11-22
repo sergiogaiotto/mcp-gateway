@@ -1687,6 +1687,7 @@ llm = [
     { name = "httpx2" },
 ]
 runner = [
+    { name = "httpx2" },
     { name = "playwright" },
     { name = "websockets" },
 ]
@@ -1713,6 +1714,7 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'fixtures'", specifier = ">=0.164" },
     { name = "httpx2", marker = "extra == 'control'", specifier = ">=2.16,<3" },
     { name = "httpx2", marker = "extra == 'llm'", specifier = ">=2.16,<3" },
+    { name = "httpx2", marker = "extra == 'runner'", specifier = ">=2.16,<3" },
     { name = "httpx2", marker = "extra == 'ui'", specifier = ">=2.16,<3" },
     { name = "jsonschema-rs", marker = "extra == 'control'", specifier = ">=0.61" },
     { name = "mcp", marker = "extra == 'control'", specifier = "==2.3.0" },

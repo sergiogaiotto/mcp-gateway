@@ -1110,3 +1110,25 @@ class PgRunQueue:
         """Por que o executor desta execução não pode ser lançado agora (certificado A1)."""
         async with self.db.dispatcher_session() as session:
             return await launch_block(session, job, now or self.clock())
+
+    async def live_attempts(self, attempts: Collection[tuple[UUID, int]]) -> set[tuple[UUID, int]]:
+        """Das tentativas dadas, as que ainda são a atual de uma execução rodando.
+
+        A varredura dos pods de execução (:meth:`rapa.control.launcher.KubernetesLauncher.sweep`)
+        apaga os pods das outras: a tentativa que o recolhedor devolveu à fila ou concluiu,
+        e a de uma execução que já terminou.
+        """
+        wanted = set(attempts)
+        if not wanted:
+            return set()
+        live: set[tuple[UUID, int]] = set()
+        ids = sorted({run_id for run_id, _ in wanted})
+        async with self.db.dispatcher_session() as session:
+            for start in range(0, len(ids), 500):
+                rows = await session.execute(
+                    select(runs.c.id, runs.c.attempt).where(
+                        runs.c.id.in_(ids[start : start + 500]), runs.c.state.in_(_ACTIVE)
+                    )
+                )
+                live.update((row.id, row.attempt) for row in rows)
+        return live & wanted

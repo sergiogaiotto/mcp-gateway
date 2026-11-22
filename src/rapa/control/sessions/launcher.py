@@ -1,9 +1,10 @@
-"""Lançadores das sessões de gravação: o protocolo e o lançador local (subprocesso).
+"""Lançadores das sessões de gravação: o protocolo, o lançador local e o de pods.
 
 Um lançador põe de pé o hospedeiro de uma sessão (:mod:`rapa.session.host`) e
 devolve onde falar com ele (``ws://...``) e o token do canal. O protocolo é pequeno
-de propósito (``start``, ``stop``, ``terminate`` e ``is_alive``): na Fase 1 um
-lançador de pods do Kubernetes toma o lugar do local, sem mudar o resto. ``stop``
+de propósito (``start``, ``stop``, ``terminate`` e ``is_alive``): o lançador de pods
+do Kubernetes (:class:`KubernetesSessionLauncher`, ``RAPA_SESSOES_EXECUTOR=kubernetes``)
+toma o lugar do local sem mudar o resto. ``stop``
 vem depois do ``parar`` e espera o hospedeiro sair sozinho (até 15 s);
 ``terminate`` encerra na hora um hospedeiro que ninguém mandou parar (o prazo, o
 navegador perdido, o fim do serviço), sem fazer ninguém esperar.
@@ -23,8 +24,13 @@ navegador perdido, o fim do serviço), sem fazer ninguém esperar.
   processo sai, mesmo num SIGKILL (o Chromium que ainda escreve nela recebe SIGKILL
   antes).
 
+Com ``egress`` (``LocalSessionSettings.egress``, a mesma guarda da execução fora do
+modo de desenvolvimento), a rede interna também fica fechada para o navegador da
+sessão, menos as redes internas permitidas, e a internet sai pelo proxy de saída se
+houver (ver :mod:`rapa.session.egress`); o hospedeiro continua sem lista de hosts.
+
 O token e o endereço ficam neste processo: com várias réplicas da API, a sessão
-só é controlada pela réplica que a abriu (o lançador de pods resolve isso).
+só é controlada pela réplica que a abriu.
 """
 
 import asyncio
@@ -37,14 +43,31 @@ import shutil
 import signal
 import sys
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import UUID
 
+from rapa.control.kube import (
+    LABEL_APP,
+    LABEL_COMPANY,
+    LABEL_SESSION,
+    SESSION_APP,
+    KubeApi,
+    PodSettings,
+    PodState,
+    pod_manifest,
+    pod_state,
+    secret_manifest,
+)
 from rapa.control.launcher import child_env
+from rapa.session.egress import EgressPolicy
 
 __all__ = [
+    "KubernetesSessionLauncher",
+    "KubernetesSessionSettings",
     "LocalSessionLauncher",
     "LocalSessionSettings",
     "SessionEndpoint",
@@ -117,6 +140,9 @@ class LocalSessionSettings:
     kill_grace_s: float = 10.0
     #: Folga além do prazo máximo da sessão antes de interromper o hospedeiro.
     deadline_grace_s: float = 30.0
+    #: A guarda da saída com a rede interna fechada (menos as redes permitidas) e o
+    #: proxy de saída; ``None``: só a própria máquina, o link-local e o metadata.
+    egress: EgressPolicy | None = None
 
 
 @dataclass
@@ -172,6 +198,11 @@ class LocalSessionLauncher:
             "max_duration_s": job.max_duration_s,
             "profile_parent": str(profiles),
         }
+        if settings.egress is not None:
+            proxy = settings.egress.upstream_proxy
+            config["egress_policy"] = True
+            config["allowed_networks"] = [str(net) for net in settings.egress.allowed_networks]
+            config["upstream_proxy"] = proxy.url if proxy is not None else None
         process: asyncio.subprocess.Process | None = None
         try:
             try:
@@ -350,3 +381,350 @@ async def _drain(stream: asyncio.StreamReader) -> None:
 
 def _url_host(host: str) -> str:
     return f"[{host}]" if ":" in host else host
+
+
+# ---------------------------------------------------------------------------
+# Sessões em pods do Kubernetes
+# ---------------------------------------------------------------------------
+
+#: Onde o Secret com a configuração do hospedeiro fica montado no pod da sessão.
+SESSION_CONFIG_DIR = "/var/run/rapa/sessao"
+#: O ``emptyDir`` do trabalho no pod: o perfil e os temporários do navegador (``TMPDIR``),
+#: em disco, nunca no ``/tmp`` em memória (que conta no limite de memória do pod).
+SESSION_WORK_DIR = "/trabalho"
+#: Intervalo entre duas consultas do pod enquanto ele sobe.
+_READY_POLL_S = 0.5
+#: Folga além de ``start_timeout_s`` antes de a varredura apagar um Secret de sessão sem
+#: pod: entre criar o Secret e criar o pod, o Secret fica sozinho por um instante.
+_ORPHAN_SECRET_GRACE_S = 60.0
+
+
+def _age_s(item: Mapping[str, Any], now: datetime) -> float | None:
+    """A idade do objeto pelo ``creationTimestamp`` (``None`` se não der para ler)."""
+    raw = (item.get("metadata") or {}).get("creationTimestamp")
+    if not isinstance(raw, str):
+        return None
+    try:
+        created = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    return (now - created).total_seconds()
+
+
+@dataclass(frozen=True)
+class KubernetesSessionSettings:
+    """Configuração do lançador de sessões em pods (``RAPA_SESSOES_EXECUTOR=kubernetes``)."""
+
+    #: Como os pods rodam (a mesma imagem e o mesmo namespace das execuções).
+    pod: PodSettings
+    browser_args: tuple[str, ...] = ()
+    #: A guarda da saída do navegador da sessão (as redes internas e o proxy de saída);
+    #: no pod, a rede interna sempre fica fechada, menos as redes permitidas.
+    egress: EgressPolicy = field(default_factory=EgressPolicy)
+    #: Porta do canal do hospedeiro no pod (o websocket que o repasse abre).
+    port: int = 8765
+    #: Espera pelo pod pronto (agendamento, imagem, navegador).
+    start_timeout_s: float = 90.0
+    #: Intervalo entre duas consultas da fase do pod pela vigia.
+    status_interval_s: float = 5.0
+    #: Tempo entre o SIGTERM e o SIGKILL do hospedeiro (o ``terminationGracePeriodSeconds``).
+    kill_grace_s: float = 10.0
+    #: Folga além do prazo máximo da sessão antes de apagar o pod.
+    deadline_grace_s: float = 30.0
+    #: Intervalo da varredura dos pods de sessão que terminaram.
+    sweep_interval_s: float = 60.0
+
+
+@dataclass
+class _PodHost:
+    name: str
+    endpoint: SessionEndpoint
+    watcher: asyncio.Task[None] | None = None
+    #: O pod terminou (o hospedeiro saiu).
+    finished: bool = False
+    #: O pod e o Secret já foram apagados.
+    removed: bool = False
+
+
+def session_pod_name(session_id: UUID) -> str:
+    return f"rapa-sessao-{session_id}"
+
+
+class KubernetesSessionLauncher:
+    """Hospedeiros das sessões em pods de uso único (``python -m rapa.session.host``).
+
+    O hospedeiro roda num pod com a mesma imagem e as mesmas regras de segurança dos
+    pods de execução (:func:`rapa.control.kube.pod_manifest`), mais a porta do
+    websocket; a configuração (com o token, gerado aqui e guardado só em memória)
+    chega por um Secret montado, em vez da entrada padrão. O aperto de mão é o pod
+    pronto (prontidão TCP na porta do canal) mais o IP do pod: o repasse conecta em
+    ``ws://<ip-do-pod>:<porta>/`` com o token de hoje. O prazo máximo da sessão também é
+    garantido de fora: a vigia apaga o pod depois dele (e o ``activeDeadlineSeconds``
+    do pod, se nem a API estiver de pé). O Secret é o dono do pod: apagar um apaga os
+    dois. O perfil e os temporários do navegador (``TMPDIR``: os do Chromium e os
+    downloads que o Playwright guarda durante a gravação) ficam no ``emptyDir`` do
+    trabalho, em disco, e não no ``/tmp`` em memória, que conta no limite de memória do
+    pod. Com o pod, o navegador não roda na máquina da API, mas o token e o endereço
+    continuam só na réplica que abriu a sessão: com várias réplicas, só ela a controla.
+    """
+
+    def __init__(self, settings: KubernetesSessionSettings, *, api: KubeApi) -> None:
+        self.settings = settings
+        self.api = api
+        self._hosts: dict[UUID, _PodHost] = {}
+        #: Pods de sessão que este processo está criando (a varredura não os toca).
+        self._starting: set[str] = set()
+
+    def __repr__(self) -> str:
+        return f"KubernetesSessionLauncher(sessoes={len(self._hosts)})"
+
+    @property
+    def running(self) -> int:
+        return sum(1 for host in self._hosts.values() if not host.finished)
+
+    def _config(self, job: SessionJob, token: str) -> dict[str, object]:
+        settings = self.settings
+        proxy = settings.egress.upstream_proxy
+        return {
+            "token": token,
+            "start_url": job.start_url,
+            "listen_host": "0.0.0.0",  # noqa: S104 - o repasse chega pela rede do cluster
+            "listen_port": settings.port,
+            "chromium": None,
+            "browser_args": list(settings.browser_args),
+            "width": job.width,
+            "height": job.height,
+            "idle_timeout_s": job.idle_timeout_s,
+            "max_duration_s": job.max_duration_s,
+            "profile_parent": SESSION_WORK_DIR,
+            "egress_policy": True,
+            "allowed_networks": [str(net) for net in settings.egress.allowed_networks],
+            "upstream_proxy": proxy.url if proxy is not None else None,
+        }
+
+    def _labels(self, job: SessionJob) -> dict[str, str]:
+        return {
+            LABEL_APP: SESSION_APP,
+            "app.kubernetes.io/part-of": "rapa",
+            LABEL_SESSION: str(job.session_id),
+            LABEL_COMPANY: str(job.company_id),
+        }
+
+    async def start(self, job: SessionJob) -> SessionEndpoint:
+        if job.session_id in self._hosts:
+            raise SessionNotStarted("esta sessão já tem um navegador")
+        settings = self.settings
+        namespace = settings.pod.namespace
+        name = session_pod_name(job.session_id)
+        labels = self._labels(job)
+        token = secrets.token_urlsafe(_TOKEN_BYTES)
+        created = False
+        self._starting.add(name)
+        try:
+            try:
+                secret = await self.api.create(
+                    namespace,
+                    "secrets",
+                    secret_manifest(
+                        settings.pod,
+                        name=name,
+                        labels=labels,
+                        data={"config.json": json.dumps(self._config(job, token)).encode()},
+                    ),
+                )
+                created = True
+                await self.api.create(
+                    namespace,
+                    "pods",
+                    pod_manifest(
+                        settings.pod,
+                        name=name,
+                        labels=labels,
+                        owner=secret,
+                        args=[
+                            "python",
+                            "-m",
+                            "rapa.session.host",
+                            "--config",
+                            f"{SESSION_CONFIG_DIR}/config.json",
+                        ],
+                        mount_path=SESSION_CONFIG_DIR,
+                        # Os temporários do Chromium e do Playwright (os downloads da
+                        # gravação) no disco do trabalho, não no /tmp em memória.
+                        env={"TMPDIR": SESSION_WORK_DIR},
+                        active_deadline_s=job.max_duration_s + settings.deadline_grace_s,
+                        termination_grace_s=settings.kill_grace_s,
+                        ports=[
+                            {"name": "canal", "containerPort": settings.port, "protocol": "TCP"}
+                        ],
+                        readiness={
+                            "tcpSocket": {"port": settings.port},
+                            "periodSeconds": 1,
+                            "timeoutSeconds": 1,
+                            "failureThreshold": 1,
+                        },
+                    ),
+                )
+            except Exception as exc:
+                logger.error("o pod da sessão não foi criado: %s", type(exc).__name__)
+                raise SessionNotStarted("não foi possível abrir o navegador da gravação") from None
+            try:
+                ip = await asyncio.wait_for(self._ready(name), timeout=settings.start_timeout_s)
+            except SessionNotStarted:
+                raise
+            except Exception as exc:
+                logger.error("o pod da sessão não ficou pronto: %s", type(exc).__name__)
+                raise SessionNotStarted("o navegador da gravação não abriu a tempo") from None
+        except BaseException:
+            self._starting.discard(name)
+            if created:
+                await asyncio.shield(self._remove(name, settings.kill_grace_s))
+            raise
+        endpoint = SessionEndpoint(url=f"ws://{_url_host(ip)}:{settings.port}/", token=token)
+        host = _PodHost(name=name, endpoint=endpoint)
+        self._hosts[job.session_id] = host
+        self._starting.discard(name)
+        host.watcher = asyncio.get_running_loop().create_task(
+            self._watch(job, host), name=f"sessao-{job.session_id}"
+        )
+        return endpoint
+
+    async def _state(self, name: str) -> PodState | None:
+        try:
+            return pod_state(await self.api.get(self.settings.pod.namespace, "pods", name))
+        except Exception as exc:
+            logger.warning("a API do Kubernetes não respondeu: %s", type(exc).__name__)
+            return None
+
+    async def _ready(self, name: str) -> str:
+        """Espera o pod pronto (a porta do canal aceita conexões) e devolve o IP dele."""
+        while True:
+            state = await self._state(name)
+            if state is not None:
+                if state.finished or state.stuck:
+                    logger.error("o pod da sessão não subiu (%s)", state.reason or state.phase)
+                    raise SessionNotStarted("o navegador da gravação não abriu")
+                if state.ready and state.ip:
+                    return state.ip
+            await asyncio.sleep(_READY_POLL_S)
+
+    async def _watch(self, job: SessionJob, host: _PodHost) -> None:
+        """Acompanha o pod e garante o prazo máximo da sessão."""
+        settings = self.settings
+        loop = asyncio.get_running_loop()
+        give_up = loop.time() + job.max_duration_s + settings.deadline_grace_s
+        try:
+            while loop.time() < give_up:
+                await asyncio.sleep(min(settings.status_interval_s, give_up - loop.time()))
+                state = await self._state(host.name)
+                if state is not None and state.finished:
+                    return
+            logger.warning("a sessão %s passou do prazo máximo; encerrando", job.session_id)
+        finally:
+            await asyncio.shield(self._discard(host))
+
+    async def _discard(self, host: _PodHost) -> None:
+        """Dá a sessão por terminada e apaga o pod e o Secret (uma vez só)."""
+        host.finished = True
+        if not host.removed:
+            host.removed = True
+            await self._remove(host.name, self.settings.kill_grace_s)
+
+    async def _remove(self, name: str, grace_s: float) -> None:
+        """Apaga o pod (SIGTERM e, depois da tolerância, SIGKILL) e o Secret."""
+        namespace = self.settings.pod.namespace
+        for plural, grace in (("pods", int(grace_s + 0.999)), ("secrets", None)):
+            try:
+                await self.api.delete(namespace, plural, name, grace_s=grace)
+            except Exception as exc:
+                logger.warning("falha ao apagar %s de uma sessão: %s", plural, type(exc).__name__)
+
+    async def _end(self, host: _PodHost) -> None:
+        if host.watcher is not None:
+            host.watcher.cancel()
+            await asyncio.gather(host.watcher, return_exceptions=True)
+        # A vigia cancelada antes de rodar não apaga nada: apaga aqui.
+        await self._discard(host)
+
+    async def stop(self, session_id: UUID) -> None:
+        host = self._hosts.pop(session_id, None)
+        if host is None:
+            return
+        # Depois do "parar" o hospedeiro sai sozinho; dá um tempo antes de apagar o pod.
+        loop = asyncio.get_running_loop()
+        give_up = loop.time() + _STOP_WAIT_S
+        while not host.finished and loop.time() < give_up:
+            state = await self._state(host.name)
+            if state is not None and state.finished:
+                break
+            await asyncio.sleep(_READY_POLL_S)
+        await self._end(host)
+
+    async def terminate(self, session_id: UUID) -> None:
+        host = self._hosts.pop(session_id, None)
+        if host is None:
+            return
+        await self._end(host)
+
+    async def is_alive(self, session_id: UUID) -> bool:
+        host = self._hosts.get(session_id)
+        return host is not None and not host.finished
+
+    async def aclose(self) -> None:
+        """Encerra todos os hospedeiros ao mesmo tempo (no fim do serviço)."""
+        await asyncio.gather(
+            *(self.terminate(session_id) for session_id in list(self._hosts)),
+            return_exceptions=True,
+        )
+
+    async def sweep(self) -> int:
+        """Apaga os pods de sessão que terminaram e os Secrets sem pod, de outras réplicas.
+
+        Um pod de sessão de outra réplica que ainda roda fica: ele termina sozinho (sem
+        entrada por ``RAPA_SESSAO_OCIOSA_S`` ou no prazo máximo, com o
+        ``activeDeadlineSeconds``) e sai na varredura seguinte. Um Secret sem pod só sai
+        depois de ``start_timeout_s`` mais um minuto da criação: uma sessão que está
+        subindo (em qualquer réplica) cria o Secret antes do pod, e apagá-lo nesse
+        instante levaria o pod novo junto. As sessões que este processo está abrindo
+        nunca entram.
+        """
+        namespace = self.settings.pod.namespace
+        selector = f"{LABEL_APP}={SESSION_APP}"
+        mine = {host.name for host in self._hosts.values()} | self._starting
+        young = self.settings.start_timeout_s + _ORPHAN_SECRET_GRACE_S
+        now = datetime.now(UTC)
+        pods = await self.api.list(namespace, "pods", label_selector=selector)
+        alive: set[str] = set()
+        removed = 0
+        for pod in pods:
+            name = (pod.get("metadata") or {}).get("name")
+            if not isinstance(name, str) or name in mine:
+                continue
+            if pod_state(pod).finished:
+                await self._remove(name, 0)
+                removed += 1
+            else:
+                alive.add(name)
+        for secret in await self.api.list(namespace, "secrets", label_selector=selector):
+            name = (secret.get("metadata") or {}).get("name")
+            if not isinstance(name, str) or name in mine or name in alive:
+                continue
+            age = _age_s(secret, now)
+            if age is not None and age < young:
+                continue  # talvez uma sessão subindo: o pod ainda vem
+            if name not in self._starting:
+                with contextlib.suppress(Exception):
+                    if await self.api.delete(namespace, "secrets", name):
+                        removed += 1
+        return removed
+
+    async def run_sweeper(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            try:
+                await self.sweep()
+            except Exception as exc:
+                logger.warning("falha na varredura dos pods de sessão: %s", type(exc).__name__)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=self.settings.sweep_interval_s)
