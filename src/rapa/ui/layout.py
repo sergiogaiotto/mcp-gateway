@@ -58,9 +58,9 @@ def page_frame(viewer: Viewer, active: str) -> ui.column:
                     link.classes("text-weight-bold underline")
         with ui.row().classes("items-center gap-2"):
             ui.label(viewer.display_name).classes("text-white").mark("usuario-logado")
-            ui.label(settings.company_label(viewer.principal.company_id)).classes(
-                "text-white text-caption"
-            ).mark("empresa-logada")
+            ui.label(viewer.company_label()).classes("text-white text-caption").mark(
+                "empresa-logada"
+            )
             ui.button("Sair", on_click=lambda: ui.navigate.to("/auth/sair")).props(
                 "flat color=white"
             ).mark("sair")

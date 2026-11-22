@@ -46,6 +46,7 @@ Rede (NetworkPolicies, os dois namespaces negam tudo por padrão):
    | `rapa-webhooks` | `chave` | `RAPA_CHAVE_WEBHOOKS` (32 caracteres ou mais) |
    | `rapa-hub` | `api-key` | `RAPA_LLM_API_KEY` |
    | `rapa-glitchtip` | `dsn` | `RAPA_GLITCHTIP_DSN` |
+| `RAPA_DOCS_API` | `0` | `1` serve a documentação da API REST em `/v1/docs` e `/v1/openapi.json` (1.13); no chart, `apiDocs` |
    | `rapa-registro` | `.dockerconfigjson` | o registro das imagens, nos dois namespaces (só com permissão de baixar: a Role da web e do despachante lê os Secrets do namespace das execuções) |
    | `rapa-proxy` (opcional) | `url` | `RAPA_PROXY_SAIDA` com usuário e senha (`executions.egress.proxy.existingSecret`); a URL nunca vai nos valores |
 
@@ -314,6 +315,15 @@ curl -s http://127.0.0.1:9100/metrics | grep -E '^rapa_(fila|despachante_saudave
 ```
 
 Alertas que valem a pena: `rapa_despachante_saudavel == 0`; `rapa_despachante_etapa_ok == 0` por mais de alguns minutos; `rapa_fila_espera_maxima_segundos` alta (fila cheia); `time() - rapa_banco_lido_em_segundos > 120` (o despachante não lê o banco); `rapa_a1_dias_para_vencer < 7`; `rapa_a1_em_aviso{tipo="vencido"} > 0`; aumento de `rapa_webhook_entregas_total{resultado="assinatura_invalida"}`; `rapa_http_pedidos_total{codigo=~"5.."}`. Com mais de um despachante, a leitura da fila é a mesma em todos (`max`) e as execuções concluídas somam (`sum`).
+
+### 1.13 Documentação da API
+
+A documentação da API REST fica desligada por padrão. Para ligar, suba o serviço com `RAPA_DOCS_API=1`:
+
+- `/v1/docs`: o Swagger UI, com os arquivos servidos pelo próprio serviço (nenhum CDN; funciona onde o navegador não alcança a internet), sem o validador público do Swagger (as licenças dele e as do código de terceiros que o bundle junta vêm junto, em `src/rapa/control/static/swagger-ui/`);
+- `/v1/openapi.json`: o documento OpenAPI da API REST (só as rotas de `/v1`; a interface e o MCP ficam de fora).
+
+As duas abrem sem token e mostram só as rotas e os formatos, nunca dados. Para chamar a API pela página, clique em **Authorize**, informe o token (sem a palavra `Bearer`: a página manda `Authorization: Bearer ...`) e use **Try it out** na rota. O token fica só na página aberta (o navegador não o guarda; recarregar a página o esquece), e cada chamada vale como qualquer outra chamada da API, com os papéis do dono do token: um `POST` feito ali cria de verdade. A entrega de webhook (`POST /v1/webhooks/{id}`) não usa o token, e sim a assinatura nos cabeçalhos. Ligue onde a documentação for útil (desenvolvimento, homologação, a rede interna) e deixe desligada onde não houver motivo para mostrar as rotas. O OpenAPI dos robôs publicados de quem chama (`GET /v1/openapi-robos.json`, com token) não depende dessa opção.
 
 ## Parte 2. Operação das empresas
 

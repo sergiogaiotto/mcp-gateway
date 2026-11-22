@@ -353,6 +353,11 @@ gateway:
   # Afinidade por cookie da interface no Envoy (BackendTrafficPolicy) quando web.replicas > 1.
   webAffinityCookie: rapa_afinidade
 
+# RAPA_DOCS_API: a documentação da API REST em /v1/docs (Swagger UI servido pelo próprio
+# serviço) e /v1/openapi.json, na web e na api. Só as rotas e os formatos, nunca dados;
+# ligue onde for útil (homologação, a rede interna). docs/OPERACAO.md, 1.13.
+apiDocs: false
+
 web:
   # A interface e as sessões ficam na memória do processo: com mais de uma réplica, a
   # afinidade por cookie no gateway mantém cada navegador na mesma réplica.

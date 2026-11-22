@@ -9,9 +9,9 @@ from uuid import UUID
 from fastapi import Request
 from fastapi.responses import RedirectResponse
 
-from rapa.core.contracts import Principal
+from rapa.core.contracts import ContractError, Principal, VisibleNames
 from rapa.ui.auth import LOGIN_PATH, UiAuth, UiSession, safe_return_path
-from rapa.ui.backend import Backend, BackendUnavailable, NotAuthenticated
+from rapa.ui.backend import Backend, BackendError, BackendUnavailable, NotAuthenticated
 
 __all__ = ["BackendFactory", "UiContext", "UiSettings", "Viewer"]
 
@@ -37,7 +37,9 @@ class UiSettings:
     #: Tamanho máximo da planilha de um lote, em bytes (o ``RAPA_LOTE_MAX_BYTES`` do
     #: servidor; o envio pela tela recusa antes um arquivo maior).
     batch_max_bytes: int = 5 * 1024 * 1024
-    #: Nomes legíveis das áreas e empresas (só para exibição).
+    #: Nomes legíveis das áreas e empresas (só para exibição), para quando o backend não
+    #: tem os nomes (a plataforma em memória do modo de desenvolvimento e dos testes). Os
+    #: do backend (:meth:`Viewer.load_names`) valem antes destes.
     area_labels: Mapping[UUID, str] = field(default_factory=dict)
     company_labels: Mapping[UUID, str] = field(default_factory=dict)
 
@@ -56,9 +58,34 @@ class Viewer:
         self._session_key = session.key
         self.principal: Principal = session.principal
         self.display_name = session.display_name
+        #: Os nomes da empresa e das áreas que a pessoa enxerga, lidos uma vez por página.
+        self.names = VisibleNames()
 
     def __repr__(self) -> str:
         return f"Viewer(subject={self.principal.subject!r})"
+
+    async def load_names(self) -> None:
+        """Lê do backend o nome da empresa e os das áreas que a pessoa enxerga.
+
+        As mesmas regras do resto (a empresa vem da sessão; as áreas, dos papéis): nunca
+        o nome de outra empresa. São só para mostrar: se não vierem (o serviço não
+        respondeu), a página usa os nomes configurados ou o começo do identificador.
+        """
+        try:
+            backend = await self.backend()
+            self.names = await backend.visible_names()
+        except NotAuthenticated:
+            raise
+        except (ContractError, BackendError) as exc:
+            logger.warning("sem os nomes da empresa e das áreas: %s", type(exc).__name__)
+
+    def area_label(self, area_id: UUID) -> str:
+        """O nome da área (ou "Área" e o começo do identificador, se não houver)."""
+        return self.names.area_names.get(area_id) or self.ctx.settings.area_label(area_id)
+
+    def company_label(self) -> str:
+        """O nome da empresa da pessoa."""
+        return self.names.company_name or self.ctx.settings.company_label(self.principal.company_id)
 
     async def backend(self) -> Backend:
         """Backend no nome do principal atual da sessão, que precisa continuar válida.

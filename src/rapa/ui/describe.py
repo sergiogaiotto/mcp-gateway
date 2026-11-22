@@ -91,6 +91,16 @@ def _quote(text: str) -> str:
     return f"“{text}”"
 
 
+def _intent(text: str) -> str:
+    """O alvo de um passo entre aspas, sem dobrar as que ele já tem.
+
+    As intenções escritas pelo compilador e pelo conserto já põem o rótulo entre aspas
+    (``botão “Acessar”``): essas ficam como estão. As escritas à mão (``botão Entrar``)
+    vão inteiras entre aspas.
+    """
+    return text if "“" in text or "”" in text else _quote(text)
+
+
 def _shorten(text: str, limit: int = _MAX_LITERAL) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
@@ -180,7 +190,7 @@ def _locator_text(locator: Locator, inputs: Mapping[str, str]) -> str:
 
 
 def _target_text(target: Target | None) -> str:
-    return _quote(target.intent) if target is not None else "a página"
+    return _intent(target.intent) if target is not None else "a página"
 
 
 def condition_text(condition: Condition, inputs: Mapping[str, str] | None = None) -> str:
@@ -222,7 +232,7 @@ def step_sentence(step: Step, inputs: Mapping[str, str] | None = None) -> str:
         case NavigateStep(url=url):
             return f"{title} ({_url_text(url, inputs)})"
         case FillStep(target=target, value=value):
-            return f"{title} em {_quote(target.intent)} ({value_text(value, inputs)})"
+            return f"{title} em {_intent(target.intent)} ({value_text(value, inputs)})"
         case SelectStep(target=target, option=option):
             ref = _single_ref(option)
             chosen = (
@@ -230,41 +240,41 @@ def step_sentence(step: Step, inputs: Mapping[str, str] | None = None) -> str:
                 if ref is not None
                 else f"opção {_quote(template_text(option, inputs))}"
             )
-            return f"{title} em {_quote(target.intent)} ({chosen})"
+            return f"{title} em {_intent(target.intent)} ({chosen})"
         case CheckStep(target=target, checked=checked):
             action = "marcar" if checked else "desmarcar"
-            return f"{title} ({action} {_quote(target.intent)})"
+            return f"{title} ({action} {_intent(target.intent)})"
         case ClickStep(target=target, expect_navigation=expect_navigation):
             suffix = " e esperar a nova página" if expect_navigation else ""
-            return f"{title} (clicar em {_quote(target.intent)}{suffix})"
+            return f"{title} (clicar em {_intent(target.intent)}{suffix})"
         case PressStep(target=target, key=key):
-            where = f" em {_quote(target.intent)}" if target is not None else ""
+            where = f" em {_intent(target.intent)}" if target is not None else ""
             return f"{title} (tecla {key}{where})"
         case WaitForStep(target=target, state=state, url_contains=url_contains):
             waits: list[str] = []
             if target is not None:
                 verb = "aparecer" if state == "visible" else "sumir"
-                waits.append(f"esperar {_quote(target.intent)} {verb}")
+                waits.append(f"esperar {_intent(target.intent)} {verb}")
             if url_contains is not None:
                 waits.append(
                     f"esperar o endereço conter {_quote(template_text(url_contains, inputs))}"
                 )
             return f"{title} ({'; '.join(waits)})"
         case ExtractTextStep(target=target, into=into):
-            return f"{title} de {_quote(target.intent)} (guarda em {into})"
+            return f"{title} de {_intent(target.intent)} (guarda em {into})"
         case ExtractTableStep(target=target, into=into, columns=columns):
             cols = f"; colunas: {', '.join(columns)}" if columns else ""
-            return f"{title} de {_quote(target.intent)} (guarda a tabela em {into}{cols})"
+            return f"{title} de {_intent(target.intent)} (guarda a tabela em {into}{cols})"
         case AssertStep(condition=condition):
             return f"{title} (confere que {condition_text(condition, inputs)})"
         case DownloadStep(target=target, save_as=save_as):
             return (
-                f"{title} de {_quote(target.intent)} "
+                f"{title} de {_intent(target.intent)} "
                 f"(salva como {_quote(template_text(save_as, inputs))})"
             )
         case UploadStep(target=target, file_input=file_input):
             source = inputs.get(file_input, file_input)
-            return f"{title} em {_quote(target.intent)} (arquivo da entrada {source})"
+            return f"{title} em {_intent(target.intent)} (arquivo da entrada {source})"
         case ForEachStep(items=items, max_items=max_items):
             scope, name = items.split(".", 1)
             what = f"entrada {inputs.get(name, name)}" if scope == "inputs" else f"tabela {name}"
@@ -550,8 +560,8 @@ def _target_changes(
             FieldChange(
                 "target",
                 "alvo",
-                _quote(old.intent) if old else "—",
-                _quote(new.intent) if new else "—",
+                _intent(old.intent) if old else "—",
+                _intent(new.intent) if new else "—",
             )
         ]
     out: list[FieldChange] = []
@@ -560,7 +570,7 @@ def _target_changes(
         if before == after:
             continue
         if key == "intent":
-            out.append(FieldChange("target.intent", label, _quote(before), _quote(after)))
+            out.append(FieldChange("target.intent", label, _intent(before), _intent(after)))
         elif key == "locators":
             out.append(
                 FieldChange(

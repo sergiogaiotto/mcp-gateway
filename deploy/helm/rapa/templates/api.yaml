@@ -61,6 +61,8 @@ API do Kubernetes (sem token montado) e nunca lê o cofre.
   value: "0"
 - name: RAPA_SESSOES
   value: "0"
+- name: RAPA_DOCS_API
+  value: {{ ternary "1" "0" (default false $.Values.apiDocs) | quote }}
 - name: RAPA_COFRE
   value: nenhum
 {{- end -}}

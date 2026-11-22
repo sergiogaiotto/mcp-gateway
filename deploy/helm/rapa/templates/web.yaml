@@ -38,6 +38,8 @@ Nunca lê o cofre (RAPA_COFRE=nenhum): o OpenBao só para as chaves dos artefato
   value: "1"
 - name: RAPA_SESSOES
   value: "1"
+- name: RAPA_DOCS_API
+  value: {{ ternary "1" "0" (default false $.Values.apiDocs) | quote }}
 - name: RAPA_COFRE
   value: nenhum
 - name: RAPA_SESSOES_EXECUTOR
