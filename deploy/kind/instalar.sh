@@ -147,7 +147,7 @@ fim
 grupo "Release da aplicação (a migração roda antes, como hook)"
 helm upgrade --install rapa "$chart" -n "$ns" -f "$chart/values-kind.yaml" \
   --set-json "network.egress.kubernetesApi.to=$rede_api" \
-  --set-json "network.egress.kubernetesApi.ports=$portas_api" --wait --timeout 15m
+  --set-json "network.egress.kubernetesApi.ports=$portas_api" --wait --timeout 8m
 fim
 
 grupo "Empresa de teste pelo CLI e os tokens dela"

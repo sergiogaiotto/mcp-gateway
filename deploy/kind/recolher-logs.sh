@@ -20,3 +20,19 @@ for ns in rapa rapa-execucoes rapa-teste cofre armazenamento cnpg-system; do
 done
 kubectl -n rapa get jobs -o yaml >"$saida/jobs-rapa.yaml" 2>&1
 echo "logs em $saida"
+
+# Um resumo no próprio log do job (o artefato pode não estar ao alcance de quem investiga):
+# os recursos, os eventos e, de cada pod do RaPA e da migração, a descrição e o fim do log.
+resumo() {
+  echo "::group::$1"
+  cat "$2" 2>/dev/null | tail -n "${3:-200}"
+  echo "::endgroup::"
+}
+resumo "recursos" "$saida/recursos.txt" 300
+resumo "eventos (os últimos)" "$saida/eventos.txt" 120
+resumo "pods do RaPA (describe)" "$saida/pods-rapa.txt" 400
+resumo "pods das execuções (describe)" "$saida/pods-rapa-execucoes.txt" 150
+for arquivo in "$saida"/log-rapa-*.txt; do
+  [ -e "$arquivo" ] || continue
+  resumo "$(basename "$arquivo")" "$arquivo" 80
+done
