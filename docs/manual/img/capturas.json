@@ -34,8 +34,7 @@
       "legenda": "Gravação ao vivo: o navegador da nuvem mostra o portal de teste v1 e a pessoa preenche o formulário com o próprio mouse e teclado.",
       "persona": "Bruno Reis (criação de robôs no Fiscal e no Financeiro) · bruno.reis@demonstracao.example",
       "url": "/gravar/{sessao}",
-      "pagina_inteira": true,
-      "nota": "A visão ao vivo não começou sozinha no serviço de verdade: com o NiceGUI 4, o <script> da configuração entra depois da resposta e não roda; a captura reexecutou os scripts da própria página (veja _START_LIVE_VIEW em capturar.py)."
+      "pagina_inteira": true
     },
     {
       "arquivo": "06-revisao-gravacao.png",
@@ -161,6 +160,13 @@
       "legenda": "GET /v1/openapi-robos.json: o OpenAPI dos robôs publicados que a pessoa do token pode chamar pelo REST (o começo do documento).",
       "persona": "Eduarda Martins (operação na empresa inteira) · eduarda.martins@demonstracao.example (token no cabeçalho Authorization)",
       "url": "/v1/openapi-robos.json",
+      "pagina_inteira": false
+    },
+    {
+      "arquivo": "24-docs-api.png",
+      "legenda": "GET /v1/docs (com RAPA_DOCS_API=1): a documentação da API REST no Swagger UI, servido pelo próprio RaPA (sem CDN); a página abre sem token, e o botão Authorize recebe o token que as chamadas feitas por ela (Try it out) mandam.",
+      "persona": "ninguém (sem token)",
+      "url": "/v1/docs",
       "pagina_inteira": false
     }
   ],

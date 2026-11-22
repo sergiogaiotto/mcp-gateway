@@ -209,6 +209,24 @@ def test_diff_target_and_reorder() -> None:
     assert not diff.raises_effect
 
 
+def test_quoted_intents_are_not_quoted_again() -> None:
+    """O compilador e o conserto já põem o rótulo entre aspas (``botão “Acessar”``)."""
+    old = _protocolo()
+
+    def change(data: dict[str, Any]) -> None:
+        _step(data, "emitir")["target"]["intent"] = "botão “Acessar”"
+
+    new = _edit(old, change)
+    diff = describe.diff_manifests(old, new)
+    fields = {f.field: f for c in diff.changed for f in c.fields}
+    assert (fields["target.intent"].before, fields["target.intent"].after) == (
+        "“botão Emitir”",
+        "botão “Acessar”",
+    )
+    [line] = [line for line in describe.describe_steps(new) if line.step_id == "emitir"]
+    assert "(clicar em botão “Acessar” e esperar a nova página)" in line.render(badge=False)
+
+
 def test_diff_moving_into_a_block() -> None:
     old = _notas()
 

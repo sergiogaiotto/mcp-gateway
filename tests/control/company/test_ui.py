@@ -19,7 +19,7 @@ from rapa.ui.app import create_ui
 from rapa.ui.auth import DevLogin, DevProfile, MemorySessionStore, UiAuth
 from rapa.ui.backend import ContractsBackendFactory
 from rapa.ui.context import UiSettings
-from tests.control.db.support import Tenant, make_tenant
+from tests.control.db.support import Tenant, make_tenant, protocolo, publish
 from tests.ui.conftest import login, no_error_logs, simulate  # noqa: F401
 
 from .support import freeze, person
@@ -124,6 +124,19 @@ async def test_area_admin_and_auditor_see_only_their_part(ui_world: Ui) -> None:
         await user.should_not_see(marker="nav-empresa")
         await user.open("/empresa")
         await user.should_see(marker="sem-permissao-empresa", retries=50)
+
+
+async def test_pages_show_the_names_of_the_company_and_of_the_areas(ui_world: Ui) -> None:
+    """O cabeçalho e as telas mostram "Empresa A" e "Fiscal", não o começo dos ids."""
+    a = ui_world.a
+    await publish(PgPlatform(ui_world.app_db), a, protocolo())
+    async with ui_world.user() as user:
+        await login(user, "operador", "/robos")
+        await user.should_see(marker="lista-robos", retries=50)
+        assert [e.text for e in user.find(marker="empresa-logada").elements] == ["Empresa A"]
+        await user.should_see("emitir_protocolo · Publicado · versão publicada 1 · Fiscal")
+        await user.should_not_see(f"Área {str(a.area_id)[:8]}")
+        await user.should_not_see(f"Empresa {str(a.company_id)[:8]}")
 
 
 async def test_newcomer_without_roles_only_sees_the_request(ui_world: Ui) -> None:

@@ -120,6 +120,7 @@ __all__ = [
     "VersionApprovals",
     "VersionStatus",
     "ViewerTicket",
+    "VisibleNames",
     "WebhookChanges",
     "WebhookDelivery",
     "WebhookInfo",
@@ -127,6 +128,7 @@ __all__ = [
     "WebhookSecret",
     "WebhookService",
     "WebhookSpec",
+    "WhoAmI",
     "can_automate",
     "required_approvals",
     "uses_a1",
@@ -1368,6 +1370,26 @@ class AreaInfo(_Model):
     created_at: datetime
 
 
+class VisibleNames(_Model):
+    """Os nomes que o principal pode ver: o da empresa dele e os das áreas que ele enxerga.
+
+    Só para mostrar (a interface escreve "Fiscal" em vez do identificador). As áreas
+    seguem a regra de :meth:`CompanyAdminService.list_areas`: as áreas em que ele tem
+    algum papel, ou todas as da empresa com um papel na empresa; nunca de outra empresa.
+    ``None`` e vazio quando o servidor não oferece a administração da empresa.
+    """
+
+    company_name: str | None = None
+    area_names: dict[UUID, str] = Field(default_factory=dict)
+
+
+class WhoAmI(Principal):
+    """Resposta de ``GET /v1/eu``: o principal, com os nomes de :class:`VisibleNames`."""
+
+    company_name: str | None = None
+    area_names: dict[UUID, str] = Field(default_factory=dict)
+
+
 class RoleGrant(_Model):
     """Um papel de um usuário: na empresa inteira (``area_id`` nulo) ou numa área."""
 
@@ -1451,6 +1473,10 @@ class CompanyAdminService(Protocol):
     async def reactivate_user(self, principal: Principal, user_id: UUID) -> CompanyUser: ...
 
     async def list_areas(self, principal: Principal) -> list[AreaInfo]: ...
+
+    async def visible_names(self, principal: Principal) -> VisibleNames:
+        """O nome da empresa e os das áreas que o principal enxerga (qualquer papel)."""
+        ...
 
     async def create_area(self, principal: Principal, name: str) -> AreaInfo: ...
 

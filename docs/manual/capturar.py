@@ -18,8 +18,8 @@ O roteiro:
    pessoas de nomes inventados (administração da empresa, criação, duas de aprovação,
    operação, auditoria e custódia do certificado A1); o arquivo de tokens de
    desenvolvimento e o de segredos dos portais;
-4. o serviço inteiro (``python -m rapa.server``) com o despachante, os webhooks e o
-   vídeo das falhas ligados;
+4. o serviço inteiro (``python -m rapa.server``) com o despachante, os webhooks, o
+   vídeo das falhas e a documentação da API (``RAPA_DOCS_API=1``) ligados;
 5. o estado da demonstração pela API REST, pelo MCP e pela interface: robôs
    publicados por quem aprova, execuções que deram certo e uma que falhou (com telas,
    vídeo e o retrato para o conserto), agendas, webhooks, um lote de CSV, o
@@ -777,8 +777,6 @@ class Demo:
     schedule_id: str = ""
     batch_id: str = ""
     session_id: str = ""
-    #: Se a visão ao vivo precisou do contorno de :data:`_START_LIVE_VIEW` para começar.
-    live_workaround: bool = False
     #: Valores que nunca podem aparecer numa página capturada.
     secrets: list[str] = field(default_factory=list)
 
@@ -979,7 +977,6 @@ class Shot:
     persona: str
     url: str
     full_page: bool
-    note: str = ""
 
 
 class Camera:
@@ -1080,7 +1077,6 @@ class Camera:
         *,
         full_page: bool = False,
         clip: FloatRect | None = None,
-        note: str = "",
         keep_focus: bool = False,
     ) -> None:
         await self.settle(page, keep_focus=keep_focus)
@@ -1092,7 +1088,7 @@ class Camera:
             animations="disabled",
             caret="hide",
         )
-        self.shots.append(Shot(file, caption, persona, url, full_page, note))
+        self.shots.append(Shot(file, caption, persona, url, full_page))
         log(f"  {file}")
 
     async def dump(self, folder: Path) -> None:
@@ -1113,15 +1109,11 @@ class Camera:
                 await context.close()
 
 
-async def _choose_nth(page: Page, label: str, index: int) -> None:
-    """Escolhe a opção ``index`` do seletor do Quasar com o rótulo ``label``.
-
-    Pela posição, e não pelo texto: a interface mostra cada área como "Área" e os 8
-    primeiros caracteres do id, e os ids (UUIDv7) de áreas criadas juntas começam iguais.
-    """
+async def _choose(page: Page, label: str, option: str) -> None:
+    """Escolhe a opção ``option`` (pelo texto) do seletor do Quasar com o rótulo ``label``."""
     title = page.locator(".q-field__label", has_text=re.compile(f"^{re.escape(label)}$"))
     await page.locator(".q-select").filter(has=title).first.click()
-    await page.get_by_role("option").nth(index).click()
+    await page.get_by_role("option", name=option, exact=True).click()
     await page.get_by_role("option").first.wait_for(state="detached")
 
 
@@ -1178,25 +1170,6 @@ class LiveDriver:
         raise RuntimeError(f"a tela ao vivo não chegou em {suffix}")
 
 
-#: Reexecuta os dois ``<script>`` da visão ao vivo que a página já tem (a configuração com o
-#: bilhete e o ``ao_vivo.js``), só se eles não rodaram. Com o NiceGUI 4, o ``ui.timer`` da
-#: tela ao vivo espera a conexão do navegador, a resposta sai antes de ``live_page``
-#: terminar (depois de ``await backend.issue_ticket``) e o ``ui.add_body_html`` passa a
-#: inserir os scripts com ``insertAdjacentHTML``, que não os executa. Quando a tela começar
-#: sozinha, isto não faz nada.
-_START_LIVE_VIEW = """() => {
-  if (window.RAPA_AO_VIVO !== undefined) return false;
-  for (const old of Array.from(document.querySelectorAll('script'))) {
-    const src = old.getAttribute('src') || '';
-    if (src.includes('/rapa-estatico/ao_vivo.js') || (!src && old.textContent.includes('window.RAPA_AO_VIVO'))) {
-      const fresh = document.createElement('script');
-      if (src) fresh.src = src; else fresh.textContent = old.textContent;
-      old.replaceWith(fresh);
-    }
-  }
-  return true;
-}"""
-
 _PAINTED = """c => {
   if (!c.width || !c.height) return false;
   const d = c.getContext('2d').getImageData(Math.floor(c.width / 2), Math.floor(c.height / 4), 1, 1).data;
@@ -1206,12 +1179,9 @@ _PAINTED = """c => {
 
 async def record_live(camera: Camera, api: Api, demo: Demo, company: Company, v1: Portal) -> None:
     """05 e 06: a gravação ao vivo no portal v1 e a revisão, pela interface."""
-    # A tela lista as áreas na ordem dos papéis da pessoa (a mesma de GET /v1/eu).
-    me = await api.call(BRUNO, "GET", "/v1/eu")
-    areas = [UUID(a) for a, roles in me["area_roles"].items() if "creator" in roles]
     page = await camera.as_person(BRUNO)
     await camera.open(page, "/gravar", "Nova gravação")
-    await _choose_nth(page, "Área", areas.index(company.fiscal))
+    await _choose(page, "Área", "Fiscal")
     await page.get_by_label("Endereço inicial").fill(f"{v1.base_url}/login")
     await page.get_by_label("Nome da tarefa (opcional)").fill("Emitir protocolo no portal")
     await page.get_by_role("button", name="Começar a gravar").click()
@@ -1221,14 +1191,11 @@ async def record_live(camera: Camera, api: Api, demo: Demo, company: Company, v1
     if session["area_id"] != str(company.fiscal):
         raise RuntimeError("a gravação abriu fora da área Fiscal")
     await page.locator("#rapa-ao-vivo").wait_for(state="attached")
-    with contextlib.suppress(PlaywrightTimeout):
-        await page.wait_for_function("() => window.RAPA_AO_VIVO !== undefined", timeout=5_000)
-    if await page.evaluate(_START_LIVE_VIEW):
-        demo.live_workaround = True
-        log(
-            "  AVISO: a visão ao vivo não começou sozinha (o <script> da configuração entrou "
-            "depois da resposta e não rodou); os scripts da própria página foram reexecutados"
-        )
+    try:
+        # A página da gravação tem de começar sozinha, como para qualquer pessoa.
+        await page.wait_for_function("() => window.RAPA_AO_VIVO !== undefined", timeout=15_000)
+    except PlaywrightTimeout:
+        raise RuntimeError("a visão ao vivo não começou (o script da página não rodou)") from None
     canvas = page.locator('canvas[aria-label="Tela do navegador da gravação"]')
     await canvas.wait_for()
     await until(lambda: canvas.evaluate(_PAINTED), "a primeira imagem da tela ao vivo", 60)
@@ -1278,7 +1245,6 @@ async def record_live(camera: Camera, api: Api, demo: Demo, company: Company, v1
             BRUNO.label,
             "/gravar/{sessao}",
             full_page=True,
-            note=_LIVE_NOTE if demo.live_workaround else "",
             # O contorno azul do foco mostra onde fica a tela do navegador da nuvem.
             keep_focus=True,
         )
@@ -1582,13 +1548,18 @@ async def capture_all(camera: Camera, api: Api, demo: Demo, company: Company, v1
         EDUARDA.label + " (token no cabeçalho Authorization)",
         "/v1/openapi-robos.json",
     )
-
-
-_LIVE_NOTE = (
-    "A visão ao vivo não começou sozinha no serviço de verdade: com o NiceGUI 4, o "
-    "<script> da configuração entra depois da resposta e não roda; a captura reexecutou os "
-    "scripts da própria página (veja _START_LIVE_VIEW em capturar.py)."
-)
+    page = await (await camera.context()).new_page()
+    await page.goto(f"{base}/v1/docs")
+    await page.locator(".swagger-ui .opblock").first.wait_for()
+    await camera.shoot(
+        page,
+        "24-docs-api.png",
+        "GET /v1/docs (com RAPA_DOCS_API=1): a documentação da API REST no Swagger UI, "
+        "servido pelo próprio RaPA (sem CDN); a página abre sem token, e o botão Authorize "
+        "recebe o token que as chamadas feitas por ela (Try it out) mandam.",
+        "ninguém (sem token)",
+        "/v1/docs",
+    )
 
 
 def write_index(out: Path, shots: Sequence[Shot]) -> None:
@@ -1604,7 +1575,6 @@ def write_index(out: Path, shots: Sequence[Shot]) -> None:
                 "persona": shot.persona,
                 "url": shot.url,
                 "pagina_inteira": shot.full_page,
-                **({"nota": shot.note} if shot.note else {}),
             }
             for shot in sorted(shots, key=lambda s: s.file)
         ],
@@ -1743,6 +1713,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "RAPA_TOKENS_DEV": str(tokens_file),
                 "RAPA_SEGREDOS_DEV": str(secrets_file),
                 "RAPA_CHAVE_WEBHOOKS": webhook_key,
+                "RAPA_DOCS_API": "1",
                 "RAPA_PUBLIC_URL": f"http://127.0.0.1:{port}",
                 "RAPA_ARGS_NAVEGADOR": shlex.quote(HOST_RESOLVER_ARG),
                 "RAPA_VIDEO_EM_FALHAS": "1",

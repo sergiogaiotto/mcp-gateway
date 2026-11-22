@@ -10,14 +10,17 @@ import re
 from collections import deque
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.datastructures import Headers
 from starlette.routing import Route
+from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from rapa.control.api.errors import error_response, install_error_handlers, log_unexpected
@@ -48,6 +51,8 @@ if TYPE_CHECKING:
     from rapa.control.sessions.service import RecordingSessions
 
 __all__ = [
+    "API_DOCS_PATH",
+    "API_OPENAPI_PATH",
     "UI_UPLOAD_PATH",
     "BodySizeLimitMiddleware",
     "CatchAllMiddleware",
@@ -63,6 +68,15 @@ _MULTIPART_SLACK = 64 * 1024
 #: Envio de arquivo da interface (o ``ui.upload`` do NiceGUI, montado na mesma
 #: aplicação): é por ele que a tela Lotes manda a planilha.
 UI_UPLOAD_PATH = r"/_nicegui/client/[^/]+/upload/[0-9]+"
+#: A documentação da própria API REST (com ``HttpSettings.api_docs``).
+API_DOCS_PATH = "/v1/docs"
+API_OPENAPI_PATH = "/v1/openapi.json"
+_DOCS_ASSETS_PATH = f"{API_DOCS_PATH}/estatico"
+#: O Swagger UI (``swagger-ui-dist`` 5.34.1, Apache-2.0, com o LICENSE e o NOTICE dele e o
+#: ``swagger-ui-bundle.js.LICENSE.txt``, as licenças do código de terceiros do bundle),
+#: servido pelo próprio RaPA: a página da documentação não depende de CDN nem de nada
+#: fora do serviço (o navegador de quem usa pode não alcançar a internet).
+SWAGGER_UI_DIR = Path(__file__).resolve().parent / "static" / "swagger-ui"
 
 
 def _version() -> str:
@@ -97,9 +111,32 @@ class HttpSettings(BaseModel):
     live_allowed_origins: tuple[str, ...] = ()
     #: Emissores (Keycloak) anunciados nos metadados do recurso protegido (RFC 9728).
     authorization_servers: tuple[str, ...] = ()
-    #: Expõe ``/v1/docs`` e ``/v1/openapi.json`` da própria API.
+    #: Expõe ``/v1/docs`` (o Swagger UI, servido daqui) e ``/v1/openapi.json`` da própria API.
     api_docs: bool = False
     validator_cache_size: int = Field(default=256, ge=1)
+
+
+def _add_api_docs(app: FastAPI) -> None:
+    """``/v1/docs``: o Swagger UI do FastAPI, com os arquivos servidos pelo próprio RaPA.
+
+    Sem o validador público do Swagger (``validatorUrl``), que receberia o endereço do
+    documento: nada da página sai do serviço.
+    """
+    app.mount(
+        _DOCS_ASSETS_PATH, StaticFiles(directory=SWAGGER_UI_DIR), name="documentacao-estatico"
+    )
+
+    async def api_docs() -> HTMLResponse:
+        return get_swagger_ui_html(
+            openapi_url=API_OPENAPI_PATH,
+            title=f"{app.title} · API REST",
+            swagger_js_url=f"{_DOCS_ASSETS_PATH}/swagger-ui-bundle.js",
+            swagger_css_url=f"{_DOCS_ASSETS_PATH}/swagger-ui.css",
+            swagger_favicon_url=f"{_DOCS_ASSETS_PATH}/favicon-32x32.png",
+            swagger_ui_parameters={"validatorUrl": None},
+        )
+
+    app.add_api_route(API_DOCS_PATH, api_docs, methods=["GET"], include_in_schema=False)
 
 
 class BodySizeLimitMiddleware:
@@ -280,11 +317,13 @@ def create_http_app(
         title="RaPA",
         version=version,
         lifespan=lifespan,
-        docs_url="/v1/docs" if settings.api_docs else None,
+        docs_url=None,
         redoc_url=None,
-        openapi_url="/v1/openapi.json" if settings.api_docs else None,
+        openapi_url=API_OPENAPI_PATH if settings.api_docs else None,
     )
     install_error_handlers(app, resource_metadata_url=metadata_url)
+    if settings.api_docs:
+        _add_api_docs(app)
     services = ApiServices(
         catalog=catalog,
         runs=runs,

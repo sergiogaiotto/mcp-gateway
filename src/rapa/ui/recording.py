@@ -120,7 +120,6 @@ async def record_page(viewer: Viewer) -> None:
         return
     backend = await viewer.backend()
     sessions = await backend.list_sessions(_SESSIONS_SHOWN)
-    settings = viewer.ctx.settings
     with ui.card().classes("w-full").mark("nova-gravacao"):
         ui.label("Nova gravação").classes("text-h6")
         ui.label(
@@ -129,7 +128,7 @@ async def record_page(viewer: Viewer) -> None:
             "cofre. A gravação termina depois de 10 minutos sem atividade ou de 60 minutos."
         ).classes("text-caption")
         areas = creator_areas(principal, [s.area_id for s in sessions])
-        options = {str(area): settings.area_label(area) for area in areas}
+        options = {str(area): viewer.area_label(area) for area in areas}
         area_select = (
             ui.select(options, label="Área", value=next(iter(options), None))
             .classes("w-96")
@@ -179,7 +178,7 @@ def _session_row(viewer: Viewer, info: RecordingSessionInfo) -> None:
                 ui.label(info.title or "Gravação sem nome").classes("text-weight-medium")
                 _status_badge(info.status)
             ui.label(
-                f"{info.start_url} · {viewer.ctx.settings.area_label(info.area_id)} · "
+                f"{info.start_url} · {viewer.area_label(info.area_id)} · "
                 f"{format_datetime(info.created_at)}"
             ).classes("text-caption break-all")
             if info.end_reason and not info.status.live:
@@ -229,18 +228,28 @@ async def live_page(viewer: Viewer, session_id: str) -> None:
     if info is None or sid is None:
         _not_found("Gravação não encontrada.")
         return
+    active = info.status is RecordingSessionStatus.ACTIVE
+    if active:
+        # O bilhete e os scripts vêm antes de tudo o que manda a página ao navegador. O
+        # ui.timer do tempo restante espera a conexão: com ele criado, o próximo await
+        # (o bilhete, que vai ao banco ou à API) deixa o NiceGUI responder com a página
+        # pela metade, e o ui.add_body_html seguinte vira um insertAdjacentHTML, que não
+        # executa <script> (a tela ao vivo nunca começaria).
+        ticket = await backend.issue_ticket(sid)
+        ui.add_body_html(_live_config(viewer, info, ticket))
+        ui.add_body_html(f'<script src="{LIVE_SCRIPT_PATH}" defer></script>')
     with ui.row().classes("w-full items-center justify-between"):
         with ui.row().classes("items-center gap-2"):
             ui.label(info.title or "Gravação").classes("text-h5").mark("titulo-gravacao-ao-vivo")
             _status_badge(info.status)
-        if info.status is RecordingSessionStatus.ACTIVE:
+        if active:
             timer_label = (
                 ui.label(_remaining(info.expires_at))
                 .classes("text-weight-medium")
                 .mark("tempo-restante")
             )
             ui.timer(1.0, lambda: timer_label.set_text(_remaining(info.expires_at)))
-    if info.status is not RecordingSessionStatus.ACTIVE:
+    if not active:
         with ui.card().classes("w-full").mark("gravacao-fechada"):
             if info.status.reviewable:
                 ui.label("Esta gravação já terminou e está guardada.")
@@ -254,7 +263,6 @@ async def live_page(viewer: Viewer, session_id: str) -> None:
                     "gravar-de-novo"
                 )
         return
-    ticket = await backend.issue_ticket(sid)
     ui.label(
         "Clique na tela para usar o mouse e o teclado do navegador da nuvem. Acentos, colar "
         "(Ctrl+V) e a barra de endereço funcionam. Senhas digitadas aqui não entram na gravação. "
@@ -264,8 +272,6 @@ async def live_page(viewer: Viewer, session_id: str) -> None:
     with ui.row().classes("w-full items-center gap-2"):
         stop_button = ui.button("Parar e revisar", color="negative").mark("parar-e-revisar")
     ui.element("div").classes("w-full").props("id=rapa-ao-vivo").mark("tela-ao-vivo")
-    ui.add_body_html(_live_config(viewer, info, ticket))
-    ui.add_body_html(f'<script src="{LIVE_SCRIPT_PATH}" defer></script>')
 
     async def stop() -> None:
         stop_button.disable()

@@ -99,6 +99,10 @@ async def test_creator_cannot_publish_own_version(world: World) -> None:
         await logout(user)
         await login(user, "aprovador", f"/robos/{robot_id}?versao=2")
         await user.should_see(marker="publicar")
+        # Uma aprovação só (sem certificado A1): nada de "0 de 1 aprovações".
+        await user.should_see("Ao publicar, o robô vira ferramenta MCP")
+        await user.should_not_see(marker="contagem-aprovacoes")
+        await user.should_not_see("aprovações")
         user.find(marker="publicar").click()
         await user.should_see("Versão 2 publicada.", retries=50)
         info = await world.platform.get_version(world.principals["aprovador"], robot_id, 2)
