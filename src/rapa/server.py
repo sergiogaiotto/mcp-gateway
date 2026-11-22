@@ -75,6 +75,7 @@ from rapa.control.services import (
     WebhookKeys,
 )
 from rapa.control.services.queue import DEFAULT_MAX_DURATION
+from rapa.control.services.retention import SUCCESS_AFTER_FAILURE
 from rapa.control.services.sessions import PgSessionStore
 from rapa.control.services.sheets import SheetLimits
 from rapa.control.services.webhooks import WebhookGate
@@ -230,6 +231,8 @@ class ServerSettings(BaseModel):
             )
         if self.session_idle_s > self.session_max_s:
             raise ValueError("o tempo sem atividade de uma sessão não pode passar do prazo máximo")
+        if self.retention_success_days > self.retention_failure_days:
+            raise ValueError(SUCCESS_AFTER_FAILURE)
         oidc = (self.oidc_client_id, self.oidc_redirect_uri)
         if any(oidc) and not all(oidc):
             raise ValueError("para o login OIDC, informe o cliente e o endereço de retorno")
@@ -302,7 +305,8 @@ class ServerSettings(BaseModel):
           todos os artefatos de falhas e indeterminadas, os arquivos baixados das que
           deram certo, e os retratos das falhas; padrão 90) e
           ``RAPA_RETENCAO_EVENTOS_DIAS`` (partições de eventos; padrão 400). Todos têm
-          no mínimo 1 dia.
+          no mínimo 1 dia, e ``RAPA_RETENCAO_SUCESSO_DIAS`` não passa de
+          ``RAPA_RETENCAO_FALHAS_DIAS`` (o servidor não sobe).
         """
         env = os.environ if env is None else env
         data: dict[str, Any] = {

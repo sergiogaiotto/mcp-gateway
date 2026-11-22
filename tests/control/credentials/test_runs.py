@@ -28,6 +28,8 @@ from rapa.control.services import (
 from rapa.control.services.a1 import record_expiry_alerts
 from rapa.core.contracts import (
     CertificateBlocked,
+    Principal,
+    RobotVersionInfo,
     RunnerJob,
     RunState,
     RunTrigger,
@@ -48,6 +50,7 @@ from .support import (
     a1_world,
     in_days,
     publish_a1,
+    ready_a1,
     register_a1,
     set_not_after,
 )
@@ -299,6 +302,144 @@ async def test_the_dispatcher_does_not_launch_when_it_cannot_check() -> None:
     assert [(r["state"], r["error_code"]) for r in queue.finished] == [
         ("failed", "certificado_a1_bloqueado")
     ]
+
+
+# -- as aprovações da versão que vai rodar ------------------------------------------------
+
+
+async def _legacy_publish(
+    world: A1World, superuser: AsyncEngine, approver: Principal
+) -> RobotVersionInfo:
+    """O estado de um robô com A1 publicado antes da revisão 0006: uma aprovação só, a de
+    quem publicou (a migração a copiou de ``approved_by``), com o certificado em dia e o
+    robô autorizado pelo custodiante depois."""
+    version = await ready_a1(world)
+    params = {
+        "company": world.tenant.company_id,
+        "robot": version.robot_id,
+        "number": version.version_no,
+        "who": approver.subject,
+    }
+    async with superuser.begin() as conn:
+        # Os gatilhos de hoje recusariam esse estado; ele vem de antes deles.
+        await conn.execute(text("SET LOCAL session_replication_role = replica"))
+        await conn.execute(
+            text(
+                "INSERT INTO version_approvals (company_id, robot_id, version_no, approved_by) "
+                "VALUES (:company, :robot, :number, :who)"
+            ),
+            params,
+        )
+        await conn.execute(
+            text(
+                "UPDATE robot_versions SET status = 'published', approved_by = :who "
+                "WHERE robot_id = :robot AND version_no = :number"
+            ),
+            params,
+        )
+        await conn.execute(
+            text(
+                "UPDATE robots SET status = 'published', current_version_no = :number "
+                "WHERE id = :robot"
+            ),
+            params,
+        )
+    return version
+
+
+#: Quem deu a única aprovação de uma versão publicada antes da 0006, e quantas valem.
+LEGACY = {"custodiante": 0, "aprovadora": 1}
+
+
+@pytest.mark.parametrize("approver", list(LEGACY))
+async def test_a_legacy_version_with_one_approval_does_not_use_the_certificate(
+    app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine, approver: str
+) -> None:
+    await reset_queue(superuser_engine, total_slots=10)
+    world = await a1_world(app_db, f"Legado {approver}")
+    who = world.custodian if approver == "custodiante" else world.approver2
+    await _legacy_publish(world, superuser_engine, who)
+    for trigger in (RunTrigger.REST, RunTrigger.MCP, RunTrigger.MANUAL):
+        with pytest.raises(CertificateBlocked) as caught:
+            await world.platform.start(world.tenant.operator, SLUG, PROTOCOLO_INPUTS, trigger)
+        assert any(
+            f"{LEGACY[approver]} de 2 aprovações que valem" in e for e in caught.value.errors
+        ), caught.value.errors
+    async with superuser_engine.connect() as conn:
+        queued = await conn.scalar(
+            text("SELECT count(*) FROM runs WHERE company_id = :c"),
+            {"c": world.tenant.company_id},
+        )
+    assert queued == 0
+
+
+async def test_validating_a_draft_does_not_use_the_certificate(
+    app_db: Database, superuser_engine: AsyncEngine
+) -> None:
+    """A autorização do custodiante é do robô: um rascunho sem aprovação nenhuma (a
+    validação roda até o primeiro passo que grava, que o autor declara) não a usa."""
+    await reset_queue(superuser_engine, total_slots=10)
+    world = await a1_world(app_db, "Validação com A1")
+    tenant = world.tenant
+    await publish_a1(world)
+    draft = await world.platform.create_version(tenant.creator, tenant.area_id, a1_protocolo())
+    with pytest.raises(CertificateBlocked) as caught:
+        await world.platform.start_validation(
+            tenant.creator, draft.robot_id, draft.version_no, PROTOCOLO_INPUTS
+        )
+    assert caught.value.errors == [
+        f"a versão {draft.version_no} do robô tem 0 de 2 aprovações que valem para o "
+        "certificado A1 (de pessoas que não criaram a versão nem são custodiantes de um "
+        "certificado do robô)"
+    ]
+    # A versão publicada pelas duas pessoas continua rodando.
+    ok = await world.platform.start(tenant.operator, SLUG, PROTOCOLO_INPUTS, RunTrigger.REST)
+    assert ok.state is RunState.QUEUED
+
+
+@pytest.mark.parametrize("case", ["rascunho", "legado"])
+async def test_the_dispatcher_does_not_launch_a_version_without_the_approvals(
+    app_db: Database,
+    dispatcher_db: Database,
+    superuser_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    """Uma execução que entrou na fila sem as aprovações da versão (de antes desta regra)
+    não é lançada: o despachante confere as aprovações com o papel dele."""
+    await reset_queue(superuser_engine, total_slots=10)
+    world = await a1_world(app_db, f"Despachante sem aprovações {case}")
+    tenant = world.tenant
+
+    async def unchecked(*_: Any, **__: Any) -> None:
+        return None
+
+    monkeypatch.setattr("rapa.control.services.runs.ensure_a1_ready", unchecked)
+    if case == "rascunho":
+        await publish_a1(world)
+        draft = await world.platform.create_version(tenant.creator, tenant.area_id, a1_protocolo())
+        queued = await world.platform.start_validation(
+            tenant.creator, draft.robot_id, draft.version_no, PROTOCOLO_INPUTS
+        )
+    else:
+        await _legacy_publish(world, superuser_engine, world.custodian)
+        queued = await world.platform.start(
+            tenant.operator, SLUG, PROTOCOLO_INPUTS, RunTrigger.REST
+        )
+    assert queued.state is RunState.QUEUED
+    launches = _Launches()
+    dispatcher = Dispatcher(PgRunQueue(dispatcher_db), launches, heartbeat_interval=0.05)
+    assert await dispatcher.run_once() == 1
+    await dispatcher.drain()
+    assert launches.jobs == []  # nada abriu no navegador
+    status = await world.platform.get(
+        tenant.creator if case == "rascunho" else tenant.operator, queued.run_id
+    )
+    assert status is not None and status.state is RunState.FAILED
+    assert status.error_code == ErrorCode.CERTIFICADO_A1_BLOQUEADO.value
+    assert status.error_message is not None
+    assert "0 de 2 aprovações que valem" in status.error_message
+    assert "empresas/" not in status.error_message
 
 
 # -- avisos de vencimento ----------------------------------------------------------------

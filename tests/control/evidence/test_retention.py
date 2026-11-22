@@ -24,6 +24,7 @@ from rapa.control.services import (
     verify_chain,
 )
 from rapa.control.services.a1 import ensure_a1_ready
+from rapa.control.services.lifecycle import freeze_company, unfreeze_company
 from rapa.core.contracts import ArtifactStatus, Gone, RunTrigger
 from tests.control.db.support import (
     PROTOCOLO_INPUTS,
@@ -205,6 +206,103 @@ class _FlakyStore:
         if run_id == self.broken:
             raise PermissionError("sem permissão na pasta")
         await self.inner.delete_run(company_id, run_id, keep=keep)
+
+
+class _CountingStore:
+    """O store de verdade, anotando cada execução que a retenção mandou apagar."""
+
+    def __init__(self, inner: ArtifactStore) -> None:
+        self.inner = inner
+        self.deleted: list[UUID] = []
+
+    async def put(self, *args: Any) -> Any:  # pragma: no cover - não é usado aqui
+        return await self.inner.put(*args)
+
+    async def open(self, *args: Any) -> Any:  # pragma: no cover - não é usado aqui
+        return await self.inner.open(*args)
+
+    async def delete_run(
+        self, company_id: UUID, run_id: UUID, *, keep: Collection[tuple[int, str]] = ()
+    ) -> None:
+        self.deleted.append(run_id)
+        await self.inner.delete_run(company_id, run_id, keep=keep)
+
+
+async def test_runs_with_nothing_listed_are_only_marked(
+    world: EvidenceWorld,
+    app_db: Database,
+    dispatcher_db: Database,
+    owner_engine: AsyncEngine,
+    superuser_engine: AsyncEngine,
+) -> None:
+    """Sem nada na lista que a etapa expira, a execução só ganha a marca (não volta na
+    próxima busca), sem auditoria; o store só é chamado para a que chegou a ser lançada,
+    e o que sobrou na pasta dela (um executor que caiu) sai do mesmo jeito."""
+    await _retention(world, dispatcher_db).tick()  # o que outros testes deixaram vencido
+    tenant = await _tenant(world, app_db, "Nada na lista")
+    # Nunca lançadas: canceladas na fila pelo congelamento (sem tentativa, sem pasta).
+    queued = [
+        (
+            await world.platform.start(
+                tenant.operator, "emitir_protocolo", PROTOCOLO_INPUTS, RunTrigger.REST
+            )
+        ).run_id
+        for _ in range(2)
+    ]
+    await freeze_company(owner_engine, tenant.company_id, reason="teste", requested_by="teste")
+    await unfreeze_company(owner_engine, tenant.company_id, requested_by="teste")
+    # Lançadas sem arquivo nenhum (o lançador cria a pasta da tentativa, vazia).
+    empty_success = await world.run(tenant, state="succeeded", files={})
+    empty_failure = await world.run(tenant, state="failed", files={})
+    # O executor caiu depois de guardar uma tela: o arquivo está na pasta, fora da lista.
+    crashed = await world.run(tenant, state="failed", files={})
+    stray = attempt_dir(world.store.root, tenant.company_id, crashed, 1) / "tela-perdida.png"
+    stray.write_bytes(PNG)
+    # Só um arquivo baixado: no prazo curto, nada da lista sai.
+    download = await world.run(tenant, state="succeeded", files={"nota-001.pdf": ("download", PDF)})
+    listed = await world.run(tenant, state="failed")  # a tela, o vídeo e o download
+    ages = {
+        queued[0]: 8,
+        queued[1]: 91,
+        empty_success: 8,
+        empty_failure: 91,
+        crashed: 91,
+        download: 8,
+        listed: 91,
+    }
+    for run_id, days in ages.items():
+        await age_run(superuser_engine, run_id, days)
+    ours = set(ages)
+    store = _CountingStore(world.store)
+
+    report = await Retention(dispatcher_db, store, RetentionPolicy(batch_size=50)).tick()
+
+    assert set(store.deleted) & ours == ours - set(queued)  # a fila nunca teve pasta
+    assert set(report.empty) & ours == ours - {listed}
+    assert set(report.artifacts) & ours == {listed} and not set(report.captures) & ours
+    for run_id, days in ages.items():
+        row = await run_row(superuser_engine, run_id)
+        assert (row["artifacts_expired_at"] is not None) is (days == 91), run_id
+        assert (row["captures_expired_at"] is not None) is (days == 8), run_id
+    assert not stray.exists() and _files(world, tenant, crashed) == []
+    assert [path.name for path in _files(world, tenant, download)] == ["nota-001.pdf"]
+    async with superuser_engine.connect() as conn:
+        audited = (
+            await conn.execute(
+                text(
+                    "SELECT action, target FROM audit_log WHERE company_id = :c "
+                    "AND action LIKE 'execucao.%expirad%'"
+                ),
+                {"c": tenant.company_id},
+            )
+        ).all()
+    assert [tuple(row) for row in audited] == [
+        ("execucao.artefatos_expirados", f"execucao:{listed}")
+    ]
+    # Marcadas, não voltam: a volta seguinte não pega nem chama o store para elas.
+    again = await Retention(dispatcher_db, store, RetentionPolicy(batch_size=50)).tick()
+    assert not set(again.empty + again.artifacts + again.captures) & ours
+    assert len([run_id for run_id in store.deleted if run_id in ours]) == len(ours) - 2
 
 
 async def test_files_that_cannot_be_deleted_keep_the_run_for_the_next_round(
@@ -548,6 +646,12 @@ def test_policy_has_a_minimum_of_one_day(tmp_path: Path) -> None:
             RetentionPolicy(**changes)
     with pytest.raises(ValueError):
         RetentionPolicy(batch_size=0)
+    # O prazo das capturas não passa o das evidências: a etapa das evidências levaria as
+    # capturas das execuções que deram certo antes do prazo delas.
+    with pytest.raises(ValueError, match="não pode passar o das evidências"):
+        RetentionPolicy(success_days=120, failure_days=90)
+    same = RetentionPolicy(success_days=90, failure_days=90)
+    assert (same.success_days, same.failure_days) == (90, 90)
     store = LocalArtifactStore(tmp_path)
     with pytest.raises(ValueError):
         Retention(None, store, max_tick_s=0)  # type: ignore[arg-type]

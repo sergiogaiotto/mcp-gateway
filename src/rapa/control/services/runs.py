@@ -10,8 +10,10 @@ os webhooks e os lotes. Todos tomam a mesma trava da empresa, respeitam o limite
 da fila, recusam empresa congelada (:func:`ensure_company_active`) e auditam cada
 execução. Um robô com certificado digital A1 só entra na fila se o certificado pode
 ser usado agora (registrado na área, não revogado, não vencido e com a autorização do
-custodiante na impressão atual: :func:`rapa.control.services.a1.ensure_a1_ready`);
-senão, :class:`~rapa.core.contracts.CertificateBlocked`, com o que falta. A empresa
+custodiante na impressão atual) e a versão que vai rodar tem as duas aprovações de
+pessoas que não a criaram nem são custodiantes
+(:func:`rapa.control.services.a1.ensure_a1_ready`); senão,
+:class:`~rapa.core.contracts.CertificateBlocked`, com o que falta. A empresa
 congelada é conferida antes do certificado.
 """
 

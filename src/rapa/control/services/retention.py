@@ -1,7 +1,8 @@
 """Retenção: o despachante apaga, uma vez por hora, o que passou do prazo.
 
-Os prazos são da plataforma (``ServerSettings``, mínimo de 1 dia) e ainda estão
-**a validar com o jurídico**:
+Os prazos são da plataforma (``ServerSettings``, mínimo de 1 dia; o das capturas nunca
+passa o das evidências, senão a etapa das evidências levaria as capturas antes do prazo
+delas) e ainda estão **a validar com o jurídico**:
 
 - capturas (telas e vídeos) de execuções que deram certo (ou foram canceladas):
   ``RAPA_RETENCAO_SUCESSO_DIAS`` (7 dias); os arquivos baixados por elas ficam;
@@ -35,6 +36,12 @@ Cada execução expirada (as capturas ou tudo) e cada retrato apagado entram na
 auditoria da empresa; a
 remoção de uma partição de eventos, que não é de nenhuma empresa, vai só para o log,
 e as chaves de idempotência vencidas (que já não valiam para nada) só são contadas.
+Uma execução cuja lista não tem nada que a etapa expira (a cancelada na fila, a que
+não guardou nenhuma tela, a que só tem arquivos baixados no prazo curto) só ganha a
+marca, sem auditoria (:attr:`RetentionReport.empty`), para não ser pega de novo. Os
+arquivos dela no disco são apagados assim mesmo quando ela chegou a ser lançada
+(``attempt`` a partir de 1: o executor que caiu no meio deixa arquivos fora da lista);
+a que nunca foi lançada não tem pasta, e o store nem é chamado.
 
 Empresa congelada fica de fora de tudo: nada dela expira enquanto está congelada (as
 evidências ficam para a exportação da saída da empresa, ``docs/OPERACAO.md``). Os
@@ -71,6 +78,7 @@ from rapa.core.contracts import CompanyStatus, RunState
 
 __all__ = [
     "MAX_RETENTION_DAYS",
+    "SUCCESS_AFTER_FAILURE",
     "Retention",
     "RetentionPolicy",
     "RetentionReport",
@@ -80,6 +88,12 @@ logger = logging.getLogger("rapa.control.retention")
 
 #: Maior prazo aceito (100 anos): o mesmo limite das funções do banco.
 MAX_RETENTION_DAYS = 36_500
+#: Por que o prazo das capturas não pode passar o das evidências.
+SUCCESS_AFTER_FAILURE = (
+    "o prazo das telas e dos vídeos das execuções que deram certo "
+    "(RAPA_RETENCAO_SUCESSO_DIAS) não pode passar o das evidências "
+    "(RAPA_RETENCAO_FALHAS_DIAS): elas sairiam com as evidências, antes do prazo dado"
+)
 #: Estados cujas capturas (telas e vídeo) saem pelo prazo curto.
 _SHORT_STATES = (RunState.SUCCEEDED.value, RunState.CANCELLED.value)
 #: Estados cujos artefatos todos saem pelo prazo longo (o das evidências).
@@ -104,6 +118,10 @@ class RetentionPolicy:
         for days in (self.success_days, self.failure_days, self.events_days):
             if isinstance(days, bool) or not 1 <= days <= MAX_RETENTION_DAYS:
                 raise ValueError(f"os prazos de retenção vão de 1 a {MAX_RETENTION_DAYS} dias")
+        if self.success_days > self.failure_days:
+            # A etapa das evidências leva tudo de toda execução que terminou, também as
+            # capturas das que deram certo: elas sairiam antes do prazo delas.
+            raise ValueError(SUCCESS_AFTER_FAILURE)
         if not 1 <= self.batch_size <= 1000:
             raise ValueError("o lote da retenção vai de 1 a 1000")
 
@@ -118,6 +136,8 @@ class RetentionReport:
     captures: list[UUID] = field(default_factory=list)
     #: Execuções cujos arquivos não puderam ser apagados (ficam para a próxima volta).
     failed: list[UUID] = field(default_factory=list)
+    #: Execuções sem nada na lista que a etapa expira: só ganharam a marca (sem auditoria).
+    empty: list[UUID] = field(default_factory=list)
     snapshots: int = 0
     idempotency_keys: int = 0
     partitions: int = 0
@@ -243,8 +263,10 @@ class Retention:
 
         Com ``captures_only`` (o prazo curto das execuções que deram certo), saem só as
         telas e o vídeo, os arquivos baixados ficam, e a marca é ``captures_expired_at``;
-        senão sai tudo e a marca é ``artifacts_expired_at``. Devolve quantas execuções o
-        lote pegou (as que falharam ao apagar contam, mas ficam de fora das próximas
+        senão sai tudo e a marca é ``artifacts_expired_at``. A execução sem nada na lista
+        que a etapa expira ganha a marca sem auditoria, e o store só é chamado para ela
+        se ela chegou a ser lançada (veja o começo do módulo). Devolve quantas execuções
+        o lote pegou (as que falharam ao apagar contam, mas ficam de fora das próximas
         buscas desta volta).
         """
         mark: Column[Any] = (
@@ -278,17 +300,27 @@ class Retention:
                 if await lock_company_status(session, company) is CompanyStatus.ACTIVE
             }
             expired: list[Any] = []
+            audited: list[Any] = []
             for row in rows:
                 if row["company_id"] not in allowed:
                     continue
-                keep = _downloads(row) if captures_only else ()
-                try:
-                    await self.store.delete_run(row["company_id"], row["id"], keep=keep)
-                except Exception as exc:  # permissão, disco, store fora: tenta na próxima volta
-                    logger.warning("retenção: falha ao apagar artefatos: %s", type(exc).__name__)
-                    report.failed.append(row["id"])
-                    continue
+                keep = _downloads(row) if captures_only else []
+                listed = _expiring(row, keep)
+                # Só uma execução lançada tem pasta (a da tentativa, que o lançador cria).
+                if listed or int(row["attempt"] or 0) >= 1:
+                    try:
+                        await self.store.delete_run(row["company_id"], row["id"], keep=keep)
+                    except Exception as exc:  # permissão, disco, store fora: na próxima volta
+                        logger.warning(
+                            "retenção: falha ao apagar artefatos: %s", type(exc).__name__
+                        )
+                        report.failed.append(row["id"])
+                        continue
                 expired.append(row)
+                if listed:
+                    audited.append(row)
+                else:
+                    report.empty.append(row["id"])
             if expired:
                 await session.execute(
                     update(runs)
@@ -300,7 +332,7 @@ class Retention:
                     if captures_only
                     else "execucao.artefatos_expirados"
                 )
-                for row in expired:
+                for row in audited:
                     await audit.append(
                         session,
                         company_id=row["company_id"],
@@ -310,7 +342,7 @@ class Retention:
                         payload={"estado": row["state"], "prazo_dias": days},
                     )
         (report.captures if captures_only else report.artifacts).extend(
-            row["id"] for row in expired
+            row["id"] for row in audited
         )
         return len(rows)
 
@@ -376,6 +408,19 @@ class Retention:
             if loop.time() >= give_up:
                 break
         return dropped, True
+
+
+def _expiring(row: RowMapping, keep: list[tuple[int, str]]) -> bool:
+    """Se a lista da execução (``runs.artifacts``) tem algo que a etapa expira.
+
+    Na etapa das evidências, qualquer artefato; na das capturas, qualquer um além dos
+    arquivos baixados que ficam (``keep``). Uma lista fora do formato conta (na dúvida,
+    a expiração é auditada).
+    """
+    items = row["artifacts"]
+    if not isinstance(items, list):
+        return bool(items)
+    return len(items) > len(keep)
 
 
 def _downloads(row: RowMapping) -> list[tuple[int, str]]:

@@ -128,7 +128,9 @@ class UserProvisioner(Protocol):
     """Cria, no primeiro login, o usuário que ainda não existe (sem nenhum papel).
 
     Devolve ``None`` quando não pode criar (empresa inexistente ou congelada, sujeito
-    já existente e desativado, ou de outra empresa): o acesso é negado.
+    já existente e desativado, ou de outra empresa): o acesso é negado. Se o usuário
+    ativo desta empresa acabou de ser criado por outro login do mesmo sujeito, devolve
+    o principal dele.
     """
 
     async def provision(

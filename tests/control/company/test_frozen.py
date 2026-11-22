@@ -14,11 +14,14 @@ from rapa.control.db import Database
 from rapa.control.http_app import HttpSettings, create_http_app
 from rapa.control.services import PgRepairs, PgRunQueue, Scheduler
 from rapa.control.services.lifecycle import unfreeze_company
+from rapa.control.services.repairs import FROZEN_SUGGESTION
 from rapa.control.services.sessions import PgSessionStore
 from rapa.control.sessions import LiveRelay, RecordingSessions, SessionLimits
 from rapa.core.contracts import (
+    COMPANY_FROZEN_MESSAGE,
     CompanyFrozen,
     Forbidden,
+    RepairSuggestionStatus,
     RunState,
     RunTrigger,
     ScheduleChanges,
@@ -26,6 +29,7 @@ from rapa.core.contracts import (
     WebhookChanges,
     WebhookSpec,
 )
+from rapa.llm.repair import RepairAnswer
 from tests.control.api.support import DictResolver, asgi_client, auth
 from tests.control.db.support import PROTOCOLO_INPUTS, failed_run, protocolo, result
 from tests.control.publishing.support import (
@@ -36,6 +40,7 @@ from tests.control.publishing.support import (
     runs_of,
     signed,
 )
+from tests.control.repairs.test_service import FakeAssistant
 from tests.control.sessions.support import FakeLauncher
 from tests.repair.support import login_page
 
@@ -136,6 +141,10 @@ async def test_frozen_company_refuses_every_write_path(
     try:
         with pytest.raises(CompanyFrozen):
             await sessions.create_session(a.creator, a.area_id, "https://portal.exemplo.gov.br/")
+        # A revisão de uma gravação também sabe que a empresa está congelada (e não
+        # pergunta ao modelo); a outra empresa não.
+        assert await sessions.store.company_frozen(a.company_id)
+        assert not await sessions.store.company_frozen(world.b.company_id)
     finally:
         await sessions.aclose()
     assert launcher.jobs == []
@@ -340,14 +349,31 @@ async def test_repair_is_refused_while_frozen(
     run_id = await failed_run(
         app_db, dispatcher_db, a, snapshot=login_page().model_dump(mode="json")
     )
-    repairs = PgRepairs(app_db)
+    assistant = FakeAssistant(RepairAnswer(candidate_id="c1", reason="Acessar é o login."))
+    repairs = PgRepairs(app_db, assistant=assistant)
     await freeze(owner_engine, a.company_id)
-    # Ver os candidatos é leitura; pedir o conserto, não.
-    view = await repairs.get_repair(a.creator, run_id, suggest=False)
-    assert view.candidates
+    asked_before = (await audit_actions(superuser_engine, a.company_id)).count(
+        "conserto.sugestao_pedida"
+    )
+    # Ver os candidatos é leitura; perguntar ao modelo e pedir o conserto, não.
+    for suggest in (True, False):
+        view = await repairs.get_repair(a.creator, run_id, suggest=suggest)
+        assert view.candidates
+        assert view.suggestion.status is RepairSuggestionStatus.OFF
+        assert view.suggestion.message == FROZEN_SUGGESTION
+        assert view.blocked_reason == COMPANY_FROZEN_MESSAGE
+    assert assistant.calls == []
+    actions = await audit_actions(superuser_engine, a.company_id)
+    assert actions.count("conserto.sugestao_pedida") == asked_before
     with pytest.raises(CompanyFrozen):
         await repairs.create_repair(a.creator, run_id, view.candidates[0].candidate_id)
     await unfreeze_company(owner_engine, a.company_id, requested_by="teste")
+    # Descongelada, a sugestão volta (e a pergunta entra na auditoria).
+    active = await repairs.get_repair(a.creator, run_id)
+    assert active.suggestion.status is RepairSuggestionStatus.CHOSEN
+    assert active.blocked_reason is None and len(assistant.calls) == 1
+    actions = await audit_actions(superuser_engine, a.company_id)
+    assert actions.count("conserto.sugestao_pedida") == asked_before + 1
     proposal = await repairs.create_repair(a.creator, run_id, view.candidates[0].candidate_id)
     assert proposal.run_id == run_id
 

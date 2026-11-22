@@ -10,6 +10,14 @@ uma delas:
 4. o custodiante autorizou este robô (``a1_authorizations`` ativa) com a impressão
    atual do certificado: trocar o certificado derruba a autorização.
 
+Na hora de rodar (:func:`ensure_a1_ready` ao enfileirar e :func:`launch_block` logo
+antes de lançar), a versão que vai rodar também precisa de duas aprovações
+(``version_approvals``) de pessoas que não a criaram e não são custodiantes de um
+certificado A1 do robô (:func:`approval_problems`): a autorização do custodiante é do
+robô, não da versão, então ela não vale para um rascunho sem aprovação (a validação)
+nem para uma versão publicada antes da revisão 0006 só com a aprovação de quem a
+publicou (às vezes o próprio custodiante).
+
 As mesmas funções servem à aplicação (numa transação fixada na empresa) e ao
 despachante (``BYPASSRLS``, que só lê as colunas que estão aqui: nunca ``vault_path``),
 por isso toda consulta filtra a empresa explicitamente. As mensagens dizem o que falta
@@ -35,9 +43,16 @@ from rapa.control.db.schema import (
     robot_versions,
     runs,
     users,
+    version_approvals,
 )
 from rapa.control.services import audit
-from rapa.core.contracts import CertificateBlocked, CompanyStatus, RunnerJob, uses_a1
+from rapa.core.contracts import (
+    A1_APPROVALS,
+    CertificateBlocked,
+    CompanyStatus,
+    RunnerJob,
+    uses_a1,
+)
 from rapa.core.cron import DEFAULT_TIMEZONE, load_zone
 from rapa.core.robot import CredentialKind, CredentialRef, Manifest
 
@@ -51,6 +66,7 @@ __all__ = [
     "a1_custodians",
     "a1_problems",
     "a1_refs",
+    "approval_problems",
     "ensure_a1_ready",
     "is_expired",
     "launch_block",
@@ -70,7 +86,9 @@ BLOCKED_MESSAGE = "o certificado A1 do robô não pode ser usado agora"
 ALERT_BATCH = 500
 _ZONE = load_zone(DEFAULT_TIMEZONE)
 
-#: As colunas de ``credentials`` que a conferência lê (as mesmas concedidas ao despachante).
+#: As colunas de ``credentials`` que a conferência lê. O despachante pode ler estas e
+#: ``custodian_user_id`` (para achar os custodiantes, :func:`a1_custodians`), nunca
+#: ``vault_path``.
 _CREDENTIAL_COLUMNS = (
     credentials.c.id,
     credentials.c.company_id,
@@ -214,6 +232,57 @@ async def a1_custodians(
     return set(rows.all())
 
 
+async def approval_problems(
+    session: AsyncSession,
+    *,
+    company_id: UUID,
+    area_id: UUID,
+    robot_id: UUID,
+    version_id: UUID,
+    manifest: Manifest,
+) -> list[str]:
+    """O que falta nas aprovações da versão para ela usar o certificado A1 (vazio: nada).
+
+    Contam só as aprovações (``version_approvals``) de quem não criou a versão e não é
+    custodiante de um certificado A1 do robô (os registrados na área dele com os nomes
+    do manifesto, como em :func:`a1_custodians`); são precisas :data:`A1_APPROVALS`.
+    Uma versão que não é deste robô e desta empresa também falta (falha fechada).
+    """
+    refs = a1_refs(manifest)
+    if not refs:
+        return []
+    version = (
+        await session.execute(
+            select(robot_versions.c.version_no, robot_versions.c.created_by).where(
+                robot_versions.c.company_id == company_id,
+                robot_versions.c.robot_id == robot_id,
+                robot_versions.c.id == version_id,
+            )
+        )
+    ).one_or_none()
+    if version is None:
+        return ["a versão do robô não foi encontrada"]
+    version_no, author = version
+    custodians = await a1_custodians(
+        session, company_id=company_id, area_id=area_id, names=[r.name for r in refs]
+    )
+    approvers = await session.scalars(
+        select(version_approvals.c.approved_by).where(
+            version_approvals.c.company_id == company_id,
+            version_approvals.c.robot_id == robot_id,
+            version_approvals.c.version_no == version_no,
+        )
+    )
+    valid = {who for who in approvers.all() if who != author and who not in custodians}
+    if len(valid) >= A1_APPROVALS:
+        return []
+    return [
+        f"a versão {version_no} do robô tem {len(valid)} de {A1_APPROVALS} aprovações que "
+        "valem para o certificado A1 (de pessoas que não criaram a versão nem são "
+        "custodiantes de um certificado do robô)"
+    ]
+
+
 async def _manifest_of(session: AsyncSession, robot: Mapping[str, Any]) -> Manifest:
     raw = robot.get("manifest")
     if raw is None:
@@ -229,7 +298,9 @@ async def ensure_a1_ready(
     """Levanta :class:`CertificateBlocked` se a versão que vai rodar não pode usar o A1.
 
     ``robot`` é a linha que :func:`rapa.control.services.runs.enqueue_run` recebe
-    (``robot_id``, ``area_id``, ``version_id`` e, de preferência, ``manifest``).
+    (``robot_id``, ``area_id``, ``version_id`` e, de preferência, ``manifest``). Além do
+    certificado (:func:`a1_problems`), a versão precisa das aprovações
+    (:func:`approval_problems`).
     """
     manifest = await _manifest_of(session, robot)
     if not uses_a1(manifest):
@@ -242,6 +313,14 @@ async def ensure_a1_ready(
         manifest=manifest,
         now=now,
     )
+    problems += await approval_problems(
+        session,
+        company_id=company_id,
+        area_id=robot["area_id"],
+        robot_id=robot["robot_id"],
+        version_id=robot["version_id"],
+        manifest=manifest,
+    )
     if problems:
         raise CertificateBlocked(f"{BLOCKED_MESSAGE}; nada foi enfileirado", problems)
 
@@ -251,26 +330,37 @@ async def launch_block(session: AsyncSession, job: RunnerJob, now: datetime) -> 
 
     Roda na sessão do despachante, logo antes de lançar: o certificado pode ter sido
     revogado, ter vencido ou ter perdido a autorização depois de a execução entrar na
-    fila. Uma execução que sumiu também não é lançada (falha fechada).
+    fila, e uma execução que entrou na fila sem as aprovações da versão
+    (:func:`approval_problems`) também não roda. Uma execução que sumiu também não é
+    lançada (falha fechada).
     """
     if not uses_a1(job.manifest):
         return None
     run = (
         await session.execute(
-            select(runs.c.robot_id, runs.c.area_id).where(
+            select(runs.c.robot_id, runs.c.area_id, runs.c.version_id).where(
                 runs.c.id == job.run_id, runs.c.company_id == job.company_id
             )
         )
     ).one_or_none()
     if run is None:
         return "A execução não foi encontrada; o executor não foi lançado."
+    robot_id, area_id, version_id = run
     problems = await a1_problems(
         session,
         company_id=job.company_id,
-        area_id=run[1],
-        robot_id=run[0],
+        area_id=area_id,
+        robot_id=robot_id,
         manifest=job.manifest,
         now=now,
+    )
+    problems += await approval_problems(
+        session,
+        company_id=job.company_id,
+        area_id=area_id,
+        robot_id=robot_id,
+        version_id=version_id,
+        manifest=job.manifest,
     )
     if not problems:
         return None

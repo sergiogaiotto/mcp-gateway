@@ -32,6 +32,7 @@ __all__ = [
     "PRIORITY_BY_TRIGGER",
     "PgService",
     "clean_title",
+    "company_frozen",
     "ensure_company_active",
     "lock_company_status",
     "now_utc",
@@ -102,6 +103,18 @@ async def lock_company_status(session: AsyncSession, company_id: UUID) -> Compan
     )
     status = await session.scalar(select(companies.c.status).where(companies.c.id == company_id))
     return None if status is None else CompanyStatus(status)
+
+
+async def company_frozen(session: AsyncSession, company_id: UUID) -> bool:
+    """Se a empresa está congelada agora (só lê, sem a trava da situação).
+
+    Para as leituras que, numa empresa ativa, também fazem algo novo (perguntar ao
+    modelo de linguagem na tela do conserto ou na revisão de uma gravação): congelada,
+    elas mostram o que já existe e não fazem o resto. Escrever continua passando por
+    :func:`ensure_company_active`.
+    """
+    status = await session.scalar(select(companies.c.status).where(companies.c.id == company_id))
+    return status == CompanyStatus.FROZEN.value
 
 
 async def ensure_company_active(session: AsyncSession, company_id: UUID) -> None:

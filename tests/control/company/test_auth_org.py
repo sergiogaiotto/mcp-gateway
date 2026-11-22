@@ -1,5 +1,6 @@
 """A empresa pela organização guardada no banco (sem reinício) e o usuário criado no primeiro login."""
 
+import asyncio
 import secrets
 from uuid import UUID
 
@@ -194,6 +195,41 @@ async def test_first_login_creates_the_user_without_roles(
     with pytest.raises(AccessDenied):
         await authenticator.authenticate(f"Bearer {token}")
     assert (await audit_actions(superuser_engine, company)).count("usuario.criado_no_login") == 1
+
+
+async def test_first_logins_that_arrive_together_all_get_in(
+    app_db: Database, superuser_engine: AsyncEngine, keys: Keys, fake: FakeJwks
+) -> None:
+    """Os primeiros logins do mesmo sujeito que chegam juntos (um cliente do MCP com várias
+    chamadas de uma vez): um cria o usuário; os outros perdem a inclusão para ele e entram
+    com o mesmo usuário, em vez de 403. Só uma linha e uma auditoria."""
+    tag = secrets.token_hex(4)
+    alias = f"jit3-{tag}"
+    company = await _company(app_db, alias, f"admin-{tag}@jit3")
+    resolver = PgPrincipalResolver(app_db)
+    # Quem perde a inclusão (o outro login já gravou o usuário): entra com ele.
+    first = await resolver.provision(f"antes-{tag}@jit3", company)
+    lost = await resolver.provision(f"antes-{tag}@jit3", company)
+    assert first is not None and lost is not None
+    assert (lost.user_id, lost.company_id) == (first.user_id, company)
+    assert lost.company_roles == frozenset() and lost.area_roles == {}
+    # De verdade, ao mesmo tempo, pelo autenticador.
+    directory = CachedOrganizationDirectory(PgOrganizationDirectory(app_db))
+    authenticator = Authenticator(_verifier(fake, directory), resolver, provisioner=resolver)
+    newcomer = f"juntos-{tag}@jit3"
+    token = sign(keys.rsa, claims(sub=newcomer, organization=[alias]))
+    principals = await asyncio.gather(
+        *(authenticator.authenticate(f"Bearer {token}") for _ in range(4))
+    )
+    assert {(p.subject, p.company_id) for p in principals} == {(newcomer, company)}
+    assert len({p.user_id for p in principals}) == 1
+    async with superuser_engine.connect() as conn:
+        rows = await conn.scalar(
+            text("SELECT count(*) FROM users WHERE subject = ANY(:s)"),
+            {"s": [newcomer, f"antes-{tag}@jit3"]},
+        )
+    assert rows == 2
+    assert (await audit_actions(superuser_engine, company)).count("usuario.criado_no_login") == 2
 
 
 async def test_first_login_is_refused_where_it_should_be(

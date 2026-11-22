@@ -158,6 +158,17 @@ def test_evidence_configuration(tmp_path: Path) -> None:
     ):
         with pytest.raises(ValueError):
             ServerSettings.from_env({**base, name: "0"})
+    # As capturas das que deram certo não ficam mais que as evidências (o servidor não sobe).
+    with pytest.raises(ValueError, match="RAPA_RETENCAO_SUCESSO_DIAS"):
+        ServerSettings.from_env(
+            {**base, "RAPA_RETENCAO_SUCESSO_DIAS": "120", "RAPA_RETENCAO_FALHAS_DIAS": "90"}
+        )
+    with pytest.raises(ValueError, match="não pode passar"):
+        ServerSettings.from_env({**base, "RAPA_RETENCAO_FALHAS_DIAS": "6"})
+    equal = ServerSettings.from_env(
+        {**base, "RAPA_RETENCAO_SUCESSO_DIAS": "30", "RAPA_RETENCAO_FALHAS_DIAS": "30"}
+    )
+    assert (equal.retention_success_days, equal.retention_failure_days) == (30, 30)
     app = create_server_app(
         ServerSettings.from_env(
             {

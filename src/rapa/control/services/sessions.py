@@ -24,6 +24,7 @@ from rapa.control.services import audit
 from rapa.control.services._common import (
     INTERACTIVE_PRIORITY,
     PgService,
+    company_frozen,
     ensure_company_active,
 )
 from rapa.control.services.admission import Capacity
@@ -98,6 +99,10 @@ class PgSessionStore(PgService):
                 select(areas.c.id).where(areas.c.company_id == company_id, areas.c.id == area_id)
             )
         return found is not None
+
+    async def company_frozen(self, company_id: UUID) -> bool:
+        async with self.db.tenant_session(company_id) as session:
+            return await company_frozen(session, company_id)
 
     async def interactive_reserve(self) -> int | None:
         async with self.db.dispatcher_session() as session:

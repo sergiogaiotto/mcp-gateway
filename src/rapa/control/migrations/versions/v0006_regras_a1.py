@@ -30,9 +30,11 @@ Anterior: 0005
   despachante.
 
 Todas com a empresa liderando as chaves e o isolamento por linha de sempre (ENABLE
-e FORCE). O despachante ganha só a leitura das colunas de ``credentials`` e de
-``a1_authorizations`` que a conferência antes de lançar precisa (nunca
-``vault_path``) e a inclusão dos avisos.
+e FORCE). O despachante ganha só a leitura das colunas que a conferência antes de
+lançar precisa: de ``credentials`` (nunca ``vault_path``) e de ``a1_authorizations``, e,
+para contar as aprovações da versão que vai rodar sem as do custodiante, as de
+``version_approvals`` (sem a data) e a empresa, o identificador e o sujeito de
+``users``; e a inclusão dos avisos.
 """
 
 from collections.abc import Sequence

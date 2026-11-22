@@ -20,7 +20,10 @@ Regras:
   tela e do REST), sem hub ou com uma resposta inválida, a tela mostra os
   candidatos do mesmo jeito e a pessoa escolhe sozinha. A sugestão fica na memória do
   processo por uma hora (por execução e retrato), para não perguntar de novo a cada
-  abertura da tela; cada pergunta ao modelo entra na auditoria.
+  abertura da tela; cada pergunta ao modelo entra na auditoria. Numa empresa congelada
+  ("lê tudo, mas nada novo acontece"), a tela mostra os candidatos sem a sugestão: o
+  modelo não é perguntado, nada entra na auditoria e o pedido do conserto fica bloqueado
+  (pedir é recusado com ``CompanyFrozen``).
 - **Sempre um rascunho novo.** O conserto nunca muda uma versão publicada: ele cria a
   próxima versão do robô, em rascunho, com o alvo daquele passo trocado e mais nada
   (``rapa.repair.apply_candidate``), pelo mesmo caminho de toda versão
@@ -62,9 +65,10 @@ from rapa.control.db.schema import (
 )
 from rapa.control.db.session import Database
 from rapa.control.services import audit
-from rapa.control.services._common import PgService, ensure_company_active
+from rapa.control.services._common import PgService, company_frozen, ensure_company_active
 from rapa.control.services.robots import insert_version
 from rapa.core.contracts import (
+    COMPANY_FROZEN_MESSAGE,
     Conflict,
     Forbidden,
     InvalidInput,
@@ -96,6 +100,7 @@ from rapa.repair import (
 
 __all__ = [
     "A1_DISABLED",
+    "FROZEN_SUGGESTION",
     "HubRepairAssistant",
     "PgRepairs",
     "RepairAssistant",
@@ -110,6 +115,11 @@ A1_DISABLED = (
     "o conserto assistido fica desligado para robôs com certificado digital A1: o "
     "conserto deles nunca é automático e passa por uma gravação nova, acompanhada pelo "
     "custodiante"
+)
+#: A sugestão numa empresa congelada: o modelo não é perguntado.
+FROZEN_SUGGESTION = (
+    "A empresa está congelada: o modelo de linguagem não é consultado, e os candidatos "
+    "ficam só para consulta."
 )
 _VIEW_ROLES = (Role.CREATOR, Role.APPROVER)
 _SUGGESTION_TTL_S = 3600.0
@@ -491,7 +501,16 @@ class PgRepairs(PgService):
     ) -> RepairView:
         async with self.db.tenant_session(principal.company_id) as session:
             context = await self._context(session, principal, run_id, lock=False)
-        if suggest and context.blocked_reason is None:
+            frozen = await company_frozen(session, principal.company_id)
+        blocked_reason = context.blocked_reason
+        if frozen:
+            # Lê tudo, mas nada novo acontece: nem a pergunta ao modelo, nem a auditoria dela.
+            suggestion = RepairSuggestion(
+                status=RepairSuggestionStatus.OFF, message=FROZEN_SUGGESTION
+            )
+            asked = False
+            blocked_reason = blocked_reason or COMPANY_FROZEN_MESSAGE
+        elif suggest and context.blocked_reason is None:
             # Fora da transação: a resposta do hub pode demorar.
             suggestion, asked = await self._ask(context)
         else:
@@ -531,7 +550,7 @@ class PgRepairs(PgService):
             suggestion=suggestion,
             truncated=context.snapshot.truncated,
             proposal=context.proposal,
-            blocked_reason=context.blocked_reason,
+            blocked_reason=blocked_reason,
         )
 
     async def create_repair(

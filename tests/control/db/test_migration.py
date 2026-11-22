@@ -417,8 +417,13 @@ def _a1_schema(pg: PgDatabase, database: str) -> dict[str, Any]:
                 "has_column_privilege(%s, 'credentials', 'not_after', 'SELECT'), "
                 "has_column_privilege(%s, 'credentials', 'vault_path', 'SELECT'), "
                 "has_column_privilege(%s, 'a1_authorizations', 'authorized_by', 'SELECT'), "
-                "has_table_privilege(%s, 'credential_alerts', 'INSERT')",
-                (app, app, app, app, app, app, app, dispatcher, dispatcher, dispatcher, dispatcher),
+                "has_table_privilege(%s, 'credential_alerts', 'INSERT'), "
+                "has_column_privilege(%s, 'version_approvals', 'approved_by', 'SELECT'), "
+                "has_column_privilege(%s, 'version_approvals', 'approved_at', 'SELECT'), "
+                "has_column_privilege(%s, 'credentials', 'custodian_user_id', 'SELECT'), "
+                "has_column_privilege(%s, 'users', 'subject', 'SELECT'), "
+                "has_column_privilege(%s, 'users', 'display_name', 'SELECT')",
+                (app, app, app, app, app, app, app, *[dispatcher] * 9),
             ).fetchone()
             if tables
             else None
@@ -505,8 +510,13 @@ async def test_a1_rules_migrate_back_and_forth(pg_database: PgDatabase) -> None:
             "credentials": (False, False),
             # Aplicação: muda só a validade, inclui aprovações (sem mudar), revoga
             # autorizações (sem trocar a credencial) e só lê os avisos. Despachante: lê a
-            # validade, nunca o caminho no cofre nem quem autorizou, e inclui os avisos.
-            "privileges": (True, False, True, False, True, False, False, True, False, False, True),
+            # validade, nunca o caminho no cofre nem quem autorizou, e inclui os avisos;
+            # lê quem aprovou a versão e quem é custodiante (o sujeito do usuário), mais
+            # nada das aprovações e dos usuários.
+            "privileges": (
+                *(True, False, True, False, True, False, False, True, False, False, True),
+                *(True, False, True, True, False),
+            ),
         }
         robot_id = await _published_robot(pg_database, name)
         approver = _approvals_of(pg_database, name, robot_id)
@@ -526,9 +536,11 @@ async def test_a1_rules_migrate_back_and_forth(pg_database: PgDatabase) -> None:
         assert _credentials_acl(pg_database, name) == fresh
         with pg_database.server.connect(name) as conn:
             reads = conn.execute(
-                "SELECT has_any_column_privilege(%s, 'credentials', 'SELECT')", (dispatcher,)
+                "SELECT has_any_column_privilege(%s, 'credentials', 'SELECT'), "
+                "has_any_column_privilege(%s, 'users', 'SELECT')",
+                (dispatcher, dispatcher),
             ).fetchone()
-        assert reads is not None and reads[0] is False
+        assert reads is not None and tuple(reads) == (False, False)
         with pg_database.server.connect(name) as conn:
             functions = conn.execute(
                 "SELECT count(*) FROM pg_proc WHERE proname IN ('rapa_robot_versions_approvals', "

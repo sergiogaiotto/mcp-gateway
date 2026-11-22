@@ -56,8 +56,10 @@ As regras do certificado A1 (revisão 0006) têm o bloco :func:`a1_grants_sql`. 
 aplicação lê e inclui credenciais, e só muda a validade, a impressão e a revogação
 (nunca apaga); lê e inclui autorizações do custodiante e só as revoga; lê e inclui
 aprovações de versões; e só lê os avisos de vencimento. O despachante lê só as
-colunas de ``credentials`` e de ``a1_authorizations`` de que a conferência antes de
-lançar precisa (nunca ``vault_path``) e inclui os avisos de vencimento. O
+colunas de que a conferência antes de lançar precisa: de ``credentials`` (nunca
+``vault_path``), de ``a1_authorizations``, as aprovações de ``version_approvals`` (sem a
+data) e, de ``users``, só a empresa, o identificador e o sujeito (para não contar a
+aprovação do custodiante); e inclui os avisos de vencimento. O
 ``UPDATE`` e o ``DELETE`` amplos que :func:`grants_sql` dá à aplicação em
 ``credentials`` (como na revisão 0001) saem em :func:`a1_revokes_sql`, que só age
 quando as tabelas da 0006 existem: assim cada revisão anterior continua com as
@@ -208,9 +210,11 @@ GRANT SELECT ON credential_alerts TO {role};
 
 _A1_DISPATCHER_GRANTS = """
 GRANT SELECT (id, company_id, area_id, name, kind, origin, not_after, fingerprint_sha256,
-    revoked_at) ON credentials TO {role};
+    revoked_at, custodian_user_id) ON credentials TO {role};
 GRANT SELECT (company_id, id, robot_id, credential_id, fingerprint_sha256, revoked_at)
     ON a1_authorizations TO {role};
+GRANT SELECT (company_id, robot_id, version_no, approved_by) ON version_approvals TO {role};
+GRANT SELECT (company_id, id, subject) ON users TO {role};
 GRANT SELECT, INSERT ON credential_alerts TO {role};
 """
 
@@ -226,10 +230,11 @@ _A1_APP_RESTORE = """
 GRANT UPDATE, DELETE ON credentials TO {role};
 """
 
-#: Na revisão 0005 o despachante não lia nada de ``credentials``. Apagar as colunas
-#: novas leva só as permissões delas; as das colunas antigas saem aqui.
+#: Na revisão 0005 o despachante não lia nada de ``credentials`` nem de ``users``. Apagar
+#: as colunas novas leva só as permissões delas; as das colunas antigas saem aqui.
 _A1_DISPATCHER_RESTORE = """
 REVOKE ALL ON credentials FROM {role};
+REVOKE ALL ON users FROM {role};
 """
 
 _A1_TABLES = ("a1_authorizations", "version_approvals", "credential_alerts")
@@ -346,7 +351,8 @@ def a1_restore_sql(roles: RoleNames) -> list[str]:
     """Volta as permissões de ``credentials`` às da revisão 0005 (o ``downgrade`` da 0006).
 
     A aplicação recebe de novo o ``UPDATE`` e o ``DELETE``; o despachante perde a
-    leitura das colunas antigas (as novas somem com elas).
+    leitura das colunas antigas de ``credentials`` (as novas somem com elas) e a de
+    ``users``.
     """
     return [
         _block(roles.app, _A1_APP_RESTORE),

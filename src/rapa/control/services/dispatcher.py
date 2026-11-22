@@ -38,7 +38,8 @@ começa sem esperar ``poll_interval``, e o despacho roda entre uma volta e outra
 Certificado A1: logo antes de lançar o executor de um robô que declara um
 certificado A1, o despachante confere de novo se ele ainda pode ser usado
 (:meth:`PgRunQueue.a1_block`: registrado, não revogado, não vencido e com a
-autorização do custodiante na impressão atual). Se não puder, nada é lançado e a
+autorização do custodiante na impressão atual) e se a versão tem as duas aprovações
+de quem não a criou nem é custodiante. Se não puder, nada é lançado e a
 execução termina ``failed`` com o código ``certificado_a1_bloqueado``; se a
 conferência falhar (banco fora do ar), também não lança (falha fechada). Com
 ``alerts``, uma etapa da manutenção (``"certificates"``, a cada 6 horas) registra os

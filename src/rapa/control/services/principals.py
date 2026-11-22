@@ -78,8 +78,11 @@ class PgPrincipalResolver(PgService):
         """Cria, no primeiro login, o usuário que ainda não existe, sem nenhum papel.
 
         ``None`` (sem acesso) quando a empresa não existe ou está congelada, ou quando o
-        sujeito já existe (desativado nesta empresa, ou de outra empresa: o ``subject`` é
-        único na plataforma).
+        sujeito já existe desativado nesta empresa ou é de outra empresa (o ``subject`` é
+        único na plataforma). Quando o sujeito já existe, o principal é procurado de novo,
+        uma vez (:meth:`resolve`, fixado nesta empresa): o primeiro login que chega junto
+        com outro do mesmo sujeito perde a inclusão para ele, e entra com o usuário que o
+        outro acabou de criar.
         """
         name = " ".join(display_name.split())[:MAX_DISPLAY_NAME]
         async with self.db.tenant_session(company_id) as session:
@@ -91,16 +94,19 @@ class PgPrincipalResolver(PgService):
                 .on_conflict_do_nothing(index_elements=["subject"])
                 .returning(users.c.id)
             )
-            if created is None:
-                return None
-            await audit.append(
-                session,
-                company_id=company_id,
-                actor=subject,
-                action="usuario.criado_no_login",
-                target=f"usuario:{created}",
-                payload={"usuario": str(created)},
-            )
+            if created is not None:
+                await audit.append(
+                    session,
+                    company_id=company_id,
+                    actor=subject,
+                    action="usuario.criado_no_login",
+                    target=f"usuario:{created}",
+                    payload={"usuario": str(created)},
+                )
+        if created is None:
+            # Já existia (outro login do mesmo sujeito ganhou a inclusão, ou o sujeito é
+            # desativado ou de outra empresa): só o usuário ativo desta empresa entra.
+            return await self.resolve(subject, company_id)
         return Principal(subject=subject, company_id=company_id, user_id=created)
 
 
