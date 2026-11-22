@@ -414,8 +414,10 @@ def create_database(cluster: PgCluster) -> Database:
         conn.execute("CREATE DATABASE rapa OWNER rapa_owner")
     db = Database(cluster, passwords)
     log("migrações do banco (como o dono das tabelas)")
-    _python("-m", "rapa.control.db.migrate", "--url", db.owner_url)
-    _python("-m", "rapa.control.db.migrate", "--url", db.owner_url, "--somente-permissoes")
+    # A URL (com a senha) vai pelo ambiente: nem a linha de comando nem o erro a mostram.
+    owner = {"RAPA_DATABASE_URL": db.owner_url}
+    _python("-m", "rapa.control.db.migrate", env=owner)
+    _python("-m", "rapa.control.db.migrate", "--somente-permissoes", env=owner)
     return db
 
 
