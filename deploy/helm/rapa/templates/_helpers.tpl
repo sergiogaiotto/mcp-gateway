@@ -158,13 +158,12 @@ própria e entra na URL pela expansão $(VAR) do Kubernetes: o valor nunca apare
 {{- end }}
 {{- end -}}
 
-{{/* O endereço do canal desta réplica do despachante (o IP do pod). */}}
+{{/*
+O endereço do canal desta réplica do despachante: {ip} é trocado pelo RaPA pelo IP do pod
+(com colchetes, se for IPv6). Um endereço sem {ip} (um Service) é recusado na partida.
+*/}}
 {{- define "rapa.channelAddress" -}}
-{{- if .Values.executions.channel.ipv6 -}}
-{{- printf "http://[$(RAPA_POD_IP)]:%v" .Values.executions.channel.port -}}
-{{- else -}}
-{{- printf "http://$(RAPA_POD_IP):%v" .Values.executions.channel.port -}}
-{{- end -}}
+{{- printf "http://{ip}:%v" .Values.executions.channel.port -}}
 {{- end -}}
 
 {{/* O token projetado da conta de serviço para o OpenBao (RAPA_BAO_TOKEN_SA). */}}

@@ -61,9 +61,11 @@ tentativa ele:
    um certificado A1 em arquivo (``pfx_path`` do arquivo de dev) vai como
    ``pfx_base64``, e os arquivos de entrada que as entradas de arquivo citam (os da
    pasta da empresa em ``files_dir``, com as regras do lançador local) ficam
-   disponíveis para o pod buscar pelo canal. Se a API recusa o Secret ou o pod (a cota,
-   a RuntimeClass, a permissão), a falha é ``executor_nao_iniciou``, com o motivo do
-   Kubernetes;
+   disponíveis para o pod buscar pelo canal. Se a fonte diz que um segredo falta
+   (:class:`SecretsUnavailable`, também um ``pfx_base64`` inválido), a execução termina
+   ``failed`` com ``segredo_indisponivel`` sem criar o Secret nem o pod, como no
+   lançador local. Se a API recusa o Secret ou o pod (a cota, a RuntimeClass, a
+   permissão), a falha é ``executor_nao_iniciou``, com o motivo do Kubernetes;
 2. segue os eventos como o lançador local e acompanha a fase do pod: um pod que não
    sobe (``ImagePullBackOff`` e os outros motivos que não passam sozinhos, ou
    ``Pending``/``Unschedulable`` além de ``start_timeout_s``) ou que nunca buscou o
@@ -139,8 +141,8 @@ from rapa.session.egress import EgressPolicy
 
 __all__ = [
     "EXECUTOR_NOT_STARTED",
-    "AttemptRegistry",
     "SOURCE_SECRET_FIELDS",
+    "AttemptRegistry",
     "EventIngestor",
     "KubernetesLauncher",
     "KubernetesLauncherSettings",
@@ -808,11 +810,16 @@ def _pod_secrets(secrets: Mapping[str, Mapping[str, str]]) -> dict[str, dict[str
 
     Um ``pfx_path`` (o arquivo de desenvolvimento) é um caminho desta máquina: o arquivo
     é lido aqui e vai inteiro. Se não puder ser lido, o certificado fica de fora e o
-    worker falha com ``segredo_indisponivel`` claro, sem abrir o navegador.
+    worker falha com ``segredo_indisponivel`` claro, sem abrir o navegador. Um
+    ``pfx_base64`` da fonte (o OpenBao) é conferido aqui, como no lançador local: um que
+    não é base64 ou tem tamanho inválido levanta :class:`SecretsUnavailable` (nenhum pod
+    é criado).
     """
     out: dict[str, dict[str, str]] = {}
     for name, fields in secrets.items():
         converted = {key: value for key, value in fields.items() if key != "pfx_path"}
+        if (encoded := converted.get("pfx_base64")) is not None:
+            _pfx_bytes(name, encoded)
         path = fields.get("pfx_path")
         if path and "pfx_base64" not in converted:
             data = _read_pfx(path)
@@ -865,9 +872,11 @@ class KubernetesLauncher(_Follower):
         return grace
 
     def _paths(self, job: RunnerJob) -> tuple[Path, Path]:
-        work = self.settings.work_dir / f"{job.run_id}-{job.attempt}"
+        # Caminhos absolutos, como no lançador local: os caminhos dos artefatos do
+        # RESULT.json são trocados pelos desta pasta e conferidos pelo store.
+        work = self.settings.work_dir.absolute() / f"{job.run_id}-{job.attempt}"
         artifacts = attempt_dir(
-            self.settings.artifacts_dir, job.company_id, job.run_id, job.attempt
+            self.settings.artifacts_dir.absolute(), job.company_id, job.run_id, job.attempt
         )
         return work, artifacts
 
@@ -957,7 +966,19 @@ class KubernetesLauncher(_Follower):
         try:
             try:
                 await asyncio.to_thread(self._prepare, work, artifacts)
-                secrets = await asyncio.to_thread(_pod_secrets, await self.secrets.secrets_for(job))
+                try:
+                    secrets = await asyncio.to_thread(
+                        _pod_secrets, await self.secrets.secrets_for(job)
+                    )
+                except SecretsUnavailable as exc:
+                    # Como no lançador local: sem o segredo, nada abre e nenhum pod é criado.
+                    logger.warning("execução %s sem os segredos; nenhum pod criado", job.run_id)
+                    return failure_result(
+                        job,
+                        _SECRETS_CODE,
+                        f"Os segredos da execução não estão disponíveis: {exc.message}.",
+                        started=False,
+                    )
                 files = await asyncio.to_thread(self._input_files, job)
                 attempt, ticket = self.channel.open(
                     job,

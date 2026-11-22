@@ -1381,7 +1381,10 @@ def create_server_app(settings: ServerSettings, *, tracing: Tracing | None = Non
     metrics.watch_dispatcher(supervisor)
     metrics.watch_sessions(sessions)
     # Antes da interface: o NiceGUI, montado em "/", pegaria o caminho.
-    readiness = Readiness(build_readiness_checks(db, dispatcher_db, supervisor))
+    # As do cofre e do S3 (as que estiverem configuradas) entram junto com as do banco.
+    readiness = Readiness(
+        build_readiness_checks(db, dispatcher_db, supervisor, backends.readiness_checks())
+    )
     app.add_api_route(READY_PATH, readiness.endpoint, methods=["GET"], include_in_schema=False)
     app.state.dispatcher = dispatcher
     app.state.dispatcher_supervisor = supervisor
@@ -1391,7 +1394,8 @@ def create_server_app(settings: ServerSettings, *, tracing: Tracing | None = Non
     app.state.credentials = credentials
     app.state.artifacts = artifacts
     app.state.backends = backends
-    # As checagens de prontidão do cofre e do S3 (as que estiverem configuradas).
+    # As checagens de prontidão do cofre e do S3 (as que estiverem configuradas; também
+    # em /saude/pronto, acima).
     app.state.readiness_checks = backends.readiness_checks()
     app.state.metrics = metrics
     app.state.readiness = readiness
@@ -1490,6 +1494,21 @@ def create_server_app(settings: ServerSettings, *, tracing: Tracing | None = Non
     return app
 
 
+def _check_ports(settings: ServerSettings, port: int) -> None:
+    """As portas do processo não se cruzam: a do serviço (``--port``), a das métricas e,
+    num despachante com pods, a do canal (que abre o próprio servidor)."""
+    if settings.metrics_port and settings.metrics_port == port:
+        raise ValueError("RAPA_METRICAS_PORTA não pode ser a porta do serviço")
+    if settings.executor == "kubernetes" and settings.dispatcher_database_url:
+        if settings.channel_port == port:
+            raise ValueError(
+                "RAPA_CANAL_PORTA não pode ser a porta do serviço (--port): o canal dos pods "
+                "tem o servidor dele, e a saúde do despachante fica na porta do serviço"
+            )
+        if settings.metrics_port and settings.metrics_port == settings.channel_port:
+            raise ValueError("RAPA_METRICAS_PORTA não pode ser a porta do canal")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m rapa.server",
@@ -1500,8 +1519,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         settings = ServerSettings.from_env()
-        if settings.metrics_port and settings.metrics_port == args.port:
-            raise ValueError("RAPA_METRICAS_PORTA não pode ser a porta do serviço")
+        _check_ports(settings, args.port)
     except ValueError as exc:
         print(f"rapa.server: configuração inválida: {exc}", file=sys.stderr)
         return 2

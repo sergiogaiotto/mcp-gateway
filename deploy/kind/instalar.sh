@@ -5,9 +5,10 @@
 # aplicação (a migração roda antes, como hook), a empresa de teste pelo CLI e os tokens de
 # desenvolvimento dela.
 #
-# Precisa de kind, kubectl, helm e openssl, e das imagens rapa-controle:ci e rapa-executor:ci
-# já construídas (IMAGEM_CONTROLE e IMAGEM_EXECUTOR trocam os nomes). As versões dos charts
-# externos podem ser fixadas com CNPG_CHART_VERSION e OPENBAO_CHART_VERSION.
+# Precisa de kind, kubectl, helm, openssl e o CLI bao (deploy/ci/instalar-bao.sh), e das
+# imagens rapa-controle:ci e rapa-executor:ci já construídas (IMAGEM_CONTROLE e
+# IMAGEM_EXECUTOR trocam os nomes). As versões dos charts externos podem ser fixadas com
+# CNPG_CHART_VERSION e OPENBAO_CHART_VERSION.
 #
 # Nenhuma senha sai deste script: as do banco e as chaves do S3 são aleatórias e vão direto
 # para Secrets; os tokens de desenvolvimento só valem neste cluster.
@@ -125,10 +126,22 @@ done
 fim
 
 grupo "Preparo do OpenBao (deploy/openbao/preparar.sh)"
-kubectl cp "$raiz/deploy/openbao" cofre/openbao-0:/tmp/openbao
-kubectl -n cofre exec openbao-0 -- env BAO_ADDR=http://127.0.0.1:8200 BAO_TOKEN=root \
-  RAPA_NAMESPACE="$ns" KUBERNETES_HOST=https://kubernetes.default.svc \
-  sh /tmp/openbao/preparar.sh
+# O script roda aqui (o CLI bao no PATH, deploy/ci/instalar-bao.sh), contra o OpenBao do
+# cluster pelo port-forward: a imagem do OpenBao não tem o bash. O OpenBao roda num pod, então
+# confere os tokens das contas de serviço com o CA e o token montados nele.
+command -v bao >/dev/null || { echo "instalar.sh: o CLI 'bao' não está no PATH" >&2; exit 1; }
+kubectl -n cofre port-forward pod/openbao-0 18200:8200 >/dev/null 2>&1 &
+encaminhamento=$!
+trap 'kill "$encaminhamento" 2>/dev/null || true; rm -rf "$trabalho"' EXIT
+for _ in $(seq 1 30); do
+  if (exec 3<>/dev/tcp/127.0.0.1/18200) 2>/dev/null; then
+    break
+  fi
+  sleep 1
+done
+BAO_ADDR=http://127.0.0.1:18200 BAO_TOKEN=root RAPA_NAMESPACE="$ns" \
+  KUBERNETES_HOST=https://kubernetes.default.svc "$raiz/deploy/openbao/preparar.sh"
+kill "$encaminhamento" 2>/dev/null || true
 fim
 
 grupo "Release da aplicação (a migração roda antes, como hook)"

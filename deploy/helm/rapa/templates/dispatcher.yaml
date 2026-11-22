@@ -1,7 +1,8 @@
 {{- if .Values.app.enabled }}
 {{- $v := .Values -}}
 {{- $env := include "rapa.dispatcherEnv" . -}}
-{{ include "rapa.deployment" (dict "root" . "component" "despachante" "values" $v.dispatcher "port" (int $v.executions.channel.port) "portName" "canal" "http" false "kubeApi" true "baoRole" $v.vault.roles.dispatcher "env" $env "volumes" (include "rapa.dispatcherVolumes" .) "mounts" (include "rapa.dispatcherMounts" .) "hpa" false) }}
+{{- $channel := list (dict "name" "canal" "port" (int $v.executions.channel.port)) -}}
+{{ include "rapa.deployment" (dict "root" . "component" "despachante" "values" $v.dispatcher "port" (int $v.dispatcher.healthPort) "portName" "saude" "extraPorts" $channel "http" false "kubeApi" true "baoRole" $v.vault.roles.dispatcher "env" $env "volumes" (include "rapa.dispatcherVolumes" .) "mounts" (include "rapa.dispatcherMounts" .) "hpa" false) }}
 ---
 {{ include "rapa.pdb" (dict "root" . "component" "despachante" "values" $v.dispatcher) }}
 ---
@@ -9,10 +10,11 @@
 {{- end }}
 
 {{/*
-O despachante: sem HTTP público (RAPA_HTTP=0). O processo ouve uma porta só, a do canal
-(RAPA_CANAL_PORTA): ali ficam o canal dos pods de execução e a saúde (/saude e
-/saude/pronto) que os probes usam. O endereço do canal que vai para cada pod é o IP desta
-réplica (os bilhetes ficam na memória dela).
+O despachante: sem HTTP público (RAPA_HTTP=0). O processo ouve duas portas: a da saúde
+(dispatcher.healthPort, o --port do serviço: /saude e /saude/pronto, para os probes) e a do
+canal (RAPA_CANAL_PORTA, o servidor próprio do canal dos pods de execução, com os limites
+dele). O endereço do canal que vai para cada pod é http://{ip}:<porta>, e o RaPA troca {ip}
+pelo IP desta réplica (os bilhetes ficam na memória dela).
 */}}
 {{- define "rapa.dispatcherEnv" -}}
 {{- $v := .Values -}}
@@ -32,10 +34,6 @@ réplica (os bilhetes ficam na memória dela).
 - name: RAPA_EXECUTOR
   value: kubernetes
 {{ include "rapa.podsEnv" (dict "root" .) }}
-- name: RAPA_POD_IP
-  valueFrom:
-    fieldRef:
-      fieldPath: status.podIP
 - name: RAPA_CANAL_PORTA
   value: {{ $v.executions.channel.port | quote }}
 - name: RAPA_CANAL_ENDERECO

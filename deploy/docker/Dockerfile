@@ -6,8 +6,11 @@
 #   docker buildx build -f deploy/docker/Dockerfile --target executor -t rapa-executor .
 #
 # - controle: o plano de controle (python -m rapa.server, a migração e a linha de comando de
-#   administração), com todos os extras e o Chromium do Debian para o host de sessão local
-#   (RAPA_SESSOES_EXECUTOR=local; no cluster, as sessões rodam em pods com a imagem do executor).
+#   administração), com todos os extras e o mesmo navegador do executor (o Chromium do Debian,
+#   as fontes e o ffmpeg do vídeo da falha) para o lançador e o host de sessão locais
+#   (RAPA_EXECUTOR=local e RAPA_SESSOES_EXECUTOR=local, fora do cluster, com
+#   RAPA_CHROMIUM_PATH=/usr/bin/chromium; no cluster, as execuções e as sessões rodam em pods
+#   com a imagem do executor).
 # - executor: o pod de uso único de cada execução e de cada sessão de gravação (só o extra
 #   runner), com o Chromium do Debian, as fontes, o fuso e o ffmpeg do vídeo da falha.
 #
@@ -78,15 +81,29 @@ WORKDIR /
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
 # ---------------------------------------------------------------------------------------------
+# O navegador das duas imagens: o Chromium do Debian 13, as fontes e o ffmpeg do vídeo da falha.
+# ---------------------------------------------------------------------------------------------
+FROM base AS navegador
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends chromium fonts-liberation fonts-noto-core ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+# O vídeo da falha usa o ffmpeg que o Playwright procura em
+# <PLAYWRIGHT_BROWSERS_PATH>/ffmpeg-<revisão>/ffmpeg-linux: aqui, o do Debian (o link é posto
+# em cada imagem, com o Playwright do ambiente dela, e conferido na construção).
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/rapa-navegadores
+
+# ---------------------------------------------------------------------------------------------
 # Plano de controle.
 # ---------------------------------------------------------------------------------------------
-FROM base AS controle
+FROM navegador AS controle
 LABEL org.opencontainers.image.title="rapa-controle" \
       org.opencontainers.image.description="RaPA: plano de controle (REST, MCP, interface e despachante)"
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends chromium fonts-liberation \
-    && rm -rf /var/lib/apt/lists/*
 COPY --from=dependencias-controle /opt/rapa /opt/rapa
+RUN set -eu; \
+    revisao="$(python -c 'import json, pathlib, playwright; p = pathlib.Path(playwright.__file__).parent / "driver" / "package" / "browsers.json"; print(next(b["revision"] for b in json.loads(p.read_text())["browsers"] if b["name"] == "ffmpeg"))')"; \
+    mkdir -p "/opt/rapa-navegadores/ffmpeg-${revisao}"; \
+    ln -s /usr/bin/ffmpeg "/opt/rapa-navegadores/ffmpeg-${revisao}/ffmpeg-linux"; \
+    python -c 'import sys; from rapa.runner.video import ffmpeg_installed; sys.exit(0 if ffmpeg_installed() else 1)'
 # O NiceGUI guarda o que for preciso em /tmp (o resto do disco é só de leitura).
 ENV NICEGUI_STORAGE_PATH=/tmp/nicegui
 USER 10001:10001
@@ -96,16 +113,10 @@ CMD ["python", "-m", "rapa.server", "--host", "0.0.0.0", "--port", "8000"]
 # ---------------------------------------------------------------------------------------------
 # Executor: o pod de uso único de cada execução e de cada sessão de gravação.
 # ---------------------------------------------------------------------------------------------
-FROM base AS executor
+FROM navegador AS executor
 LABEL org.opencontainers.image.title="rapa-executor" \
       org.opencontainers.image.description="RaPA: executor dos robôs e host das sessões de gravação"
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends chromium fonts-liberation fonts-noto-core ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
 COPY --from=dependencias-executor /opt/rapa /opt/rapa
-# O vídeo da falha usa o ffmpeg que o Playwright procura em
-# <PLAYWRIGHT_BROWSERS_PATH>/ffmpeg-<revisão>/ffmpeg-linux: aqui, o do Debian.
-ENV PLAYWRIGHT_BROWSERS_PATH=/opt/rapa-navegadores
 RUN set -eu; \
     revisao="$(python -c 'import json, pathlib, playwright; p = pathlib.Path(playwright.__file__).parent / "driver" / "package" / "browsers.json"; print(next(b["revision"] for b in json.loads(p.read_text())["browsers"] if b["name"] == "ffmpeg"))')"; \
     mkdir -p "/opt/rapa-navegadores/ffmpeg-${revisao}"; \

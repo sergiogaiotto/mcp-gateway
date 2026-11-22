@@ -1205,7 +1205,7 @@ async def test_readiness_of_a_dispatcher_process_follows_the_dispatcher(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "rapa.server.build_dispatcher", lambda settings, db: FakeDispatcher(crashes=1000)
+        "rapa.server.build_dispatcher", lambda settings, db, *_: FakeDispatcher(crashes=1000)
     )
     app = create_server_app(
         ServerSettings(database_url=DOWN_DB, dispatcher_database_url=DOWN_DISPATCHER_DB, http=False)

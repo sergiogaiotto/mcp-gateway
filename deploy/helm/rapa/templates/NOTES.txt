@@ -3,7 +3,7 @@ RaPA {{ .Chart.AppVersion }} instalado em {{ .Release.Namespace }} (execuções 
 
 - rapa-web: interface, REST, MCP e sessões ({{ .Values.web.replicas }} réplica(s)).
 - rapa-api: REST e MCP.
-- rapa-despachante: fila e pods de uso único; saúde e canal na porta {{ .Values.executions.channel.port }}.
+- rapa-despachante: fila e pods de uso único; saúde na porta {{ .Values.dispatcher.healthPort }} e o canal dos pods na {{ .Values.executions.channel.port }} (http://{ip}:{{ .Values.executions.channel.port }}).
 {{- if and .Values.network.policies.enabled (not .Values.network.egress.kubernetesApi.to) }}
 
 ATENÇÃO: network.egress.kubernetesApi.to está vazio. Com as NetworkPolicies ligadas, o

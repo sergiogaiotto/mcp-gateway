@@ -878,12 +878,14 @@ def test_components_and_their_modes(variant: str) -> None:
         assert replicas == {"web": 1, "api": 2, "despachante": 2}
 
 
-def test_dispatcher_health_and_channel_are_on_the_channel_port() -> None:
-    """O despachante ouve só a porta do canal, onde ficam também /saude e /saude/pronto."""
+def test_dispatcher_health_and_channel_have_their_own_ports() -> None:
+    """A saúde do despachante (/saude e /saude/pronto, o --port do serviço) numa porta e o
+    canal dos pods (o servidor próprio dele, com os limites do canal) noutra."""
     pod = deployment_pod(rendered("producao"), "rapa-despachante")
     container = pod["containers"][0]
-    assert container["args"][-2:] == ["--port", "8081"]
+    assert container["args"][-2:] == ["--port", "8080"]
     assert {p["name"]: p["containerPort"] for p in container["ports"]} == {
+        "saude": 8080,
         "canal": 8081,
         "metricas": 9100,
     }
@@ -892,20 +894,32 @@ def test_dispatcher_health_and_channel_are_on_the_channel_port() -> None:
         ("livenessProbe", "/saude"),
         ("readinessProbe", "/saude/pronto"),
     ):
-        assert container[probe]["httpGet"] == {"path": path, "port": "canal"}
+        assert container[probe]["httpGet"] == {"path": path, "port": "saude"}
     env = container_env(pod)
     assert env["RAPA_CANAL_PORTA"] == "8081"
-    # O canal desta réplica: o IP do próprio pod (os bilhetes ficam na memória dela).
-    assert env["RAPA_CANAL_ENDERECO"] == "http://$(RAPA_POD_IP):8081"
-    assert env["RAPA_POD_IP"] == {"fieldRef": {"fieldPath": "status.podIP"}}
-    names = [e["name"] for e in container["env"]]
-    assert names.index("RAPA_POD_IP") < names.index("RAPA_CANAL_ENDERECO")
+    # O canal desta réplica: {ip} vira o IP do próprio pod no RaPA (os bilhetes ficam na
+    # memória dela); um endereço sem {ip} seria recusado na partida.
+    assert env["RAPA_CANAL_ENDERECO"] == "http://{ip}:8081"
+    assert "RAPA_POD_IP" not in env
     # Nenhum Service espalha o canal entre as réplicas.
     for service in rendered("producao").of_kind("Service"):
         assert service["spec"]["selector"].get("app.kubernetes.io/component") != "despachante"
     ipv6 = template("values-producao-exemplo.yaml", sets={"executions.channel.ipv6": "true"})
     env6 = container_env(deployment_pod(ipv6, "rapa-despachante"))
-    assert env6["RAPA_CANAL_ENDERECO"] == "http://[$(RAPA_POD_IP)]:8081"
+    # O RaPA põe os colchetes de um IPv6.
+    assert env6["RAPA_CANAL_ENDERECO"] == "http://{ip}:8081"
+
+
+def test_the_dispatcher_ports_never_cross() -> None:
+    for sets in (
+        {"dispatcher.healthPort": "8081"},
+        {"observability.metricsPort": "8081"},
+        {"observability.metricsPort": "8080"},
+        {"observability.metricsPort": "8000"},
+    ):
+        assert "porta" in template_error("values-producao-exemplo.yaml", sets=sets)
+    error = template_error("values-producao-exemplo.yaml", sets={"executions.sessionPort": "9000"})
+    assert "8765" in error
 
 
 @pytest.mark.parametrize("component", ["web", "api"])

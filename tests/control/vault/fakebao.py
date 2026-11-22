@@ -16,6 +16,7 @@ existe.
 
 import base64
 import os
+import re
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -27,14 +28,24 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from .acl import ACL, Rule, load_policy
+from .acl import ACL, POLICY_FOLDER, Rule, load_policy
 
 ROLE = "rapa-despachante"
+WEB_ROLE = "rapa-web"
 API_ROLE = "rapa-api"
 OPERATION_ROLE = "rapa-operacao"
 SA_TOKEN = "jwt-de-teste-da-conta-de-servico"
-#: Papel -> políticas (como o preparar.sh: cada papel com a política do mesmo nome).
-ROLES = {name: (name,) for name in (ROLE, API_ROLE, OPERATION_ROLE)}
+
+
+def script_roles() -> dict[str, tuple[str, ...]]:
+    """Papel -> políticas, lidos do próprio ``preparar.sh`` (``role <papel> "$CONTA" <política>``)."""
+    text = (POLICY_FOLDER.parent / "preparar.sh").read_text(encoding="utf-8")
+    found = re.findall(r'^role (\S+) "\$\w+" (\S+)$', text, flags=re.MULTILINE)
+    return {name: (policy,) for name, policy in found}
+
+
+#: Papel -> políticas, como o preparar.sh escreve (o da interface e o da API com a mesma).
+ROLES = script_roles()
 
 
 class FakeClock:
@@ -86,7 +97,9 @@ class FakeBao:
     roles: dict[str, tuple[str, ...]] = field(default_factory=lambda: dict(ROLES))
     #: Política -> regras; por padrão, as de ``deploy/openbao/politicas``.
     policies: dict[str, dict[str, Rule]] = field(
-        default_factory=lambda: {name: load_policy(name) for name in ROLES}
+        default_factory=lambda: {
+            name: load_policy(name) for policies in ROLES.values() for name in policies
+        }
     )
     #: Caminho no KV (sem a montagem) -> dados da versão atual.
     secrets: dict[str, dict[str, Any]] = field(default_factory=dict)

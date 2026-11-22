@@ -10,9 +10,10 @@ prazo curto, as :class:`ReadinessCheck` do processo:
 - ``banco``: ``SELECT 1`` no banco da aplicação (:class:`DatabaseCheck`);
 - ``banco_despachante``: o mesmo no banco do despachante, quando o processo tem um;
 - ``despachante``: a saúde do despachante, quando há (:class:`DispatcherCheck`);
-- as checagens do cofre e do armazenamento de objetos, quando configurados: a parte do
-  OpenBao e do S3 traz as dela com a mesma interface (``name`` e ``async ready()``, o
-  ``ReadinessCheck`` de ``rapa.control.backends``), e elas entram pelo ``extra`` de
+- as checagens do cofre e do armazenamento de objetos, quando configurados (``openbao``:
+  responde e não está selado; ``s3``: o bucket existe): ``Backends.readiness_checks()``
+  (:mod:`rapa.control.backends`, com este mesmo :class:`ReadinessCheck`), que
+  :func:`rapa.server.create_server_app` passa pelo ``extra`` de
   :func:`rapa.server.build_readiness_checks`.
 
 Responde 200 ``{"estado": "pronto"}`` ou 503 ``{"estado": "nao_pronto", "falhas":

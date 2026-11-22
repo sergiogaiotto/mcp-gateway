@@ -250,3 +250,28 @@ async def test_the_channel_and_the_sweeper_start_with_the_service(tmp_path: Path
     with pytest.raises(httpx2.ConnectError):
         async with httpx2.AsyncClient(trust_env=False) as http:
             await http.get(f"http://127.0.0.1:{port}/canal/{new_id()}/1/trabalho")
+
+
+def test_the_dispatcher_ports_never_cross(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """O canal tem o servidor dele: a porta do serviço (a da saúde do despachante) e a das
+    métricas nunca são a do canal, ou o processo não sobe (com a mensagem, sem traceback)."""
+    from rapa.server import _check_ports, main
+
+    env = {**_dev(tmp_path), **PODS, "RAPA_DISPATCHER_DATABASE_URL": DISPATCHER}
+    settings = ServerSettings.from_env(env)
+    _check_ports(settings, 8080)  # a saúde do despachante, como no chart
+    with pytest.raises(ValueError, match="RAPA_CANAL_PORTA"):
+        _check_ports(settings, 8081)
+    metrics = ServerSettings.from_env({**env, "RAPA_METRICAS_PORTA": "8081"})
+    with pytest.raises(ValueError, match="canal"):
+        _check_ports(metrics, 8080)
+    # Sem despachante (a web e a api), a porta do canal não abre: nada a conferir.
+    _check_ports(ServerSettings.from_env({**_dev(tmp_path), **PODS}), 8081)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    assert main(["--port", "8081"]) == 2
+    err = capsys.readouterr().err
+    assert "configuração inválida" in err and "RAPA_CANAL_PORTA" in err
+    assert "Traceback" not in err

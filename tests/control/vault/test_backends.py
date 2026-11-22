@@ -179,6 +179,57 @@ def test_the_server_wires_the_chosen_vault_store_and_checks() -> None:
     assert plain.state.readiness_checks == ()
 
 
+async def test_the_vault_and_s3_checks_are_part_of_saude_pronto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Com o OpenBao e o S3 configurados, ``/saude/pronto`` também os confere: o cofre
+    selado ou o bucket fora deixam o processo não pronto, pelo nome e nada mais."""
+    from rapa.control.artifacts import S3Readiness
+    from rapa.control.health import DatabaseCheck, DispatcherCheck
+    from rapa.control.vault import BaoReadiness
+
+    app = create_server_app(ServerSettings.from_env(_server_env(**BAO, **S3)))
+    readiness = app.state.readiness
+    assert [check.name for check in readiness.checks] == [
+        "banco",
+        "banco_despachante",
+        "despachante",
+        "openbao",
+        "s3",
+    ]
+    state = {"openbao": False, "s3": False}
+
+    async def database_ready(self: object) -> bool:
+        return True
+
+    async def bao_ready(self: BaoReadiness) -> bool:
+        return state["openbao"]
+
+    async def s3_ready(self: S3Readiness) -> bool:
+        return state["s3"]
+
+    monkeypatch.setattr(DatabaseCheck, "ready", database_ready)
+    monkeypatch.setattr(DispatcherCheck, "ready", database_ready)  # não subiu aqui
+    monkeypatch.setattr(BaoReadiness, "ready", bao_ready)
+    monkeypatch.setattr(S3Readiness, "ready", s3_ready)
+    readiness.cache_s = 0.0
+    response = await readiness.endpoint()
+    assert response.status_code == 503
+    assert json.loads(bytes(response.body)) == {
+        "estado": "nao_pronto",
+        "falhas": ["openbao", "s3"],
+    }
+    state.update(openbao=True, s3=True)
+    assert (await readiness.endpoint()).status_code == 200
+    # Sem o cofre e o S3, só o banco e o despachante.
+    plain = create_server_app(ServerSettings.from_env(_server_env()))
+    assert [check.name for check in plain.state.readiness.checks] == [
+        "banco",
+        "banco_despachante",
+        "despachante",
+    ]
+
+
 @pytest.mark.parametrize(
     ("extra", "message"),
     [

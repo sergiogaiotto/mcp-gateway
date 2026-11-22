@@ -29,8 +29,9 @@ from rapa.control.vault import (
 from rapa.core.ids import new_id
 
 from .acl import load_policy
-from .fakebao import API_ROLE, OPERATION_ROLE, ROLE, FakeBao
+from .fakebao import API_ROLE, OPERATION_ROLE, ROLE, WEB_ROLE, FakeBao
 from .support import bao_client
+from .tls import make_tls
 
 ROOT = Path(__file__).resolve().parents[3]
 FOLDER = ROOT / "deploy" / "openbao"
@@ -199,6 +200,28 @@ async def test_each_role_does_its_work_and_nothing_more(tmp_path: Path) -> None:
     }
 
 
+async def test_the_web_role_only_unwraps(tmp_path: Path) -> None:
+    """A interface entra com o papel dela (rapa-web, a política da API): desembrulha a chave
+    de uma execução para servir o artefato e nada mais (nem segredo, nem embrulho)."""
+    bao = FakeBao()
+    company, run = new_id(), new_id()
+    bao.put_secret(f"empresas/{company}/portal/acesso", {"password": "senha-de-teste"})
+    dispatcher = bao_client(bao, tmp_path, role=ROLE)
+    web = bao_client(bao, tmp_path, role=WEB_ROLE)
+    try:
+        data_key = os.urandom(32)
+        wrapped = await TransitCompanyKeys(dispatcher).wrap(company, run, data_key)
+        assert await TransitCompanyKeys(web).unwrap(company, run, wrapped) == data_key
+        with pytest.raises(VaultDenied):
+            await web.read_kv("rapa", f"empresas/{company}/portal/acesso")
+        with pytest.raises(KeyUnavailable):
+            await TransitCompanyKeys(web).wrap(company, new_id(), os.urandom(32))
+    finally:
+        await dispatcher.aclose()
+        await web.aclose()
+    assert {policies for _, _, policies in bao.refusals} == {(API_ROLE,)}
+
+
 def test_the_script_is_strict_bash_without_secrets() -> None:
     subprocess.run(["bash", "-n", str(SCRIPT)], check=True)  # noqa: S603, S607
     text = SCRIPT.read_text()
@@ -271,15 +294,39 @@ def test_the_script_is_idempotent_and_follows_the_configured_mounts(tmp_path: Pa
     policy = (state / "policy-rapa-despachante").read_text()
     assert 'path "cofre-rapa/data/empresas/*"' in policy and 'path "rapa/' not in policy
     roles = [call for call in calls if call.startswith("write auth/kubernetes/role/")]
-    assert len(roles) == 6  # três papéis, duas vezes (reescritos iguais)
-    despachante = next(call for call in roles if "role/rapa-despachante " in call)
-    for part in (
-        "bound_service_account_names=rapa-despachante",
-        "bound_service_account_namespaces=plataforma",
-        "audience=openbao",
-        "token_policies=rapa-despachante",
+    assert len(roles) == 8  # quatro papéis, duas vezes (reescritos iguais)
+    # Cada papel só aceita a própria conta de serviço; a interface e a API só desembrulham.
+    for role, account, policies in (
+        ("rapa-despachante", "rapa-despachante", "rapa-despachante"),
+        ("rapa-web", "rapa-web", "rapa-api"),
+        ("rapa-api", "rapa-api", "rapa-api"),
+        ("rapa-operacao", "rapa-operacao", "rapa-operacao"),
     ):
-        assert part in despachante
+        call = next(call for call in roles if f"role/{role} " in call)
+        for part in (
+            f"bound_service_account_names={account} ",
+            "bound_service_account_namespaces=plataforma",
+            "audience=openbao",
+            f"token_policies={policies} ",
+            "token_no_default_policy=true",
+        ):
+            assert part in f"{call} ", (role, part)
+    # Com o OpenBao no cluster, ele usa o CA e o token do próprio pod.
+    assert "write auth/kubernetes/config kubernetes_host=https://kubernetes.default.svc" in calls
+    # Fora do cluster, o CA da API vem de KUBERNETES_CA_CERT.
+    ca = tmp_path / "ca.pem"
+    ca.write_text("-----BEGIN CERTIFICATE-----\n")
+    done = _run_script(tmp_path, KUBERNETES_CA_CERT=str(ca))
+    assert done.returncode == 0, done.stderr
+    last = (state / "calls").read_text().splitlines()
+    assert any(
+        call.startswith("write auth/kubernetes/config ")
+        and f"kubernetes_ca_cert=@{ca}" in call
+        and "disable_local_ca_jwt=true" in call
+        for call in last
+    )
+    missing = _run_script(tmp_path, KUBERNETES_CA_CERT=str(tmp_path / "nao-existe.pem"))
+    assert missing.returncode == 1 and "KUBERNETES_CA_CERT" in missing.stderr
     # Um nome fora da regra não chega ao OpenBao.
     refused = _run_script(tmp_path, RAPA_BAO_KV="../sys")
     assert refused.returncode == 1 and "montagem inválida" in refused.stderr
@@ -287,6 +334,10 @@ def test_the_script_is_idempotent_and_follows_the_configured_mounts(tmp_path: Pa
 
 
 # -- bao server -dev (só com o binário no PATH) ---------------------------------------
+
+#: Com ``1`` (no CI, que baixa o binário oficial do OpenBao, conferido pelo SHA-256), o teste
+#: contra o ``bao server -dev`` falha em vez de ser pulado quando não há ``bao``.
+BAO_REQUIRED_ENV = "RAPA_TEST_BAO_OBRIGATORIO"
 
 
 def _free_port() -> int:
@@ -299,6 +350,8 @@ def _free_port() -> int:
 def bao_dev(tmp_path: Path) -> Iterator[tuple[str, str]]:
     binary = shutil.which("bao")
     if binary is None:
+        if os.environ.get(BAO_REQUIRED_ENV) == "1":
+            pytest.fail(f"o binário 'bao' (OpenBao) não está no PATH, e {BAO_REQUIRED_ENV}=1")
         pytest.skip("o binário 'bao' (OpenBao) não está no PATH")
     token = "dev-" + secrets.token_hex(8)
     address = f"http://127.0.0.1:{_free_port()}"
@@ -344,11 +397,14 @@ def _role_token(address: str, root: str, policy: str) -> str:
 async def test_everything_against_bao_server_dev(bao_dev: tuple[str, str], tmp_path: Path) -> None:
     """O preparar.sh de verdade, e cada papel com um token só da política dele."""
     address, token = bao_dev
+    # Fora de um pod, o OpenBao não tem o CA da API do Kubernetes montado: vem do script.
+    ca, _, _ = make_tls(tmp_path)
     env = {
         **os.environ,
         "BAO_ADDR": address,
         "BAO_TOKEN": token,
         "KUBERNETES_HOST": "https://127.0.0.1:6443",
+        "KUBERNETES_CA_CERT": str(ca),
     }
     for _ in range(2):  # idempotente de verdade
         await asyncio.to_thread(

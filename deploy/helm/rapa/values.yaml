@@ -217,11 +217,14 @@ executions:
   tolerations: []
   # O canal do despachante (RAPA_CANAL_PORTA). Cada réplica do despachante guarda os
   # bilhetes das tentativas que ela lançou, então o endereço do canal (RAPA_CANAL_ENDERECO)
-  # é o IP do próprio pod, nunca um Service que espalhe entre as réplicas.
+  # é http://{ip}:<porta>, com {ip} trocado pelo RaPA pelo IP do próprio pod, nunca um
+  # Service que espalhe entre as réplicas (o despachante recusa um endereço sem {ip}).
+  # ipv6: o cluster é IPv6 (pede o bloco IPv6 da VPC em egress.extraInternalNetworks).
   channel:
     port: 8081
     ipv6: false
-  # Porta do WebSocket do host de sessão num pod (o relay da web conecta nela).
+  # Porta do WebSocket do host de sessão num pod (o relay da web conecta nela). Fixa no
+  # host de sessão (rapa.control.sessions.launcher): o chart recusa outra.
   sessionPort: 8765
   # Rótulos dos pods que o despachante e a web criam (app.kubernetes.io/name).
   podLabels:
@@ -397,6 +400,9 @@ api:
 
 dispatcher:
   replicas: 2
+  # Porta da saúde do despachante (/saude e /saude/pronto, só para os probes do kubelet).
+  # O canal dos pods tem o servidor dele, em executions.channel.port.
+  healthPort: 8080
   # RAPA_CONCORRENCIA: execuções ao mesmo tempo em cada réplica.
   concurrency: 4
   resources:

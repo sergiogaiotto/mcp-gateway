@@ -21,6 +21,7 @@ from rapa.control.launcher import (
     EXECUTOR_NOT_STARTED,
     KubernetesLauncher,
     KubernetesLauncherSettings,
+    SecretsUnavailable,
     StaticSecretSource,
     _pod_secrets,
 )
@@ -372,6 +373,41 @@ async def test_an_api_failure_before_the_pod_is_worker_not_started(tmp_path: Pat
     with pytest.raises(WorkerNotStarted):
         await _launcher(tmp_path, fake, channel, job)(job)
     assert fake.objects == {} and len(channel) == 0
+
+
+class _MissingSecrets:
+    """Uma fonte de segredos (como o OpenBao) que diz que um segredo falta."""
+
+    async def secrets_for(self, job: RunnerJob) -> dict[str, dict[str, str]]:
+        raise SecretsUnavailable("a credencial 'portal' não está registrada")
+
+
+class _BrokenCertificate:
+    """Uma fonte que entrega um certificado A1 que não é base64."""
+
+    async def secrets_for(self, job: RunnerJob) -> dict[str, dict[str, str]]:
+        return {"a1": {"pfx_base64": "não é base64!", "pfx_password": "senha-do-a1"}}
+
+
+@pytest.mark.parametrize("source", [_MissingSecrets(), _BrokenCertificate()])
+async def test_a_missing_secret_fails_without_creating_the_pod(tmp_path: Path, source: Any) -> None:
+    """Como no lançador local: sem o segredo, ``segredo_indisponivel`` e nenhum pod."""
+    fake, channel = FakeKube(), Channel()
+    job = _job()
+    launcher = KubernetesLauncher(
+        RecordingIngestor(),
+        _settings(tmp_path),
+        api=fake.api(tmp_path),
+        channel=channel,
+        secrets=source,
+    )
+    result = await launcher(job)
+    assert result["state"] == RunState.FAILED
+    assert result["error_code"] == "segredo_indisponivel"
+    assert "não estão disponíveis" in result["error_message"]
+    assert "não é base64" not in result["error_message"]  # nunca o valor
+    assert fake.objects == {} and len(channel) == 0
+    assert not (tmp_path / "trabalho" / f"{job.run_id}-1").exists()
 
 
 def test_a_certificate_file_goes_to_the_pod_as_base64(tmp_path: Path) -> None:

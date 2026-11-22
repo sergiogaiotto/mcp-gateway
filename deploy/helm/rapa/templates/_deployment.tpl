@@ -3,8 +3,9 @@ O Deployment de um componente do plano de controle. Parâmetros:
   root       o contexto do chart
   component  web, api ou despachante
   values     .Values.<componente>
-  port       porta em que o processo ouve (a do HTTP ou, no despachante, a do canal)
-  portName   http ou canal
+  port       porta do serviço (--port: a do HTTP ou, no despachante, a da saúde)
+  portName   http ou saude (os probes usam esta)
+  extraPorts outras portas do contêiner (lista de name e port; no despachante, o canal)
   http       o componente serve o HTTP público (web e api)
   kubeApi    o componente fala com a API do Kubernetes (cria os pods de uso único)
   baoRole    papel do OpenBao do componente
@@ -85,6 +86,11 @@ spec:
             - name: {{ .portName }}
               containerPort: {{ .port }}
               protocol: TCP
+            {{- range .extraPorts }}
+            - name: {{ .name }}
+              containerPort: {{ .port }}
+              protocol: TCP
+            {{- end }}
             {{- if ne (int $v.observability.metricsPort) 0 }}
             - name: metricas
               containerPort: {{ $v.observability.metricsPort }}

@@ -1,6 +1,7 @@
 """O CI do deploy (.github/workflows/ci.yml): os jobs chart, imagens e kind e os scripts deles."""
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -13,6 +14,7 @@ from tests.deploy.support import REPO
 
 WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
 SCRIPTS = (
+    "deploy/ci/instalar-bao.sh",
     "deploy/ci/testar-controle.sh",
     "deploy/ci/testar-executor.sh",
     "deploy/kind/instalar.sh",
@@ -147,3 +149,49 @@ def test_portal_runs_restricted_in_kind() -> None:
     container = pod["containers"][0]
     assert container["securityContext"]["readOnlyRootFilesystem"] is True
     assert container["image"] == "rapa-controle:ci"
+
+
+def test_the_tests_job_runs_the_real_openbao_test_and_never_skips_it() -> None:
+    """O teste das políticas contra o bao server -dev roda no CI com o binário oficial do
+    OpenBao (versão e SHA-256 fixos), sozinho e na suíte inteira, e lá não pode ser pulado."""
+    job = jobs()["testes"]
+    assert job["env"]["RAPA_TEST_BAO_OBRIGATORIO"] == "1"
+    assert job["env"]["RAPA_TEST_VIDEO_OBRIGATORIO"] == "1"
+    names = [step.get("name", "") for step in steps("testes")]
+    commands = runs("testes")
+    install = commands.index("deploy/ci/instalar-bao.sh")
+    real = commands.index("test_openbao_files.py::test_everything_against_bao_server_dev")
+    assert install < real < commands.index("uv run pytest -q -o faulthandler_timeout=300")
+    assert "curl" in next(
+        s["run"] for s in steps("testes") if "apt-get install" in s.get("run", "")
+    )
+    assert any("OpenBao" in name for name in names)
+    # O lint e o formato cobrem o que o gate cobre.
+    assert "ruff check src tests deploy docs" in commands
+    assert "ruff format --check src tests deploy docs" in commands
+    assert job["timeout-minutes"] <= 60
+
+
+def test_the_openbao_binary_is_pinned_and_checked_before_use() -> None:
+    script = (REPO / "deploy/ci/instalar-bao.sh").read_text(encoding="utf-8")
+    assert re.search(r"^versao=\d+\.\d+\.\d+$", script, flags=re.MULTILINE)
+    assert re.search(r"^sha256=[0-9a-f]{64}$", script, flags=re.MULTILINE)
+    assert "https://github.com/openbao/openbao/releases/download/" in script
+    # O pacote só é aberto depois de conferido.
+    assert script.index("sha256sum --check --strict") < script.index("tar -xzf")
+    assert "--proto '=https'" in script
+
+
+def test_kind_prepares_openbao_from_the_runner_and_checks_the_pods() -> None:
+    commands = runs("kind")
+    assert commands.index("deploy/ci/instalar-bao.sh") < commands.index("deploy/kind/instalar.sh")
+    install = (REPO / "deploy/kind/instalar.sh").read_text(encoding="utf-8")
+    # A imagem do OpenBao não tem o bash: o preparar.sh roda no runner, pelo port-forward.
+    assert '"$raiz/deploy/openbao/preparar.sh"' in install
+    assert "port-forward pod/openbao-0" in install and "sh /tmp/openbao" not in install
+    check = (REPO / "deploy/kind/testar.sh").read_text(encoding="utf-8")
+    assert "app.kubernetes.io/name=rapa-executor" in check
+    assert "pod/rapa-execucao-" in check and "get pods,secrets" in check
+    for step in steps("kind"):
+        if "instalar.sh" in step.get("run", "") or "testar.sh" in step.get("run", ""):
+            assert step.get("timeout-minutes", 0) <= 30, step["name"]

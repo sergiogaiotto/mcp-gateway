@@ -1,6 +1,6 @@
 # Operação do RaPA
 
-Roteiro do time da plataforma em duas partes: o RaPA no Kubernetes (EKS no AWS Outposts: instalar, atualizar, o que cada valor do chart faz, backup e restauração do banco, o cofre, as chaves e os incidentes) e a operação de cada empresa (entrada, consumo, congelar, exportar e apagar).
+Roteiro do time da plataforma em duas partes: o RaPA no Kubernetes (EKS no AWS Outposts: instalar, atualizar, o que cada valor do chart e cada variável do serviço faz, backup e restauração do banco, o cofre, as chaves, os incidentes, a observabilidade e a saúde) e a operação de cada empresa (entrada, consumo, congelar, exportar e apagar).
 
 ## Parte 1. O RaPA no Kubernetes
 
@@ -12,7 +12,7 @@ O chart `deploy/helm/rapa` instala, no namespace `rapa` (o plano de controle):
 
 - `rapa-web`: a interface, a REST, o MCP e as sessões de gravação. Uma réplica por padrão: a interface e as sessões ficam na memória do processo. Com mais de uma, o chart põe a afinidade por cookie no Envoy (`BackendTrafficPolicy`), e cada navegador fica sempre na mesma réplica; um cliente da REST que não guarda cookies pode cair noutra réplica e não ver a sessão que abriu.
 - `rapa-api`: só a REST e o MCP (`RAPA_UI=0`, `RAPA_SESSOES=0`), duas réplicas, HPA opcional.
-- `rapa-despachante`: a fila e os pods de uso único (`RAPA_HTTP=0`), duas réplicas. O processo ouve uma porta só, a do canal (`RAPA_CANAL_PORTA`, 8081): ali ficam o canal dos pods de execução e a saúde (`/saude` e `/saude/pronto`) dos probes. Cada réplica guarda na memória os bilhetes das tentativas que lançou, então o endereço do canal que vai para cada pod (`RAPA_CANAL_ENDERECO`) é o IP da própria réplica, nunca um Service que espalhe entre elas.
+- `rapa-despachante`: a fila e os pods de uso único (`RAPA_HTTP=0`, `RAPA_EXECUTOR=kubernetes`), duas réplicas. O processo ouve duas portas: a da saúde (`/saude` e `/saude/pronto`, só para os probes; `dispatcher.healthPort`, 8080, o `--port` do serviço) e a do canal dos pods de execução (`RAPA_CANAL_PORTA`, 8081, um servidor próprio, com os limites do canal); o processo recusa subir com as duas iguais. Cada réplica guarda na memória os bilhetes das tentativas que lançou, então o endereço do canal que vai para cada pod é `RAPA_CANAL_ENDERECO=http://{ip}:8081`, com `{ip}` trocado pelo IP da própria réplica, nunca um Service que espalhe entre elas (um endereço sem `{ip}` é recusado na partida).
 - O Job de migração (hook `pre-install,pre-upgrade`; no Argo CD, PreSync) e, opcional, o de permissões (`--somente-permissoes`, depois de instalar).
 - O modelo do pod da operação (o `PodTemplate` `rapa-operacao`, com a conta de serviço e o papel do OpenBao da operação): nada roda sozinho; quem opera cria um pod dele para congelar, exportar e apagar uma empresa (1.10).
 - As NetworkPolicies, o RBAC, as contas de serviço, a `ValidatingAdmissionPolicy` dos pods de uso único e as `HTTPRoute`.
@@ -24,7 +24,7 @@ O banco (CloudNativePG) vem de outra release do mesmo chart (`rapa-banco`, com `
 Rede (NetworkPolicies, os dois namespaces negam tudo por padrão):
 
 - `rapa-web` e `rapa-api` só recebem do Envoy (`gateway.pods`) e do coletor de métricas, na porta de métricas.
-- `rapa-despachante` só recebe dos pods de execução, na porta do canal.
+- `rapa-despachante` só recebe dos pods de execução, na porta do canal (e do coletor de métricas, na porta de métricas); os probes vêm do kubelet, no próprio nó, que os CNIs com NetworkPolicy deixam passar (como os da web e da api).
 - O plano de controle só sai para o DNS, o banco, o OpenBao, o Keycloak, o S3, o hub do modelo, a API do Kubernetes e a observabilidade (`network.egress`), cada componente só para o que usa: a api nunca fala com a API do Kubernetes; o despachante nunca fala com o Keycloak nem com o hub; o pod da operação só fala com o banco, o S3 e o OpenBao. Um destino sem endereços fica fechado. O banco é sempre o Cluster de `database.cnpg.name` e o Pooler dele (o nome vale nas duas releases).
 - Os pods de execução e de sessão só saem para o DNS, para o canal do despachante (só os de execução) e para a internet menos as redes internas (10/8, 172.16/12, 192.168/16, 100.64/10, 169.254/16, 127/8, 0/8 e as de IPv6 equivalentes, inclusive as que o NAT64 e o 6to4 carregam), mais as de `executions.egress.allowedInternalNetworks` (`RAPA_REDES_INTERNAS_PERMITIDAS`) e o proxy de saída (`RAPA_PROXY_SAIDA`). A web conecta no WebSocket dos pods de sessão (o relay da visão ao vivo). Uma rede interna fora dessas (o pool de IPs do cliente no Outposts, uma rede da empresa fora da RFC 1918) vai em `executions.egress.extraInternalNetworks`; as de IPv4 ali fecham também pelo NAT64 (`64:ff9b::<v4>`).
 - Num cluster IPv6 (`network.listenAddress: "::"` ou `executions.channel.ipv6`), os endereços dos pods e dos serviços são globais, fora de `fc00::/7`: o bloco IPv6 da VPC em `executions.egress.extraInternalNetworks` é obrigatório (o chart recusa sem ele), senão a regra da internet (`::/0`) abriria o OpenBao, o Keycloak e o S3.
@@ -33,7 +33,7 @@ Rede (NetworkPolicies, os dois namespaces negam tudo por padrão):
 
 1. **Nós.** Dois grupos de nós autogerenciados no Outposts: o do plano de controle e o das execuções, com o gVisor (`runsc` como handler do containerd), o rótulo `rapa.dev/execucoes=sim` e o taint `rapa.dev/execucoes:NoSchedule`. Aplique `deploy/gvisor/runtimeclass.yaml` (a RuntimeClass `gvisor` já leva os pods para esses nós).
 2. **Componentes externos**, cada um pelo chart dele: cert-manager, o operador CloudNativePG e o plugin Barman Cloud (`cnpg-system`), o OpenBao em HA com TLS (`cofre`; veja 1.6 para iniciar e desbloquear), o Keycloak (`identidade`; `deploy/keycloak/README.md`), o SeaweedFS com o S3 em TLS e os buckets `rapa-artefatos` e `rapa-backups` (`armazenamento`), o Envoy Gateway com o `Gateway` externo `rapa-externo`, o certificado TLS dele e um listener HTTPS que aceita rotas do namespace `rapa` (`allowedRoutes.namespaces`) (`envoy-gateway-system`; as redes dos pods do Envoy vão para `gateway.trustedNetworks`), o VictoriaMetrics (`monitoramento`), o GlitchTip e o Argo CD (`argocd`).
-3. **OpenBao**: `deploy/openbao/preparar.sh` monta o KV, o transit, o método kubernetes e os papéis das contas de serviço `rapa-despachante`, `rapa-web` e `rapa-api` (os valores `vault.roles`).
+3. **OpenBao**: `deploy/openbao/preparar.sh` monta o KV, o transit, o método kubernetes e os quatro papéis, um por conta de serviço e só para ela: `rapa-despachante` (lê os segredos e embrulha as chaves), `rapa-web` e `rapa-api` (só desembrulham) e `rapa-operacao` (o pod da operação: apaga os segredos e a chave de uma empresa). São os valores `vault.roles` do chart (`RAPA_BAO_PAPEL` de cada componente); a tabela está em `deploy/openbao/README.md`. O script roda de qualquer máquina com o CLI `bao` e o token de quem administra o cofre (no kind, do runner do CI, pelo port-forward); com o OpenBao fora de um pod do cluster, informe o CA da API em `KUBERNETES_CA_CERT`.
 4. **Segredos.** Crie os Secrets no namespace `rapa` antes do chart (o chart só leva os nomes; nenhum valor fica no Git nem nos valores). As senhas, sempre aleatórias e só com caracteres seguros numa URL (`openssl rand -hex 32`), de um arquivo 0600 e nunca na linha de comando:
 
    | Secret | Chaves | Para |
@@ -109,7 +109,7 @@ Os nomes do serviço que cada valor preenche (o resto está nos comentários de 
 
 | Valor | Variável | O que faz |
 |---|---|---|
-| `images.control`, `images.executor` | `RAPA_K8S_IMAGEM_EXECUTOR` | as imagens (o digest vale no lugar da tag) |
+| `images.control`, `images.executor` | `RAPA_K8S_IMAGEM_EXECUTOR` | as imagens (o digest vale no lugar da tag); a do executor é também a dos pods de sessão |
 | `images.pullSecrets` | `RAPA_K8S_PULL_SECRET` | o registro (o primeiro também nos pods de uso único) |
 | `publicUrl` | `RAPA_PUBLIC_URL` | o endereço público (OpenAPI dos robôs, metadados do MCP, origem da visão ao vivo) |
 | `auth.jwt.*` | `RAPA_JWT_ISSUER`, `RAPA_JWT_AUDIENCE`, `RAPA_JWKS_URL` | os tokens do Keycloak |
@@ -123,13 +123,15 @@ Os nomes do serviço que cada valor preenche (o resto está nos comentários de 
 | `executions.cpu`, `executions.memory` | `RAPA_K8S_CPU`, `RAPA_K8S_MEMORIA` | os limites de cada pod de uso único |
 | `executions.serviceAccount` | `RAPA_K8S_SA_EXECUTOR` | a conta deles, sem permissão e sem token |
 | `executions.nodeSelector`, `executions.tolerations` | `RAPA_K8S_NODE_SELECTOR`, `RAPA_K8S_TOLERATIONS` | onde eles rodam (JSON) |
-| `executions.channel.port` | `RAPA_CANAL_PORTA`, `RAPA_CANAL_ENDERECO` | o canal do despachante (o endereço é o IP de cada réplica) |
+| `executions.channel.port`, `executions.channel.ipv6` | `RAPA_CANAL_PORTA`, `RAPA_CANAL_ENDERECO` | o canal do despachante (o endereço é `http://{ip}:<porta>`: o RaPA troca `{ip}` pelo IP de cada réplica, com colchetes em IPv6); `ipv6` marca o cluster IPv6 (pede o bloco da VPC) |
+| `executions.sessionPort` | | a porta do WebSocket do host de sessão (8765, fixa no código: o chart recusa outra) |
+| `dispatcher.healthPort` | `--port` do despachante | a saúde do despachante para os probes (8080; nunca a do canal nem a das métricas) |
 | `executions.egress.proxy` | `RAPA_PROXY_SAIDA` | o proxy CONNECT corporativo (a URL, ou com senha, `existingSecret`) e as redes dele na NetworkPolicy |
 | `executions.egress.allowedInternalNetworks` | `RAPA_REDES_INTERNAS_PERMITIDAS` | os portais internos que os robôs alcançam (na guarda e na NetworkPolicy), CIDRs estreitos |
 | `executions.egress.extraInternalNetworks` | | redes internas a mais que os robôs nunca alcançam (o bloco IPv6 da VPC; as de IPv4 também pelo NAT64) |
 | `executions.admissionPolicy.enabled` | | a `ValidatingAdmissionPolicy` do que a web e o despachante criam no namespace das execuções |
 | `operation.*` | `RAPA_OWNER_DATABASE_URL`, `RAPA_BAO_PAPEL` (`vault.roles.operation`) | o modelo do pod da operação: o disco da exportação (`workSizeLimit`) e o prazo dele |
-| `vault.*` | `RAPA_COFRE` (só no despachante), `RAPA_BAO_ENDERECO`, `RAPA_BAO_CA`, `RAPA_BAO_KV`, `RAPA_BAO_TRANSIT`, `RAPA_BAO_AUTH`, `RAPA_BAO_PAPEL` (um por componente), `RAPA_BAO_TOKEN_SA` | o OpenBao; o token da conta de serviço é projetado com audiência própria |
+| `vault.*` | `RAPA_COFRE` (só no despachante e na operação), `RAPA_BAO_ENDERECO`, `RAPA_BAO_CA`, `RAPA_BAO_KV`, `RAPA_BAO_TRANSIT`, `RAPA_BAO_AUTH`, `RAPA_BAO_PAPEL` (`vault.roles`: um papel por componente, os do `preparar.sh`), `RAPA_BAO_TOKEN_SA` | o OpenBao; o token da conta de serviço é projetado com a audiência `vault.tokenAudience` (a do `preparar.sh`, `openbao`) |
 | `storage.*` | `RAPA_ARMAZENAMENTO`, `RAPA_S3_ENDERECO`, `RAPA_S3_REGIAO`, `RAPA_S3_BUCKET`, `RAPA_S3_CA`, `RAPA_S3_ESTILO_CAMINHO`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | os artefatos no S3 (sempre `s3` no cluster) |
 | `keys.*` | `RAPA_CHAVES`, `RAPA_CHAVE_ARTEFATOS` | as chaves dos artefatos (`openbao` em produção) |
 | `observability.*` | `RAPA_METRICAS_PORTA`, `RAPA_METRICAS_POR_EMPRESA`, `RAPA_LOG_JSON`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, `RAPA_GLITCHTIP_DSN` | métricas (só no pod; o `VMPodScrape` opcional), logs em JSON, traços e o GlitchTip |
@@ -141,7 +143,7 @@ Os nomes do serviço que cada valor preenche (o resto está nos comentários de 
 | `gateway.*` | `FORWARDED_ALLOW_IPS` | as `HTTPRoute`, as redes do Envoy (obrigatórias), o prazo dos pedidos comuns (`requestTimeout`; sem prazo só os websockets e o `/mcp`) e a afinidade da web |
 | `network.*` | | as NetworkPolicies: DNS, coletor de métricas e os destinos de saída |
 
-`RAPA_EXECUTOR` e `RAPA_SESSOES_EXECUTOR` são sempre `kubernetes` no cluster.
+`RAPA_EXECUTOR` (no despachante) e `RAPA_SESSOES_EXECUTOR` (na web) são sempre `kubernetes` no cluster. O que cada variável faz, com o padrão dela, está em 1.11.
 
 ### 1.5 Backup e restauração do banco
 
@@ -216,7 +218,9 @@ Troque também quando houver suspeita de vazamento.
   - `Unschedulable` (CPU, memória, cota): faltam nós de execução, ou o `ResourceQuota` do namespace chegou ao limite;
   - `forbidden` nos logs do despachante: o RBAC (a RoleBinding da conta `rapa-despachante`) ou a NetworkPolicy para a API do Kubernetes (`network.egress.kubernetesApi`);
   - `denied request: ValidatingAdmissionPolicy 'rapa-execucoes-pods-de-uso-unico'` nos logs: o pod que o lançador montou não é o de uso único (a imagem não é a de `images.executor`, a RuntimeClass, a conta ou o comando); a mensagem diz qual regra;
-  - o pod sobe mas a execução não anda: a NetworkPolicy do canal (o despachante na porta 8081) ou o `RAPA_CANAL_ENDERECO`.
+  - o pod sobe mas a execução não anda: a NetworkPolicy do canal (o despachante na porta 8081) ou o `RAPA_CANAL_ENDERECO`;
+  - a execução falha com `segredo_indisponivel` sem nenhum pod: a credencial não está registrada na área do robô, o segredo ou um campo não está no KV (`rapa/data/empresas/<empresa>/<caminho>`), o certificado A1 não é um PFX em base64, ou o OpenBao não respondeu (a mensagem diz o que falta, só pelos nomes).
+- **Despachante que não sobe.** `rapa.server: configuração inválida: ...` no log, sem traceback e sem os valores: um `RAPA_CANAL_ENDERECO` sem `{ip}` (um Service), a porta do canal igual à da saúde ou à das métricas, a imagem do executor que falta, ou um valor do cofre e do S3 fora da regra (1.11).
 
 ### 1.9 Conferir a guarda de saída
 
@@ -256,6 +260,60 @@ kubectl -n rapa delete pod rapa-operacao      # o disco da exportação some com
 ```
 
 O pod não leva o rótulo `app.kubernetes.io/instance`: o Argo CD (com o rastreio por rótulo) não o toma como recurso da Application nem o apaga no meio do trabalho. Com um registro privado, o `rapa-registro` já está no modelo. A exportação leva os artefatos decifrados: o arquivo sai do cluster só para quem vai entregá-lo, e o pod é apagado logo depois.
+
+### 1.11 As variáveis do serviço
+
+As variáveis de `python -m rapa.server` que o deploy no Kubernetes acrescentou (as de antes estão na docstring de `rapa.server.ServerSettings.from_env` e no README). Todas são conferidas na partida: um valor fora da regra para o processo com `configuração inválida`, sem traceback e sem repetir o valor. Os valores do chart que as preenchem estão em 1.4.
+
+| Variável | Padrão | O que faz |
+|---|---|---|
+| `RAPA_EXECUTOR` | `local` | onde rodam as execuções: `local` (um processo por tentativa) ou `kubernetes` (um pod de uso único por tentativa, que o despachante cria e segue pelo canal) |
+| `RAPA_SESSOES_EXECUTOR` | o de `RAPA_EXECUTOR` | o mesmo para as sessões de gravação (`kubernetes`: o host de sessão num pod, com a mesma imagem e o mesmo namespace) |
+| `RAPA_K8S_NAMESPACE_EXECUCOES` | `rapa-execucoes` | o namespace dos pods de uso único |
+| `RAPA_K8S_IMAGEM_EXECUTOR` | (obrigatória no modo `kubernetes`) | a imagem do executor (alvo `executor`) |
+| `RAPA_K8S_RUNTIME_CLASS` | `gvisor` | a RuntimeClass dos pods; vazia, nenhuma (só kind e desenvolvimento) |
+| `RAPA_K8S_CPU`, `RAPA_K8S_MEMORIA` | `1`, `2Gi` | os limites (iguais aos pedidos) de cada pod |
+| `RAPA_K8S_SA_EXECUTOR` | (a conta `default`) | a conta de serviço dos pods, sem permissão e sem token montado (no chart, `rapa-executor`) |
+| `RAPA_K8S_PULL_SECRET` | (nenhum) | o Secret do registro no namespace das execuções |
+| `RAPA_K8S_NODE_SELECTOR`, `RAPA_K8S_TOLERATIONS` | (nenhum) | onde os pods rodam, em JSON (`{"rótulo": "valor"}` e uma lista como a do Kubernetes) |
+| `RAPA_CANAL_PORTA` | `8081` | onde o despachante ouve o canal dos pods (só no modo `kubernetes`); nunca a porta do serviço nem a das métricas |
+| `RAPA_CANAL_ENDERECO` | `http://{ip}:<RAPA_CANAL_PORTA>` | o endereço que os pods usam para falar com o despachante; precisa de `{ip}`, que vira o IP do pod do despachante (um Service é recusado: cada réplica tem os bilhetes das tentativas dela) |
+| `RAPA_PROXY_SAIDA` | (nenhum) | o proxy HTTP CONNECT corporativo para a internet dos navegadores (`http://host:porta`, sem usuário e senha na URL; com senha, de um Secret) |
+| `RAPA_REDES_INTERNAS_PERMITIDAS` | (nenhuma) | CIDRs, separados por vírgula, que os robôs e as sessões alcançam além da internet (os portais internos) |
+| `RAPA_COFRE` | `nenhum` (`dev` com `RAPA_DEV=1` e `RAPA_SEGREDOS_DEV`) | de onde vêm os segredos das credenciais: `nenhum`, `dev` (o arquivo de `RAPA_SEGREDOS_DEV`, só em desenvolvimento) ou `openbao` |
+| `RAPA_BAO_ENDERECO` | (obrigatório com o OpenBao) | o OpenBao (`https://` fora do desenvolvimento; o serviço ativo: o cliente não segue redirecionamento) |
+| `RAPA_BAO_CA` | (os CAs do sistema) | o CA que confere o TLS do OpenBao |
+| `RAPA_BAO_KV`, `RAPA_BAO_TRANSIT` | `rapa`, `rapa-transit` | as montagens do KV v2 e do transit |
+| `RAPA_BAO_AUTH`, `RAPA_BAO_PAPEL` | `kubernetes`, (obrigatório) | o método de entrada e o papel do componente (os do `preparar.sh`) |
+| `RAPA_BAO_TOKEN_SA` | `/var/run/secrets/rapa/bao/token` | o token projetado da conta de serviço, com a audiência do OpenBao |
+| `RAPA_BAO_TOKEN_ARQUIVO` | (nenhum) | um token do OpenBao num arquivo, em vez da entrada pelo método kubernetes: só em desenvolvimento |
+| `RAPA_ARMAZENAMENTO` | `local` | onde ficam os artefatos: `local` (a pasta `RAPA_PASTA_ARTEFATOS`) ou `s3` (cifrados, e a pasta vira só a de passagem); no cluster, sempre `s3` |
+| `RAPA_S3_ENDERECO`, `RAPA_S3_BUCKET` | (obrigatórios com `s3`) | o S3 (o SeaweedFS; `https://` fora do desenvolvimento) e o bucket |
+| `RAPA_S3_REGIAO` | `us-east-1` | a região da assinatura |
+| `RAPA_S3_CA` | (os CAs do sistema) | o CA que confere o TLS do S3 |
+| `RAPA_S3_ESTILO_CAMINHO` | `1` | o bucket no caminho, não no nome do host (o SeaweedFS) |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | (obrigatórias com `s3`) | as credenciais do S3, de um Secret; o cliente nunca procura outras |
+| `RAPA_CHAVES` | `openbao` com `RAPA_COFRE=openbao`; senão `local` | a chave de cada empresa, que embrulha a chave de cada execução: `openbao` (transit, `empresa-<uuid>`) ou `local` |
+| `RAPA_CHAVE_ARTEFATOS` | (sorteada por processo, só em desenvolvimento) | a chave mestra das chaves locais, 32 caracteres ou mais, só para desenvolvimento e testes |
+| `RAPA_METRICAS_PORTA` | `9100` | a porta do `GET /metrics`, no mesmo endereço do serviço (o `--host`); `0` desliga; nunca a porta do serviço |
+| `RAPA_METRICAS_POR_EMPRESA` | `0` | `1` põe o rótulo `empresa` (o uuid) nas execuções concluídas, na fila e nos avisos do A1 |
+| `RAPA_LOG_JSON` | `0` | `1`: um objeto JSON por linha (`hora`, `nivel`, `logger`, `mensagem` e `rastreio`), também nas linhas do uvicorn |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | (nenhum: nada de traços) | liga os traços OpenTelemetry por OTLP/HTTP (o extra `observability`); `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` troca só o dos traços |
+| `OTEL_SERVICE_NAME` | `rapa` | o nome do serviço nos traços (no chart, o do componente) |
+| `RAPA_GLITCHTIP_DSN` | (nenhum) | as exceções não tratadas, limpas, no GlitchTip (o extra `observability`); o DSN tem a chave do projeto: de um Secret |
+
+No cluster, a pasta dos arquivos de entrada (`RAPA_PASTA_ARQUIVOS`) não é montada no despachante (o disco de um pod não chega aos outros): um robô com passo de envio falha com "nenhum diretório de arquivos de entrada foi configurado".
+
+### 1.12 Observabilidade e saúde
+
+As regras estão em `docs/CONTRIBUINDO.md` ("Regras da observabilidade e da saúde"); as variáveis, em 1.11. Sondas: vida em `/saude`, prontidão em `/saude/pronto` (503 com os nomes do que falhou: `banco`, `banco_despachante`, `despachante` e, com o cofre e o armazenamento de objetos, `openbao` e `s3`). No despachante, as duas ficam na porta da saúde (`dispatcher.healthPort`), nunca na do canal. As métricas (`GET /metrics` na `RAPA_METRICAS_PORTA`, nunca pelo gateway) o coletor (VictoriaMetrics, o `VMPodScrape` opcional do chart) lê direto do pod. Para conferir à mão, num port-forward do pod:
+
+```bash
+curl -s http://127.0.0.1:8000/saude/pronto     # no despachante, a porta 8080
+curl -s http://127.0.0.1:9100/metrics | grep -E '^rapa_(fila|despachante_saudavel|a1_)'
+```
+
+Alertas que valem a pena: `rapa_despachante_saudavel == 0`; `rapa_despachante_etapa_ok == 0` por mais de alguns minutos; `rapa_fila_espera_maxima_segundos` alta (fila cheia); `time() - rapa_banco_lido_em_segundos > 120` (o despachante não lê o banco); `rapa_a1_dias_para_vencer < 7`; `rapa_a1_em_aviso{tipo="vencido"} > 0`; aumento de `rapa_webhook_entregas_total{resultado="assinatura_invalida"}`; `rapa_http_pedidos_total{codigo=~"5.."}`. Com mais de um despachante, a leitura da fila é a mesma em todos (`max`) e as execuções concluídas somam (`sum`).
 
 ## Parte 2. Operação das empresas
 
@@ -345,23 +403,3 @@ SELECT at, action, actor, data FROM platform_events ORDER BY id DESC LIMIT 5;
 - Sem o OpenBao, nenhuma chave por empresa existe para destruir (o comando só registra); as chaves dos webhooks derivadas do sal somem com as linhas.
 - Uma exclusão que falha depois de o S3 ou o cofre terem apagado uma parte deixa o banco inteiro; a repetição apaga o resto, e o registro conta só o que sobrou.
 - Uma empresa que fica congelada por muito tempo segura a remoção das partições de eventos em que tem eventos (as das outras empresas ficam junto, porque a partição é de todas).
-
-## Observabilidade e saúde
-
-As variáveis valem para cada processo de `python -m rapa.server` (as regras estão em `docs/CONTRIBUINDO.md`, "Regras da observabilidade e da saúde"):
-
-- `RAPA_METRICAS_PORTA` (padrão 9100; 0 desliga): a porta do `GET /metrics`, no mesmo endereço do serviço (o `--host`; no pod, `--host 0.0.0.0`) e nunca publicada pelo gateway; o coletor (VictoriaMetrics) lê direto do pod. Não pode ser a porta do serviço.
-- `RAPA_METRICAS_POR_EMPRESA=1`: as execuções concluídas, a fila e os avisos do A1 ganham o rótulo `empresa` (o uuid). Desligado por padrão, para não multiplicar as séries.
-- `RAPA_LOG_JSON=1`: um objeto JSON por linha (`hora`, `nivel`, `logger`, `mensagem` e `rastreio`).
-- `OTEL_EXPORTER_OTLP_ENDPOINT` (e, se preciso, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` e as outras variáveis padrão do exportador OTLP/HTTP), `OTEL_SERVICE_NAME` (padrão `rapa`): os traços. Precisam do extra `observability`.
-- `RAPA_GLITCHTIP_DSN`: as exceções não tratadas, limpas, no GlitchTip. Precisa do extra `observability`. O DSN tem a chave do projeto: guarde-o num Secret.
-
-Sondas: vida em `/saude`, prontidão em `/saude/pronto` (503 com os nomes do que falhou: `banco`, `banco_despachante`, `despachante` e, com o cofre e o armazenamento de objetos, os deles). Para conferir à mão:
-
-```bash
-curl -s http://127.0.0.1:8000/saude/pronto
-curl -s http://127.0.0.1:9100/metrics | grep -E '^rapa_(fila|despachante_saudavel|a1_)'
-```
-
-Alertas que valem a pena: `rapa_despachante_saudavel == 0`; `rapa_despachante_etapa_ok == 0` por mais de alguns minutos; `rapa_fila_espera_maxima_segundos` alta (fila cheia); `time() - rapa_banco_lido_em_segundos > 120` (o despachante não lê o banco); `rapa_a1_dias_para_vencer < 7`; `rapa_a1_em_aviso{tipo="vencido"} > 0`; aumento de `rapa_webhook_entregas_total{resultado="assinatura_invalida"}`; `rapa_http_pedidos_total{codigo=~"5.."}`. Com mais de um despachante, a leitura da fila é a mesma em todos (`max`) e as execuções concluídas somam (`sum`).
-

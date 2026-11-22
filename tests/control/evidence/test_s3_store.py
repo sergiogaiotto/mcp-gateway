@@ -387,6 +387,27 @@ async def test_delete_run_keeps_what_is_asked_and_the_company_listing(
     assert await store.delete_company(company) == 0
 
 
+async def test_delete_run_tolerates_a_legacy_download_name(s3: Any, tmp_path: Path) -> None:
+    """A retenção do prazo curto pede para guardar os downloads pelo nome registrado, e um
+    de antes da regra do ``..`` (``nota..fiscal.pdf``) não trava a execução: só é
+    comparado (como no store local); um nome que nem é de artefato continua recusado."""
+    store = s3_store(s3, tmp_path / "passagem")
+    company, run = new_id(), new_id()
+    for name in ("tela-001.png", "nota-001.pdf"):
+        source = stage(store.staging_root, company, run, 1, name, MARK)
+        await store.put(company, run, 1, name, "download", source)
+    await store.delete_run(company, run, keep=[(1, "nota..fiscal.pdf"), (1, "nota-001.pdf")])
+    assert [item async for item in store.list_company(company)] == [
+        StoredArtifact(run, 1, "nota-001.pdf")
+    ]
+    for bad in ("..", "../nota..fiscal.pdf", ".nota..pdf"):
+        with pytest.raises(ValueError):
+            await store.delete_run(company, run, keep=[(1, bad)])
+    assert [item async for item in store.list_company(company)] == [
+        StoredArtifact(run, 1, "nota-001.pdf")
+    ]
+
+
 async def test_the_staging_rules_are_those_of_the_local_store(s3: Any, tmp_path: Path) -> None:
     store = s3_store(s3, tmp_path / "passagem")
     company, run = new_id(), new_id()

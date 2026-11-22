@@ -235,6 +235,23 @@ internas e da guarda), sempre com as portas.
 {{- end -}}
 {{- end -}}
 
+{{/*
+As portas do despachante não se cruzam (o processo recusa na partida): a da saúde, a do canal
+e a das métricas. A do host de sessão é fixa no código (o relay conecta nela).
+*/}}
+{{- $health := int $v.dispatcher.healthPort -}}
+{{- $channelPort := int $v.executions.channel.port -}}
+{{- $metricsPort := int $v.observability.metricsPort -}}
+{{- if eq $health $channelPort -}}
+{{- fail "dispatcher.healthPort precisa ser outra porta que executions.channel.port: o canal dos pods tem o servidor dele" -}}
+{{- end -}}
+{{- if and (ne $metricsPort 0) (or (eq $metricsPort $health) (eq $metricsPort $channelPort) (eq $metricsPort 8000)) -}}
+{{- fail "observability.metricsPort precisa ser outra porta que a do serviço (8000 ou dispatcher.healthPort) e a do canal" -}}
+{{- end -}}
+{{- if ne (int $v.executions.sessionPort) 8765 -}}
+{{- fail "executions.sessionPort é a porta fixa do host de sessão (8765): o chart não a troca" -}}
+{{- end -}}
+
 {{/* Em produção, as imagens pelo digest. */}}
 {{- if $v.images.requireDigest -}}
 {{- if not (and $v.images.control.digest $v.images.executor.digest) -}}

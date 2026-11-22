@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Prepara o OpenBao para o RaPA: o KV v2, o transit, o método kubernetes, as políticas e
-# os papéis do despachante, da interface e API e da operação.
+# os papéis do despachante, da interface, da API e da operação. Cada conta de serviço tem o
+# papel dela (o RAPA_BAO_PAPEL do componente, os vault.roles do chart), e só ela entra nele.
 #
 # Idempotente: rodar de novo não muda o que já está certo (monta só o que falta e
 # reescreve políticas e papéis com o mesmo conteúdo). Nenhum segredo aqui: quem prepara
@@ -20,11 +21,14 @@
 #   RAPA_NAMESPACE      namespace do plano de controle (padrão: rapa)
 #   RAPA_BAO_AUDIENCIA  audiência do token projetado das contas de serviço (padrão: openbao)
 #   RAPA_BAO_TTL        validade dos tokens do OpenBao dos papéis (padrão: 1h)
-#   RAPA_SA_DESPACHANTE contas de serviço do despachante (padrão: rapa-despachante)
-#   RAPA_SA_API         contas de serviço da interface e da API (padrão: rapa-web,rapa-api)
-#   RAPA_SA_OPERACAO    conta de serviço dos Jobs da operação (padrão: rapa-operacao)
+#   RAPA_SA_DESPACHANTE conta de serviço do despachante (padrão: rapa-despachante)
+#   RAPA_SA_WEB         conta de serviço da interface (padrão: rapa-web)
+#   RAPA_SA_API         conta de serviço da API (padrão: rapa-api)
+#   RAPA_SA_OPERACAO    conta de serviço do pod da operação (padrão: rapa-operacao)
 #   KUBERNETES_HOST     API do Kubernetes vista pelo OpenBao
 #                       (padrão: https://kubernetes.default.svc)
+#   KUBERNETES_CA_CERT  arquivo PEM do CA dessa API, só quando o OpenBao não roda num pod
+#                       do cluster (sem ele, o OpenBao usa o CA e o token montados no pod dele)
 set -euo pipefail
 
 : "${BAO_ADDR:?defina BAO_ADDR com o endereço do OpenBao}"
@@ -37,9 +41,11 @@ NAMESPACE="${RAPA_NAMESPACE:-rapa}"
 AUDIENCE="${RAPA_BAO_AUDIENCIA:-openbao}"
 TTL="${RAPA_BAO_TTL:-1h}"
 SA_DISPATCHER="${RAPA_SA_DESPACHANTE:-rapa-despachante}"
-SA_API="${RAPA_SA_API:-rapa-web,rapa-api}"
+SA_WEB="${RAPA_SA_WEB:-rapa-web}"
+SA_API="${RAPA_SA_API:-rapa-api}"
 SA_OPERATION="${RAPA_SA_OPERACAO:-rapa-operacao}"
 K8S_HOST="${KUBERNETES_HOST:-https://kubernetes.default.svc}"
+K8S_CA="${KUBERNETES_CA_CERT:-}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Os nomes vão para caminhos do OpenBao: só letras, números, _ e - (e / nas montagens).
@@ -49,8 +55,8 @@ for value in "$KV" "$TRANSIT" "$AUTH"; do
     exit 1
   }
 done
-for value in "$NAMESPACE" "$AUDIENCE" "$SA_DISPATCHER" "$SA_API" "$SA_OPERATION" "$TTL"; do
-  [[ "$value" =~ ^[A-Za-z0-9_.,-]+$ ]] || {
+for value in "$NAMESPACE" "$AUDIENCE" "$SA_DISPATCHER" "$SA_WEB" "$SA_API" "$SA_OPERATION" "$TTL"; do
+  [[ "$value" =~ ^[A-Za-z0-9_.-]+$ ]] || {
     echo "preparar.sh: valor inválido: $value" >&2
     exit 1
   }
@@ -76,8 +82,15 @@ if ! mounted auth "$AUTH"; then
   bao auth enable -path="$AUTH" kubernetes
 fi
 # Rodando no cluster, o OpenBao confere os tokens com a própria conta de serviço (que
-# precisa do papel system:auth-delegator) e o CA montado no pod dele.
-bao write "auth/$AUTH/config" kubernetes_host="$K8S_HOST" >/dev/null
+# precisa do papel system:auth-delegator) e o CA montado no pod dele. Fora do cluster, o CA
+# da API vem de KUBERNETES_CA_CERT.
+if [[ -n "$K8S_CA" ]]; then
+  [[ -f "$K8S_CA" ]] || { echo "preparar.sh: KUBERNETES_CA_CERT não é um arquivo" >&2; exit 1; }
+  bao write "auth/$AUTH/config" kubernetes_host="$K8S_HOST" kubernetes_ca_cert="@$K8S_CA" \
+    disable_local_ca_jwt=true >/dev/null
+else
+  bao write "auth/$AUTH/config" kubernetes_host="$K8S_HOST" >/dev/null
+fi
 
 policy() {
   # As políticas usam as montagens padrão; aqui elas trocam para as configuradas.
@@ -90,19 +103,22 @@ policy rapa-api
 policy rapa-operacao
 
 role() {
-  # $1: papel e política; $2: contas de serviço.
+  # $1: papel; $2: a conta de serviço (só ela); $3: a política.
   bao write "auth/$AUTH/role/$1" \
     bound_service_account_names="$2" \
     bound_service_account_namespaces="$NAMESPACE" \
     audience="$AUDIENCE" \
-    token_policies="$1" \
+    token_policies="$3" \
     token_ttl="$TTL" \
     token_max_ttl=24h \
     token_no_default_policy=true >/dev/null
-  echo "papel $1 (contas: $2; namespace: $NAMESPACE)"
+  echo "papel $1 (conta: $2; namespace: $NAMESPACE; política: $3)"
 }
-role rapa-despachante "$SA_DISPATCHER"
-role rapa-api "$SA_API"
-role rapa-operacao "$SA_OPERATION"
+# O despachante lê os segredos e embrulha as chaves; a interface e a API só desembrulham
+# (servir um artefato cifrado: a mesma política, papéis separados); a operação apaga.
+role rapa-despachante "$SA_DISPATCHER" rapa-despachante
+role rapa-web "$SA_WEB" rapa-api
+role rapa-api "$SA_API" rapa-api
+role rapa-operacao "$SA_OPERATION" rapa-operacao
 
 echo "pronto: configure RAPA_BAO_PAPEL com o papel de cada componente"

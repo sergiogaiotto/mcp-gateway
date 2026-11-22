@@ -880,7 +880,15 @@ class S3ArtifactStore:
     def _delete_run(
         self, company_id: UUID, run_id: UUID, keep: Collection[tuple[int, str]]
     ) -> None:
-        kept = {object_key(company_id, run_id, attempt, name) for attempt, name in keep}
+        kept = set()
+        for attempt, name in keep:
+            # O nome de keep é só comparado (a regra da retenção, como no store local): um
+            # download antigo com ".." no nome nunca foi para o bucket (o put recusa), então
+            # não há o que guardar dele aqui, mas também não trava a retenção da execução.
+            if valid_artifact_name(_kept_name(name)):
+                kept.add(object_key(company_id, run_id, attempt, name))
+            else:
+                _attempt(attempt)
         self._delete_keys(
             [key for key in self._keys(_run_prefix(company_id, run_id)) if key not in kept]
         )

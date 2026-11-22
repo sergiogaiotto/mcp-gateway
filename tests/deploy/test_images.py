@@ -150,7 +150,20 @@ def test_runs_as_10001_read_only_with_tini(target: str) -> None:
 
 
 def test_control_image() -> None:
-    assert {"chromium", "fonts-liberation", "ca-certificates", "tzdata"} <= apt_packages("controle")
+    # O mesmo navegador do executor, para o lançador e o host de sessão locais (fora do
+    # cluster): o Chromium do Debian, as fontes e o ffmpeg do vídeo da falha.
+    assert {
+        "chromium",
+        "fonts-liberation",
+        "fonts-noto-core",
+        "ffmpeg",
+        "ca-certificates",
+        "tzdata",
+    } <= apt_packages("controle")
+    text = stages()["controle"].text
+    assert final_env("controle")["PLAYWRIGHT_BROWSERS_PATH"] == "/opt/rapa-navegadores"
+    assert 'ln -s /usr/bin/ffmpeg "/opt/rapa-navegadores/ffmpeg-${revisao}/ffmpeg-linux"' in text
+    assert "ffmpeg_installed()" in text
     assert last("controle", "CMD") == (
         '["python", "-m", "rapa.server", "--host", "0.0.0.0", "--port", "8000"]'
     )

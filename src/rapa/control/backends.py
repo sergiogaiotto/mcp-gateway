@@ -39,7 +39,7 @@ import secrets
 from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -53,6 +53,7 @@ from pydantic import (
 
 from rapa.control.artifacts import ArtifactStore, LocalArtifactStore, S3ArtifactStore, S3Readiness
 from rapa.control.db.session import Database
+from rapa.control.health import ReadinessCheck
 from rapa.control.keys import (
     MIN_MASTER_KEY,
     CompanyKeys,
@@ -102,18 +103,6 @@ class StorageKind(StrEnum):
 class KeysKind(StrEnum):
     LOCAL = "local"
     OPENBAO = "openbao"
-
-
-class ReadinessCheck(Protocol):
-    """Uma checagem de prontidão (``/saude/pronto``): o nome e se está pronto.
-
-    ``ready`` nunca levanta exceção: qualquer falha é ``False``.
-    """
-
-    @property
-    def name(self) -> str: ...
-
-    async def ready(self) -> bool: ...
 
 
 class S3Settings(BaseModel):
