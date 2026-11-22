@@ -57,11 +57,19 @@ do mesmo jeito. O que o store não consegue guardar agora (o S3 ou o cofre fora 
 é tentado de novo algumas vezes; se não der, a execução ganha na mensagem quantos
 artefatos se perderam e, se não tiver outro código, ``artefatos_nao_guardados``. No
 fim, o store solta a tentativa (no S3, a pasta de passagem dela sai inteira).
+
+Observabilidade: :meth:`Dispatcher.step_status` dá a situação de cada etapa do laço
+(as métricas leem na hora da coleta), e com um ``tracer`` (:class:`RunTracer`, o do
+OpenTelemetry quando ligado) cada execução ganha um span, com o id, a tentativa, a
+empresa e, no fim, a situação e o código de erro informados: nunca as entradas, as
+saídas ou a mensagem.
 """
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -72,6 +80,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy.exc import DataError, DBAPIError, IntegrityError
 
 from rapa.control.artifacts import ArtifactStore
+from rapa.control.observability.glitchtip import report_unhandled
 from rapa.control.services._common import now_utc
 from rapa.control.services.queue import PgRunQueue, StaleAttempt
 from rapa.core.contracts import InvalidInput, RunMode, RunnerJob, RunState, uses_a1
@@ -83,6 +92,9 @@ __all__ = [
     "ExpiryWatch",
     "Launcher",
     "RetentionTicker",
+    "RunSpan",
+    "RunTracer",
+    "StepStatus",
     "Ticker",
     "WorkerNotStarted",
     "failure_result",
@@ -155,6 +167,32 @@ class RetentionTicker(Protocol):
     async def tick(self, now: datetime | None = None) -> object:
         """Apaga o que passou do prazo, em lotes pequenos e com tempo limitado."""
         ...
+
+
+class RunSpan(Protocol):
+    """O span de uma execução, visto do despachante."""
+
+    def finished(self, result: Mapping[str, Any] | None) -> None:
+        """O resultado que o despachante mandou gravar (``None``: a tentativa ficou antiga)."""
+        ...
+
+
+class RunTracer(Protocol):
+    """Quem abre um span por execução (:class:`rapa.control.observability.tracing.RunSpans`)."""
+
+    def run(self, job: RunnerJob) -> AbstractContextManager[RunSpan]:
+        """O span da execução, corrente enquanto o despachante cuida dela."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class StepStatus:
+    """A situação de uma etapa do laço, para as métricas (sem o texto de nenhum erro)."""
+
+    #: Falhas seguidas (0: a última vez deu certo, ou ainda não rodou).
+    failures: int
+    failing_since: datetime | None
+    last_ok: datetime | None
 
 
 class _ReportedArtifact(BaseModel):
@@ -266,6 +304,7 @@ class Dispatcher:
         artifact_retries: int = 3,
         artifact_retry_s: float = 1.0,
         clock: Callable[[], datetime] = now_utc,
+        tracer: RunTracer | None = None,
     ) -> None:
         """``finish_retry_s`` é a primeira espera entre tentativas de gravar o
         resultado (dobra a cada falha, até 5 s); ``finish_grace_s`` é quanto
@@ -293,7 +332,9 @@ class Dispatcher:
         Uma etapa da manutenção que falha é repetida depois de ``poll_interval``,
         espera que dobra a cada falha seguida, até 60 s. ``unhealthy_after_s`` é
         quanto tempo uma etapa do laço pode falhar sem parar antes de
-        :attr:`healthy` ficar falso."""
+        :attr:`healthy` ficar falso.
+
+        Com ``tracer``, cada execução roda dentro do span dela."""
         if concurrency < 1:
             raise ValueError("a concorrência precisa ser pelo menos 1")
         if finish_retry_s <= 0 or finish_grace_s < 0:
@@ -323,6 +364,7 @@ class Dispatcher:
         self.retention_interval = retention_interval
         self.retention_catch_up = retention_catch_up
         self.clock = clock
+        self.tracer = tracer
         self._tasks: dict[asyncio.Task[None], RunnerJob] = {}
         self._steps = {name: _StepState() for name in _STEPS}
         self._wakeup = asyncio.Event()
@@ -350,6 +392,27 @@ class Dispatcher:
             name: state.failing_since
             for name, state in self._steps.items()
             if state.failing_since is not None
+        }
+
+    def step_status(self) -> dict[str, StepStatus]:
+        """A situação das etapas do laço que este despachante roda.
+
+        Sempre ``"partitions"``, ``"reap"`` e ``"claim"``; ``"schedules"`` com um
+        agendador, ``"certificates"`` com os avisos do A1 e ``"retention"`` com a retenção.
+        """
+        used = {
+            "schedules": self.scheduler is not None,
+            "certificates": self.alerts is not None,
+            "retention": self.retention is not None,
+        }
+        return {
+            name: StepStatus(
+                failures=state.failures,
+                failing_since=state.failing_since,
+                last_ok=state.last_ok,
+            )
+            for name, state in self._steps.items()
+            if used.get(name, True)
         }
 
     @property
@@ -509,8 +572,9 @@ class Dispatcher:
     def _done(self, task: asyncio.Task[None]) -> None:
         self._tasks.pop(task, None)
         self._wakeup.set()
-        if not task.cancelled() and task.exception() is not None:
-            logger.error("falha inesperada no despacho: %s", type(task.exception()).__name__)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            logger.error("falha inesperada no despacho: %s", type(error).__name__)
+            report_unhandled(error)
 
     async def drain(self) -> None:
         """Espera as execuções em andamento terminarem."""
@@ -592,16 +656,30 @@ class Dispatcher:
             return _A1_UNCHECKED
 
     async def _handle(self, job: RunnerJob) -> None:
+        with contextlib.ExitStack() as stack:
+            span: RunSpan | None = None
+            if self.tracer is not None:
+                try:
+                    span = stack.enter_context(self.tracer.run(job))
+                except Exception as exc:  # o rastreio nunca impede a execução
+                    logger.warning("falha ao abrir o span da execução: %s", type(exc).__name__)
+            result = await self._dispatch(job)
+            if span is not None:
+                try:
+                    span.finished(result)
+                except Exception as exc:
+                    logger.warning("falha ao fechar o span da execução: %s", type(exc).__name__)
+
+    async def _dispatch(self, job: RunnerJob) -> Mapping[str, Any] | None:
+        """Lança a execução e grava o resultado; devolve o resultado mandado gravar."""
         blocked = await self._a1_blocked(job)
         if blocked is not None:
             logger.warning("execução %s não lançada: certificado A1 bloqueado", job.run_id)
-            await self._finish(
-                job,
-                failure_result(
-                    job, ErrorCode.CERTIFICADO_A1_BLOQUEADO.value, blocked, started=False
-                ),
+            refused = failure_result(
+                job, ErrorCode.CERTIFICADO_A1_BLOQUEADO.value, blocked, started=False
             )
-            return
+            await self._finish(job, refused)
+            return refused
         launch_task: asyncio.Task[Mapping[str, Any]] = asyncio.create_task(
             _call(self.launch, job), name=f"lancamento-{job.run_id}"
         )
@@ -615,7 +693,7 @@ class Dispatcher:
                 if not stale.is_set():
                     raise
                 # A tentativa ficou antiga: outra já assumiu, nada a gravar.
-                return
+                return None
             except WorkerNotStarted as exc:
                 logger.error("o executor não foi iniciado: %s", _error_name(exc.__cause__ or exc))
                 result = failure_result(job, exc.code, exc.public_message, started=False)
@@ -627,6 +705,7 @@ class Dispatcher:
             # A concessão segue renovada até os artefatos e o resultado serem gravados.
             result = await self._register_artifacts(job, result)
             await self._finish(job, result)
+            return result
         finally:
             beats.cancel()
             # Erros da renovação já foram registrados; não impedem gravar o resultado.

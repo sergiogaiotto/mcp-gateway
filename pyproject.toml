@@ -46,6 +46,17 @@ control = [
     # threads e a cifra (AES-256-GCM, HKDF) do cryptography.
     "boto3>=1.40",
     "cryptography>=46",
+    # Métricas Prometheus numa porta própria (RAPA_METRICAS_PORTA).
+    "prometheus-client>=0.26",
+]
+# Observabilidade opcional do plano de controle: traços OpenTelemetry (só com
+# OTEL_EXPORTER_OTLP_ENDPOINT) e erros no GlitchTip (só com RAPA_GLITCHTIP_DSN).
+observability = [
+    "opentelemetry-sdk>=1.45.2,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.45.2,<2",
+    "opentelemetry-instrumentation-fastapi>=0.66b2",
+    "opentelemetry-instrumentation-httpx>=0.66b2",
+    "sentry-sdk>=2.75,<3",
 ]
 # Interface web em Python.
 ui = [

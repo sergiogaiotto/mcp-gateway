@@ -86,3 +86,23 @@ SELECT at, action, actor, data FROM platform_events ORDER BY id DESC LIMIT 5;
 - Sem o OpenBao, nenhuma chave por empresa existe para destruir (o comando só registra); as chaves dos webhooks derivadas do sal somem com as linhas.
 - Uma exclusão que falha depois de o S3 ou o cofre terem apagado uma parte deixa o banco inteiro; a repetição apaga o resto, e o registro conta só o que sobrou.
 - Uma empresa que fica congelada por muito tempo segura a remoção das partições de eventos em que tem eventos (as das outras empresas ficam junto, porque a partição é de todas).
+
+## Observabilidade e saúde
+
+As variáveis valem para cada processo de `python -m rapa.server` (as regras estão em `docs/CONTRIBUINDO.md`, "Regras da observabilidade e da saúde"):
+
+- `RAPA_METRICAS_PORTA` (padrão 9100; 0 desliga): a porta do `GET /metrics`, no mesmo endereço do serviço (o `--host`; no pod, `--host 0.0.0.0`) e nunca publicada pelo gateway; o coletor (VictoriaMetrics) lê direto do pod. Não pode ser a porta do serviço.
+- `RAPA_METRICAS_POR_EMPRESA=1`: as execuções concluídas, a fila e os avisos do A1 ganham o rótulo `empresa` (o uuid). Desligado por padrão, para não multiplicar as séries.
+- `RAPA_LOG_JSON=1`: um objeto JSON por linha (`hora`, `nivel`, `logger`, `mensagem` e `rastreio`).
+- `OTEL_EXPORTER_OTLP_ENDPOINT` (e, se preciso, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` e as outras variáveis padrão do exportador OTLP/HTTP), `OTEL_SERVICE_NAME` (padrão `rapa`): os traços. Precisam do extra `observability`.
+- `RAPA_GLITCHTIP_DSN`: as exceções não tratadas, limpas, no GlitchTip. Precisa do extra `observability`. O DSN tem a chave do projeto: guarde-o num Secret.
+
+Sondas: vida em `/saude`, prontidão em `/saude/pronto` (503 com os nomes do que falhou: `banco`, `banco_despachante`, `despachante` e, com o cofre e o armazenamento de objetos, os deles). Para conferir à mão:
+
+```bash
+curl -s http://127.0.0.1:8000/saude/pronto
+curl -s http://127.0.0.1:9100/metrics | grep -E '^rapa_(fila|despachante_saudavel|a1_)'
+```
+
+Alertas que valem a pena: `rapa_despachante_saudavel == 0`; `rapa_despachante_etapa_ok == 0` por mais de alguns minutos; `rapa_fila_espera_maxima_segundos` alta (fila cheia); `time() - rapa_banco_lido_em_segundos > 120` (o despachante não lê o banco); `rapa_a1_dias_para_vencer < 7`; `rapa_a1_em_aviso{tipo="vencido"} > 0`; aumento de `rapa_webhook_entregas_total{resultado="assinatura_invalida"}`; `rapa_http_pedidos_total{codigo=~"5.."}`. Com mais de um despachante, a leitura da fila é a mesma em todos (`max`) e as execuções concluídas somam (`sum`).
+

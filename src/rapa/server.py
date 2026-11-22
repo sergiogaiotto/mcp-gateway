@@ -11,18 +11,25 @@ Em produção, o despachante roda em réplicas próprias (``RAPA_HTTP=0``, com
 Fase 0 e em desenvolvimento, tudo cabe num processo.
 
 O esquema do banco é criado antes, com ``python -m rapa.control.db.migrate``.
+
+Observabilidade e saúde (:mod:`rapa.control.observability` e :mod:`rapa.control.health`):
+métricas Prometheus numa porta própria (``RAPA_METRICAS_PORTA``), logs em JSON
+(``RAPA_LOG_JSON``), traços OpenTelemetry (``OTEL_EXPORTER_OTLP_ENDPOINT``), exceções
+não tratadas no GlitchTip (``RAPA_GLITCHTIP_DSN``), ``/saude`` (vivo) e
+``/saude/pronto`` (pronto).
 """
 
 import argparse
 import asyncio
 import contextlib
+import importlib.metadata
 import json
 import logging
 import os
 import shlex
 import sys
 import tempfile
-from collections.abc import AsyncIterator, Coroutine, Mapping, Sequence
+from collections.abc import AsyncIterator, Coroutine, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -49,6 +56,13 @@ from rapa.control.auth import (
 from rapa.control.backends import Backends, BackendSettings, VaultKind
 from rapa.control.channel import Channel, ChannelServer
 from rapa.control.db import Database
+from rapa.control.health import (
+    READY_PATH,
+    DatabaseCheck,
+    DispatcherCheck,
+    Readiness,
+    ReadinessCheck,
+)
 from rapa.control.http_app import HttpSettings, create_http_app
 from rapa.control.kube import (
     KubeApi,
@@ -64,6 +78,23 @@ from rapa.control.launcher import (
     LocalLauncherSettings,
     LocalProcessLauncher,
 )
+from rapa.control.observability.glitchtip import (
+    GlitchTip,
+    configure_glitchtip,
+    dsn_problem,
+    report_unhandled,
+)
+from rapa.control.observability.logs import configure_logging, uvicorn_log_config
+from rapa.control.observability.metrics import (
+    DEFAULT_METRICS_PORT,
+    MeteredWebhooks,
+    Metrics,
+    MetricsServer,
+    instrument_http,
+    serve_metrics,
+    watch_platform,
+)
+from rapa.control.observability.tracing import Tracing, activate_tracing
 from rapa.control.services import (
     CredentialAlerts,
     Dispatcher,
@@ -84,6 +115,7 @@ from rapa.control.services import (
     Scheduler,
     WebhookKeys,
 )
+from rapa.control.services._common import now_utc
 from rapa.control.services.queue import DEFAULT_MAX_DURATION
 from rapa.control.services.retention import SUCCESS_AFTER_FAILURE
 from rapa.control.services.sessions import PgSessionStore
@@ -111,6 +143,7 @@ __all__ = [
     "build_credentials",
     "build_pod_launcher",
     "build_publishing",
+    "build_readiness_checks",
     "build_repairs",
     "build_scheduler",
     "build_sessions",
@@ -120,6 +153,8 @@ __all__ = [
 ]
 
 logger = logging.getLogger("rapa.server")
+
+_HTTP_URL_PREFIXES = ("http://", "https://")
 
 _TRUE = {"1", "true", "sim", "yes", "on"}
 _FALSE = {"0", "false", "nao", "não", "no", "off", ""}
@@ -153,13 +188,23 @@ def _json(env: Mapping[str, str], name: str) -> Any:
         raise ValueError(f"{name} precisa ser um JSON válido") from None
 
 
+def _version() -> str:
+    try:
+        return importlib.metadata.version("rapa")
+    except importlib.metadata.PackageNotFoundError:  # pragma: no cover - sempre instalado
+        return "0"
+
+
 type Executor = Literal["local", "kubernetes"]
 
 
 class ServerSettings(BaseModel):
     """Configuração do serviço."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    # Sem a entrada nas mensagens de erro: o pydantic poria nelas o valor recusado (ou um
+    # pedaço do dicionário inteiro, numa regra do modelo), e ali estão as senhas dos
+    # bancos, as chaves dos webhooks e do hub e o DSN do GlitchTip.
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     #: Banco com o papel da aplicação (``rapa_app``, sujeito ao isolamento por linha).
     database_url: str = Field(min_length=1, repr=False)
@@ -307,6 +352,21 @@ class ServerSettings(BaseModel):
             return {**data, "backends": BackendSettings(dev=bool(data.get("dev", False)))}
         return data
 
+    #: Porta do servidor de métricas (só ``GET /metrics``, fora do gateway); 0 desliga.
+    metrics_port: int = Field(default=DEFAULT_METRICS_PORT, ge=0, le=65_535)
+    #: Rótulo ``empresa`` nas execuções concluídas, na fila e nos avisos do A1.
+    metrics_per_company: bool = False
+    #: Logs em JSON, um objeto por linha.
+    log_json: bool = False
+    #: Base do OTLP (``OTEL_EXPORTER_OTLP_ENDPOINT``); sem ela, nada de rastreio.
+    otel_endpoint: str | None = None
+    #: Endereço só dos traços (``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT``), se for outro.
+    otel_traces_endpoint: str | None = None
+    #: Nome do serviço nos traços (``OTEL_SERVICE_NAME``; padrão ``rapa``).
+    otel_service_name: str | None = None
+    #: GlitchTip das exceções não tratadas (o DSN tem a chave do projeto).
+    glitchtip_dsn: str | None = Field(default=None, repr=False)
+
     @model_validator(mode="after")
     def _check(self) -> ServerSettings:
         if not self.http and self.dispatcher_database_url is None:
@@ -359,6 +419,21 @@ class ServerSettings(BaseModel):
         if self.executor == "kubernetes":
             # Só o formato: o IP deste pod é descoberto ao montar o despachante.
             channel_address(self.channel_address, self.channel_port, resolve_ip=lambda: "10.0.0.1")
+        for url, name in (
+            (self.otel_endpoint, "OTEL_EXPORTER_OTLP_ENDPOINT"),
+            (self.otel_traces_endpoint, "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"),
+        ):
+            if url is not None and not url.startswith(_HTTP_URL_PREFIXES):
+                raise ValueError(f"{name} precisa ser um endereço http:// ou https://")
+        if self.otel_traces_endpoint and not self.otel_endpoint:
+            raise ValueError(
+                "o rastreio só liga com OTEL_EXPORTER_OTLP_ENDPOINT (o endereço dos traços "
+                "sozinho não basta)"
+            )
+        if self.glitchtip_dsn is not None and (problem := dsn_problem(self.glitchtip_dsn)):
+            # A mesma leitura do sentry_sdk, na partida; sem o valor na mensagem (o DSN
+            # tem a chave do projeto).
+            raise ValueError(f"RAPA_GLITCHTIP_DSN {problem}")
         return self
 
     @classmethod
@@ -448,12 +523,23 @@ class ServerSettings(BaseModel):
           portais internos; padrão nenhuma) e ``RAPA_PROXY_SAIDA`` (proxy HTTP CONNECT
           para a internet, ``http://host:porta``, sem usuário e senha). A guarda (só os
           domínios do robô, a rede interna fechada) vale sempre nos pods e, no lançador
-          local, quando uma das duas está definida e sempre fora de ``RAPA_DEV``.
+          local, quando uma das duas está definida e sempre fora de ``RAPA_DEV``;
         - cofre, armazenamento e chaves (:mod:`rapa.control.backends`): ``RAPA_COFRE``
           (``nenhum``, ``dev`` ou ``openbao``), ``RAPA_BAO_*``, ``RAPA_ARMAZENAMENTO``
           (``local`` ou ``s3``), ``RAPA_S3_*`` com ``AWS_ACCESS_KEY_ID`` e
           ``AWS_SECRET_ACCESS_KEY``, ``RAPA_CHAVES`` (``openbao`` ou ``local``) e
-          ``RAPA_CHAVE_ARTEFATOS``, conferidos na partida.
+          ``RAPA_CHAVE_ARTEFATOS``, conferidos na partida;
+        - observabilidade: ``RAPA_METRICAS_PORTA`` (a porta do servidor de métricas,
+          só ``GET /metrics``, no mesmo endereço do serviço, o ``--host``, e que nunca
+          passa pelo gateway; padrão 9100, 0 desliga),
+          ``RAPA_METRICAS_POR_EMPRESA`` (1 ou 0; desligado por padrão: com ele, as
+          execuções concluídas, a fila e os avisos do A1 ganham o rótulo ``empresa``),
+          ``RAPA_LOG_JSON`` (1 ou 0: um objeto JSON por linha, com hora, nível, logger,
+          mensagem e o id de rastreio), ``OTEL_EXPORTER_OTLP_ENDPOINT`` (liga os traços
+          OpenTelemetry por OTLP/HTTP; sem ele, nada é carregado),
+          ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` e ``OTEL_SERVICE_NAME`` (padrão
+          ``rapa``), e ``RAPA_GLITCHTIP_DSN`` (as exceções não tratadas, limpas, no
+          GlitchTip). Os traços e o GlitchTip precisam do extra ``observability``.
         """
         env = os.environ if env is None else env
         data: dict[str, Any] = {
@@ -498,6 +584,14 @@ class ServerSettings(BaseModel):
                 if n.strip()
             ),
             "backends": BackendSettings.from_env(env),
+            "metrics_per_company": _flag(env, "RAPA_METRICAS_POR_EMPRESA", False),
+            "log_json": _flag(env, "RAPA_LOG_JSON", False),
+            "otel_endpoint": env.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip() or None,
+            "otel_traces_endpoint": (
+                env.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip() or None
+            ),
+            "otel_service_name": env.get("OTEL_SERVICE_NAME", "").strip() or None,
+            "glitchtip_dsn": env.get("RAPA_GLITCHTIP_DSN", "").strip() or None,
         }
         for key, name in (
             ("k8s_namespace", "RAPA_K8S_NAMESPACE_EXECUCOES"),
@@ -527,6 +621,7 @@ class ServerSettings(BaseModel):
             ("retention_success_days", "RAPA_RETENCAO_SUCESSO_DIAS", int),
             ("retention_failure_days", "RAPA_RETENCAO_FALHAS_DIAS", int),
             ("retention_events_days", "RAPA_RETENCAO_EVENTOS_DIAS", int),
+            ("metrics_port", "RAPA_METRICAS_PORTA", int),
         ):
             if raw := env.get(name, "").strip():
                 data[key] = kind(raw)
@@ -796,6 +891,7 @@ class DispatcherSupervisor:
             except Exception as exc:
                 # Só o tipo: a mensagem de um erro inesperado pode trazer dados.
                 error = type(exc).__name__
+                report_unhandled(exc)
             finally:
                 self._running = False
             if stop.is_set():
@@ -820,6 +916,7 @@ class DispatcherSupervisor:
         error = task.exception()
         if error is not None:
             logger.error("a supervisão do despachante parou: %s", type(error).__name__)
+            report_unhandled(error)
 
 
 async def _stop_dispatcher(
@@ -993,8 +1090,13 @@ def build_pod_launcher(
     )
 
 
-def build_publishing(settings: ServerSettings, db: Database) -> PublishingServices:
-    """Agendas, webhooks (só com ``RAPA_CHAVE_WEBHOOKS``) e lotes sobre o banco da aplicação."""
+def build_publishing(
+    settings: ServerSettings, db: Database, metrics: Metrics | None = None
+) -> PublishingServices:
+    """Agendas, webhooks (só com ``RAPA_CHAVE_WEBHOOKS``) e lotes sobre o banco da aplicação.
+
+    Com ``metrics``, cada entrega de webhook é contada pelo resultado.
+    """
     webhooks = (
         PgWebhooks(
             db,
@@ -1004,10 +1106,11 @@ def build_publishing(settings: ServerSettings, db: Database) -> PublishingServic
         if settings.webhook_key
         else None
     )
+    receiver = MeteredWebhooks(webhooks, metrics) if webhooks and metrics else webhooks
     return PublishingServices(
         schedules=PgSchedules(db, max_enabled_per_company=settings.schedules_per_company),
         webhooks=webhooks,
-        receiver=webhooks,
+        receiver=receiver,
         batches=PgBatches(
             db,
             limits=SheetLimits(
@@ -1155,7 +1258,33 @@ async def _start_pod_launcher(
     stack.push_async_callback(_stop_task, stop, sweeper)
 
 
-def create_server_app(settings: ServerSettings) -> FastAPI:
+def build_readiness_checks(
+    db: Database,
+    dispatcher_db: Database | None,
+    supervisor: DispatcherSupervisor | None,
+    extra: Iterable[ReadinessCheck] = (),
+) -> list[ReadinessCheck]:
+    """As checagens de ``/saude/pronto``: o banco, o do despachante e o despachante.
+
+    ``extra`` são as do cofre e do armazenamento de objetos, quando configurados (as
+    ``readiness_checks()`` dos backends do OpenBao e do S3, que já têm a forma de
+    :class:`~rapa.control.health.ReadinessCheck`).
+    """
+    checks: list[ReadinessCheck] = [DatabaseCheck(db)]
+    if dispatcher_db is not None:
+        checks.append(DatabaseCheck(dispatcher_db, "banco_despachante"))
+    if supervisor is not None:
+        checks.append(DispatcherCheck(supervisor))
+    checks.extend(extra)
+    return checks
+
+
+async def _stop_watch(stop: asyncio.Event, task: asyncio.Task[None]) -> None:
+    stop.set()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+def create_server_app(settings: ServerSettings, *, tracing: Tracing | None = None) -> FastAPI:
     """Monta a aplicação: REST e MCP, interface (opcional) e despachante (opcional).
 
     O ``lifespan`` da aplicação roda uma vez só: para subir de novo, monte outra.
@@ -1163,7 +1292,20 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
     execuções em andamento), depois o gateway MCP e a interface encerram, e só
     então o verificador de tokens e os bancos são fechados, mesmo se a subida
     falhar no meio.
+
+    As métricas (``app.state.metrics``) são montadas aqui, mas o servidor delas só
+    sobe em :func:`main`. Com ``OTEL_EXPORTER_OTLP_ENDPOINT`` (ou ``tracing``, nos
+    testes), os pedidos e as execuções ganham traços.
     """
+    version = _version()
+    metrics = Metrics(per_company=settings.metrics_per_company, version=version)
+    if tracing is None and settings.otel_endpoint:
+        tracing = activate_tracing(
+            endpoint=settings.otel_endpoint,
+            traces_endpoint=settings.otel_traces_endpoint,
+            service_name=settings.otel_service_name,
+            version=version,
+        )
     db = Database.from_url(settings.database_url)
     dispatcher_db = (
         Database.from_url(
@@ -1184,7 +1326,7 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
         if settings.http and settings.sessions
         else (None, None)
     )
-    publishing = build_publishing(settings, db)
+    publishing = build_publishing(settings, db, metrics)
     repairs = build_repairs(settings, db)
     credentials = build_credentials(settings, db)
     backends = Backends(settings.backends)
@@ -1228,9 +1370,19 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
         if dispatcher.alerts is None:
             # Os avisos de vencimento do certificado A1 são outra etapa do mesmo laço.
             dispatcher.alerts = CredentialAlerts(dispatcher_db, warn_days=settings.a1_warn_days)
+        if isinstance(dispatcher.queue, PgRunQueue) and dispatcher.queue.observer is None:
+            # Cada execução concluída conta nas métricas (depois de gravada).
+            dispatcher.queue.observer = metrics
+        if tracing is not None and dispatcher.tracer is None:
+            dispatcher.tracer = tracing.run_spans()
     supervisor = DispatcherSupervisor(dispatcher) if dispatcher else None
     if supervisor is not None:
         app.add_middleware(_DispatcherHealth, supervisor=supervisor)
+    metrics.watch_dispatcher(supervisor)
+    metrics.watch_sessions(sessions)
+    # Antes da interface: o NiceGUI, montado em "/", pegaria o caminho.
+    readiness = Readiness(build_readiness_checks(db, dispatcher_db, supervisor))
+    app.add_api_route(READY_PATH, readiness.endpoint, methods=["GET"], include_in_schema=False)
     app.state.dispatcher = dispatcher
     app.state.dispatcher_supervisor = supervisor
     app.state.sessions = sessions
@@ -1241,6 +1393,9 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
     app.state.backends = backends
     # As checagens de prontidão do cofre e do S3 (as que estiverem configuradas).
     app.state.readiness_checks = backends.readiness_checks()
+    app.state.metrics = metrics
+    app.state.readiness = readiness
+    app.state.tracing = tracing
     if settings.http and settings.ui:
         # Antes de envolver o lifespan: o NiceGUI (ui.run_with) envolve o que encontrar
         # com a subida e o encerramento dele, e esse conjunto fica dentro do nosso.
@@ -1256,6 +1411,10 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
             company,
             artifacts,
         )
+    # Por fora de tudo o que a aplicação já tem (inclusive os 413 e 503 das proteções).
+    instrument_http(app, metrics)
+    if tracing is not None:
+        tracing.instrument_app(app)
     inner = app.router.lifespan_context
     started = False
 
@@ -1280,12 +1439,30 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
                 stack.push_async_callback(dispatcher_db.dispose)
             if isinstance(verifier, TokenVerifier):
                 stack.push_async_callback(verifier.aclose)
+            if tracing is not None:
+                # O que ficou na fila dos traços sai antes de o processo parar.
+                stack.push_async_callback(asyncio.to_thread, tracing.flush)
+            stack.push_async_callback(readiness.aclose)
             # A interface (se houver) e o gateway MCP: encerram antes de fechar os bancos.
             state = await stack.enter_async_context(inner(application))
             pod_launcher = getattr(dispatcher, "launch", None)
             if isinstance(pod_launcher, KubernetesLauncher):
                 # Antes do despachante: o canal fica aberto até as tentativas terminarem.
                 await _start_pod_launcher(stack, pod_launcher, settings.channel_port)
+            if dispatcher_db is not None and settings.metrics_port:
+                # A fila e os avisos do A1, lidos do banco do despachante a cada 30 s.
+                watch_stop = asyncio.Event()
+                watch = asyncio.create_task(
+                    watch_platform(
+                        metrics,
+                        dispatcher_db,
+                        watch_stop,
+                        warn_days=settings.a1_warn_days,
+                        clock=now_utc,
+                    ),
+                    name="metricas-da-fila",
+                )
+                stack.push_async_callback(_stop_watch, watch_stop, watch)
             if sessions is not None and session_launcher is not None:
                 # Os navegadores das sessões fecham antes dos bancos (a situação é gravada).
                 sweep_stop = asyncio.Event()
@@ -1321,19 +1498,68 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(argv)
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
     try:
         settings = ServerSettings.from_env()
+        if settings.metrics_port and settings.metrics_port == args.port:
+            raise ValueError("RAPA_METRICAS_PORTA não pode ser a porta do serviço")
     except ValueError as exc:
         print(f"rapa.server: configuração inválida: {exc}", file=sys.stderr)
         return 2
+    configure_logging(json_logs=settings.log_json)
     import uvicorn
 
-    app = create_server_app(settings)
-    with contextlib.suppress(KeyboardInterrupt):
-        uvicorn.run(app, host=args.host, port=args.port, log_level="info", access_log=False)
+    version = _version()
+    glitchtip: GlitchTip | None = None
+    tracing: Tracing | None = None
+    try:
+        # Primeiro o GlitchTip e o rastreio: o que ligar é o que foi pedido, ou nada sobe.
+        if settings.glitchtip_dsn:
+            glitchtip = configure_glitchtip(settings.glitchtip_dsn, release=f"rapa@{version}")
+        if settings.otel_endpoint:
+            tracing = activate_tracing(
+                endpoint=settings.otel_endpoint,
+                traces_endpoint=settings.otel_traces_endpoint,
+                service_name=settings.otel_service_name,
+                version=version,
+            )
+    except RuntimeError as exc:  # o extra observability não está instalado
+        print(f"rapa.server: {exc}", file=sys.stderr)
+        if glitchtip is not None:
+            glitchtip.close()
+        return 2
+    metrics_server: MetricsServer | None = None
+    try:
+        app = create_server_app(settings, tracing=tracing)
+        if settings.metrics_port:
+            # Antes do serviço: sem a porta das métricas, o processo não sobe. No mesmo
+            # endereço do serviço: com o padrão (127.0.0.1), nada fica aberto na rede.
+            try:
+                metrics_server = serve_metrics(
+                    app.state.metrics, settings.metrics_port, host=args.host
+                )
+            except OSError as exc:
+                logger.error(
+                    "não foi possível abrir a porta %d das métricas: %s",
+                    settings.metrics_port,
+                    type(exc).__name__,
+                )
+                return 2
+        with contextlib.suppress(KeyboardInterrupt):
+            uvicorn.run(
+                app,
+                host=args.host,
+                port=args.port,
+                log_level="info",
+                access_log=False,
+                log_config=uvicorn_log_config(json_logs=settings.log_json),
+            )
+    finally:
+        if metrics_server is not None:
+            metrics_server.stop()
+        if tracing is not None:
+            tracing.shutdown()
+        if glitchtip is not None:
+            glitchtip.close()
     return 0
 
 

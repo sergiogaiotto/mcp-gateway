@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from rapa.control.auth import AuthError
+from rapa.control.observability.glitchtip import report_unhandled
 from rapa.core.contracts import (
     CompanyFrozen,
     Conflict,
@@ -83,13 +84,15 @@ def log_unexpected(log: logging.Logger, what: str, exc: BaseException) -> None:
 
     A mensagem de uma exceção de outra camada pode trazer dados da requisição ou
     da conexão; o tipo e os quadros da pilha (arquivo, linha e função, sem o
-    código-fonte) bastam para investigar.
+    código-fonte) bastam para investigar. Com o GlitchTip ligado, o erro também vai
+    para lá, limpo do mesmo jeito (:mod:`rapa.control.observability.glitchtip`).
     """
     frames = "\n".join(
         f"  {frame.filename}:{frame.lineno} em {frame.name}"
         for frame in traceback.extract_tb(exc.__traceback__)
     )
     log.error("%s: %s (mensagem omitida)\n%s", what, type(exc).__name__, frames)
+    report_unhandled(exc)
 
 
 def error_response(

@@ -53,7 +53,13 @@ gravado), e o executor numera a partir dele. Assim ``(run_id, seq)`` continua
 único e crescente entre as tentativas, e um evento só é dado como gravado
 quando está gravado para esta tentativa, com o mesmo conteúdo.
 
-:class:`PgRunQueue` embrulha cada função na sua própria transação.
+:class:`PgRunQueue` embrulha cada função na sua própria transação. Com um
+``observer`` (:class:`RunObserver`, as métricas do processo), cada execução que ela
+conclui (o resultado gravado, o recolhimento que falha, marca indeterminada ou cancela,
+e a que falha ao ser pega porque esta versão não lê o manifesto dela) é informada
+depois de a transação confirmar, com a situação final, a origem e a duração
+(:class:`ConcludedRun`): nada de entradas, saídas ou mensagens. Um erro do observador
+nunca muda o que a fila fez.
 """
 
 import hashlib
@@ -64,7 +70,7 @@ from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -123,14 +129,17 @@ __all__ = [
     "DISPATCHER_ACTOR",
     "QUEUE_LOCK_KEY",
     "ArtifactInfo",
+    "ConcludedRun",
     "EventConflict",
     "PgRunQueue",
     "ReapReport",
+    "RunObserver",
     "RunnerOutcome",
     "StaleAttempt",
     "claim_next",
     "ensure_event_partitions",
     "finish",
+    "finish_run",
     "frozen_companies",
     "heartbeat",
     "ingest_events",
@@ -215,6 +224,34 @@ class RunnerOutcome(BaseModel):
 
 
 @dataclass(frozen=True, slots=True)
+class ConcludedRun:
+    """Uma execução que a fila acabou de concluir, para as métricas.
+
+    Só o que é preciso para contar: a empresa, a situação final, a origem (``trigger``)
+    e a duração da tentativa (do início ao fim, quando ela chegou a começar).
+    """
+
+    company_id: UUID
+    state: RunState
+    trigger: str
+    duration_s: float | None = None
+
+
+class RunObserver(Protocol):
+    """Quem acompanha as execuções concluídas (as métricas do processo)."""
+
+    def run_concluded(self, run: ConcludedRun) -> None: ...
+
+
+def _concluded(row: RowMapping, state: RunState, now: datetime) -> ConcludedRun:
+    started = row["started_at"]
+    duration = (now - _utc(started)).total_seconds() if started is not None else None
+    return ConcludedRun(
+        company_id=row["company_id"], state=state, trigger=str(row["trigger"]), duration_s=duration
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class ReapReport:
     """O que :func:`reap_expired` fez com as concessões vencidas."""
 
@@ -223,6 +260,8 @@ class ReapReport:
     failed: list[UUID] = field(default_factory=list)
     #: Não gravaram nada, mas a empresa está congelada: canceladas em vez de voltar à fila.
     cancelled: list[UUID] = field(default_factory=list)
+    #: As que terminaram aqui (indeterminadas, falhas e canceladas), para as métricas.
+    concluded: list[ConcludedRun] = field(default_factory=list)
 
 
 def _utc(value: datetime) -> datetime:
@@ -340,11 +379,14 @@ async def claim_next(
     now: datetime,
     lease: timedelta = DEFAULT_LEASE,
     max_duration: timedelta = DEFAULT_MAX_DURATION,
+    concluded: list[ConcludedRun] | None = None,
 ) -> RunnerJob | None:
     """Pega a próxima execução admissível e a marca como ``running``.
 
     Deve rodar numa transação curta e própria (ver :class:`PgRunQueue`): a
-    trava consultiva só é solta no fim da transação.
+    trava consultiva só é solta no fim da transação. Uma execução cujo manifesto
+    esta versão não lê falha aqui (``manifesto_invalido``) e, com ``concluded``, entra
+    nessa lista (para as métricas, depois de a transação confirmar).
     """
     now = _utc(now)
     await session.execute(select(func.pg_advisory_xact_lock(QUEUE_LOCK_KEY)))
@@ -388,7 +430,14 @@ async def claim_next(
         else literal(0)
     )
     candidates = (
-        select(runs.c.id, runs.c.company_id, runs.c.version_id, runs.c.inputs, runs.c.mode)
+        select(
+            runs.c.id,
+            runs.c.company_id,
+            runs.c.version_id,
+            runs.c.inputs,
+            runs.c.mode,
+            runs.c.trigger,
+        )
         .where(*where)
         .order_by(runs.c.priority, borrowing_last, runs.c.queued_at, runs.c.id)
         .limit(1)
@@ -405,6 +454,15 @@ async def claim_next(
             manifest = Manifest.model_validate(manifest_json)
         except ValidationError:
             await _fail_unrunnable(session, candidate["id"], candidate["company_id"], now)
+            if concluded is not None:
+                # Não chegou a começar nesta versão: sem duração.
+                concluded.append(
+                    ConcludedRun(
+                        company_id=candidate["company_id"],
+                        state=RunState.FAILED,
+                        trigger=str(candidate["trigger"]),
+                    )
+                )
             continue
         deadline = now + max_duration
         attempt = await session.scalar(
@@ -499,6 +557,8 @@ async def _lock_run(session: AsyncSession, run_id: UUID) -> RowMapping:
                     runs.c.state,
                     runs.c.irreversible_started_at,
                     runs.c.write_started_at,
+                    runs.c.trigger,
+                    runs.c.started_at,
                 )
                 .where(runs.c.id == run_id)
                 .with_for_update()
@@ -807,6 +867,18 @@ async def finish(
     (ou um cancelamento) depois de um passo que grava ter começado ganha na
     mensagem o pedido de conferir o sistema de destino antes de executar de novo.
     """
+    return await finish_run(session, run_id, attempt, result, now=now) is not None
+
+
+async def finish_run(
+    session: AsyncSession,
+    run_id: UUID,
+    attempt: int,
+    result: RunnerOutcome | Mapping[str, Any],
+    *,
+    now: datetime,
+) -> ConcludedRun | None:
+    """Como :func:`finish`, mas devolve a execução concluída (``None``: já estava)."""
     try:
         outcome = (
             result if isinstance(result, RunnerOutcome) else RunnerOutcome.model_validate(result)
@@ -819,7 +891,7 @@ async def finish(
     run = await _lock_run(session, run_id)
     _fence(run, attempt)
     if RunState(run["state"]).finished:
-        return False
+        return None
     irreversible = outcome.irreversible_started or run["irreversible_started_at"] is not None
     state = _final_state(outcome.state, irreversible)
     error_code = outcome.error_code
@@ -877,7 +949,7 @@ async def finish(
         target=f"execucao:{run_id}",
         payload={"estado": state.value, "tentativa": attempt, "erro": error_code},
     )
-    return True
+    return _concluded(run, state, now)
 
 
 async def reap_expired(
@@ -912,6 +984,8 @@ async def reap_expired(
                     runs.c.attempt,
                     runs.c.irreversible_started_at,
                     runs.c.write_started_at,
+                    runs.c.trigger,
+                    runs.c.started_at,
                 )
                 .where(*conditions)
                 .order_by(runs.c.lease_expires_at)
@@ -994,6 +1068,9 @@ async def reap_expired(
             action = "execucao.reenfileirada"
             report.requeued.append(run_id)
         await session.execute(update(runs).where(runs.c.id == run_id).values(**values))
+        final = RunState(values["state"])
+        if final.finished:
+            report.concluded.append(_concluded(row, final, now))
         payload: dict[str, Any] = {"tentativa": row["attempt"], "estado": values["state"]}
         if values.get("error_code"):
             payload["erro"] = values["error_code"]
@@ -1034,12 +1111,16 @@ class PgRunQueue:
         maintenance_lock_timeout: timedelta = DEFAULT_MAINTENANCE_LOCK_TIMEOUT,
         maintenance_statement_timeout: timedelta = DEFAULT_MAINTENANCE_STATEMENT_TIMEOUT,
         clock: Callable[[], datetime] = now_utc,
+        observer: RunObserver | None = None,
     ) -> None:
         """``maintenance_lock_timeout`` e ``maintenance_statement_timeout`` limitam as
         transações de manutenção (partições e recolhimento): criar uma partição pede
         trava exclusiva em ``run_events`` e, enquanto espera, enfileira atrás de si
         as leituras e gravações de eventos. Com o limite, a espera vira erro, e o
-        despachante segue despachando e tenta a manutenção de novo mais tarde."""
+        despachante segue despachando e tenta a manutenção de novo mais tarde.
+
+        ``observer`` recebe cada execução concluída aqui, depois de a transação
+        confirmar (ver o começo do módulo)."""
         if maintenance_lock_timeout <= timedelta(0) or maintenance_statement_timeout <= timedelta(
             0
         ):
@@ -1051,6 +1132,18 @@ class PgRunQueue:
         self.maintenance_lock_timeout = maintenance_lock_timeout
         self.maintenance_statement_timeout = maintenance_statement_timeout
         self.clock = clock
+        self.observer = observer
+
+    def _observe(self, concluded: Iterable[ConcludedRun]) -> None:
+        """Informa o observador; um erro dele só vai para o log (pelo tipo)."""
+        observer = self.observer
+        if observer is None:
+            return
+        for run in concluded:
+            try:
+                observer.run_concluded(run)
+            except Exception as exc:
+                logger.warning("falha ao registrar uma execução concluída: %s", type(exc).__name__)
 
     async def _limit_maintenance(self, session: AsyncSession) -> None:
         """Limita a espera por travas e a duração dos comandos desta transação."""
@@ -1061,13 +1154,18 @@ class PgRunQueue:
         await session.execute(text(f"SET LOCAL statement_timeout = {statement_ms}"))
 
     async def claim_next(self, *, now: datetime | None = None) -> RunnerJob | None:
+        concluded: list[ConcludedRun] = []
         async with self.db.dispatcher_session() as session:
-            return await claim_next(
+            job = await claim_next(
                 session,
                 now=now or self.clock(),
                 lease=self.lease,
                 max_duration=self.max_duration,
+                concluded=concluded,
             )
+        # Só depois de confirmar: as de manifesto ilegível falharam nesta transação.
+        self._observe(concluded)
+        return job
 
     async def heartbeat(self, run_id: UUID, attempt: int, *, now: datetime | None = None) -> bool:
         async with self.db.dispatcher_session() as session:
@@ -1090,16 +1188,23 @@ class PgRunQueue:
         now: datetime | None = None,
     ) -> bool:
         async with self.db.dispatcher_session() as session:
-            return await finish(session, run_id, attempt, result, now=now or self.clock())
+            concluded = await finish_run(session, run_id, attempt, result, now=now or self.clock())
+        # Só depois de confirmar: uma transação desfeita não conta.
+        if concluded is not None:
+            self._observe((concluded,))
+        return concluded is not None
 
     async def reap_expired(
         self, *, now: datetime | None = None, skip: Collection[UUID] = ()
     ) -> ReapReport:
         async with self.db.dispatcher_session() as session:
             await self._limit_maintenance(session)
-            return await reap_expired(
+            report = await reap_expired(
                 session, now=now or self.clock(), max_attempts=self.max_attempts, skip=skip
             )
+        # Só depois de confirmar: uma transação desfeita não conta.
+        self._observe(report.concluded)
+        return report
 
     async def ensure_event_partitions(self, months_ahead: int = 2) -> int:
         async with self.db.dispatcher_session() as session:
