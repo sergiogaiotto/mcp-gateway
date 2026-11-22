@@ -13,7 +13,10 @@ Funções para o despachante, todas recebendo uma sessão sem empresa (papel
 - :func:`finish` grava o resultado do executor (e, numa falha do alvo de um
   passo, o retrato da página que o executor tirou, em ``run_snapshots``);
 - :func:`reap_expired` recolhe concessões vencidas: volta para a fila só o que
-  não começou nenhum passo que grava (ver a regra abaixo).
+  não começou nenhum passo que grava (ver a regra abaixo);
+- :meth:`PgRunQueue.a1_block` confere, logo antes de lançar o executor, se o
+  certificado A1 de um robô ainda pode ser usado
+  (:func:`rapa.control.services.a1.launch_block`).
 
 Escritas de uma tentativa antiga (``attempt`` diferente do atual, ou execução
 já devolvida à fila) são recusadas com :class:`StaleAttempt`.
@@ -87,6 +90,7 @@ from rapa.control.db.schema import (
 from rapa.control.db.session import Database
 from rapa.control.services import audit
 from rapa.control.services._common import INTERACTIVE_PRIORITY, now_utc
+from rapa.control.services.a1 import launch_block
 from rapa.control.services.admission import Capacity, CompanyLoad, plan
 from rapa.core.contracts import (
     Conflict,
@@ -1043,3 +1047,8 @@ class PgRunQueue:
         async with self.db.dispatcher_session() as session:
             await self._limit_maintenance(session)
             return await ensure_event_partitions(session, months_ahead)
+
+    async def a1_block(self, job: RunnerJob, *, now: datetime | None = None) -> str | None:
+        """Por que o executor desta execução não pode ser lançado agora (certificado A1)."""
+        async with self.db.dispatcher_session() as session:
+            return await launch_block(session, job, now or self.clock())

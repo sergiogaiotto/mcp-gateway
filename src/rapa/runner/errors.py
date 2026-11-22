@@ -43,6 +43,9 @@ class ErrorCode(StrEnum):
     NAVEGADOR_INDISPONIVEL = "navegador_indisponivel"
     #: O plano de controle não confirmou o aviso de passo irreversível; nada foi enviado.
     SEM_CONFIRMACAO = "sem_confirmacao"
+    #: O certificado A1 do robô não pode ser usado agora (registro, revogação, validade ou
+    #: autorização do custodiante): o despachante não lançou o executor.
+    CERTIFICADO_A1_BLOQUEADO = "certificado_a1_bloqueado"
     ERRO_INTERNO = "erro_interno"
 
 

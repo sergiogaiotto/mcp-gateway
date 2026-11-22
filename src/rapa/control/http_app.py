@@ -28,7 +28,13 @@ from rapa.control.api.sessions import live_origins
 from rapa.control.auth import Authenticator, BearerVerifier, PrincipalResolver, StaticTokenVerifier
 from rapa.control.mcp.server import McpGateway, McpSettings
 from rapa.control.validation import InputValidator
-from rapa.core.contracts import RepairService, RobotAdmin, RobotCatalog, RunService
+from rapa.core.contracts import (
+    CredentialService,
+    RepairService,
+    RobotAdmin,
+    RobotCatalog,
+    RunService,
+)
 
 if TYPE_CHECKING:
     from rapa.control.sessions.service import RecordingSessions
@@ -208,13 +214,15 @@ def create_http_app(
     sessions: RecordingSessions | None = None,
     publishing: PublishingServices | None = None,
     repairs: RepairService | None = None,
+    credentials: CredentialService | None = None,
 ) -> FastAPI:
     """Monta a aplicação FastAPI com REST, MCP, saúde e as proteções comuns.
 
     ``sessions`` liga as sessões de gravação (``/v1/sessoes`` e a visão ao vivo);
     elas não entram no MCP, que só executa robôs publicados. ``publishing`` liga
-    as agendas, os webhooks e os lotes por planilha (também fora do MCP), e
-    ``repairs``, o conserto assistido (``/v1/execucoes/{id}/conserto``).
+    as agendas, os webhooks e os lotes por planilha (também fora do MCP),
+    ``repairs``, o conserto assistido (``/v1/execucoes/{id}/conserto``), e
+    ``credentials``, as credenciais e as regras do certificado A1 (``/v1/credenciais``).
     """
     settings = settings or HttpSettings()
     publishing = publishing or PublishingServices()
@@ -275,6 +283,7 @@ def create_http_app(
         live_origins=live_origins(public_url, settings.live_allowed_origins),
         publishing=publishing,
         repairs=repairs,
+        credentials=credentials,
     )
     app.include_router(create_api_router(services))
     app.router.routes.append(Route("/mcp", endpoint=gateway, include_in_schema=False))

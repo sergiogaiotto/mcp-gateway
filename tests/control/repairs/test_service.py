@@ -29,10 +29,11 @@ from rapa.core.contracts import (
     RepairSuggestionStatus,
     VersionStatus,
 )
-from rapa.core.robot import ClickStep, LocatorBy, Manifest
+from rapa.core.robot import ClickStep, LocatorBy
 from rapa.fixtures.portal import DEFAULT_PASSWORD, DEFAULT_USER
 from rapa.llm.repair import RepairAnswer
 from rapa.repair import enumerate_candidates, step_info
+from tests.control.credentials.support import a1_world, publish_a1
 from tests.control.db.support import (
     Tenant,
     failed_run,
@@ -264,13 +265,11 @@ async def test_a1_robots_have_no_assisted_repair(
     app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine
 ) -> None:
     await reset_queue(superuser_engine, total_slots=10)
-    tenant = await make_tenant(app_db, "Conserto A1")
-    platform = PgPlatform(app_db)
-    data = protocolo().model_dump(mode="json")
-    data["credentials"].append(
-        {"name": "certificado", "kind": "pfx_a1", "origin": data["credentials"][0]["origin"]}
-    )
-    await publish(platform, tenant, Manifest.model_validate(data))
+    # O robô com A1 publicado como as regras do A1 pedem: certificado registrado, a
+    # autorização do custodiante e duas aprovações.
+    world = await a1_world(app_db, "Conserto A1")
+    tenant, platform = world.tenant, world.platform
+    await publish_a1(world)
     run_id = await _failed(app_db, dispatcher_db, tenant)
     assistant = FakeAssistant()
     repairs = PgRepairs(app_db, assistant=assistant)

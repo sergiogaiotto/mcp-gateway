@@ -1,8 +1,9 @@
 """Isolamento entre empresas, provado como ``rapa_app`` (o papel da API e da interface).
 
 A empresa B não vê nada da A (robôs, versões, execuções, eventos, credenciais,
-auditoria, usuários, sessões de gravação, agendas, webhooks e lotes), não consegue
-gravar com o company_id da A, e uma transação sem empresa não vê nada de ninguém.
+auditoria, usuários, sessões de gravação, agendas, webhooks, lotes, autorizações e
+avisos do certificado A1 e aprovações), não consegue gravar com o company_id da A, e
+uma transação sem empresa não vê nada de ninguém.
 """
 
 import json
@@ -18,7 +19,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from rapa.control.db import Database
 from rapa.control.db.schema import TENANT_TABLES
 from rapa.control.services import (
+    CredentialAlerts,
     PgBatches,
+    PgCredentials,
     PgPlatform,
     PgProvisioning,
     PgRepairs,
@@ -35,13 +38,15 @@ from rapa.core.contracts import (
     BatchFormat,
     NotFound,
     RecordingSessionStatus,
+    Role,
     RunTrigger,
     ScheduleSpec,
     WebhookSpec,
 )
 from rapa.core.events import RunEventKind
 from rapa.core.ids import new_id
-from rapa.core.robot import CredentialRef
+from rapa.core.robot import CredentialKind, CredentialRef
+from tests.control.credentials.support import CERT, a1_protocolo, in_days, person
 from tests.repair.support import login_page
 
 from .support import (
@@ -69,6 +74,8 @@ class World:
     a_published: dict[str, UUID]
     #: A execução da empresa A que falhou com retrato e já tem um conserto.
     a_repaired_run: UUID
+    #: O certificado A1 da empresa A, o robô que o usa e a autorização do custodiante.
+    a_a1: dict[str, UUID]
 
 
 async def _world(app_db: Database, dispatcher_db: Database, superuser: AsyncEngine) -> World:
@@ -111,6 +118,11 @@ async def _world(app_db: Database, dispatcher_db: Database, superuser: AsyncEngi
         )
         await PgRepairs(app_db).create_repair(tenant.creator, run_id, "c1")
         repaired[tenant.company_id] = run_id
+    a1 = {}
+    for tenant in (a, b):
+        a1[tenant.company_id] = await _a1_rows(app_db, tenant)
+    # Os avisos de vencimento (os certificados vencem em 10 dias), pelo despachante.
+    assert await CredentialAlerts(dispatcher_db).check() >= 2
     return World(
         a=a,
         b=b,
@@ -119,7 +131,37 @@ async def _world(app_db: Database, dispatcher_db: Database, superuser: AsyncEngi
         a_session=sessions[a.company_id],
         a_published=published[a.company_id],
         a_repaired_run=repaired[a.company_id],
+        a_a1=a1[a.company_id],
     )
+
+
+async def _a1_rows(app_db: Database, tenant: Tenant) -> dict[str, UUID]:
+    """Um certificado A1 que vence em 10 dias e um robô autorizado pelo custodiante."""
+    area = tenant.area_id
+    admin = await person(app_db, tenant, "adm", (Role.AREA_ADMIN, area))
+    custodian = await person(app_db, tenant, "guarda", (Role.CREDENTIAL_CUSTODIAN, area))
+    credentials = PgCredentials(app_db)
+    credential = await credentials.register(
+        admin,
+        area,
+        name=CERT,
+        kind=CredentialKind.PFX_A1,
+        origin="http://portal-v1.rapa.test:8080",
+        vault_path=f"empresas/{tenant.company_id}/a1",
+        custodian_subject=custodian.subject,
+        not_after=in_days(10),
+        fingerprint="ab" * 32,
+    )
+    platform = PgPlatform(app_db)
+    version = await platform.create_version(
+        tenant.creator, area, a1_protocolo(name="protocolo_com_a1")
+    )
+    authorization = await credentials.authorize(custodian, version.robot_id, CERT)
+    return {
+        "credential": credential.credential_id,
+        "robot": version.robot_id,
+        "authorization": authorization.authorization_id,
+    }
 
 
 async def _publishing_rows(
@@ -281,6 +323,36 @@ async def test_company_b_sees_nothing_of_company_a(
             )
             assert count == 0, table
 
+    # O certificado A1 da A, as autorizações, as aprovações e os avisos: nem pelo
+    # serviço nem pelo SQL.
+    a1 = world.a_a1
+    credentials = PgCredentials(app_db)
+    assert all(c.credential_id != a1["credential"] for c in await credentials.list(admin_b))
+    assert all(
+        c.credential_id != a1["credential"] for c in await credentials.expiring(admin_b, 3650)
+    )
+    for call in (
+        credentials.list_authorizations(admin_b, a1["robot"]),
+        credentials.authorize(admin_b, a1["robot"], CERT),
+        credentials.approvals(admin_b, world.a_robot, 1),
+        credentials.revoke(admin_b, a1["credential"]),
+        credentials.revoke_authorization(admin_b, a1["authorization"]),
+    ):
+        with pytest.raises(NotFound):
+            await call
+    async with app_db.tenant_session(world.b.company_id) as session:
+        for table, column, key in (
+            ("credentials", "id", "credential"),
+            ("a1_authorizations", "id", "authorization"),
+            ("credential_alerts", "credential_id", "credential"),
+            ("version_approvals", "robot_id", "robot"),
+        ):
+            count = await session.scalar(
+                text(f"SELECT count(*) FROM {table} WHERE {column} = :id"),  # noqa: S608
+                {"id": a1[key]},
+            )
+            assert count == 0, table
+
 
 async def test_writes_with_another_company_id_fail_with_check(
     app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine
@@ -349,6 +421,17 @@ async def test_writes_with_another_company_id_fail_with_check(
             "INSERT INTO batch_rows (company_id, batch_id, row_no, line_no, run_id) "
             "VALUES (:a, :lote, 99, 2, :run)",
             {"lote": world.a_published["batch"], "run": world.a_run},
+        ),
+        "a1_authorizations": (
+            "INSERT INTO a1_authorizations (company_id, id, area_id, robot_id, credential_id, "
+            "origin, authorized_by) VALUES (:a, :new, :area, :robo, :cred, "
+            "'http://portal-v1.rapa.test:8080', 'b')",
+            {"area": a.area_id, "robo": world.a_a1["robot"], "cred": world.a_a1["credential"]},
+        ),
+        "version_approvals": (
+            "INSERT INTO version_approvals (company_id, robot_id, version_no, approved_by) "
+            "VALUES (:a, :robo, 1, 'b')",
+            {"robo": world.a_a1["robot"]},
         ),
         "repair_proposals": (
             "INSERT INTO repair_proposals (company_id, id, run_id, robot_id, step_id, "

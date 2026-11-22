@@ -47,7 +47,9 @@ que sobrar fica para a volta seguinte, que então não espera o intervalo
    está publicado (``robo_indisponivel``), quando as entradas não valem para a
    versão publicada (``entradas_invalidas``), quando a execução anterior da
    agenda ainda não terminou (``anterior_em_andamento``: uma agenda nunca se
-   sobrepõe a ela mesma) e quando a fila da empresa está cheia (``fila_cheia``);
+   sobrepõe a ela mesma), quando a fila da empresa está cheia (``fila_cheia``) e
+   quando o certificado A1 do robô não pode ser usado agora (``certificado_bloqueado``:
+   revogado, vencido ou sem a autorização do custodiante);
 5. ``next_run_at`` passa para a ocorrência seguinte depois de agora.
 
 Nada é repetido: uma execução da agenda que falhar fica como falhou, e a próxima
@@ -76,6 +78,7 @@ from rapa.control.services.robots import published_robot
 from rapa.control.services.runs import enqueue_run, request_hash
 from rapa.core.contracts import (
     MAX_OCCURRENCES_LISTED,
+    CertificateBlocked,
     Conflict,
     Forbidden,
     InvalidInput,
@@ -136,6 +139,8 @@ class SkipReason:
     INVALID_INPUTS = "entradas_invalidas"
     PREVIOUS_RUNNING = "anterior_em_andamento"
     QUEUE_FULL = "fila_cheia"
+    #: O certificado A1 do robô não pode ser usado agora (``CertificateBlocked``).
+    CERTIFICATE_BLOCKED = "certificado_bloqueado"
 
 
 def _cron(text: str, timezone: str) -> tuple[CronExpression, Any]:
@@ -690,6 +695,8 @@ class Scheduler:
             )
         except QuotaExceeded:
             return SkipReason.QUEUE_FULL
+        except CertificateBlocked:
+            return SkipReason.CERTIFICATE_BLOCKED
         # A chave primária (agenda, horário) garante: uma ocorrência, uma execução.
         await session.execute(
             insert(schedule_occurrences).values(

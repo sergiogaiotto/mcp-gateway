@@ -11,7 +11,10 @@ plataforma em memória (:mod:`rapa.fixtures.memory`):
 - publicar: :class:`PgSchedules` e :class:`Scheduler` (agendas), :class:`PgWebhooks`
   (webhooks) e :class:`PgBatches` (lote por planilha);
 - consertar: :class:`PgRepairs` (o passo que quebrou, com os candidatos do retrato e
-  a sugestão do modelo).
+  a sugestão do modelo);
+- credenciais e as regras do certificado A1: :class:`PgCredentials` (registro,
+  custodiante, autorizações por robô e aprovações) e :class:`CredentialAlerts` (os
+  avisos de vencimento, uma etapa do despachante).
 """
 
 from typing import TYPE_CHECKING
@@ -19,6 +22,7 @@ from typing import TYPE_CHECKING
 from rapa.control.db.session import Database
 from rapa.control.services.audit import ChainReport, verify_chain
 from rapa.control.services.batches import PgBatches
+from rapa.control.services.credentials import CredentialAlerts, PgCredentials
 from rapa.control.services.dispatcher import (
     Dispatcher,
     Launcher,
@@ -42,6 +46,7 @@ from rapa.control.services.schedules import PgSchedules, Scheduler
 from rapa.control.services.webhooks import PgWebhooks, WebhookKeys
 from rapa.core.contracts import (
     BatchService,
+    CredentialService,
     RepairService,
     RobotAdmin,
     RobotCatalog,
@@ -53,11 +58,13 @@ from rapa.core.contracts import (
 
 __all__ = [
     "ChainReport",
+    "CredentialAlerts",
     "Dispatcher",
     "EventConflict",
     "HubRepairAssistant",
     "Launcher",
     "PgBatches",
+    "PgCredentials",
     "PgPlatform",
     "PgPrincipalResolver",
     "PgProvisioning",
@@ -104,3 +111,6 @@ if TYPE_CHECKING:
 
     def _repair_conforms(db: Database) -> RepairService:
         return PgRepairs(db)
+
+    def _credentials_conforms(db: Database) -> CredentialService:
+        return PgCredentials(db)

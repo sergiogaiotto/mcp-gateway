@@ -34,6 +34,15 @@ O disparo das agendas fica no mesmo laço, antes de pegar execuções, mas com t
 limitado por volta (``Scheduler.max_tick_s``): muitas agendas vencidas atrasam o
 despacho no máximo esse tanto. Quando o agendador fica para trás, a volta seguinte
 começa sem esperar ``poll_interval``, e o despacho roda entre uma volta e outra.
+
+Certificado A1: logo antes de lançar o executor de um robô que declara um
+certificado A1, o despachante confere de novo se ele ainda pode ser usado
+(:meth:`PgRunQueue.a1_block`: registrado, não revogado, não vencido e com a
+autorização do custodiante na impressão atual). Se não puder, nada é lançado e a
+execução termina ``failed`` com o código ``certificado_a1_bloqueado``; se a
+conferência falhar (banco fora do ar), também não lança (falha fechada). Com
+``alerts``, uma etapa da manutenção (``"certificates"``, a cada 6 horas) registra os
+avisos de vencimento dos certificados.
 """
 
 import asyncio
@@ -48,10 +57,18 @@ from sqlalchemy.exc import DataError, DBAPIError, IntegrityError
 
 from rapa.control.services._common import now_utc
 from rapa.control.services.queue import PgRunQueue, StaleAttempt
-from rapa.core.contracts import InvalidInput, RunMode, RunnerJob, RunState
+from rapa.core.contracts import InvalidInput, RunMode, RunnerJob, RunState, uses_a1
 from rapa.core.robot import Effect
+from rapa.runner.errors import ErrorCode
 
-__all__ = ["Dispatcher", "Launcher", "Ticker", "WorkerNotStarted", "failure_result"]
+__all__ = [
+    "Dispatcher",
+    "ExpiryWatch",
+    "Launcher",
+    "Ticker",
+    "WorkerNotStarted",
+    "failure_result",
+]
 
 logger = logging.getLogger("rapa.control.dispatcher")
 
@@ -67,8 +84,14 @@ _STEPS = {
     "partitions": "criação das partições de eventos",
     "reap": "recolhimento das concessões vencidas",
     "schedules": "disparo das agendas",
+    "certificates": "aviso de vencimento dos certificados A1",
     "claim": "despacho de execuções",
 }
+#: Mensagem quando não deu para conferir o certificado A1 antes de lançar.
+_A1_UNCHECKED = (
+    "Não foi possível conferir o certificado A1 do robô antes de lançar; nada foi aberto "
+    "no navegador."
+)
 
 
 class Ticker(Protocol):
@@ -85,6 +108,15 @@ class Ticker(Protocol):
         Cada volta precisa ser curta (o despacho vem logo depois, no mesmo laço):
         o que não couber fica para a próxima, com :attr:`behind` verdadeiro.
         """
+        ...
+
+
+class ExpiryWatch(Protocol):
+    """O aviso de vencimento dos certificados A1, visto do laço
+    (:class:`rapa.control.services.credentials.CredentialAlerts`)."""
+
+    async def check(self, now: datetime | None = None) -> int:
+        """Registra os avisos do dia que faltam; devolve quantos registrou."""
         ...
 
 
@@ -163,6 +195,8 @@ class Dispatcher:
         unhealthy_after_s: float = 60.0,
         scheduler: Ticker | None = None,
         schedule_interval: float = 5.0,
+        alerts: ExpiryWatch | None = None,
+        alerts_interval: float = 6 * 3600.0,
         clock: Callable[[], datetime] = now_utc,
     ) -> None:
         """``finish_retry_s`` é a primeira espera entre tentativas de gravar o
@@ -175,6 +209,10 @@ class Dispatcher:
         do agendador tem tempo limitado; quando ele fica para trás
         (``scheduler.behind``), a volta seguinte do laço vem sem esperar o intervalo,
         e o despacho continua rodando entre uma e outra.
+
+        Com ``alerts``, a manutenção registra os avisos de vencimento dos
+        certificados A1 a cada ``alerts_interval`` segundos (a etapa
+        ``"certificates"``).
 
         Uma etapa da manutenção que falha é repetida depois de ``poll_interval``,
         espera que dobra a cada falha seguida, até 60 s. ``unhealthy_after_s`` é
@@ -198,6 +236,8 @@ class Dispatcher:
         self.unhealthy_after_s = unhealthy_after_s
         self.scheduler = scheduler
         self.schedule_interval = schedule_interval
+        self.alerts = alerts
+        self.alerts_interval = alerts_interval
         self.clock = clock
         self._tasks: dict[asyncio.Task[None], RunnerJob] = {}
         self._steps = {name: _StepState() for name in _STEPS}
@@ -216,7 +256,8 @@ class Dispatcher:
         """Etapas do laço que falharam na última vez, com o início das falhas seguidas.
 
         As etapas são ``"partitions"`` (partições de eventos), ``"reap"``
-        (recolhimento das concessões vencidas) e ``"claim"`` (pegar execuções).
+        (recolhimento das concessões vencidas), ``"schedules"`` (agendas),
+        ``"certificates"`` (avisos de vencimento do A1) e ``"claim"`` (pegar execuções).
         """
         return {
             name: state.failing_since
@@ -344,6 +385,13 @@ class Dispatcher:
             else:
                 self._succeeded("schedules", now)
                 self._schedules_behind = bool(self.scheduler.behind)
+        if self.alerts is not None and self._due("certificates", now, self.alerts_interval):
+            try:
+                await self.alerts.check(now)
+            except Exception as exc:  # banco fora, erro inesperado: tenta de novo depois
+                self._failed("certificates", now, exc, backoff=True)
+            else:
+                self._succeeded("certificates", now)
 
     async def run_once(self) -> int:
         """Pega execuções até encher a concorrência; devolve quantas lançou."""
@@ -433,7 +481,27 @@ class Dispatcher:
                 launch_task.cancel()
                 return
 
+    async def _a1_blocked(self, job: RunnerJob) -> str | None:
+        """Por que não lançar o executor (certificado A1); ``None`` para os outros robôs."""
+        if not uses_a1(job.manifest):
+            return None
+        try:
+            return await self.queue.a1_block(job, now=self.clock())
+        except Exception as exc:  # banco fora: não lança sem conferir (falha fechada)
+            logger.error("conferência do certificado A1 falhou: %s", _error_name(exc))
+            return _A1_UNCHECKED
+
     async def _handle(self, job: RunnerJob) -> None:
+        blocked = await self._a1_blocked(job)
+        if blocked is not None:
+            logger.warning("execução %s não lançada: certificado A1 bloqueado", job.run_id)
+            await self._finish(
+                job,
+                failure_result(
+                    job, ErrorCode.CERTIFICADO_A1_BLOQUEADO.value, blocked, started=False
+                ),
+            )
+            return
         launch_task: asyncio.Task[Mapping[str, Any]] = asyncio.create_task(
             _call(self.launch, job), name=f"lancamento-{job.run_id}"
         )

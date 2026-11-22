@@ -184,6 +184,32 @@ def test_repair_configuration(tmp_path: Path) -> None:
     assert app.state.repairs.limit == 3 and app.state.repairs.assistant is None
 
 
+def test_a1_configuration(tmp_path: Path) -> None:
+    base = {"RAPA_DATABASE_URL": DB, "RAPA_DEV": "1", "RAPA_TOKENS_DEV": str(_tokens(tmp_path))}
+    assert ServerSettings.from_env(base).a1_warn_days == 30
+    for value in ("0", "3651"):
+        with pytest.raises(ValueError, match="a1_warn_days"):
+            ServerSettings.from_env({**base, "RAPA_A1_AVISO_DIAS": value})
+    app = create_server_app(
+        ServerSettings.from_env({**base, "RAPA_UI": "0", "RAPA_A1_AVISO_DIAS": "45"})
+    )
+    assert app.state.credentials.warn_days == 45
+    # O despachante ganha a etapa dos avisos de vencimento, com o mesmo prazo.
+    dispatcher_app = create_server_app(
+        ServerSettings.from_env(
+            {
+                "RAPA_DATABASE_URL": DB,
+                "RAPA_DISPATCHER_DATABASE_URL": "postgresql://rapa_dispatcher:x@banco:5432/rapa",
+                "RAPA_HTTP": "0",
+                "RAPA_A1_AVISO_DIAS": "15",
+            }
+        )
+    )
+    alerts = dispatcher_app.state.dispatcher.alerts
+    assert alerts is not None and alerts.warn_days == 15
+    assert dispatcher_app.state.dispatcher.alerts_interval == 6 * 3600
+
+
 def test_dispatcher_gets_the_scheduler(tmp_path: Path) -> None:
     base = {
         "RAPA_DATABASE_URL": DB,

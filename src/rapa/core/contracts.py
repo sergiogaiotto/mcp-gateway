@@ -5,6 +5,7 @@ persistência só por estes protocolos. Assim cada parte pode ser testada com
 implementações em memória.
 """
 
+import builtins
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal, Protocol
@@ -13,14 +14,25 @@ from uuid import UUID
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from rapa.core.cron import DEFAULT_TIMEZONE
-from rapa.core.robot import NAME_PATTERN, SLUG_PATTERN, Effect, Locator, Manifest, Target
+from rapa.core.robot import (
+    NAME_PATTERN,
+    SLUG_PATTERN,
+    CredentialKind,
+    Effect,
+    Locator,
+    Manifest,
+    Target,
+)
 
 __all__ = [
+    "A1_APPROVALS",
     "AUTOMATION_ROLES",
     "MAX_BATCHES_LISTED",
     "MAX_OCCURRENCES_LISTED",
     "MAX_RUNS_LISTED",
     "MAX_SESSIONS_LISTED",
+    "A1AuthorizationInfo",
+    "ApprovalInfo",
     "BatchColumn",
     "BatchFile",
     "BatchFormat",
@@ -29,9 +41,13 @@ __all__ = [
     "BatchRow",
     "BatchRowError",
     "BatchService",
+    "CertificateBlocked",
     "CheckProposal",
     "Conflict",
     "ContractError",
+    "CredentialInfo",
+    "CredentialService",
+    "CredentialStatus",
     "DraftChoices",
     "EffectChoice",
     "EffectProposal",
@@ -84,6 +100,7 @@ __all__ = [
     "StepNameChoice",
     "StepNameProposal",
     "StepOverview",
+    "VersionApprovals",
     "VersionStatus",
     "ViewerTicket",
     "WebhookChanges",
@@ -94,6 +111,8 @@ __all__ = [
     "WebhookService",
     "WebhookSpec",
     "can_automate",
+    "required_approvals",
+    "uses_a1",
 ]
 
 
@@ -190,6 +209,24 @@ class RobotInfo(_Model):
     created_at: datetime
 
 
+#: Aprovações exigidas para publicar uma versão que declara um certificado digital A1.
+A1_APPROVALS = 2
+
+
+def uses_a1(manifest: Manifest) -> bool:
+    """Se o manifesto declara alguma credencial do tipo certificado digital A1."""
+    return any(c.kind is CredentialKind.PFX_A1 for c in manifest.credentials)
+
+
+def required_approvals(manifest: Manifest) -> int:
+    """Quantas pessoas diferentes aprovam a versão antes de ela ser publicada.
+
+    Duas para um robô com certificado A1 (a mesma conta do gatilho do banco, que
+    olha ``manifest->'credentials'``), uma para os outros.
+    """
+    return A1_APPROVALS if uses_a1(manifest) else 1
+
+
 class RobotVersionInfo(_Model):
     robot_id: UUID
     version_id: UUID
@@ -201,6 +238,10 @@ class RobotVersionInfo(_Model):
     approved_by: str | None
     created_at: datetime
     violations: list[str] = Field(default_factory=list)
+    #: Quem já aprovou a versão, na ordem (o último publica).
+    approvals: list[str] = Field(default_factory=list)
+    #: Quantas aprovações a versão precisa para ser publicada (2 com certificado A1).
+    approvals_required: int = Field(default=1, ge=1)
 
 
 class RunState(StrEnum):
@@ -306,6 +347,16 @@ class InvalidInput(ContractError):
     def __init__(self, message: str, errors: list[str] | None = None) -> None:
         super().__init__(message)
         self.errors = errors or []
+
+
+class CertificateBlocked(InvalidInput):
+    """O certificado A1 de um robô não pode ser usado agora; ``errors`` diz o que falta.
+
+    Registro na área, revogação, validade e a autorização do custodiante para o robô
+    (com a impressão atual do certificado). Nada sigiloso entra na lista.
+    """
+
+    code = "certificado_a1_bloqueado"
 
 
 class SignatureInvalid(ContractError):
@@ -1118,3 +1169,132 @@ class RepairService(Protocol):
     async def create_repair(
         self, principal: Principal, run_id: UUID, candidate_id: str
     ) -> RepairProposalInfo: ...
+
+
+# ---------------------------------------------------------------------------
+# Credenciais do cofre e as regras do certificado A1
+# ---------------------------------------------------------------------------
+
+
+class CredentialStatus(StrEnum):
+    """Situação de uma credencial registrada."""
+
+    ACTIVE = "ativa"
+    #: Certificado A1 que vence dentro do prazo do aviso.
+    EXPIRING = "vencendo"
+    #: Certificado A1 vencido (ou sem a validade registrada: conta como vencido).
+    EXPIRED = "vencida"
+    REVOKED = "revogada"
+
+
+class CredentialInfo(_Model):
+    """Uma credencial registrada: só a referência ao cofre e os metadados, nunca o valor."""
+
+    credential_id: UUID
+    area_id: UUID
+    name: str
+    kind: CredentialKind
+    origin: str
+    custodian_subject: str | None = None
+    custodian_name: str | None = None
+    #: Validade do certificado (só A1).
+    not_after: datetime | None = None
+    #: Impressão SHA-256 do certificado (64 hexadecimais minúsculos).
+    fingerprint_sha256: str | None = None
+    status: CredentialStatus
+    created_at: datetime
+    updated_at: datetime
+    revoked_at: datetime | None = None
+    revoked_by: str | None = None
+    #: Caminho no cofre; só para quem administra a área e para o custodiante.
+    vault_path: str | None = None
+
+
+class A1AuthorizationInfo(_Model):
+    """A autorização do custodiante para um robô usar um certificado A1 num portal."""
+
+    authorization_id: UUID
+    robot_id: UUID
+    area_id: UUID
+    credential_id: UUID
+    credential_name: str
+    origin: str
+    #: A impressão do certificado no momento da autorização.
+    fingerprint_sha256: str | None = None
+    authorized_by: str
+    created_at: datetime
+    revoked_at: datetime | None = None
+    revoked_by: str | None = None
+    #: Ativa e com a impressão atual do certificado (a que vale para rodar).
+    current: bool = False
+
+
+class ApprovalInfo(_Model):
+    approved_by: str
+    approved_at: datetime
+
+
+class VersionApprovals(_Model):
+    """As aprovações de uma versão: quem aprovou, quantas faltam e o que impede."""
+
+    robot_id: UUID
+    version_no: int
+    status: VersionStatus
+    required: int
+    approvals: list[ApprovalInfo] = Field(default_factory=list)
+    missing: int = 0
+    #: O que falta no certificado A1 para contar a próxima aprovação (sem segredos).
+    problems: list[str] = Field(default_factory=list)
+
+
+class CredentialService(Protocol):
+    """Credenciais registradas (referências ao cofre) e as regras do certificado A1."""
+
+    async def register(
+        self,
+        principal: Principal,
+        area_id: UUID,
+        *,
+        name: str,
+        kind: CredentialKind,
+        origin: str,
+        vault_path: str,
+        custodian_subject: str | None = None,
+        not_after: datetime | None = None,
+        fingerprint: str | None = None,
+    ) -> CredentialInfo: ...
+
+    async def renew(
+        self,
+        principal: Principal,
+        credential_id: UUID,
+        *,
+        not_after: datetime,
+        fingerprint: str | None = None,
+    ) -> CredentialInfo: ...
+
+    async def revoke(self, principal: Principal, credential_id: UUID) -> CredentialInfo: ...
+
+    async def list(
+        self, principal: Principal, area_id: UUID | None = None
+    ) -> builtins.list[CredentialInfo]: ...
+
+    async def expiring(
+        self, principal: Principal, within_days: int | None = None
+    ) -> builtins.list[CredentialInfo]: ...
+
+    async def authorize(
+        self, principal: Principal, robot_id: UUID, credential_name: str
+    ) -> A1AuthorizationInfo: ...
+
+    async def revoke_authorization(
+        self, principal: Principal, authorization_id: UUID, *, robot_id: UUID | None = None
+    ) -> A1AuthorizationInfo: ...
+
+    async def list_authorizations(
+        self, principal: Principal, robot_id: UUID
+    ) -> builtins.list[A1AuthorizationInfo]: ...
+
+    async def approvals(
+        self, principal: Principal, robot_id: UUID, version_no: int
+    ) -> VersionApprovals: ...

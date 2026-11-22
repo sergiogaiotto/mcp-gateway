@@ -1,5 +1,6 @@
 """Auxiliares compartilhados pelos serviços do PostgreSQL."""
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -15,6 +16,7 @@ from rapa.core.contracts import (
     RunStatus,
     RunTrigger,
     VersionStatus,
+    required_approvals,
 )
 from rapa.core.robot import Manifest
 
@@ -77,18 +79,24 @@ def visible_areas(principal: Principal) -> list[UUID] | None:
     return sorted(area for area, roles in principal.area_roles.items() if roles)
 
 
-def version_info(robot_id: UUID, row: RowMapping) -> RobotVersionInfo:
+def version_info(
+    robot_id: UUID, row: RowMapping, approvals: Sequence[str] = ()
+) -> RobotVersionInfo:
+    """A versão como os contratos a mostram; ``approvals`` são os aprovadores, em ordem."""
+    manifest = Manifest.model_validate(row["manifest"])
     return RobotVersionInfo(
         robot_id=robot_id,
         version_id=row["id"],
         version_no=row["version_no"],
         status=VersionStatus(row["status"]),
-        manifest=Manifest.model_validate(row["manifest"]),
+        manifest=manifest,
         fingerprint=row["fingerprint"],
         created_by=row["created_by"],
         approved_by=row["approved_by"],
         created_at=row["created_at"],
         violations=list(row["violations"]),
+        approvals=list(approvals),
+        approvals_required=required_approvals(manifest),
     )
 
 

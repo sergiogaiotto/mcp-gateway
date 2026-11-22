@@ -53,9 +53,11 @@ from rapa.control.launcher import (
     StaticSecretSource,
 )
 from rapa.control.services import (
+    CredentialAlerts,
     Dispatcher,
     HubRepairAssistant,
     PgBatches,
+    PgCredentials,
     PgPlatform,
     PgPrincipalResolver,
     PgRepairs,
@@ -83,6 +85,7 @@ __all__ = [
     "AuthenticatorLoginResolver",
     "DispatcherSupervisor",
     "ServerSettings",
+    "build_credentials",
     "build_publishing",
     "build_repairs",
     "build_scheduler",
@@ -183,6 +186,8 @@ class ServerSettings(BaseModel):
     batch_max_bytes: int = Field(default=5 * 1024 * 1024, ge=1024, le=100 * 1024 * 1024)
     #: Quantos candidatos o conserto assistido mostra (e o modelo vê) para o passo que quebrou.
     repair_candidates: int = Field(default=8, ge=1, le=20)
+    #: Quantos dias antes do vencimento de um certificado A1 o aviso começa.
+    a1_warn_days: int = Field(default=30, ge=1, le=3650)
 
     @model_validator(mode="after")
     def _check(self) -> ServerSettings:
@@ -266,7 +271,9 @@ class ServerSettings(BaseModel):
         - consertar: ``RAPA_CONSERTO_CANDIDATOS`` (quantos candidatos o conserto
           assistido mostra para o passo que quebrou, e o modelo vê; de 1 a 20, padrão
           8). O modelo que escolhe entre eles é o mesmo hub da revisão
-          (``RAPA_LLM_*``); sem ele, a pessoa escolhe sozinha, com um aviso.
+          (``RAPA_LLM_*``); sem ele, a pessoa escolhe sozinha, com um aviso;
+        - certificado A1: ``RAPA_A1_AVISO_DIAS`` (quantos dias antes do vencimento o
+          aviso começa, na interface, no REST e na auditoria; de 1 a 3650, padrão 30).
         """
         env = os.environ if env is None else env
         data: dict[str, Any] = {
@@ -308,6 +315,7 @@ class ServerSettings(BaseModel):
             ("batch_max_rows", "RAPA_LOTE_MAX_LINHAS", int),
             ("batch_max_bytes", "RAPA_LOTE_MAX_BYTES", int),
             ("repair_candidates", "RAPA_CONSERTO_CANDIDATOS", int),
+            ("a1_warn_days", "RAPA_A1_AVISO_DIAS", int),
         ):
             if raw := env.get(name, "").strip():
                 data[key] = kind(raw)
@@ -420,6 +428,7 @@ def _mount_ui(
     sessions: RecordingSessions | None = None,
     publishing: PublishingServices | None = None,
     repairs: PgRepairs | None = None,
+    credentials: PgCredentials | None = None,
 ) -> None:
     from rapa.ui.app import create_ui
     from rapa.ui.auth import DevLogin, DevProfile, OidcLogin, OidcSettings, UiAuth
@@ -463,6 +472,7 @@ def _mount_ui(
             webhooks=publishing.webhooks if publishing else None,
             batches=publishing.batches if publishing else None,
             repairs=repairs,
+            credentials=credentials,
         ),
         # A interface age direto nos serviços, então a sessão confere de novo no banco
         # (conta ativa e papéis), como a API faz a cada pedido.
@@ -745,6 +755,11 @@ def build_repairs(settings: ServerSettings, db: Database) -> PgRepairs:
     return PgRepairs(db, assistant=assistant, candidates=settings.repair_candidates)
 
 
+def build_credentials(settings: ServerSettings, db: Database) -> PgCredentials:
+    """As credenciais registradas e as regras do certificado A1, sobre o banco da aplicação."""
+    return PgCredentials(db, warn_days=settings.a1_warn_days)
+
+
 def build_sessions(
     settings: ServerSettings,
     db: Database,
@@ -836,6 +851,7 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
     )
     publishing = build_publishing(settings, db)
     repairs = build_repairs(settings, db)
+    credentials = build_credentials(settings, db)
     if verifier is not None:
         app = create_http_app(
             catalog=platform,
@@ -854,6 +870,7 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
             sessions=sessions,
             publishing=publishing,
             repairs=repairs,
+            credentials=credentials,
         )
     else:
         app = FastAPI(title="RaPA (despachante)", docs_url=None, redoc_url=None, openapi_url=None)
@@ -868,6 +885,9 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
             # As agendas vencidas viram execuções numa etapa do mesmo laço.
             dispatcher.scheduler = build_scheduler(settings, db, dispatcher_db)
             dispatcher.schedule_interval = settings.schedule_interval_s
+        if dispatcher.alerts is None:
+            # Os avisos de vencimento do certificado A1 são outra etapa do mesmo laço.
+            dispatcher.alerts = CredentialAlerts(dispatcher_db, warn_days=settings.a1_warn_days)
     supervisor = DispatcherSupervisor(dispatcher) if dispatcher else None
     if supervisor is not None:
         app.add_middleware(_DispatcherHealth, supervisor=supervisor)
@@ -876,6 +896,7 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
     app.state.sessions = sessions
     app.state.publishing = publishing
     app.state.repairs = repairs
+    app.state.credentials = credentials
     if settings.http and settings.ui:
         # Antes de envolver o lifespan: o NiceGUI (ui.run_with) envolve o que encontrar
         # com a subida e o encerramento dele, e esse conjunto fica dentro do nosso.
@@ -887,6 +908,7 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
             sessions,
             publishing,
             repairs,
+            credentials,
         )
     inner = app.router.lifespan_context
     started = False

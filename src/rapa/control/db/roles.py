@@ -51,6 +51,17 @@ As tabelas do conserto (revisão 0005: retratos das falhas e consertos pedidos)
 têm o bloco :func:`repair_grants_sql`. O despachante só inclui os retratos, junto
 com o resultado da execução; a aplicação lê os retratos e lê e inclui os consertos.
 As duas só aceitam inclusões.
+
+As regras do certificado A1 (revisão 0006) têm o bloco :func:`a1_grants_sql`. A
+aplicação lê e inclui credenciais, e só muda a validade, a impressão e a revogação
+(nunca apaga); lê e inclui autorizações do custodiante e só as revoga; lê e inclui
+aprovações de versões; e só lê os avisos de vencimento. O despachante lê só as
+colunas de ``credentials`` e de ``a1_authorizations`` de que a conferência antes de
+lançar precisa (nunca ``vault_path``) e inclui os avisos de vencimento. O
+``UPDATE`` e o ``DELETE`` amplos que :func:`grants_sql` dá à aplicação em
+``credentials`` (como na revisão 0001) saem em :func:`a1_revokes_sql`, que só age
+quando as tabelas da 0006 existem: assim cada revisão anterior continua com as
+permissões dela, e ``--somente-permissoes`` na 0006 não devolve o que ela tirou.
 """
 
 import os
@@ -61,6 +72,9 @@ __all__ = [
     "DEFAULT_APP_ROLE",
     "DEFAULT_DISPATCHER_ROLE",
     "RoleNames",
+    "a1_grants_sql",
+    "a1_restore_sql",
+    "a1_revokes_sql",
     "all_grants_sql",
     "grants_sql",
     "publishing_grants_sql",
@@ -168,6 +182,43 @@ GRANT INSERT ON run_snapshots TO {role};
 _REPAIR_TABLES = ("run_snapshots", "repair_proposals")
 
 
+_A1_APP_GRANTS = """
+GRANT UPDATE (not_after, fingerprint_sha256, revoked_at, revoked_by, updated_at)
+    ON credentials TO {role};
+GRANT SELECT, INSERT ON a1_authorizations, version_approvals TO {role};
+GRANT UPDATE (revoked_at, revoked_by) ON a1_authorizations TO {role};
+GRANT SELECT ON credential_alerts TO {role};
+"""
+
+_A1_DISPATCHER_GRANTS = """
+GRANT SELECT (id, company_id, area_id, name, kind, origin, not_after, fingerprint_sha256,
+    revoked_at) ON credentials TO {role};
+GRANT SELECT (company_id, id, robot_id, credential_id, fingerprint_sha256, revoked_at)
+    ON a1_authorizations TO {role};
+GRANT SELECT, INSERT ON credential_alerts TO {role};
+"""
+
+#: A aplicação deixa de apagar credenciais e de mudar as colunas fixas (revisão 0006).
+#: Vem antes de :data:`_A1_APP_GRANTS`: tirar o ``UPDATE`` da tabela tira também o das
+#: colunas.
+_A1_APP_REVOKES = """
+REVOKE UPDATE, DELETE ON credentials FROM {role};
+"""
+
+#: O que a revisão 0005 concedia sobre as credenciais (para voltar atrás da 0006).
+_A1_APP_RESTORE = """
+GRANT UPDATE, DELETE ON credentials TO {role};
+"""
+
+#: Na revisão 0005 o despachante não lia nada de ``credentials``. Apagar as colunas
+#: novas leva só as permissões delas; as das colunas antigas saem aqui.
+_A1_DISPATCHER_RESTORE = """
+REVOKE ALL ON credentials FROM {role};
+"""
+
+_A1_TABLES = ("a1_authorizations", "version_approvals", "credential_alerts")
+
+
 def _block(
     role: str, grants: str, *, tables: tuple[str, ...] = (), what: str = "das sessões"
 ) -> str:
@@ -225,6 +276,37 @@ def repair_grants_sql(roles: RoleNames) -> list[str]:
     ]
 
 
+def a1_grants_sql(roles: RoleNames) -> list[str]:
+    """Permissões das regras do certificado A1 (revisão 0006), se as tabelas existirem."""
+    what = "do certificado A1"
+    return [
+        _block(roles.app, _A1_APP_GRANTS, tables=_A1_TABLES, what=what),
+        _block(roles.dispatcher, _A1_DISPATCHER_GRANTS, tables=_A1_TABLES, what=what),
+    ]
+
+
+def a1_revokes_sql(roles: RoleNames) -> list[str]:
+    """Tira da aplicação o ``UPDATE`` e o ``DELETE`` amplos de ``credentials`` (revisão 0006).
+
+    Só quando as tabelas da 0006 existem: numa revisão anterior, :func:`grants_sql`
+    (que a 0001 aplica) continua concedendo o que concedia. Roda antes de
+    :func:`a1_grants_sql`, que devolve o ``UPDATE`` das colunas que mudam.
+    """
+    return [_block(roles.app, _A1_APP_REVOKES, tables=_A1_TABLES, what="do certificado A1")]
+
+
+def a1_restore_sql(roles: RoleNames) -> list[str]:
+    """Volta as permissões de ``credentials`` às da revisão 0005 (o ``downgrade`` da 0006).
+
+    A aplicação recebe de novo o ``UPDATE`` e o ``DELETE``; o despachante perde a
+    leitura das colunas antigas (as novas somem com elas).
+    """
+    return [
+        _block(roles.app, _A1_APP_RESTORE),
+        _block(roles.dispatcher, _A1_DISPATCHER_RESTORE),
+    ]
+
+
 def all_grants_sql(roles: RoleNames) -> list[str]:
     """Todas as permissões, das tabelas que existirem na revisão atual do banco."""
     return [
@@ -232,4 +314,6 @@ def all_grants_sql(roles: RoleNames) -> list[str]:
         *session_grants_sql(roles),
         *publishing_grants_sql(roles),
         *repair_grants_sql(roles),
+        *a1_revokes_sql(roles),
+        *a1_grants_sql(roles),
     ]

@@ -7,8 +7,14 @@ numa transação fixada na empresa, então o isolamento por linha continua valen
 
 A capacidade da plataforma (``platform_settings``) só muda pelo dono das
 tabelas: nem a aplicação nem o despachante podem alterá-la.
+
+O caminho de produto para registrar credenciais é
+:class:`rapa.control.services.credentials.PgCredentials` (quem pode, custodiante,
+validade e auditoria); :meth:`PgProvisioning.register_credential` continua para a
+automação de cadastro e os testes.
 """
 
+from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
@@ -117,8 +123,14 @@ class PgProvisioning(PgService):
         ref: CredentialRef,
         vault_path: str,
         custodian_user_id: UUID | None = None,
+        *,
+        not_after: datetime | None = None,
+        fingerprint_sha256: str | None = None,
     ) -> UUID:
-        """Registra a referência a uma credencial do cofre; o valor nunca passa por aqui."""
+        """Registra a referência a uma credencial do cofre; o valor nunca passa por aqui.
+
+        Um certificado A1 precisa da validade (``not_after``: o banco recusa sem ela).
+        """
         credential_id = new_id()
         async with self.db.tenant_session(company_id) as session:
             await session.execute(
@@ -131,6 +143,8 @@ class PgProvisioning(PgService):
                     origin=ref.origin,
                     vault_path=vault_path,
                     custodian_user_id=custodian_user_id,
+                    not_after=not_after,
+                    fingerprint_sha256=fingerprint_sha256,
                 )
             )
         return credential_id

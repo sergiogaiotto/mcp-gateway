@@ -7,7 +7,11 @@ mesma requisição devolve a mesma execução, e com outra requisição é confl
 :func:`enqueue_run` e :func:`enqueue_many` são o único caminho que inclui
 execuções: o REST, o MCP e a interface (por :class:`PgRunService`), as agendas,
 os webhooks e os lotes. Todos tomam a mesma trava da empresa, respeitam o limite
-da fila e auditam cada execução.
+da fila e auditam cada execução. Um robô com certificado digital A1 só entra na
+fila se o certificado pode ser usado agora (registrado na área, não revogado, não
+vencido e com a autorização do custodiante na impressão atual:
+:func:`rapa.control.services.a1.ensure_a1_ready`); senão,
+:class:`~rapa.core.contracts.CertificateBlocked`, com o que falta.
 """
 
 import hashlib
@@ -32,9 +36,11 @@ from rapa.control.services import audit
 from rapa.control.services._common import (
     PRIORITY_BY_TRIGGER,
     PgService,
+    now_utc,
     run_status,
     visible_areas,
 )
+from rapa.control.services.a1 import ensure_a1_ready
 from rapa.control.services.inputs import validate_inputs
 from rapa.control.services.robots import published_query
 from rapa.core.contracts import (
@@ -296,6 +302,7 @@ async def enqueue_run(
             if found is not None:
                 return Enqueued(run_id=found, created=False)
 
+    await ensure_a1_ready(session, company_id=company_id, robot=robot, now=now_utc())
     await ensure_queue_room(session, company_id)
     run_id = new_id()
     if idempotency_key is not None:
@@ -374,6 +381,7 @@ async def enqueue_many(
     if not inputs:
         return []
     await lock_company_starts(session, company_id)
+    await ensure_a1_ready(session, company_id=company_id, robot=robot, now=now_utc())
     await ensure_queue_room(session, company_id, len(inputs))
     run_ids = [new_id() for _ in inputs]
     rows = [

@@ -140,6 +140,10 @@ OCCURRENCE_REASON_LABELS: dict[str, str] = {
     "entradas_invalidas": "Não rodou: as entradas da agenda não valem para a versão publicada.",
     "anterior_em_andamento": "Não rodou: a execução anterior da agenda ainda não tinha terminado.",
     "fila_cheia": "Não rodou: a fila de execuções da empresa estava cheia.",
+    "certificado_bloqueado": (
+        "Não rodou: o certificado A1 do robô estava revogado, vencido ou sem a autorização "
+        "do custodiante."
+    ),
 }
 
 #: Tipos que uma entrada criada na revisão pode ter, na ordem do seletor.

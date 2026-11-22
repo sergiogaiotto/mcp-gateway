@@ -11,6 +11,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     Computed,
+    Date,
     DateTime,
     Integer,
     LargeBinary,
@@ -26,12 +27,14 @@ from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 
 __all__ = [
     "TENANT_TABLES",
+    "a1_authorizations",
     "areas",
     "audit_log",
     "batch_rows",
     "batches",
     "companies",
     "company_quotas",
+    "credential_alerts",
     "credentials",
     "idempotency_keys",
     "memberships",
@@ -48,6 +51,7 @@ __all__ = [
     "schedule_occurrences",
     "schedules",
     "users",
+    "version_approvals",
     "webhook_deliveries",
     "webhooks",
 ]
@@ -169,6 +173,12 @@ credentials = Table(
     Column("vault_path", Text, nullable=False),
     Column("custodian_user_id", Uuid, nullable=True),
     _ts("created_at", nullable=False, server_default=True),
+    #: Revisão 0006: validade e impressão do certificado A1, revogação.
+    _ts("not_after"),
+    Column("fingerprint_sha256", Text, nullable=True),
+    _ts("revoked_at"),
+    Column("revoked_by", Text, nullable=True),
+    _ts("updated_at", nullable=False, server_default=True),
 )
 
 runs = Table(
@@ -401,6 +411,43 @@ repair_proposals = Table(
     _ts("created_at", nullable=False, server_default=True),
 )
 
+a1_authorizations = Table(
+    "a1_authorizations",
+    metadata,
+    Column("company_id", Uuid, primary_key=True),
+    Column("id", Uuid, primary_key=True),
+    Column("area_id", Uuid, nullable=False),
+    Column("robot_id", Uuid, nullable=False),
+    Column("credential_id", Uuid, nullable=False),
+    Column("origin", Text, nullable=False),
+    Column("fingerprint_sha256", Text, nullable=True),
+    Column("authorized_by", Text, nullable=False),
+    _ts("created_at", nullable=False, server_default=True),
+    _ts("revoked_at"),
+    Column("revoked_by", Text, nullable=True),
+)
+
+version_approvals = Table(
+    "version_approvals",
+    metadata,
+    Column("company_id", Uuid, primary_key=True),
+    Column("robot_id", Uuid, primary_key=True),
+    Column("version_no", Integer, primary_key=True),
+    Column("approved_by", Text, primary_key=True),
+    _ts("approved_at", nullable=False, server_default=True),
+)
+
+credential_alerts = Table(
+    "credential_alerts",
+    metadata,
+    Column("company_id", Uuid, primary_key=True),
+    Column("credential_id", Uuid, primary_key=True),
+    Column("day", Date, primary_key=True),
+    Column("kind", Text, primary_key=True),
+    _ts("not_after"),
+    _ts("created_at", nullable=False, server_default=True),
+)
+
 #: Tabelas com dados de empresa (todas com isolamento por linha).
 TENANT_TABLES: tuple[Table, ...] = (
     companies,
@@ -425,4 +472,7 @@ TENANT_TABLES: tuple[Table, ...] = (
     batch_rows,
     run_snapshots,
     repair_proposals,
+    a1_authorizations,
+    version_approvals,
+    credential_alerts,
 )

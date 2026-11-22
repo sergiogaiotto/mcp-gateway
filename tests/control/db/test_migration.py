@@ -14,11 +14,12 @@ from psycopg import sql
 from sqlalchemy.pool import NullPool
 
 from rapa.control.db import Database, create_engine
-from rapa.control.db.migrate import alembic_config, main, upgrade
+from rapa.control.db.migrate import alembic_config, apply_grants, main, upgrade
 from rapa.control.db.roles import RoleNames
-from rapa.control.services import PgPlatform, PgRunQueue
-from rapa.core.contracts import RunTrigger
+from rapa.control.services import PgCredentials, PgPlatform, PgRunQueue
+from rapa.core.contracts import CredentialStatus, Principal, Role, RunTrigger
 from rapa.core.events import RunEventKind
+from rapa.core.ids import new_id
 
 from .support import PROTOCOLO_INPUTS, PgDatabase, event, make_tenant, protocolo, publish, result
 
@@ -107,8 +108,8 @@ def test_grants_skip_missing_roles_and_cli_reapplies(pg_database: PgDatabase) ->
         # As permissões das tabelas das sessões de gravação (revisão 0003) também.
         assert _app_can_read_runs(pg_database, name, "recording_sessions")
         assert _app_can_read_runs(pg_database, name, "recordings")
-        # E as da publicação (revisão 0004) e as do conserto (revisão 0005).
-        for table in (*_PUBLISHING_TABLES, *_REPAIR_TABLES):
+        # E as da publicação (revisão 0004), as do conserto (revisão 0005) e as do A1 (0006).
+        for table in (*_PUBLISHING_TABLES, *_REPAIR_TABLES, *_A1_TABLES):
             assert _app_can_read_runs(pg_database, name, table), table
 
 
@@ -241,6 +242,226 @@ def test_repair_tables_migrate_back_and_forth(pg_database: PgDatabase) -> None:
         }
         upgrade(url, roles=pg_database.roles)
         assert _repair_schema(pg_database, name) == head
+
+
+_A1_TABLES = ("a1_authorizations", "credential_alerts", "version_approvals")
+_A1_TRIGGERS = (
+    "robot_versions_approvals",
+    "credentials_guard",
+    "a1_authorizations_guard",
+    "version_approvals_check",
+    "version_approvals_append_only",
+    "credential_alerts_append_only",
+)
+_A1_COLUMNS = ("not_after", "fingerprint_sha256", "revoked_at", "revoked_by", "updated_at")
+
+
+def _a1_schema(pg: PgDatabase, database: str) -> dict[str, Any]:
+    app, dispatcher = pg.roles.app, pg.roles.dispatcher
+    with pg.server.connect(database) as conn:
+        tables = conn.execute(
+            "SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class "
+            "WHERE relnamespace = 'public'::regnamespace AND relname = ANY(%s) ORDER BY relname",
+            (list(_A1_TABLES),),
+        ).fetchall()
+        columns = conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' "
+            "AND table_name = 'credentials' AND column_name = ANY(%s) ORDER BY column_name",
+            (list(_A1_COLUMNS),),
+        ).fetchall()
+        triggers = conn.execute(
+            "SELECT count(*) FROM pg_trigger WHERE tgname = ANY(%s)", (list(_A1_TRIGGERS),)
+        ).fetchone()
+        credentials = conn.execute(
+            "SELECT has_table_privilege(%s, 'credentials', 'UPDATE'), "
+            "has_table_privilege(%s, 'credentials', 'DELETE')",
+            (app, app),
+        ).fetchone()
+        privileges = (
+            conn.execute(
+                "SELECT has_column_privilege(%s, 'credentials', 'not_after', 'UPDATE'), "
+                "has_column_privilege(%s, 'credentials', 'vault_path', 'UPDATE'), "
+                "has_table_privilege(%s, 'version_approvals', 'INSERT'), "
+                "has_table_privilege(%s, 'version_approvals', 'UPDATE'), "
+                "has_column_privilege(%s, 'a1_authorizations', 'revoked_at', 'UPDATE'), "
+                "has_column_privilege(%s, 'a1_authorizations', 'credential_id', 'UPDATE'), "
+                "has_table_privilege(%s, 'credential_alerts', 'INSERT'), "
+                "has_column_privilege(%s, 'credentials', 'not_after', 'SELECT'), "
+                "has_column_privilege(%s, 'credentials', 'vault_path', 'SELECT'), "
+                "has_column_privilege(%s, 'a1_authorizations', 'authorized_by', 'SELECT'), "
+                "has_table_privilege(%s, 'credential_alerts', 'INSERT')",
+                (app, app, app, app, app, app, app, dispatcher, dispatcher, dispatcher, dispatcher),
+            ).fetchone()
+            if tables
+            else None
+        )
+    assert triggers is not None and credentials is not None
+    return {
+        "tables": [tuple(row) for row in tables],
+        "columns": [row[0] for row in columns],
+        "triggers": int(triggers[0]),
+        "credentials": tuple(credentials),
+        "privileges": tuple(privileges) if privileges else None,
+    }
+
+
+def _credentials_acl(pg: PgDatabase, database: str) -> set[tuple[str, str, str]]:
+    """As permissões exatas dos papéis de execução em ``credentials``: (papel, coluna ou
+    ``*`` para a tabela, privilégio)."""
+    roles = [pg.roles.app, pg.roles.dispatcher]
+    with pg.server.connect(database) as conn:
+        rows = conn.execute(
+            "SELECT r.rolname, '*', a.privilege_type "
+            "FROM pg_class c, aclexplode(c.relacl) a JOIN pg_roles r ON r.oid = a.grantee "
+            "WHERE c.oid = 'credentials'::regclass AND r.rolname = ANY(%s) "
+            "UNION ALL "
+            "SELECT r.rolname, att.attname, a.privilege_type "
+            "FROM pg_attribute att, aclexplode(att.attacl) a JOIN pg_roles r ON r.oid = a.grantee "
+            "WHERE att.attrelid = 'credentials'::regclass AND att.attacl IS NOT NULL "
+            "AND NOT att.attisdropped "
+            "AND r.rolname = ANY(%s)",
+            (roles, roles),
+        ).fetchall()
+    return {(str(role), str(column), str(privilege)) for role, column, privilege in rows}
+
+
+async def _published_robot(pg: PgDatabase, database: str) -> UUID:
+    """Um robô publicado pelos serviços (aprovação de uma pessoa), no banco ``database``."""
+    app = Database(
+        create_engine(
+            pg.server.url(database, pg.roles.app, pg.passwords[pg.roles.app]), poolclass=NullPool
+        )
+    )
+    try:
+        tenant = await make_tenant(app, "Aprovações antigas")
+        version = await publish(PgPlatform(app), tenant, protocolo())
+        return version.robot_id
+    finally:
+        await app.dispose()
+
+
+def _approvals_of(pg: PgDatabase, database: str, robot_id: UUID) -> list[tuple[Any, ...]]:
+    with pg.server.connect(database) as conn:
+        rows = conn.execute(
+            "SELECT version_no, approved_by FROM version_approvals WHERE robot_id = %s",
+            (robot_id,),
+        ).fetchall()
+    return [tuple(row) for row in rows]
+
+
+async def test_a1_rules_migrate_back_and_forth(pg_database: PgDatabase) -> None:
+    with _scratch_database(pg_database) as name:
+        url = pg_database.server.url(
+            name, pg_database.owner, pg_database.passwords[pg_database.owner]
+        )
+        # As permissões de credentials numa 0005 nova (a 0001 continua concedendo o que
+        # concedia): a volta da 0006 precisa chegar exatamente aqui.
+        command.upgrade(alembic_config(url, pg_database.roles), "0005")
+        app, dispatcher = pg_database.roles.app, pg_database.roles.dispatcher
+        fresh = _credentials_acl(pg_database, name)
+        assert {(role, column) for role, column, _ in fresh} == {(app, "*")}
+        assert {privilege for *_, privilege in fresh} >= {"UPDATE", "DELETE"}
+        upgrade(url, roles=pg_database.roles)
+        head = _a1_schema(pg_database, name)
+        acl = _credentials_acl(pg_database, name)
+        # Reaplicar as permissões (--somente-permissoes) na 0006 não devolve o UPDATE e o
+        # DELETE amplos da aplicação.
+        apply_grants(url, pg_database.roles)
+        assert _credentials_acl(pg_database, name) == acl
+        assert _a1_schema(pg_database, name) == head
+        assert head == {
+            "tables": sorted((t, True, True) for t in _A1_TABLES),
+            "columns": sorted(_A1_COLUMNS),
+            "triggers": len(_A1_TRIGGERS),
+            # A aplicação não apaga credenciais nem muda as colunas fixas.
+            "credentials": (False, False),
+            # Aplicação: muda só a validade, inclui aprovações (sem mudar), revoga
+            # autorizações (sem trocar a credencial) e só lê os avisos. Despachante: lê a
+            # validade, nunca o caminho no cofre nem quem autorizou, e inclui os avisos.
+            "privileges": (True, False, True, False, True, False, False, True, False, False, True),
+        }
+        robot_id = await _published_robot(pg_database, name)
+        approver = _approvals_of(pg_database, name, robot_id)
+        assert [number for number, _ in approver] == [1]
+
+        command.downgrade(alembic_config(url, pg_database.roles), "0005")
+        back = _a1_schema(pg_database, name)
+        assert back == {
+            "tables": [],
+            "columns": [],
+            "triggers": 0,
+            # Volta o que a revisão 0005 concedia.
+            "credentials": (True, True),
+            "privileges": None,
+        }
+        # Exatamente: o despachante não fica lendo as colunas antigas de credentials.
+        assert _credentials_acl(pg_database, name) == fresh
+        with pg_database.server.connect(name) as conn:
+            reads = conn.execute(
+                "SELECT has_any_column_privilege(%s, 'credentials', 'SELECT')", (dispatcher,)
+            ).fetchone()
+        assert reads is not None and reads[0] is False
+        with pg_database.server.connect(name) as conn:
+            functions = conn.execute(
+                "SELECT count(*) FROM pg_proc WHERE proname IN ('rapa_robot_versions_approvals', "
+                "'rapa_version_approvals_check', 'rapa_a1_authorizations_guard', "
+                "'rapa_credentials_guard')"
+            ).fetchone()
+        assert functions is not None and functions[0] == 0
+
+        # De novo na 0006: a versão publicada antes ganha a aprovação de quem a publicou.
+        upgrade(url, roles=pg_database.roles)
+        assert _a1_schema(pg_database, name) == head
+        assert _approvals_of(pg_database, name, robot_id) == approver
+
+
+async def test_old_a1_rows_without_validity_stay_and_count_as_expired(
+    pg_database: PgDatabase,
+) -> None:
+    """Um certificado A1 registrado antes da 0006 (sem validade) fica no banco, mas o
+    serviço o trata como vencido (falha fechada)."""
+    with _scratch_database(pg_database) as name:
+        url = pg_database.server.url(
+            name, pg_database.owner, pg_database.passwords[pg_database.owner]
+        )
+        command.upgrade(alembic_config(url, pg_database.roles), "0005")
+        company, area, credential = new_id(), new_id(), new_id()
+        with pg_database.server.connect(name) as conn:
+            conn.execute("SELECT set_config('rapa.company_id', %s, false)", (str(company),))
+            conn.execute("INSERT INTO companies (id, name) VALUES (%s, 'Antiga')", (company,))
+            conn.execute(
+                "INSERT INTO areas (id, company_id, name) VALUES (%s, %s, 'Fiscal')",
+                (area, company),
+            )
+            conn.execute(
+                "INSERT INTO credentials (id, company_id, area_id, name, kind, origin, vault_path)"
+                " VALUES (%s, %s, %s, 'certificado', 'pfx_a1', 'https://portal.rapa.test', 'x/y')",
+                (credential, company, area),
+            )
+        upgrade(url, roles=pg_database.roles)
+        app = Database(
+            create_engine(
+                pg_database.server.url(
+                    name, pg_database.roles.app, pg_database.passwords[pg_database.roles.app]
+                ),
+                poolclass=NullPool,
+            )
+        )
+        try:
+            admin = Principal(
+                subject="admin@antiga",
+                company_id=company,
+                company_roles=frozenset({Role.COMPANY_ADMIN}),
+            )
+            credentials = PgCredentials(app)
+            [info] = await credentials.list(admin)
+            assert info.not_after is None and info.status is CredentialStatus.EXPIRED
+            assert [c.credential_id for c in await credentials.expiring(admin)] == [credential]
+            # Revogar a linha antiga continua possível (a restrição nova não a barra).
+            revoked = await credentials.revoke(admin, credential)
+            assert revoked.status is CredentialStatus.REVOKED
+        finally:
+            await app.dispose()
 
 
 def test_offline_sql_is_generated(pg_database: PgDatabase) -> None:

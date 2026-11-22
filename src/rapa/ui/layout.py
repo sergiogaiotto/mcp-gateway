@@ -35,6 +35,7 @@ NAV_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("agendas", "Agendas", "/agendas"),
     ("webhooks", "Webhooks", "/webhooks"),
     ("lotes", "Lotes", "/lotes"),
+    ("credenciais", "Credenciais", "/credenciais"),
 )
 #: Itens que só aparecem para quem pode usá-los (o servidor confere de novo).
 _NAV_RULES = {"gravar": can_record}

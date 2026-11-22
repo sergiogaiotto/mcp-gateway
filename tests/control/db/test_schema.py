@@ -109,7 +109,15 @@ async def test_metadata_matches_migrated_tables(superuser_engine: AsyncEngine) -
 async def test_dispatcher_cannot_touch_tenant_admin_tables(dispatcher_db: Database) -> None:
     for statement in (
         "SELECT count(*) FROM users",
-        "SELECT count(*) FROM credentials",
+        # Das credenciais, o despachante só lê o que a conferência do A1 precisa.
+        "SELECT vault_path FROM credentials",
+        "SELECT custodian_user_id FROM credentials",
+        "SELECT * FROM credentials",
+        "UPDATE credentials SET revoked_at = now()",
+        "SELECT authorized_by FROM a1_authorizations",
+        "UPDATE a1_authorizations SET revoked_at = now(), revoked_by = 'x'",
+        "SELECT count(*) FROM version_approvals",
+        "DELETE FROM credential_alerts",
         "INSERT INTO companies (id, name) VALUES (gen_random_uuid(), 'x')",
         "UPDATE platform_settings SET total_browser_slots = 1",
         "DELETE FROM run_events",
