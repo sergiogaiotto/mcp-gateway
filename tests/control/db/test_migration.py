@@ -107,8 +107,8 @@ def test_grants_skip_missing_roles_and_cli_reapplies(pg_database: PgDatabase) ->
         # As permissões das tabelas das sessões de gravação (revisão 0003) também.
         assert _app_can_read_runs(pg_database, name, "recording_sessions")
         assert _app_can_read_runs(pg_database, name, "recordings")
-        # E as da publicação (revisão 0004).
-        for table in _PUBLISHING_TABLES:
+        # E as da publicação (revisão 0004) e as do conserto (revisão 0005).
+        for table in (*_PUBLISHING_TABLES, *_REPAIR_TABLES):
             assert _app_can_read_runs(pg_database, name, table), table
 
 
@@ -175,6 +175,72 @@ def test_publishing_tables_migrate_back_and_forth(pg_database: PgDatabase) -> No
         assert guards is not None and guards[0] == 0
         upgrade(url, roles=pg_database.roles)
         assert _publishing_schema(pg_database, name) == head
+
+
+_REPAIR_TABLES = ("run_snapshots", "repair_proposals")
+
+
+def _repair_schema(pg: PgDatabase, database: str) -> dict[str, Any]:
+    with pg.server.connect(database) as conn:
+        tables = conn.execute(
+            "SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class "
+            "WHERE relnamespace = 'public'::regnamespace AND relname = ANY(%s) ORDER BY relname",
+            (list(_REPAIR_TABLES),),
+        ).fetchall()
+        privileges = (
+            conn.execute(
+                "SELECT has_table_privilege(%s, 'run_snapshots', 'INSERT'), "
+                "has_table_privilege(%s, 'run_snapshots', 'SELECT'), "
+                "has_table_privilege(%s, 'repair_proposals', 'INSERT'), "
+                "has_table_privilege(%s, 'repair_proposals', 'UPDATE'), "
+                "has_table_privilege(%s, 'run_snapshots', 'INSERT'), "
+                "has_table_privilege(%s, 'repair_proposals', 'SELECT')",
+                (
+                    pg.roles.app,
+                    pg.roles.app,
+                    pg.roles.app,
+                    pg.roles.app,
+                    pg.roles.dispatcher,
+                    pg.roles.dispatcher,
+                ),
+            ).fetchone()
+            if tables
+            else None
+        )
+        triggers = conn.execute(
+            "SELECT count(*) FROM pg_trigger WHERE tgname IN "
+            "('run_snapshots_append_only', 'repair_proposals_append_only')"
+        ).fetchone()
+    assert triggers is not None
+    return {
+        "tables": [tuple(row) for row in tables],
+        "privileges": tuple(privileges) if privileges else None,
+        "append_only": int(triggers[0]),
+    }
+
+
+def test_repair_tables_migrate_back_and_forth(pg_database: PgDatabase) -> None:
+    with _scratch_database(pg_database) as name:
+        url = pg_database.server.url(
+            name, pg_database.owner, pg_database.passwords[pg_database.owner]
+        )
+        upgrade(url, roles=pg_database.roles)
+        head = _repair_schema(pg_database, name)
+        assert head == {
+            "tables": sorted((t, True, True) for t in _REPAIR_TABLES),
+            # A aplicação lê os retratos (nunca os inclui) e inclui consertos (nunca os
+            # muda); o despachante só inclui retratos.
+            "privileges": (False, True, True, False, True, False),
+            "append_only": 2,
+        }
+        command.downgrade(alembic_config(url, pg_database.roles), "0004")
+        assert _repair_schema(pg_database, name) == {
+            "tables": [],
+            "privileges": None,
+            "append_only": 0,
+        }
+        upgrade(url, roles=pg_database.roles)
+        assert _repair_schema(pg_database, name) == head
 
 
 def test_offline_sql_is_generated(pg_database: PgDatabase) -> None:

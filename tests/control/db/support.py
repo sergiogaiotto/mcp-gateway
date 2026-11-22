@@ -205,3 +205,44 @@ def result(run_id: UUID, attempt: int, state: str = "succeeded", **extra: Any) -
     }
     body.update(extra)
     return body
+
+
+async def failed_run(
+    app_db: Database,
+    dispatcher_db: Database,
+    tenant: Tenant,
+    *,
+    snapshot: dict[str, Any] | None,
+    error_code: str = "elemento_nao_encontrado",
+    step_id: str = "entrar",
+    slug: str = "emitir_protocolo",
+    state: str = "failed",
+) -> UUID:
+    """Uma execução que o executor deu por falha no passo ``step_id``, com o retrato dado.
+
+    O despachante pega execuções até chegar a esta (as outras ficam rodando).
+    """
+    from rapa.control.services import PgRunQueue
+    from rapa.core.contracts import RunTrigger
+
+    run = await PgPlatform(app_db).start(tenant.operator, slug, PROTOCOLO_INPUTS, RunTrigger.REST)
+    queue = PgRunQueue(dispatcher_db)
+    for _ in range(20):
+        # Outras execuções na fila (de outra prioridade) ficam rodando: não importam aqui.
+        job = await queue.claim_next()
+        assert job is not None, "a execução não foi pega pelo despachante"
+        if job.run_id == run.run_id:
+            break
+    else:  # pragma: no cover - auxiliar de teste
+        raise AssertionError("a execução não foi pega pelo despachante")
+    body = result(
+        job.run_id,
+        job.attempt,
+        state,
+        error_code=error_code,
+        error_message="Não encontrei o elemento 'botão Entrar' no passo 'Clicar em Entrar'.",
+        failed_step_id=step_id,
+        failure_snapshot=snapshot,
+    )
+    assert await queue.finish(job.run_id, job.attempt, body)
+    return run.run_id

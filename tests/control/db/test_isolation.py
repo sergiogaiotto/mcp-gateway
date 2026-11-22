@@ -21,6 +21,7 @@ from rapa.control.services import (
     PgBatches,
     PgPlatform,
     PgProvisioning,
+    PgRepairs,
     PgRunQueue,
     PgSchedules,
     PgWebhooks,
@@ -41,8 +42,18 @@ from rapa.core.contracts import (
 from rapa.core.events import RunEventKind
 from rapa.core.ids import new_id
 from rapa.core.robot import CredentialRef
+from tests.repair.support import login_page
 
-from .support import PROTOCOLO_INPUTS, Tenant, event, make_tenant, protocolo, publish, reset_queue
+from .support import (
+    PROTOCOLO_INPUTS,
+    Tenant,
+    event,
+    failed_run,
+    make_tenant,
+    protocolo,
+    publish,
+    reset_queue,
+)
 
 pytestmark = pytest.mark.database
 
@@ -56,6 +67,8 @@ class World:
     a_session: UUID
     #: A agenda, o webhook e o lote da empresa A.
     a_published: dict[str, UUID]
+    #: A execução da empresa A que falhou com retrato e já tem um conserto.
+    a_repaired_run: UUID
 
 
 async def _world(app_db: Database, dispatcher_db: Database, superuser: AsyncEngine) -> World:
@@ -90,6 +103,14 @@ async def _world(app_db: Database, dispatcher_db: Database, superuser: AsyncEngi
     published = {}
     for tenant in (a, b):
         published[tenant.company_id] = await _publishing_rows(app_db, dispatcher_db, tenant)
+    repaired = {}
+    for tenant in (a, b):
+        # Um retrato e um conserto (o rascunho da versão 2) por empresa.
+        run_id = await failed_run(
+            app_db, dispatcher_db, tenant, snapshot=login_page().model_dump(mode="json")
+        )
+        await PgRepairs(app_db).create_repair(tenant.creator, run_id, "c1")
+        repaired[tenant.company_id] = run_id
     return World(
         a=a,
         b=b,
@@ -97,6 +118,7 @@ async def _world(app_db: Database, dispatcher_db: Database, superuser: AsyncEngi
         a_run=a_run.run_id,
         a_session=sessions[a.company_id],
         a_published=published[a.company_id],
+        a_repaired_run=repaired[a.company_id],
     )
 
 
@@ -246,6 +268,19 @@ async def test_company_b_sees_nothing_of_company_a(
             )
             assert count == 0, table
 
+    # O retrato e o conserto da A: nem pelo serviço nem pelo SQL.
+    with pytest.raises(NotFound):
+        await PgRepairs(app_db).get_repair(admin_b, world.a_repaired_run)
+    with pytest.raises(NotFound):
+        await PgRepairs(app_db).create_repair(world.b.creator, world.a_repaired_run, "c1")
+    async with app_db.tenant_session(world.b.company_id) as session:
+        for table in ("run_snapshots", "repair_proposals"):
+            count = await session.scalar(
+                text(f"SELECT count(*) FROM {table} WHERE run_id = :id"),  # noqa: S608
+                {"id": world.a_repaired_run},
+            )
+            assert count == 0, table
+
 
 async def test_writes_with_another_company_id_fail_with_check(
     app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine
@@ -314,6 +349,13 @@ async def test_writes_with_another_company_id_fail_with_check(
             "INSERT INTO batch_rows (company_id, batch_id, row_no, line_no, run_id) "
             "VALUES (:a, :lote, 99, 2, :run)",
             {"lote": world.a_published["batch"], "run": world.a_run},
+        ),
+        "repair_proposals": (
+            "INSERT INTO repair_proposals (company_id, id, run_id, robot_id, step_id, "
+            "base_version_id, base_version_no, version_id, version_no, candidate_id, candidate, "
+            "snapshot_sha256, requested_by) VALUES (:a, :new, :run, :robo, 'entrar', :new, 1, "
+            "gen_random_uuid(), 2, 'c1', '{}', repeat('0', 64), 'b')",
+            {"run": world.a_repaired_run, "robo": world.a_robot},
         ),
     }
     for table, (statement, extra) in attempts.items():

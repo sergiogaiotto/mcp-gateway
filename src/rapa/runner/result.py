@@ -11,6 +11,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from rapa.core.contracts import RunState
+from rapa.core.snapshot import PageSnapshot
 
 __all__ = ["ArtifactKind", "ArtifactRef", "RunResult"]
 
@@ -53,3 +54,6 @@ class RunResult(BaseModel):
     irreversible_started: bool = False
     steps_done: int = Field(default=0, ge=0)
     artifacts: list[ArtifactRef] = Field(default_factory=list)
+    #: Retrato da página no passo que falhou por causa do alvo (para o conserto
+    #: assistido), sem valores de campos nem segredos; só em execuções que não deram certo.
+    failure_snapshot: PageSnapshot | None = None

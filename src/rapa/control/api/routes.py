@@ -19,6 +19,7 @@ from rapa.control.api.errors import error_response
 from rapa.control.api.openapi_robots import build_robots_openapi
 from rapa.control.api.publishing import PublishingServices, add_publishing_routes
 from rapa.control.api.ratelimit import RateLimiter
+from rapa.control.api.repairs import add_repair_routes
 from rapa.control.api.sessions import add_session_routes
 from rapa.control.auth import Authenticator
 from rapa.control.sessions.service import RecordingSessions
@@ -28,6 +29,7 @@ from rapa.core.contracts import (
     InvalidInput,
     NotFound,
     Principal,
+    RepairService,
     RobotAdmin,
     RobotCatalog,
     RobotInfo,
@@ -91,6 +93,8 @@ class ApiServices:
     live_origins: frozenset[str] = frozenset()
     #: Agendas, webhooks e lotes; o que faltar responde 503.
     publishing: PublishingServices = field(default_factory=PublishingServices)
+    #: O conserto assistido; sem ele, ``/v1/execucoes/{id}/conserto`` responde 503.
+    repairs: RepairService | None = None
 
 
 def check_idempotency_key(key: str | None) -> str | None:
@@ -211,6 +215,10 @@ def create_api_router(services: ApiServices) -> APIRouter:
         if status is None:
             raise NotFound("execução não encontrada")
         return status
+
+    # -- consertar ----------------------------------------------------------------
+
+    add_repair_routes(router, services.repairs, current_principal)
 
     # -- administração de robôs ---------------------------------------------
 

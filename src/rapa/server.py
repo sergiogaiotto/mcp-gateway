@@ -54,9 +54,11 @@ from rapa.control.launcher import (
 )
 from rapa.control.services import (
     Dispatcher,
+    HubRepairAssistant,
     PgBatches,
     PgPlatform,
     PgPrincipalResolver,
+    PgRepairs,
     PgRunQueue,
     PgSchedules,
     PgWebhooks,
@@ -82,6 +84,7 @@ __all__ = [
     "DispatcherSupervisor",
     "ServerSettings",
     "build_publishing",
+    "build_repairs",
     "build_scheduler",
     "build_sessions",
     "create_server_app",
@@ -178,6 +181,8 @@ class ServerSettings(BaseModel):
     #: Linhas e tamanho máximos da planilha de um lote.
     batch_max_rows: int = Field(default=1000, ge=1, le=100_000)
     batch_max_bytes: int = Field(default=5 * 1024 * 1024, ge=1024, le=100 * 1024 * 1024)
+    #: Quantos candidatos o conserto assistido mostra (e o modelo vê) para o passo que quebrou.
+    repair_candidates: int = Field(default=8, ge=1, le=20)
 
     @model_validator(mode="after")
     def _check(self) -> ServerSettings:
@@ -257,7 +262,11 @@ class ServerSettings(BaseModel):
           endereço de origem, então atrás de um proxy o uvicorn precisa de
           ``FORWARDED_ALLOW_IPS`` para ver o do cliente), ``RAPA_LOTE_MAX_LINHAS`` (padrão
           1000) e ``RAPA_LOTE_MAX_BYTES`` (tamanho máximo da planilha de um lote, pelo
-          REST e pela tela Lotes; padrão 5 MiB).
+          REST e pela tela Lotes; padrão 5 MiB);
+        - consertar: ``RAPA_CONSERTO_CANDIDATOS`` (quantos candidatos o conserto
+          assistido mostra para o passo que quebrou, e o modelo vê; de 1 a 20, padrão
+          8). O modelo que escolhe entre eles é o mesmo hub da revisão
+          (``RAPA_LLM_*``); sem ele, a pessoa escolhe sozinha, com um aviso.
         """
         env = os.environ if env is None else env
         data: dict[str, Any] = {
@@ -298,6 +307,7 @@ class ServerSettings(BaseModel):
             ("webhook_lookups_per_s", "RAPA_WEBHOOKS_POR_SEGUNDO", float),
             ("batch_max_rows", "RAPA_LOTE_MAX_LINHAS", int),
             ("batch_max_bytes", "RAPA_LOTE_MAX_BYTES", int),
+            ("repair_candidates", "RAPA_CONSERTO_CANDIDATOS", int),
         ):
             if raw := env.get(name, "").strip():
                 data[key] = kind(raw)
@@ -409,6 +419,7 @@ def _mount_ui(
     authenticator: Authenticator,
     sessions: RecordingSessions | None = None,
     publishing: PublishingServices | None = None,
+    repairs: PgRepairs | None = None,
 ) -> None:
     from rapa.ui.app import create_ui
     from rapa.ui.auth import DevLogin, DevProfile, OidcLogin, OidcSettings, UiAuth
@@ -451,6 +462,7 @@ def _mount_ui(
             schedules=publishing.schedules if publishing else None,
             webhooks=publishing.webhooks if publishing else None,
             batches=publishing.batches if publishing else None,
+            repairs=repairs,
         ),
         # A interface age direto nos serviços, então a sessão confere de novo no banco
         # (conta ativa e papéis), como a API faz a cada pedido.
@@ -703,22 +715,34 @@ def build_scheduler(settings: ServerSettings, db: Database, dispatcher_db: Datab
     return Scheduler(db, dispatcher_db, catch_up=timedelta(seconds=settings.schedule_catch_up_s))
 
 
+def _hub_client(settings: ServerSettings) -> Any:
+    from rapa.llm.client import HubClient
+
+    return HubClient(
+        base_url=settings.llm_base_url,
+        model=settings.llm_model,
+        api_key=settings.llm_api_key,
+        timeout_s=60.0,
+        max_retries=1,
+    )
+
+
 def _assistant(settings: ServerSettings) -> GeneralizationAssistant | None:
     if not (settings.llm_base_url and settings.llm_model):
         return None
-    from rapa.llm.client import HubClient
-
     capabilities = str(settings.llm_capabilities_file) if settings.llm_capabilities_file else None
-    return HubAssistant(
-        lambda: HubClient(
-            base_url=settings.llm_base_url,
-            model=settings.llm_model,
-            api_key=settings.llm_api_key,
-            timeout_s=60.0,
-            max_retries=1,
-        ),
-        capabilities,
-    )
+    return HubAssistant(lambda: _hub_client(settings), capabilities)
+
+
+def build_repairs(settings: ServerSettings, db: Database) -> PgRepairs:
+    """O conserto assistido, com o hub de LLM da revisão (se houver) escolhendo o candidato."""
+    assistant = None
+    if settings.llm_base_url and settings.llm_model:
+        capabilities = (
+            str(settings.llm_capabilities_file) if settings.llm_capabilities_file else None
+        )
+        assistant = HubRepairAssistant(lambda: _hub_client(settings), capabilities)
+    return PgRepairs(db, assistant=assistant, candidates=settings.repair_candidates)
 
 
 def build_sessions(
@@ -811,6 +835,7 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
         else (None, None)
     )
     publishing = build_publishing(settings, db)
+    repairs = build_repairs(settings, db)
     if verifier is not None:
         app = create_http_app(
             catalog=platform,
@@ -828,6 +853,7 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
             ),
             sessions=sessions,
             publishing=publishing,
+            repairs=repairs,
         )
     else:
         app = FastAPI(title="RaPA (despachante)", docs_url=None, redoc_url=None, openapi_url=None)
@@ -849,6 +875,7 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
     app.state.dispatcher_supervisor = supervisor
     app.state.sessions = sessions
     app.state.publishing = publishing
+    app.state.repairs = repairs
     if settings.http and settings.ui:
         # Antes de envolver o lifespan: o NiceGUI (ui.run_with) envolve o que encontrar
         # com a subida e o encerramento dele, e esse conjunto fica dentro do nosso.
@@ -859,6 +886,7 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
             Authenticator(verifier, resolver),  # type: ignore[arg-type]
             sessions,
             publishing,
+            repairs,
         )
     inner = app.router.lifespan_context
     started = False

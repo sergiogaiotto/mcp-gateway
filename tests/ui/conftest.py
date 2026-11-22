@@ -31,7 +31,7 @@ from nicegui.storage import Storage
 from nicegui.testing import User
 from nicegui.testing.general import nicegui_reset_globals
 
-from rapa.core.contracts import Principal, RecordingService, Role
+from rapa.core.contracts import Principal, RecordingService, RepairService, Role
 from rapa.core.ids import new_id
 from rapa.fixtures.memory import MemoryPlatform
 from rapa.fixtures.robots import baixar_notas, emitir_protocolo
@@ -90,6 +90,8 @@ class World:
     resolver: PrincipalResolver | None = None
     #: Sessões de gravação (Gravar e a revisão); sem elas, a interface mostra que não há.
     sessions: RecordingService | None = None
+    #: O conserto assistido (a tela "Consertar este passo").
+    repairs: RepairService | None = None
 
     def auth(self) -> UiAuth:
         profiles = [
@@ -115,7 +117,7 @@ class World:
         create_ui(
             app,
             backend_factory=ContractsBackendFactory.from_platform(
-                self.platform, sessions=self.sessions
+                self.platform, sessions=self.sessions, repairs=self.repairs
             ),
             auth=self.auth(),
             settings=self.settings(),

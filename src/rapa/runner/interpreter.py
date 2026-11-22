@@ -193,7 +193,14 @@ principais:
   recusado antes, e a mensagem diz o passo e o ramo;
 - eventos, mensagens, saídas e nomes de artefatos nunca contêm valores de
   credenciais; as chaves dos eventos e os valores que são constantes do
-  executor (efeito, estado, código de erro, id de passo) nunca são mascarados.
+  executor (efeito, estado, código de erro, id de passo) nunca são mascarados;
+- quando um passo com alvo falha com ``elemento_nao_encontrado``,
+  ``elemento_ambiguo`` ou ``localizador_alternativo_em_gravacao``, o executor tira,
+  uma vez por execução (no passo mais interno), um retrato só de leitura dos
+  elementos da página que podem ser o alvo (:mod:`rapa.runner.snapshot`), para o
+  conserto assistido: nenhum evento, foco ou rolagem, nenhum valor de campo, e os
+  valores das credenciais e das entradas saem de todo texto. Ele vai no resultado
+  (``failure_snapshot``) e nunca muda o desfecho da execução.
 """
 
 import asyncio
@@ -259,6 +266,7 @@ from rapa.core.robot import (
     WaitForStep,
     max_effect,
 )
+from rapa.core.snapshot import SNAPSHOT_ERROR_CODES, PageSnapshot
 from rapa.runner.errors import ErrorCode, StepError
 from rapa.runner.ports import (
     ArtifactSink,
@@ -270,6 +278,8 @@ from rapa.runner.ports import (
     sanitize_filename,
 )
 from rapa.runner.result import ArtifactKind, ArtifactRef, RunResult
+from rapa.runner.snapshot import capture as capture_snapshot
+from rapa.runner.snapshot import flatten_strings
 
 __all__ = ["MASK", "Interpreter"]
 
@@ -1230,6 +1240,11 @@ class _Redactor:
         if len(value) >= _MIN_MASKED_LENGTH:
             self._values.add(value)
 
+    @property
+    def values(self) -> frozenset[str]:
+        """Os valores mascarados até agora (para o retrato da página, que os tira também)."""
+        return frozenset(self._values)
+
     def text(self, text: str) -> str:
         for value in sorted(self._values, key=len, reverse=True):
             if value in text:
@@ -2075,6 +2090,8 @@ class Interpreter:
         self._secret_locators: list[PwLocator] = []
         self._blocked_navigation: str | None = None
         self._screenshots = 0
+        #: Retrato da página no passo que falhou por causa do alvo (:meth:`_snapshot`).
+        self._failure_snapshot: PageSnapshot | None = None
 
     @classmethod
     def from_job(
@@ -2349,6 +2366,7 @@ class Interpreter:
             irreversible_started=self.irreversible_started,
             steps_done=self._steps_done,
             artifacts=list(self._artifacts),
+            failure_snapshot=self._failure_snapshot if state is not RunState.SUCCEEDED else None,
         )
 
     def _prepare_inputs(self) -> dict[str, Any]:
@@ -3184,6 +3202,31 @@ class Interpreter:
             },
         )
         await self._screenshot(step.id, "falha")
+        await self._snapshot(step, err)
+
+    async def _snapshot(self, step: Step, err: StepError) -> None:
+        """Retrato só de leitura da página no passo cujo alvo falhou (para o conserto).
+
+        Só para os códigos de ``SNAPSHOT_ERROR_CODES``, num passo com alvo, e uma vez
+        por execução: o passo mais interno, que falhou primeiro. O retrato nunca leva o
+        valor de um campo, e os valores das credenciais digitadas e das entradas saem de
+        todos os textos (:func:`rapa.runner.snapshot.capture`). Melhor esforço: sem
+        retrato, a execução termina igual.
+        """
+        if self._failure_snapshot is not None or str(err.code) not in SNAPSHOT_ERROR_CODES:
+            return
+        if not isinstance(getattr(step, "target", None), Target):
+            return
+        page = self._page
+        if page is None or page.is_closed():
+            return
+        self._failure_snapshot = await capture_snapshot(
+            page,
+            step_id=step.id,
+            step_kind=step.kind,
+            error_code=str(err.code),
+            mask_values=[*self._redactor.values, *flatten_strings(self._inputs)],
+        )
 
     async def _run_container(self, step: ForEachStep | IfStep) -> None:
         """Roda uma repetição ou um ``if``.

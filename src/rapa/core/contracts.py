@@ -13,7 +13,7 @@ from uuid import UUID
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from rapa.core.cron import DEFAULT_TIMEZONE
-from rapa.core.robot import NAME_PATTERN, SLUG_PATTERN, Effect, Manifest
+from rapa.core.robot import NAME_PATTERN, SLUG_PATTERN, Effect, Locator, Manifest, Target
 
 __all__ = [
     "AUTOMATION_ROLES",
@@ -48,6 +48,13 @@ __all__ = [
     "RecordingService",
     "RecordingSessionInfo",
     "RecordingSessionStatus",
+    "RepairCandidate",
+    "RepairProposalInfo",
+    "RepairService",
+    "RepairStepInfo",
+    "RepairSuggestion",
+    "RepairSuggestionStatus",
+    "RepairView",
     "RepetitionChoice",
     "RepetitionField",
     "RepetitionFieldChoice",
@@ -982,3 +989,132 @@ class BatchService(Protocol):
     async def batch_results(
         self, principal: Principal, batch_id: UUID, format: BatchFormat
     ) -> BatchFile: ...
+
+
+# ---------------------------------------------------------------------------
+# Consertar (o passo que quebrou)
+# ---------------------------------------------------------------------------
+
+
+class RepairStepInfo(_Model):
+    """O passo que quebrou, como está na versão da execução que falhou."""
+
+    step_id: str
+    title: str
+    kind: str
+    effect: Effect
+    intent: str
+    locators: list[Locator]
+    frames: list[str] = Field(default_factory=list)
+    within: Locator | None = None
+    within_has_text: str | None = None
+
+
+class RepairCandidate(_Model):
+    """Um elemento do retrato que pode ser o alvo do passo, com o alvo já montado.
+
+    Os candidatos saem só do retrato da página (nada é executado de novo para
+    montá-los) e vêm do mais provável para o menos provável, pela nota
+    determinística ``score`` (0 a 100). ``target`` é o alvo que o passo ganha se a
+    pessoa escolher este candidato: os localizadores montados pelas regras do
+    compilador, o iframe e, num passo dentro de uma linha, a mesma linha de antes.
+    """
+
+    candidate_id: str = Field(pattern=r"^c[0-9]{1,3}$")
+    description: str
+    role: str | None = None
+    tag: str
+    name: str | None = None
+    label: str | None = None
+    placeholder: str | None = None
+    text: str | None = None
+    test_id: str | None = None
+    row_text: str | None = None
+    frames: list[str] = Field(default_factory=list)
+    sensitive: bool = False
+    enabled: bool = True
+    score: int = Field(ge=0, le=100)
+    #: Por que o candidato ganhou a nota, em pt-BR.
+    reasons: list[str] = Field(default_factory=list)
+    target: Target
+
+
+class RepairSuggestionStatus(StrEnum):
+    """O que aconteceu com o pedido ao modelo de linguagem."""
+
+    #: O modelo escolheu um dos candidatos.
+    CHOSEN = "escolhido"
+    #: O modelo disse que nenhum candidato serve.
+    NONE = "nenhum"
+    #: O hub não respondeu, ou a resposta não passou no esquema.
+    UNAVAILABLE = "indisponivel"
+    #: O modelo escolheu um candidato que não estava na lista: o código recusou.
+    REFUSED = "recusada"
+    #: Não há hub configurado, ou a sugestão não foi pedida.
+    OFF = "desligado"
+
+
+class RepairSuggestion(_Model):
+    """A sugestão do modelo: só um dos candidatos, ou nenhum. Quem decide é a pessoa."""
+
+    status: RepairSuggestionStatus
+    candidate_id: str | None = None
+    #: O motivo dado pelo modelo (texto dele, já sem marcadores de controle).
+    reason: str | None = None
+    #: O que a tela mostra, em pt-BR.
+    message: str
+
+
+class RepairProposalInfo(_Model):
+    """Um conserto pedido: a versão nova (rascunho) criada com o candidato escolhido."""
+
+    proposal_id: UUID
+    run_id: UUID
+    robot_id: UUID
+    step_id: str
+    #: A versão da execução que falhou, sobre a qual o conserto foi feito.
+    base_version_no: int
+    #: O rascunho criado com o passo consertado; uma outra pessoa, que aprova, publica.
+    version_no: int
+    candidate_id: str
+    #: O que o modelo sugeriu quando a pessoa escolheu (``None``: não sugeriu).
+    model_candidate_id: str | None = None
+    requested_by: str
+    created_at: datetime
+
+
+class RepairView(_Model):
+    """O conserto de uma execução que falhou: o passo, os candidatos e a sugestão do modelo."""
+
+    run_id: UUID
+    robot_id: UUID
+    robot_slug: str
+    area_id: UUID
+    version_no: int
+    error_code: str
+    error_message: str | None = None
+    page_url: str
+    page_title: str
+    step: RepairStepInfo
+    candidates: list[RepairCandidate]
+    suggestion: RepairSuggestion
+    #: O retrato não guardou todos os elementos da página (página grande demais).
+    truncated: bool = False
+    #: O conserto já pedido para esta execução (só um por execução).
+    proposal: RepairProposalInfo | None = None
+    #: Por que um conserto novo não pode ser pedido a partir desta execução (já pedido,
+    #: versão antiga), em pt-BR; ``None`` quando pode.
+    blocked_reason: str | None = None
+
+
+class RepairService(Protocol):
+    """Consertar o passo que quebrou: candidatos enumerados, a escolha de uma pessoa e
+    um rascunho novo, que outra pessoa (com o papel de aprovação) publica."""
+
+    async def get_repair(
+        self, principal: Principal, run_id: UUID, *, suggest: bool = True
+    ) -> RepairView: ...
+
+    async def create_repair(
+        self, principal: Principal, run_id: UUID, candidate_id: str
+    ) -> RepairProposalInfo: ...

@@ -45,6 +45,9 @@ from rapa.core.contracts import (
     QuotaExceeded,
     RecordingService,
     RecordingSessionInfo,
+    RepairProposalInfo,
+    RepairService,
+    RepairView,
     RobotAdmin,
     RobotCatalog,
     RobotInfo,
@@ -72,6 +75,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "BATCHES_OFF",
+    "REPAIRS_OFF",
     "SCHEDULES_OFF",
     "SESSIONS_OFF",
     "WEBHOOKS_OFF",
@@ -213,6 +217,12 @@ class Backend(Protocol):
 
     async def batch_results(self, batch_id: UUID, format: BatchFormat) -> BatchFile: ...
 
+    # -- consertar ---------------------------------------------------------------------
+
+    async def get_repair(self, run_id: UUID, *, suggest: bool = True) -> RepairView: ...
+
+    async def create_repair(self, run_id: UUID, candidate_id: str) -> RepairProposalInfo: ...
+
 
 #: Mensagem quando este servidor não oferece a gravação de demonstrações.
 SESSIONS_OFF = "a gravação de demonstrações não está disponível neste servidor"
@@ -220,6 +230,8 @@ SESSIONS_OFF = "a gravação de demonstrações não está disponível neste ser
 SCHEDULES_OFF = "as agendas não estão disponíveis neste servidor"
 WEBHOOKS_OFF = "os webhooks não estão disponíveis neste servidor"
 BATCHES_OFF = "os lotes por planilha não estão disponíveis neste servidor"
+#: Mensagem quando este servidor não oferece o conserto assistido.
+REPAIRS_OFF = "o conserto assistido não está disponível neste servidor"
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +329,7 @@ class ContractsBackend:
         schedules: ScheduleService | None = None,
         webhooks: WebhookService | None = None,
         batches: BatchService | None = None,
+        repairs: RepairService | None = None,
     ) -> None:
         self._catalog = catalog
         self._runs = runs
@@ -326,6 +339,7 @@ class ContractsBackend:
         self._schedules = schedules
         self._webhooks = webhooks
         self._batches = batches
+        self._repairs = repairs
 
     def __repr__(self) -> str:
         return f"ContractsBackend(subject={self._principal.subject!r})"
@@ -498,6 +512,19 @@ class ContractsBackend:
     async def batch_results(self, batch_id: UUID, format: BatchFormat) -> BatchFile:
         return await self._batch_service().batch_results(self._principal, batch_id, format)
 
+    # -- consertar ---------------------------------------------------------------------
+
+    def _repair_service(self) -> RepairService:
+        if self._repairs is None:
+            raise BackendUnavailable(REPAIRS_OFF)
+        return self._repairs
+
+    async def get_repair(self, run_id: UUID, *, suggest: bool = True) -> RepairView:
+        return await self._repair_service().get_repair(self._principal, run_id, suggest=suggest)
+
+    async def create_repair(self, run_id: UUID, candidate_id: str) -> RepairProposalInfo:
+        return await self._repair_service().create_repair(self._principal, run_id, candidate_id)
+
 
 class _Platform(RobotCatalog, RunService, RobotAdmin, Protocol):
     """Um objeto que segue os três contratos (como a plataforma em memória)."""
@@ -516,6 +543,7 @@ class ContractsBackendFactory:
         schedules: ScheduleService | None = None,
         webhooks: WebhookService | None = None,
         batches: BatchService | None = None,
+        repairs: RepairService | None = None,
     ) -> None:
         self._catalog = catalog
         self._runs = runs
@@ -524,6 +552,7 @@ class ContractsBackendFactory:
         self._schedules = schedules
         self._webhooks = webhooks
         self._batches = batches
+        self._repairs = repairs
 
     @classmethod
     def from_platform(
@@ -534,6 +563,7 @@ class ContractsBackendFactory:
         schedules: ScheduleService | None = None,
         webhooks: WebhookService | None = None,
         batches: BatchService | None = None,
+        repairs: RepairService | None = None,
     ) -> ContractsBackendFactory:
         return cls(
             platform,
@@ -543,6 +573,7 @@ class ContractsBackendFactory:
             schedules=schedules,
             webhooks=webhooks,
             batches=batches,
+            repairs=repairs,
         )
 
     def __call__(self, session: UiSession) -> ContractsBackend:
@@ -555,6 +586,7 @@ class ContractsBackendFactory:
             schedules=self._schedules,
             webhooks=self._webhooks,
             batches=self._batches,
+            repairs=self._repairs,
         )
 
 
@@ -583,6 +615,8 @@ _PREVIEW: TypeAdapter[BatchPreview] = TypeAdapter(BatchPreview)
 _BATCH: TypeAdapter[BatchInfo] = TypeAdapter(BatchInfo)
 _BATCHES: TypeAdapter[list[BatchInfo]] = TypeAdapter(list[BatchInfo])
 _BATCH_ROWS: TypeAdapter[list[BatchRow]] = TypeAdapter(list[BatchRow])
+_REPAIR: TypeAdapter[RepairView] = TypeAdapter(RepairView)
+_REPAIR_PROPOSAL: TypeAdapter[RepairProposalInfo] = TypeAdapter(RepairProposalInfo)
 
 _MAX_MESSAGE = 500
 _MAX_DETAILS = 50
@@ -976,6 +1010,22 @@ class RestBackend:
             media_type=response.headers.get("content-type", "application/octet-stream"),
             content=response.content,
         )
+
+    # -- consertar ---------------------------------------------------------------------
+
+    async def get_repair(self, run_id: UUID, *, suggest: bool = True) -> RepairView:
+        data = await self._send(
+            "GET",
+            f"/v1/execucoes/{run_id}/conserto",
+            params={"sugestao": "true" if suggest else "false"},
+        )
+        return self._parse(_REPAIR, data)
+
+    async def create_repair(self, run_id: UUID, candidate_id: str) -> RepairProposalInfo:
+        data = await self._send(
+            "POST", f"/v1/execucoes/{run_id}/conserto", json_body={"candidato": candidate_id}
+        )
+        return self._parse(_REPAIR_PROPOSAL, data)
 
     @staticmethod
     def _json(response: httpx2.Response) -> Any:

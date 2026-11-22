@@ -46,6 +46,11 @@ autor), e as ocorrências, entregas e lotes só aceitam inclusões. O despachant
 lê a fila das agendas (empresa, identificador, ligada, próxima ocorrência e
 arquivada): as ocorrências viram execuções pelo papel da aplicação, numa
 transação fixada na empresa da agenda.
+
+As tabelas do conserto (revisão 0005: retratos das falhas e consertos pedidos)
+têm o bloco :func:`repair_grants_sql`. O despachante só inclui os retratos, junto
+com o resultado da execução; a aplicação lê os retratos e lê e inclui os consertos.
+As duas só aceitam inclusões.
 """
 
 import os
@@ -59,6 +64,7 @@ __all__ = [
     "all_grants_sql",
     "grants_sql",
     "publishing_grants_sql",
+    "repair_grants_sql",
     "session_grants_sql",
 ]
 
@@ -150,6 +156,18 @@ _PUBLISHING_TABLES = (
 )
 
 
+_REPAIR_APP_GRANTS = """
+GRANT SELECT ON run_snapshots TO {role};
+GRANT SELECT, INSERT ON repair_proposals TO {role};
+"""
+
+_REPAIR_DISPATCHER_GRANTS = """
+GRANT INSERT ON run_snapshots TO {role};
+"""
+
+_REPAIR_TABLES = ("run_snapshots", "repair_proposals")
+
+
 def _block(
     role: str, grants: str, *, tables: tuple[str, ...] = (), what: str = "das sessões"
 ) -> str:
@@ -198,6 +216,20 @@ def publishing_grants_sql(roles: RoleNames) -> list[str]:
     ]
 
 
+def repair_grants_sql(roles: RoleNames) -> list[str]:
+    """Permissões dos retratos das falhas e dos consertos (revisão 0005), se existirem."""
+    what = "do conserto"
+    return [
+        _block(roles.app, _REPAIR_APP_GRANTS, tables=_REPAIR_TABLES, what=what),
+        _block(roles.dispatcher, _REPAIR_DISPATCHER_GRANTS, tables=_REPAIR_TABLES, what=what),
+    ]
+
+
 def all_grants_sql(roles: RoleNames) -> list[str]:
     """Todas as permissões, das tabelas que existirem na revisão atual do banco."""
-    return [*grants_sql(roles), *session_grants_sql(roles), *publishing_grants_sql(roles)]
+    return [
+        *grants_sql(roles),
+        *session_grants_sql(roles),
+        *publishing_grants_sql(roles),
+        *repair_grants_sql(roles),
+    ]
