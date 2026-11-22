@@ -103,6 +103,11 @@ async def _protected(ctx: UiContext, request: Request, active: str, body: _Body)
         # O primeiro login cria a pessoa sem papel: ela só vê o pedido para ganhar um.
         no_role_frame(viewer)
         return None
+    try:
+        # Os nomes da empresa e das áreas, para o cabeçalho e para o corpo da página.
+        await viewer.load_names()
+    except NotAuthenticated:
+        return ctx.login_redirect(request, expired=True)
     main = page_frame(viewer, active)
     with main:
         content = ui.column().classes("w-full gap-4")
@@ -340,7 +345,6 @@ async def _catalog(viewer: Viewer, query: str) -> None:
 async def _robots(viewer: Viewer) -> None:
     backend = await viewer.backend()
     robots = await backend.list_robots()
-    settings = viewer.ctx.settings
     ui.label("Robôs").classes("text-h5")
     with ui.card().classes("w-full").mark("lista-robos"):
         if not robots:
@@ -356,7 +360,7 @@ async def _robots(viewer: Viewer) -> None:
                     )
                     ui.label(
                         f"{robot.slug} · {ROBOT_STATUS_LABELS[robot.status]} · {published} · "
-                        f"{settings.area_label(robot.area_id)}"
+                        f"{viewer.area_label(robot.area_id)}"
                     ).classes("text-caption")
                 ui.button(
                     "Abrir",
@@ -367,7 +371,6 @@ async def _robots(viewer: Viewer) -> None:
 
 def _create_version_card(viewer: Viewer, robots: list[RobotInfo]) -> None:
     principal = viewer.principal
-    settings = viewer.ctx.settings
     areas = creator_areas(principal, [r.area_id for r in robots])
     anywhere = can_create_anywhere(principal)
     if not areas and not anywhere:
@@ -378,7 +381,7 @@ def _create_version_card(viewer: Viewer, robots: list[RobotInfo]) -> None:
             "Cole o manifesto do robô em JSON. Se já existir um robô com o mesmo nome técnico "
             "na área, a versão entra como a próxima dele."
         ).classes("text-caption")
-        options = {str(area): settings.area_label(area) for area in areas}
+        options = {str(area): viewer.area_label(area) for area in areas}
         area_select = (
             ui.select(options, label="Área", value=next(iter(options), None))
             .classes("w-96")
@@ -430,8 +433,7 @@ async def _robot(viewer: Viewer, robot_id: str, versao: str) -> None:
     versions = await backend.list_versions(robot_uuid)
     ui.label(robot.title).classes("text-h5").mark("titulo-robo")
     ui.label(
-        f"{robot.slug} · {ROBOT_STATUS_LABELS[robot.status]} · "
-        f"{viewer.ctx.settings.area_label(robot.area_id)}"
+        f"{robot.slug} · {ROBOT_STATUS_LABELS[robot.status]} · {viewer.area_label(robot.area_id)}"
     ).classes("text-caption")
     if not versions:
         _not_found("Este robô ainda não tem versões.")
@@ -479,11 +481,15 @@ def _versions_card(
                     ).props("flat dense").mark(f"ver-versao-{version.version_no}")
 
 
+def _counts_approvals(version: RobotVersionInfo) -> bool:
+    """Se a contagem ("1 de 2 aprovações") aparece: só quando a versão precisa de mais de
+    uma aprovação (o certificado A1). Com uma só, a aprovação já publica."""
+    return version.status is VersionStatus.VALIDATED and version.approvals_required > 1
+
+
 def _approvals_text(version: RobotVersionInfo) -> str:
     """O trecho "1 de 2 aprovações" de uma versão validada que ainda espera aprovação."""
-    if version.status is not VersionStatus.VALIDATED or not (
-        version.approvals or version.approvals_required > 1
-    ):
+    if not _counts_approvals(version):
         return ""
     return f" · {len(version.approvals)} de {version.approvals_required} aprovações"
 
@@ -538,9 +544,10 @@ def _approval_card(
                 ui.label(reason).classes("text-warning").mark("motivo-validar")
         elif version.status is VersionStatus.VALIDATED:
             required = version.approvals_required
-            ui.label(f"{len(version.approvals)} de {required} aprovações").mark(
-                "contagem-aprovacoes"
-            )
+            if _counts_approvals(version):
+                ui.label(f"{len(version.approvals)} de {required} aprovações").mark(
+                    "contagem-aprovacoes"
+                )
             if version.approvals:
                 ui.label(f"Aprovada até agora por: {', '.join(version.approvals)}").classes(
                     "text-caption"

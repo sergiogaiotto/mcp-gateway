@@ -10,13 +10,15 @@ navegador, do mesmo tamanho, que só mede a página.
 
 import asyncio
 import http.server
+import inspect
 import socket
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import uvicorn
@@ -40,9 +42,9 @@ from rapa.fixtures.portal import DEFAULT_PASSWORD, DEFAULT_TOTP_SECRET, DEFAULT_
 from rapa.fixtures.server import HOST_RESOLVER_ARG, RunningPortal
 from rapa.recorder import InputEvent, Recording
 from rapa.ui.app import create_ui
-from rapa.ui.auth import DevLogin, DevProfile, UiAuth
-from rapa.ui.backend import ContractsBackendFactory
-from rapa.ui.context import UiSettings
+from rapa.ui.auth import DevLogin, DevProfile, UiAuth, UiSession
+from rapa.ui.backend import Backend, ContractsBackendFactory
+from rapa.ui.context import BackendFactory, UiSettings
 from tests.control.api.support import DictResolver
 
 pytestmark = pytest.mark.browser
@@ -55,8 +57,39 @@ def _free_port() -> int:
         return port
 
 
+class _AwaitingBackend:
+    """Como o backend do serviço de verdade (o PostgreSQL ou a API REST): cada chamada
+    espera de fato, e o laço de eventos roda as outras tarefas da página no meio (o
+    ``ui.timer``, que espera a conexão e deixa o NiceGUI responder antes do fim).
+
+    A plataforma em memória responde sem nunca devolver o controle ao laço, e assim a
+    página sempre sai inteira, o que esconde o que acontece no serviço.
+    """
+
+    def __init__(self, inner: Backend, delay_s: float = 0.05) -> None:
+        self._inner = inner
+        self._delay_s = delay_s
+
+    def __getattr__(self, name: str) -> Any:
+        attribute = getattr(self._inner, name)
+        if not inspect.iscoroutinefunction(attribute):
+            return attribute
+
+        async def call(*args: Any, **kwargs: Any) -> Any:
+            await asyncio.sleep(self._delay_s)
+            return await attribute(*args, **kwargs)
+
+        return call
+
+
+def _awaiting(factory: BackendFactory) -> Callable[[UiSession], Backend]:
+    return lambda session: cast(Backend, _AwaitingBackend(factory(session)))
+
+
 @contextmanager
-def _serve(chromium: str, sessions_dir: Path) -> Iterator[tuple[str, MemorySessionStore]]:
+def _serve(
+    chromium: str, sessions_dir: Path, *, awaiting: bool = False
+) -> Iterator[tuple[str, MemorySessionStore]]:
     saved = {name: mod for name, mod in sys.modules.items() if name.split(".")[0] == "rapa"}
     try:
         with nicegui_reset_globals():
@@ -90,9 +123,12 @@ def _serve(chromium: str, sessions_dir: Path) -> Iterator[tuple[str, MemorySessi
                 ),
                 sessions=sessions,
             )
+            factory: BackendFactory = ContractsBackendFactory.from_platform(
+                platform, sessions=sessions
+            )
             create_ui(
                 app,
-                backend_factory=ContractsBackendFactory.from_platform(platform, sessions=sessions),
+                backend_factory=_awaiting(factory) if awaiting else factory,
                 auth=UiAuth(
                     dev=DevLogin([DevProfile("criadora", "Criadora", creator)]),
                     cookie_secure=False,
@@ -227,6 +263,64 @@ async def test_live_view_in_a_real_browser_types_accents_and_secrets(
     for secret in (DEFAULT_USER, DEFAULT_PASSWORD, DEFAULT_TOTP_SECRET):
         assert secret not in text
     # O perfil do navegador da nuvem foi apagado no fim.
+    assert list((tmp_path / "sessoes").iterdir()) == []
+
+
+#: Os estilos que fazem um botão parecer com os outros da página (os do Quasar).
+_BUTTON_LOOK = """b => {
+  const s = getComputedStyle(b);
+  return [s.textTransform, s.fontWeight, s.fontSize, s.borderRadius, s.minHeight, s.boxShadow];
+}"""
+_PRIMARY = """() => {
+  const probe = document.createElement('div');
+  probe.className = 'bg-primary';
+  document.body.append(probe);
+  const color = getComputedStyle(probe).backgroundColor;
+  probe.remove();
+  return color;
+}"""
+
+
+@pytest.mark.parametrize("awaiting", [False, True], ids=["memoria", "como-o-servico"])
+async def test_live_view_starts_when_the_backend_really_awaits(
+    chromium_path: str, portal_v1: RunningPortal, tmp_path: Path, awaiting: bool
+) -> None:
+    """A tela ao vivo começa também quando o backend espera de verdade (o serviço).
+
+    Com o ``ui.timer`` do tempo restante já criado, um ``await`` faz o NiceGUI responder
+    antes de a página terminar; o que entra depois por ``ui.add_body_html`` não roda.
+    O bilhete e os scripts precisam estar na página que sai.
+    """
+    with _serve(chromium_path, tmp_path / "sessoes", awaiting=awaiting) as (base_url, store):
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(
+                executable_path=chromium_path, args=[HOST_RESOLVER_ARG]
+            )
+            try:
+                page = await browser.new_page(viewport={"width": 1200, "height": 900})
+                page.set_default_timeout(20_000)
+                await page.goto(f"{base_url}/gravar")
+                await page.get_by_role("button", name="Entrar como Criadora").click()
+                await page.get_by_label("Endereço inicial").fill(f"{portal_v1.base_url}/login")
+                await page.get_by_role("button", name="Começar a gravar").click()
+                await expect(page.get_by_text("Tempo restante:")).to_be_visible()
+                canvas = page.locator('canvas[aria-label="Tela do navegador da gravação"]')
+                await expect(canvas).to_be_visible(timeout=30_000)
+                address = page.get_by_label("Endereço da página")
+                await expect(address).to_have_value(f"{portal_v1.base_url}/login", timeout=30_000)
+                # O botão "Ir" da barra de endereço tem a cara dos outros botões da página.
+                go = page.get_by_role("button", name="Ir", exact=True)
+                stop = page.get_by_role("button", name="Parar e revisar")
+                assert await go.evaluate(_BUTTON_LOOK) == await stop.evaluate(_BUTTON_LOOK)
+                background = await go.evaluate("b => getComputedStyle(b).backgroundColor")
+                assert background == await page.evaluate(_PRIMARY)
+                assert await go.evaluate("b => getComputedStyle(b).color") == "rgb(255, 255, 255)"
+                await stop.click()
+                await expect(page.get_by_text("Revisar:")).to_be_visible(timeout=30_000)
+            finally:
+                await browser.close()
+    [record] = store.sessions.values()
+    assert record.status is RecordingSessionStatus.STOPPED
     assert list((tmp_path / "sessoes").iterdir()) == []
 
 

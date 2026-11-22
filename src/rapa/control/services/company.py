@@ -18,6 +18,9 @@ de comando):
   qualquer caminho que mexa em ``memberships`` ou ``users``.
 - Empresa congelada: dá para tirar papéis e desativar pessoas (só diminui o acesso),
   mas não dar papéis, reativar nem criar ou renomear áreas.
+- **Nomes** (:meth:`PgCompanyAdmin.visible_names`): qualquer pessoa da empresa vê o nome
+  dela e os das áreas em que tem algum papel (todas, com um papel na empresa), para a
+  interface e ``GET /v1/eu`` mostrarem "Fiscal" em vez do identificador. Só leitura.
 - **Consumo** (:func:`company_usage`): por área e por origem, num mês do fuso
   ``America/Sao_Paulo``, pela data em que a execução foi pedida. Vê quem administra a
   empresa e quem tem o papel ``auditor`` (na empresa inteira: todas as áreas; numa área:
@@ -90,6 +93,7 @@ from rapa.core.contracts import (
     RunTrigger,
     TriggerUsage,
     UsageReport,
+    VisibleNames,
 )
 from rapa.core.ids import new_id
 
@@ -504,6 +508,22 @@ class PgCompanyAdmin(PgService):
         async with self.db.tenant_session(principal.company_id) as session:
             rows = (await session.execute(query)).all()
         return [AreaInfo(area_id=r[0], name=r[1], created_at=r[2]) for r in rows]
+
+    async def visible_names(self, principal: Principal) -> VisibleNames:
+        allowed = visible_areas(principal)
+        query = (
+            select(areas.c.id, areas.c.name)
+            .where(areas.c.company_id == principal.company_id)
+            .order_by(areas.c.name, areas.c.id)
+        )
+        if allowed is not None:
+            query = query.where(areas.c.id.in_(allowed))
+        async with self.db.tenant_session(principal.company_id) as session:
+            name = await session.scalar(
+                select(companies.c.name).where(companies.c.id == principal.company_id)
+            )
+            rows = (await session.execute(query)).all() if allowed != [] else []
+        return VisibleNames(company_name=name, area_names={r[0]: r[1] for r in rows})
 
     async def usage(self, principal: Principal, month: str | None = None) -> UsageReport:
         if principal.has_role(Role.AUDITOR):

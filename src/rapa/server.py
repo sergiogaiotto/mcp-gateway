@@ -153,6 +153,8 @@ class ServerSettings(BaseModel):
     oidc_client_secret: str | None = Field(default=None, repr=False)
     oidc_redirect_uri: str | None = None
     cookie_secure: bool = True
+    #: A documentação da API REST (``/v1/docs`` e ``/v1/openapi.json``); desligada por padrão.
+    api_docs: bool = False
     mcp_allowed_origins: frozenset[str] = frozenset()
     #: Origens da interface aceitas no websocket da visão ao vivo, além da de ``public_url``.
     live_allowed_origins: tuple[str, ...] = ()
@@ -259,6 +261,10 @@ class ServerSettings(BaseModel):
           enxerga a subpasta da própria empresa, e arquivos soltos na raiz não valem;
         - ``RAPA_MCP_ORIGENS`` (separadas por vírgula), ``RAPA_LIMITE_POR_SEGUNDO``
           (0 desliga) e ``RAPA_COOKIE_SEGURO``;
+        - ``RAPA_DOCS_API`` (1 ou 0; desligada por padrão): a documentação da API REST em
+          ``/v1/docs`` (o Swagger UI, servido pelo próprio serviço, sem CDN) e o
+          documento OpenAPI em ``/v1/openapi.json``. Os dois respondem sem token: mostram
+          as rotas, nunca dados (cada chamada pela página ainda pede o token);
         - sessões de gravação (a demonstração no navegador da nuvem): ``RAPA_SESSOES``
           (1 ou 0; liga por padrão), ``RAPA_SESSOES_POR_EMPRESA`` (abertas ao mesmo tempo
           por empresa; padrão 2, nunca mais que metade de ``RAPA_SESSOES_MAX``),
@@ -325,6 +331,7 @@ class ServerSettings(BaseModel):
             "oidc_client_secret": env.get("RAPA_OIDC_CLIENT_SECRET") or None,
             "oidc_redirect_uri": env.get("RAPA_OIDC_REDIRECT_URI") or None,
             "cookie_secure": _flag(env, "RAPA_COOKIE_SEGURO", True),
+            "api_docs": _flag(env, "RAPA_DOCS_API", False),
             "chromium": env.get("RAPA_CHROMIUM_PATH") or None,
             "browser_args": tuple(shlex.split(env.get("RAPA_ARGS_NAVEGADOR", ""))),
             "files_dir": _path(env, "RAPA_PASTA_ARQUIVOS"),
@@ -952,6 +959,7 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
                 mcp_allowed_origins=settings.mcp_allowed_origins,
                 live_allowed_origins=settings.live_allowed_origins,
                 rate_limit_per_s=settings.rate_limit_per_s,
+                api_docs=settings.api_docs,
             ),
             sessions=sessions,
             publishing=publishing,

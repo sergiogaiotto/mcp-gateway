@@ -17,10 +17,12 @@ from uuid import UUID
 import httpx2
 import pytest
 from fastapi import FastAPI
+from playwright.async_api import async_playwright, expect
 from sqlalchemy import text
 
 from rapa.control.auth import TokenVerifier
 from rapa.control.db import Database
+from rapa.control.http_app import SWAGGER_UI_DIR
 from rapa.control.mcp import McpGateway
 from rapa.control.services import Dispatcher, PgPlatform, ReapReport
 from rapa.core.contracts import Forbidden, Role, RunnerJob, VersionStatus
@@ -168,6 +170,69 @@ def test_publishing_configuration(tmp_path: Path) -> None:
     publishing = app.state.publishing
     assert publishing.schedules.max_enabled_per_company == 30
     assert publishing.webhooks.gate.lookups_per_s == 50.0
+
+
+async def test_api_docs_are_off_by_default_and_served_by_the_service(tmp_path: Path) -> None:
+    base = {
+        "RAPA_DATABASE_URL": DB,
+        "RAPA_DEV": "1",
+        "RAPA_TOKENS_DEV": str(_tokens(tmp_path)),
+        "RAPA_UI": "0",
+    }
+    assert not ServerSettings.from_env(base).api_docs
+    with pytest.raises(ValueError, match="RAPA_DOCS_API"):
+        ServerSettings.from_env({**base, "RAPA_DOCS_API": "talvez"})
+    async with asgi_client(create_server_app(ServerSettings.from_env(base))) as client:
+        for path in ("/v1/docs", "/v1/openapi.json", "/v1/docs/estatico/swagger-ui.css"):
+            assert (await client.get(path)).status_code == 404, path
+    app = create_server_app(ServerSettings.from_env({**base, "RAPA_DOCS_API": "1"}))
+    async with asgi_client(app) as client:
+        page = await client.get("/v1/docs")
+        assert page.status_code == 200
+        # O Swagger UI vem do próprio serviço (nada de CDN), sem o validador público.
+        assert "cdn.jsdelivr.net" not in page.text and "https://" not in page.text
+        assert '"validatorUrl": null' in page.text
+        for asset, kind in (
+            ("swagger-ui-bundle.js", "javascript"),
+            ("swagger-ui.css", "text/css"),
+            ("favicon-32x32.png", "image/png"),
+        ):
+            assert f"/v1/docs/estatico/{asset}" in page.text
+            served = await client.get(f"/v1/docs/estatico/{asset}")
+            assert served.status_code == 200 and kind in served.headers["content-type"], asset
+        # As licenças do código de terceiros que o webpack juntou no bundle vêm com ele, no
+        # arquivo que a primeira linha do bundle indica.
+        bundle = (SWAGGER_UI_DIR / "swagger-ui-bundle.js").read_text().splitlines()[0]
+        notice = bundle.removeprefix("/*! For license information please see ").split()[0]
+        assert notice == "swagger-ui-bundle.js.LICENSE.txt"
+        served = await client.get(f"/v1/docs/estatico/{notice}")
+        assert served.status_code == 200 and "MIT License" in served.text
+        spec = await client.get("/v1/openapi.json")
+        assert spec.status_code == 200
+        document = spec.json()
+        assert {"/v1/eu", "/v1/catalogo", "/v1/robos"} <= set(document["paths"])
+        # O token entra pelo botão "Authorize" da página: o esquema Bearer está no OpenAPI
+        # e toda rota de /v1 que pede o token o declara. A entrega de um webhook não pede
+        # token (vale a assinatura nos cabeçalhos) e não o declara.
+        scheme = document["components"]["securitySchemes"]["bearer"]
+        assert (scheme["type"], scheme["scheme"]) == ("http", "bearer")
+        operations = [
+            (path, method, operation)
+            for path, item in document["paths"].items()
+            for method, operation in item.items()
+        ]
+        assert len(operations) > 40
+        for path, method, operation in operations:
+            if (method, path) == ("post", "/v1/webhooks/{webhook_id}"):
+                assert "security" not in operation
+            else:
+                assert operation.get("security") == [{"bearer": []}], (method, path)
+        # Declarar o esquema não muda quem confere o cabeçalho: sem token ou com outro
+        # esquema, o mesmo 401 do autenticador, com o desafio Bearer.
+        for headers in ({}, {"Authorization": "Basic dXNlcjpzZW5oYQ=="}):
+            denied = await client.get("/v1/eu", headers=headers)
+            assert denied.status_code == 401, headers
+            assert denied.headers["www-authenticate"].startswith("Bearer"), headers
 
 
 def test_repair_configuration(tmp_path: Path) -> None:
@@ -947,6 +1012,7 @@ def server_process(
             "RAPA_DISPATCHER_DATABASE_URL": pg_database.dispatcher_url,
             "RAPA_DEV": "1",
             "RAPA_COOKIE_SEGURO": "0",
+            "RAPA_DOCS_API": "1",
             "RAPA_TOKENS_DEV": str(_tokens(tmp_path, tokens)),
             "RAPA_PASTA_TRABALHO": str(tmp_path / "trabalho"),
             "RAPA_PASTA_ARTEFATOS": str(tmp_path / "artefatos"),
@@ -1003,6 +1069,16 @@ def test_server_process_serves_api_mcp_and_ui(server_process: str, tokens: dict[
     )
     assert me.status_code == 200, me.text
     assert me.json()["subject"] == operator["sujeito"]
+    # Os nomes que a operadora enxerga: a empresa dela e a única área em que tem papel.
+    assert me.json()["company_name"] == "Servidor"
+    assert list(me.json()["area_names"].values()) == ["Fiscal"]
+    # A documentação da API (RAPA_DOCS_API=1) com a interface montada na mesma aplicação.
+    docs = httpx2.get(f"{server_process}/v1/docs", timeout=5)
+    assert docs.status_code == 200 and "swagger-ui" in docs.text
+    bundle = httpx2.get(f"{server_process}/v1/docs/estatico/swagger-ui-bundle.js", timeout=5)
+    assert bundle.status_code == 200
+    spec = httpx2.get(f"{server_process}/v1/openapi.json", timeout=5).json()
+    assert "/v1/eu" in spec["paths"]
     # Token conhecido, mas sem usuário ativo no banco: sem acesso.
     denied = httpx2.get(
         f"{server_process}/v1/eu", headers={"Authorization": "Bearer token-sem-usuario"}, timeout=5
@@ -1018,3 +1094,40 @@ def test_server_process_serves_api_mcp_and_ui(server_process: str, tokens: dict[
     assert page.status_code == 200
     assert page.url.path == "/entrar"
     assert "RaPA" in page.text
+
+
+@pytest.mark.database
+@pytest.mark.browser
+async def test_api_docs_page_calls_the_api_with_the_token(
+    server_process: str, tokens: dict[str, Any], chromium_path: str
+) -> None:
+    """O "Try it out" de ``/v1/docs`` chama a API com o token informado em "Authorize".
+
+    Sem o esquema de segurança no OpenAPI, a página não tem onde receber o token e toda
+    chamada feita por ela volta 401.
+    """
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(executable_path=chromium_path)
+        try:
+            page = await browser.new_page()
+            page.set_default_timeout(15_000)
+            await page.goto(f"{server_process}/v1/docs")
+            await page.locator(".swagger-ui .opblock").first.wait_for()
+            await page.locator(".auth-wrapper button.authorize").click()
+            dialog = page.locator(".dialog-ux .modal-ux")
+            await dialog.locator("input").fill("token-operadora")
+            await dialog.locator("button.authorize").click()
+            await dialog.locator("button.btn-done").click()
+            operation = page.locator("#operations-default-whoami_v1_eu_get")
+            await operation.locator(".opblock-summary").click()
+            await operation.locator("button.try-out__btn").click()
+            await operation.locator("button.execute").click()
+            response = operation.locator(".live-responses-table .response")
+            await expect(response.locator(".response-col_status")).to_have_text("200")
+            await expect(response.locator(".response-col_description")).to_contain_text(
+                tokens["token-operadora"]["sujeito"]
+            )
+            # O token fica só na página aberta: nada no armazenamento do navegador.
+            assert await page.evaluate("() => window.localStorage.length") == 0
+        finally:
+            await browser.close()

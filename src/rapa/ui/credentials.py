@@ -177,7 +177,7 @@ def _expiring_card(viewer: Viewer, expiring: Sequence[CredentialInfo]) -> None:
             [
                 [
                     c.name,
-                    viewer.ctx.settings.area_label(c.area_id),
+                    viewer.area_label(c.area_id),
                     c.custodian_name or c.custodian_subject or "—",
                     _validity(c),
                     CREDENTIAL_STATUS_LABELS[c.status],
@@ -206,7 +206,7 @@ def _credential_row(viewer: Viewer, info: CredentialInfo) -> None:
             ui.badge(CREDENTIAL_KIND_LABELS[info.kind]).props("outline")
             _status_badge(info)
         details = [
-            f"área: {viewer.ctx.settings.area_label(info.area_id)}",
+            f"área: {viewer.area_label(info.area_id)}",
             f"origem: {info.origin}",
             f"custodiante: {info.custodian_name or info.custodian_subject or '—'}",
             f"validade: {_validity(info)}",
@@ -271,14 +271,13 @@ def _parse_area(text: str) -> UUID | None:
 
 
 def _register_card(viewer: Viewer, areas: Sequence[UUID], *, anywhere: bool = False) -> None:
-    settings = viewer.ctx.settings
     with ui.card().classes("w-full").mark("registrar-credencial"):
         ui.label("Registrar credencial").classes("text-h6")
         ui.label(
             "Guarde o valor no cofre antes; aqui vai só o caminho. O certificado A1 precisa "
             "de um custodiante (outra pessoa, com o papel de custodiante) e da validade."
         ).classes("text-caption")
-        options = {str(a): settings.area_label(a) for a in areas}
+        options = {str(a): viewer.area_label(a) for a in areas}
         area = (
             ui.select(options, label="Área", value=next(iter(options), None))
             .classes("w-96")

@@ -53,6 +53,22 @@
     return node;
   }
 
+  // Um botão com a cara dos botões do Quasar da página (os de ui.button): as mesmas classes
+  // e o mesmo miolo; a cor é uma das do tema (primary, negative...).
+  function quasarButton(text, color, parent) {
+    var button = el("button", {
+      type: "button",
+      "class": "q-btn q-btn-item non-selectable no-outline q-btn--standard q-btn--rectangle " +
+        "bg-" + color + " text-white q-btn--actionable q-focusable q-hoverable"
+    }, parent);
+    el("span", { "class": "q-focus-helper" }, button);
+    var content = el("span", {
+      "class": "q-btn__content text-center col items-center q-anchor--skip justify-center row"
+    }, button);
+    el("span", { "class": "block", text: text }, content);
+    return button;
+  }
+
   function emit(name, value) {
     if (typeof window.emitEvent === "function") window.emitEvent(name, value);
   }
@@ -76,12 +92,12 @@
 
   LiveView.prototype.build = function () {
     var self = this;
-    var bar = el("form", { style: "display:flex;gap:8px;margin-bottom:8px", "aria-label": "Endereço" }, this.root);
+    var bar = el("form", { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px", "aria-label": "Endereço" }, this.root);
     this.address = el("input", {
       type: "text", "aria-label": "Endereço da página", autocomplete: "off",
       style: "flex:1;padding:6px 8px;border:1px solid #bbb;border-radius:4px;font:inherit"
     }, bar);
-    el("button", { type: "submit", text: "Ir", style: "padding:6px 16px" }, bar);
+    quasarButton("Ir", "primary", bar).setAttribute("type", "submit");
     bar.addEventListener("submit", function (e) {
       e.preventDefault();
       var url = self.address.value.trim();

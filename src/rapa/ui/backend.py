@@ -79,11 +79,13 @@ from rapa.core.contracts import (
     UsageReport,
     VersionApprovals,
     ViewerTicket,
+    VisibleNames,
     WebhookChanges,
     WebhookInfo,
     WebhookSecret,
     WebhookService,
     WebhookSpec,
+    WhoAmI,
 )
 from rapa.core.robot import SLUG_PATTERN, CredentialKind, Manifest
 
@@ -281,6 +283,10 @@ class Backend(Protocol):
     async def version_approvals(self, robot_id: UUID, version_no: int) -> VersionApprovals: ...
 
     # -- a empresa: usuários e papéis, áreas e consumo -------------------------------
+
+    async def visible_names(self) -> VisibleNames:
+        """O nome da empresa e os das áreas que a pessoa enxerga (vazios se não houver)."""
+        ...
 
     async def get_company(self) -> CompanyInfo: ...
 
@@ -692,6 +698,11 @@ class ContractsBackend:
             raise BackendUnavailable(COMPANY_OFF)
         return self._company
 
+    async def visible_names(self) -> VisibleNames:
+        if self._company is None:
+            return VisibleNames()
+        return await self._company.visible_names(self._principal)
+
     async def get_company(self) -> CompanyInfo:
         return await self._company_service().get_company(self._principal)
 
@@ -845,6 +856,7 @@ _A1_AUTHORIZATION: TypeAdapter[A1AuthorizationInfo] = TypeAdapter(A1Authorizatio
 _A1_AUTHORIZATIONS: TypeAdapter[list[A1AuthorizationInfo]] = TypeAdapter(list[A1AuthorizationInfo])
 _APPROVALS: TypeAdapter[VersionApprovals] = TypeAdapter(VersionApprovals)
 _COMPANY: TypeAdapter[CompanyInfo] = TypeAdapter(CompanyInfo)
+_WHOAMI: TypeAdapter[WhoAmI] = TypeAdapter(WhoAmI)
 _COMPANY_USER: TypeAdapter[CompanyUser] = TypeAdapter(CompanyUser)
 _COMPANY_USERS: TypeAdapter[list[CompanyUser]] = TypeAdapter(list[CompanyUser])
 _AREA: TypeAdapter[AreaInfo] = TypeAdapter(AreaInfo)
@@ -1339,6 +1351,10 @@ class RestBackend:
         return self._parse(_APPROVALS, data)
 
     # -- a empresa ------------------------------------------------------------------------
+
+    async def visible_names(self) -> VisibleNames:
+        me = self._parse(_WHOAMI, await self._send("GET", "/v1/eu"))
+        return VisibleNames(company_name=me.company_name, area_names=me.area_names)
 
     async def get_company(self) -> CompanyInfo:
         return self._parse(_COMPANY, await self._send("GET", "/v1/empresa"))

@@ -69,10 +69,10 @@ def _status_card(info: CompanyInfo) -> None:
             ui.label(f"Desde {format_datetime(info.status_changed_at)}").classes("text-caption")
 
 
-def _area_name(areas: dict[UUID, str], area_id: UUID | None) -> str:
+def _area_name(viewer: Viewer, areas: dict[UUID, str], area_id: UUID | None) -> str:
     if area_id is None:
         return "Empresa inteira"
-    return areas.get(area_id, f"Área {str(area_id)[:8]}")
+    return areas.get(area_id) or viewer.area_label(area_id)
 
 
 def _user_card(viewer: Viewer, user: CompanyUser, areas: dict[UUID, str]) -> None:
@@ -91,9 +91,9 @@ def _user_card(viewer: Viewer, user: CompanyUser, areas: dict[UUID, str]) -> Non
             ui.label("Sem papéis.").classes("text-caption").mark(f"sem-papeis-{user.user_id}")
         for grant in user.roles:
             with ui.row().classes("items-center gap-2"):
-                ui.label(f"{ROLE_LABELS[grant.role]} · {_area_name(areas, grant.area_id)}").mark(
-                    f"papel-{_grant_marker(user.user_id, grant)}"
-                )
+                ui.label(
+                    f"{ROLE_LABELS[grant.role]} · {_area_name(viewer, areas, grant.area_id)}"
+                ).mark(f"papel-{_grant_marker(user.user_id, grant)}")
                 if grant in mine:
 
                     async def remove(g: RoleGrant = grant) -> None:

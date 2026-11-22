@@ -20,6 +20,7 @@ from rapa.core.contracts import (
     Principal,
     Role,
     RoleGrant,
+    VisibleNames,
 )
 from rapa.ui.backend import RestBackend
 from tests.control.api.support import DictResolver, asgi_client, auth
@@ -159,6 +160,42 @@ async def test_areas_and_usage(api: Api) -> None:
     assert (await client.get("/v1/empresa/consumo", headers=_h("operator"))).status_code == 403
     bad = await client.get("/v1/empresa/consumo?mes=2026-13", headers=_h("admin"))
     assert bad.status_code == 422
+
+
+async def test_whoami_brings_the_names_the_caller_can_see(api: Api, app_db: Database) -> None:
+    """``GET /v1/eu`` traz o nome da empresa e os das áreas que a pessoa enxerga.
+
+    Com papel numa área, só ela; com papel na empresa, todas; nunca as de outra empresa
+    (a empresa B tem uma área com nome próprio, que não aparece para ninguém da A).
+    """
+    a, b = api.a, api.b
+    await PgCompanyAdmin(app_db).rename_area(b.admin, b.other_area_id, "Tesouraria da B")
+    operator = (await api.client.get("/v1/eu", headers=_h("operator"))).json()
+    assert operator["subject"] == a.operator.subject
+    assert operator["company_name"] == "Empresa A"
+    assert operator["area_names"] == {str(a.area_id): "Fiscal"}
+    admin = (await api.client.get("/v1/eu", headers=_h("admin"))).json()
+    assert admin["company_name"] == "Empresa A"
+    assert admin["area_names"] == {str(a.area_id): "Fiscal", str(a.other_area_id): "Jurídico"}
+    other = (await api.client.get("/v1/eu", headers=_h("other"))).json()
+    assert other["company_name"] == "Empresa B"
+    assert other["area_names"] == {
+        str(b.area_id): "Fiscal",
+        str(b.other_area_id): "Tesouraria da B",
+    }
+    for who in ("admin", "operator", "boss", "auditor"):
+        body = (await api.client.get("/v1/eu", headers=_h(who))).text
+        assert "Tesouraria da B" not in body and "Empresa B" not in body
+        assert str(b.area_id) not in body and str(b.company_id) not in body
+    # A interface pelo REST lê os mesmos nomes.
+    names = await RestBackend(api.client, TOKENS["operator"]).visible_names()
+    assert names == VisibleNames(company_name="Empresa A", area_names={a.area_id: "Fiscal"})
+    # Sem a administração da empresa no servidor, os nomes vêm vazios (o resto, igual).
+    app = _app({"operator": a.operator}, None, PgPlatform(app_db))
+    async with asgi_client(app) as client:
+        bare = (await client.get("/v1/eu", headers=_h("operator"))).json()
+    assert bare["subject"] == a.operator.subject
+    assert bare["company_name"] is None and bare["area_names"] == {}
 
 
 async def test_frozen_company_answers_423(api: Api, owner_engine: AsyncEngine) -> None:

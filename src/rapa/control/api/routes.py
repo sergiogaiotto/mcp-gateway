@@ -11,8 +11,9 @@ from dataclasses import dataclass, field
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, Path, Query, Request, Response
+from fastapi import APIRouter, Depends, Header, Path, Query, Request, Response, Security
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 
 from rapa.control.api.artifacts import add_artifact_routes
@@ -44,10 +45,13 @@ from rapa.core.contracts import (
     RunService,
     RunStatus,
     RunTrigger,
+    VisibleNames,
+    WhoAmI,
 )
 from rapa.core.robot import SLUG_PATTERN, Manifest
 
 __all__ = [
+    "BEARER_SCHEME",
     "MAX_IDEMPOTENCY_KEY",
     "ApiServices",
     "CreateRobotBody",
@@ -62,6 +66,15 @@ logger = logging.getLogger(__name__)
 MAX_IDEMPOTENCY_KEY = 200
 _IDEMPOTENCY_KEY = re.compile(r"^[\x21-\x7e]+$")
 _SLUG = re.compile(SLUG_PATTERN)
+#: O token das rotas de ``/v1`` no OpenAPI (o mesmo ``bearer`` do OpenAPI dos robôs): é
+#: por ele que ``/v1/docs`` mostra o botão "Authorize" e manda o token no "Try it out".
+#: Só documenta; quem confere o cabeçalho continua sendo o ``Authenticator``, com as
+#: mesmas respostas (``auto_error=False``: este esquema nunca recusa nada).
+BEARER_SCHEME = HTTPBearer(
+    scheme_name="bearer",
+    description="O token de acesso do RaPA, sem a palavra Bearer (a página a acrescenta).",
+    auto_error=False,
+)
 
 
 class StartRunBody(BaseModel):
@@ -138,7 +151,10 @@ def create_api_router(services: ApiServices) -> APIRouter:
     """Monta as rotas de ``/v1`` sobre os serviços informados."""
     router = APIRouter(prefix="/v1")
 
-    async def current_principal(request: Request) -> Principal:
+    async def current_principal(
+        request: Request,
+        _bearer: Annotated[HTTPAuthorizationCredentials | None, Security(BEARER_SCHEME)],
+    ) -> Principal:
         principal = await services.authenticator.authenticate(request.headers.get("authorization"))
         if services.limiter is not None:
             services.limiter.check(principal.company_id)
@@ -208,10 +224,22 @@ def create_api_router(services: ApiServices) -> APIRouter:
 
     # -- quem está chamando ----------------------------------------------------
 
-    @router.get("/eu", response_model=Principal)
-    async def whoami(principal: Annotated[Principal, caller_dep]) -> Principal:
-        """O principal autenticado, com os papéis na empresa e em cada área."""
-        return principal
+    @router.get("/eu", response_model=WhoAmI)
+    async def whoami(principal: Annotated[Principal, caller_dep]) -> WhoAmI:
+        """O principal autenticado, com os papéis na empresa e em cada área.
+
+        Também os nomes que ele pode ver: o da empresa (``company_name``) e os das áreas
+        em que tem algum papel, ou de todas com um papel na empresa (``area_names``).
+        Sem a administração da empresa no servidor, os nomes vêm vazios.
+        """
+        names = (
+            await services.company.visible_names(principal)
+            if services.company is not None
+            else VisibleNames()
+        )
+        return WhoAmI.model_validate(
+            {**principal.model_dump(), **names.model_dump()},
+        )
 
     # -- execuções ----------------------------------------------------------
 
