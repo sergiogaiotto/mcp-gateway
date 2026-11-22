@@ -143,6 +143,7 @@ def test_publishing_configuration(tmp_path: Path) -> None:
     ):
         with pytest.raises(ValueError, match=field):
             ServerSettings.from_env({**base, **env})
+
     # Sem a chave, o serviço sobe sem webhooks; com ela, os três serviços existem.
     app = create_server_app(ServerSettings.from_env({**base, "RAPA_UI": "0"}))
     assert app.state.publishing.webhooks is None and app.state.publishing.schedules is not None
@@ -167,6 +168,20 @@ def test_publishing_configuration(tmp_path: Path) -> None:
     publishing = app.state.publishing
     assert publishing.schedules.max_enabled_per_company == 30
     assert publishing.webhooks.gate.lookups_per_s == 50.0
+
+
+def test_repair_configuration(tmp_path: Path) -> None:
+    base = {"RAPA_DATABASE_URL": DB, "RAPA_DEV": "1", "RAPA_TOKENS_DEV": str(_tokens(tmp_path))}
+    assert ServerSettings.from_env(base).repair_candidates == 8
+    settings = ServerSettings.from_env({**base, "RAPA_CONSERTO_CANDIDATOS": "3"})
+    assert settings.repair_candidates == 3
+    for value in ("0", "21"):
+        with pytest.raises(ValueError, match="repair_candidates"):
+            ServerSettings.from_env({**base, "RAPA_CONSERTO_CANDIDATOS": value})
+    app = create_server_app(
+        ServerSettings.from_env({**base, "RAPA_UI": "0", "RAPA_CONSERTO_CANDIDATOS": "3"})
+    )
+    assert app.state.repairs.limit == 3 and app.state.repairs.assistant is None
 
 
 def test_dispatcher_gets_the_scheduler(tmp_path: Path) -> None:

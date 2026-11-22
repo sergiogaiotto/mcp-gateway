@@ -62,6 +62,7 @@ from rapa.ui.publishing import (
     webhooks_page,
 )
 from rapa.ui.recording import live_page, record_page, review_page
+from rapa.ui.repair import can_repair, repair_page
 
 #: Quantas execuções a tela Execuções mostra.
 RECENT_RUNS = 50
@@ -157,6 +158,10 @@ def register_pages(ctx: UiContext) -> None:
     @ui.page("/execucoes/{run_id}", title=f"Execução · {name}", response_timeout=timeout)
     async def run_detail_page(request: Request, run_id: str) -> Response | None:
         return await _protected(ctx, request, "execucoes", lambda v: _run_detail(v, run_id))
+
+    @ui.page("/execucoes/{run_id}/conserto", title=f"Consertar · {name}", response_timeout=timeout)
+    async def run_repair_page(request: Request, run_id: str) -> Response | None:
+        return await _protected(ctx, request, "execucoes", lambda v: repair_page(v, run_id))
 
     @ui.page("/ao-vivo", title=f"Gravar · {name}", response_timeout=timeout)
     async def live_redirect(request: Request) -> Response:
@@ -860,3 +865,13 @@ async def _run_detail(viewer: Viewer, run_id: str) -> None:
         return
     ui.label("Execução").classes("text-h5")
     RunPanel(viewer, status).build()
+    if can_repair(status):
+        with ui.row().classes("items-center gap-2"):
+            ui.button(
+                "Consertar este passo",
+                on_click=lambda: ui.navigate.to(f"/execucoes/{status.run_id}/conserto"),
+            ).mark("consertar")
+            ui.label(
+                "O elemento de um passo não foi encontrado: escolha o elemento novo entre os "
+                "da página na hora da falha."
+            ).classes("text-caption")

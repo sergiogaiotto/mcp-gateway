@@ -10,7 +10,8 @@ Funções para o despachante, todas recebendo uma sessão sem empresa (papel
 - :func:`heartbeat` renova a concessão da tentativa atual;
 - :func:`ingest_events` grava eventos do executor, idempotente por
   ``(run_id, seq)``;
-- :func:`finish` grava o resultado do executor;
+- :func:`finish` grava o resultado do executor (e, numa falha do alvo de um
+  passo, o retrato da página que o executor tirou, em ``run_snapshots``);
 - :func:`reap_expired` recolhe concessões vencidas: volta para a fila só o que
   não começou nenhum passo que grava (ver a regra abaixo).
 
@@ -45,7 +46,9 @@ quando está gravado para esta tentativa, com o mesmo conteúdo.
 :class:`PgRunQueue` embrulha cada função na sua própria transação.
 """
 
+import hashlib
 import json
+import logging
 from collections import defaultdict
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -77,6 +80,7 @@ from rapa.control.db.schema import (
     recording_sessions,
     robot_versions,
     run_events,
+    run_snapshots,
     runs,
 )
 from rapa.control.db.session import Database
@@ -93,6 +97,7 @@ from rapa.core.contracts import (
 )
 from rapa.core.events import RunEvent, RunEventKind
 from rapa.core.robot import Effect, Manifest
+from rapa.core.snapshot import MAX_SNAPSHOT_BYTES, SNAPSHOT_ERROR_CODES, PageSnapshot
 
 __all__ = [
     "DEFAULT_LEASE",
@@ -113,6 +118,8 @@ __all__ = [
     "ingest_events",
     "reap_expired",
 ]
+
+logger = logging.getLogger(__name__)
 
 #: Chave da trava consultiva que serializa as admissões (um único despachante
 #: decide por vez, em transações curtas).
@@ -191,6 +198,9 @@ class RunnerOutcome(BaseModel):
     irreversible_started: bool = False
     steps_done: int = Field(default=0, ge=0)
     artifacts: list[ArtifactInfo] = Field(default_factory=list)
+    #: O retrato da página no passo que falhou (conferido à parte: um retrato inválido
+    #: nunca derruba o resultado, só fica de fora).
+    failure_snapshot: Any = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -695,6 +705,36 @@ async def ingest_events(
     return len(new)
 
 
+def _snapshot_row(outcome: RunnerOutcome, state: RunState) -> dict[str, Any] | None:
+    """O retrato da falha, conferido de novo, como linha de ``run_snapshots`` (ou ``None``).
+
+    Só para uma execução que não deu certo, num dos códigos do retrato; o que não passa
+    na validação, ou é grande demais, fica de fora (e o resultado é gravado do mesmo
+    jeito). Só o tipo do erro vai para o log.
+    """
+    raw = outcome.failure_snapshot
+    if raw is None or state is RunState.SUCCEEDED:
+        return None
+    try:
+        snapshot = PageSnapshot.model_validate(raw)
+    except ValidationError:
+        logger.warning("retrato inválido no resultado de %s; fica de fora", outcome.run_id)
+        return None
+    if snapshot.error_code not in SNAPSHOT_ERROR_CODES:
+        return None
+    data = snapshot.model_dump(mode="json")
+    canonical = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    if len(canonical.encode()) > MAX_SNAPSHOT_BYTES:
+        logger.warning("retrato grande demais no resultado de %s; fica de fora", outcome.run_id)
+        return None
+    return {
+        "step_id": snapshot.step_id,
+        "error_code": snapshot.error_code,
+        "snapshot": data,
+        "snapshot_sha256": hashlib.sha256(canonical.encode()).hexdigest(),
+    }
+
+
 def _final_state(reported: RunState, irreversible: bool) -> RunState:
     if reported is RunState.SUCCEEDED:
         return RunState.SUCCEEDED
@@ -770,6 +810,13 @@ async def finish(
     if run["write_started_at"] is None and outcome.irreversible_started:
         values["write_started_at"] = now
     await session.execute(update(runs).where(runs.c.id == run_id).values(**values))
+    snapshot = _snapshot_row(outcome, state)
+    if snapshot is not None:
+        await session.execute(
+            insert(run_snapshots).values(
+                company_id=run["company_id"], run_id=run_id, attempt=attempt, **snapshot
+            )
+        )
     await audit.append(
         session,
         company_id=run["company_id"],

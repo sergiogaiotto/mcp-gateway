@@ -221,7 +221,10 @@ def test_run_result_json_shape_matches_interface() -> None:
         "irreversible_started",
         "steps_done",
         "artifacts",
+        # O retrato da página no passo que falhou (o conserto); só numa falha do alvo.
+        "failure_snapshot",
     }
+    assert data["failure_snapshot"] is None
     assert data["state"] == "succeeded"
     assert set(data["artifacts"][0]) == {"kind", "name", "path", "size", "sha256"}
     assert RunResult.model_validate_json(result.model_dump_json()) == result

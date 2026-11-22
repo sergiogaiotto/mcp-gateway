@@ -9,7 +9,9 @@ plataforma em memória (:mod:`rapa.fixtures.memory`):
 - :class:`PgProvisioning`, cadastro de empresas, áreas, usuários e vínculos;
 - :mod:`~rapa.control.services.queue` e :class:`Dispatcher`, fila e despacho;
 - publicar: :class:`PgSchedules` e :class:`Scheduler` (agendas), :class:`PgWebhooks`
-  (webhooks) e :class:`PgBatches` (lote por planilha).
+  (webhooks) e :class:`PgBatches` (lote por planilha);
+- consertar: :class:`PgRepairs` (o passo que quebrou, com os candidatos do retrato e
+  a sugestão do modelo).
 """
 
 from typing import TYPE_CHECKING
@@ -33,12 +35,14 @@ from rapa.control.services.queue import (
     RunnerOutcome,
     StaleAttempt,
 )
+from rapa.control.services.repairs import HubRepairAssistant, PgRepairs
 from rapa.control.services.robots import PgRobotAdmin, PgRobotCatalog
 from rapa.control.services.runs import PgRunService
 from rapa.control.services.schedules import PgSchedules, Scheduler
 from rapa.control.services.webhooks import PgWebhooks, WebhookKeys
 from rapa.core.contracts import (
     BatchService,
+    RepairService,
     RobotAdmin,
     RobotCatalog,
     RunService,
@@ -51,11 +55,13 @@ __all__ = [
     "ChainReport",
     "Dispatcher",
     "EventConflict",
+    "HubRepairAssistant",
     "Launcher",
     "PgBatches",
     "PgPlatform",
     "PgPrincipalResolver",
     "PgProvisioning",
+    "PgRepairs",
     "PgRobotAdmin",
     "PgRobotCatalog",
     "PgRunQueue",
@@ -95,3 +101,6 @@ if TYPE_CHECKING:
     ) -> tuple[ScheduleService, WebhookService, WebhookReceiver, BatchService, Ticker]:
         webhooks = PgWebhooks(db, keys)
         return PgSchedules(db), webhooks, webhooks, PgBatches(db), Scheduler(db, db)
+
+    def _repair_conforms(db: Database) -> RepairService:
+        return PgRepairs(db)

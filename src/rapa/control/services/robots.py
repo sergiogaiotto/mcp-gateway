@@ -40,6 +40,7 @@ __all__ = [
     "PgRobotCatalog",
     "company_published_query",
     "fold_text",
+    "insert_version",
     "published_query",
     "published_robot",
 ]
@@ -119,6 +120,95 @@ async def published_robot(
     return row
 
 
+async def insert_version(
+    session: AsyncSession, principal: Principal, area_id: UUID, manifest: Manifest
+) -> RobotVersionInfo:
+    """Cria a próxima versão (rascunho) do robô dentro da transação de ``session``.
+
+    O mesmo caminho para quem grava, para a revisão da gravação e para o conserto:
+    só quem cria robôs na área cria versões, o portão de política roda e as violações
+    ficam na versão (que então não pode ser validada), e a criação entra na auditoria.
+    Quem criou a versão nunca a publica.
+    """
+    if not principal.has_role(Role.CREATOR, area_id):
+        raise Forbidden("só quem cria robôs nesta área pode criar versões")
+    violations = [v.message for v in policy.check(manifest)]
+    fingerprint = manifest.fingerprint()
+    company_id = principal.company_id
+    area = await session.scalar(
+        select(areas.c.id).where(areas.c.id == area_id, areas.c.company_id == company_id)
+    )
+    if area is None:
+        raise NotFound("área não encontrada")
+    await session.execute(
+        pg_insert(robots)
+        .values(
+            id=new_id(),
+            company_id=company_id,
+            area_id=area_id,
+            slug=manifest.name,
+            title=manifest.title,
+            status=RobotStatus.DRAFT.value,
+        )
+        .on_conflict_do_nothing(index_elements=["company_id", "slug"])
+    )
+    robot = (
+        (
+            await session.execute(
+                select(robots)
+                .where(robots.c.company_id == company_id, robots.c.slug == manifest.name)
+                .with_for_update()
+            )
+        )
+        .mappings()
+        .one()
+    )
+    if robot["area_id"] != area_id:
+        raise Conflict("já existe um robô com este nome em outra área")
+    robot_id: UUID = robot["id"]
+    last = await session.scalar(
+        select(func.coalesce(func.max(robot_versions.c.version_no), 0)).where(
+            robot_versions.c.robot_id == robot_id
+        )
+    )
+    version_no = int(last or 0) + 1
+    row = (
+        (
+            await session.execute(
+                insert(robot_versions)
+                .values(
+                    id=new_id(),
+                    company_id=company_id,
+                    robot_id=robot_id,
+                    version_no=version_no,
+                    status=VersionStatus.DRAFT.value,
+                    manifest=manifest.model_dump(mode="json"),
+                    fingerprint=fingerprint,
+                    violations=violations,
+                    created_by=principal.subject,
+                )
+                .returning(*_VERSION_COLUMNS)
+            )
+        )
+        .mappings()
+        .one()
+    )
+    await session.execute(
+        update(robots)
+        .where(robots.c.id == robot_id)
+        .values(title=manifest.title, updated_at=func.now())
+    )
+    await audit.append(
+        session,
+        company_id=company_id,
+        actor=principal.subject,
+        action="robo.versao_criada",
+        target=f"robo:{robot_id}/versao:{version_no}",
+        payload={"impressao": fingerprint, "violacoes": len(violations)},
+    )
+    return version_info(robot_id, row)
+
+
 class PgRobotAdmin(PgService):
     """Ciclo de vida rascunho → validado → publicado (:class:`RobotAdmin`)."""
 
@@ -177,84 +267,8 @@ class PgRobotAdmin(PgService):
     async def create_version(
         self, principal: Principal, area_id: UUID, manifest: Manifest
     ) -> RobotVersionInfo:
-        if not principal.has_role(Role.CREATOR, area_id):
-            raise Forbidden("só quem cria robôs nesta área pode criar versões")
-        violations = [v.message for v in policy.check(manifest)]
-        fingerprint = manifest.fingerprint()
-        company_id = principal.company_id
-        async with self.db.tenant_session(company_id) as session:
-            area = await session.scalar(
-                select(areas.c.id).where(areas.c.id == area_id, areas.c.company_id == company_id)
-            )
-            if area is None:
-                raise NotFound("área não encontrada")
-            await session.execute(
-                pg_insert(robots)
-                .values(
-                    id=new_id(),
-                    company_id=company_id,
-                    area_id=area_id,
-                    slug=manifest.name,
-                    title=manifest.title,
-                    status=RobotStatus.DRAFT.value,
-                )
-                .on_conflict_do_nothing(index_elements=["company_id", "slug"])
-            )
-            robot = (
-                (
-                    await session.execute(
-                        select(robots)
-                        .where(robots.c.company_id == company_id, robots.c.slug == manifest.name)
-                        .with_for_update()
-                    )
-                )
-                .mappings()
-                .one()
-            )
-            if robot["area_id"] != area_id:
-                raise Conflict("já existe um robô com este nome em outra área")
-            robot_id: UUID = robot["id"]
-            last = await session.scalar(
-                select(func.coalesce(func.max(robot_versions.c.version_no), 0)).where(
-                    robot_versions.c.robot_id == robot_id
-                )
-            )
-            version_no = int(last or 0) + 1
-            row = (
-                (
-                    await session.execute(
-                        insert(robot_versions)
-                        .values(
-                            id=new_id(),
-                            company_id=company_id,
-                            robot_id=robot_id,
-                            version_no=version_no,
-                            status=VersionStatus.DRAFT.value,
-                            manifest=manifest.model_dump(mode="json"),
-                            fingerprint=fingerprint,
-                            violations=violations,
-                            created_by=principal.subject,
-                        )
-                        .returning(*_VERSION_COLUMNS)
-                    )
-                )
-                .mappings()
-                .one()
-            )
-            await session.execute(
-                update(robots)
-                .where(robots.c.id == robot_id)
-                .values(title=manifest.title, updated_at=func.now())
-            )
-            await audit.append(
-                session,
-                company_id=company_id,
-                actor=principal.subject,
-                action="robo.versao_criada",
-                target=f"robo:{robot_id}/versao:{version_no}",
-                payload={"impressao": fingerprint, "violacoes": len(violations)},
-            )
-        return version_info(robot_id, row)
+        async with self.db.tenant_session(principal.company_id) as session:
+            return await insert_version(session, principal, area_id, manifest)
 
     async def get_version(
         self, principal: Principal, robot_id: UUID, version_no: int

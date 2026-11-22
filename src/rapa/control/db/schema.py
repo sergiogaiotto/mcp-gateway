@@ -39,9 +39,11 @@ __all__ = [
     "platform_settings",
     "recording_sessions",
     "recordings",
+    "repair_proposals",
     "robot_versions",
     "robots",
     "run_events",
+    "run_snapshots",
     "runs",
     "schedule_occurrences",
     "schedules",
@@ -366,6 +368,39 @@ batch_rows = Table(
     Column("run_id", Uuid, nullable=False),
 )
 
+run_snapshots = Table(
+    "run_snapshots",
+    metadata,
+    Column("company_id", Uuid, primary_key=True),
+    Column("run_id", Uuid, primary_key=True),
+    Column("attempt", Integer, primary_key=True),
+    Column("step_id", Text, nullable=False),
+    Column("error_code", Text, nullable=False),
+    Column("snapshot", JSONB, nullable=False),
+    Column("snapshot_sha256", Text, nullable=False),
+    _ts("created_at", nullable=False, server_default=True),
+)
+
+repair_proposals = Table(
+    "repair_proposals",
+    metadata,
+    Column("company_id", Uuid, primary_key=True),
+    Column("id", Uuid, primary_key=True),
+    Column("run_id", Uuid, nullable=False),
+    Column("robot_id", Uuid, nullable=False),
+    Column("step_id", Text, nullable=False),
+    Column("base_version_id", Uuid, nullable=False),
+    Column("base_version_no", Integer, nullable=False),
+    Column("version_id", Uuid, nullable=False),
+    Column("version_no", Integer, nullable=False),
+    Column("candidate_id", Text, nullable=False),
+    Column("candidate", JSONB, nullable=False),
+    Column("model_candidate_id", Text, nullable=True),
+    Column("snapshot_sha256", Text, nullable=False),
+    Column("requested_by", Text, nullable=False),
+    _ts("created_at", nullable=False, server_default=True),
+)
+
 #: Tabelas com dados de empresa (todas com isolamento por linha).
 TENANT_TABLES: tuple[Table, ...] = (
     companies,
@@ -388,4 +423,6 @@ TENANT_TABLES: tuple[Table, ...] = (
     webhook_deliveries,
     batches,
     batch_rows,
+    run_snapshots,
+    repair_proposals,
 )
