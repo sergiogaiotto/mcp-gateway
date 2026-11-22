@@ -1,7 +1,7 @@
 """Retenção: artefatos que expiram, retratos e chaves vencidas apagados, eventos antigos.
 
 Revisão: 0008
-Anterior: 0005 (durante o desenvolvimento; na integração, a 0007)
+Anterior: 0007
 
 - ``runs.artifacts_expired_at``: quando os arquivos dos artefatos da execução foram
   todos apagados pela retenção (prazo das evidências). ``runs.captures_expired_at``:
@@ -32,8 +32,15 @@ Anterior: 0005 (durante o desenvolvimento; na integração, a 0007)
   não abre nada: as políticas e a trava são só do dono.
 - ``run_snapshots`` continua só de inclusões, mas a trava aceita a exclusão feita
   pela função (o dono, com a marca ``run_snapshots``) de um retrato com mais de um
-  dia. A trava fica com o mesmo nome (``run_snapshots_append_only``) e passa a usar a
-  função própria ``rapa_run_snapshots_append_only``.
+  dia, e a saída da empresa (o dono com ``rapa.purge_company`` da empresa da linha,
+  :func:`rapa_purge_allowed` da revisão 0007, como as outras travas). A trava fica com
+  o mesmo nome (``run_snapshots_append_only``) e passa a usar a função própria
+  ``rapa_run_snapshots_append_only``.
+- Empresa congelada fica de fora da retenção (as evidências ficam para a exportação da
+  saída da empresa): as funções não apagam retratos nem chaves dela, e uma partição de
+  eventos com algum evento dela não é removida. Para ler a situação das empresas e os
+  eventos, o dono tem as políticas ``retention_sweep_read`` em ``companies`` e em
+  ``run_events``, só de leitura e só com a marca de uma das funções.
 
 As execuções que já existem perdem o caminho do disco: ``runs.artifacts`` fica sem
 ``path`` e a saída de um download (a referência inteira do artefato) vira o nome dele.
@@ -50,12 +57,18 @@ from alembic import op
 from rapa.control.db.roles import RoleNames, retention_grants_sql
 
 revision: str = "0008"
-down_revision: str | None = "0005"
+down_revision: str | None = "0007"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 #: Tabelas que as funções da retenção apagam, cada uma com a marca da sua função.
 _SWEPT = ("run_snapshots", "idempotency_keys")
+#: As marcas que deixam o dono ler a situação das empresas (para pular a congelada).
+_MARKERS = ("run_snapshots", "idempotency_keys", "run_events")
+#: A linha (de ``o``) é de uma empresa congelada: a retenção não a toca.
+_FROZEN = (
+    "EXISTS (SELECT 1 FROM public.companies AS c WHERE c.id = o.company_id AND c.status = 'frozen')"
+)
 _FUNCTIONS = (
     "rapa_purge_run_snapshots(integer, integer)",
     "rapa_purge_idempotency_keys(integer)",
@@ -200,6 +213,21 @@ def _sweep_policies() -> list[str]:
                 FOR DELETE TO CURRENT_USER USING ({marker})
             """,
         ]
+    markers = ", ".join(f"'{marker}'" for marker in _MARKERS)
+    statements += [
+        # A situação das empresas (pular a congelada), para as três funções.
+        f"""
+        CREATE POLICY retention_sweep_read ON companies
+            FOR SELECT TO CURRENT_USER
+            USING (current_setting('rapa.retention', true) IN ({markers}))
+        """,
+        # Os eventos (uma partição com evento de empresa congelada fica), pela tabela-mãe.
+        """
+        CREATE POLICY retention_sweep_read ON run_events
+            FOR SELECT TO CURRENT_USER
+            USING (current_setting('rapa.retention', true) = 'run_events')
+        """,
+    ]
     return statements
 
 
@@ -207,7 +235,8 @@ def _snapshots() -> list[str]:
     return [
         "CREATE INDEX run_snapshots_created ON run_snapshots (created_at)",
         # A trava continua recusando tudo, menos a exclusão feita pela função da
-        # retenção: o dono das tabelas, com a marca dela, num retrato com mais de um dia.
+        # retenção (o dono das tabelas, com a marca dela, num retrato com mais de um dia)
+        # e a saída da empresa (o dono, com rapa.purge_company da empresa da linha).
         """
         CREATE FUNCTION rapa_run_snapshots_append_only() RETURNS trigger
             LANGUAGE plpgsql AS $$
@@ -219,6 +248,9 @@ def _snapshots() -> list[str]:
                 )
                 AND OLD.created_at < now() - interval '1 day'
             THEN
+                RETURN OLD;
+            END IF;
+            IF TG_OP = 'DELETE' AND public.rapa_purge_allowed(TG_RELID, OLD.company_id) THEN
                 RETURN OLD;
             END IF;
             RAISE EXCEPTION USING ERRCODE = 'check_violation',
@@ -240,7 +272,7 @@ def _functions() -> list[str]:
     # apagar e tira a marca logo depois, também numa falha no meio. A marca só vale para o
     # dono: as políticas retention_sweep_* e a trava dos retratos conferem o papel.
     return [
-        """
+        f"""
         CREATE FUNCTION rapa_purge_run_snapshots(older_than_days integer, batch_size integer)
             RETURNS TABLE (company_id uuid, run_id uuid, attempt integer)
             LANGUAGE plpgsql SECURITY DEFINER
@@ -265,6 +297,7 @@ def _functions() -> list[str]:
                            SELECT o.company_id, o.run_id, o.attempt
                              FROM public.run_snapshots AS o
                             WHERE o.created_at < now() - make_interval(days => older_than_days)
+                              AND NOT {_FROZEN}
                             ORDER BY o.created_at
                             LIMIT batch_size)
                     RETURNING s.company_id, s.run_id, s.attempt
@@ -277,8 +310,8 @@ def _functions() -> list[str]:
             PERFORM set_config('rapa.retention', '', true);
         END
         $$
-        """,
-        """
+        """,  # noqa: S608 - só as constantes deste módulo
+        f"""
         CREATE FUNCTION rapa_purge_idempotency_keys(batch_size integer) RETURNS integer
             LANGUAGE plpgsql SECURITY DEFINER
             SET search_path = pg_catalog, public
@@ -297,6 +330,7 @@ def _functions() -> list[str]:
                        SELECT o.company_id, o.scope, o.key
                          FROM public.idempotency_keys AS o
                         WHERE o.expires_at < now()
+                          AND NOT {_FROZEN}
                         ORDER BY o.expires_at
                         LIMIT batch_size);
                 GET DIAGNOSTICS deleted = ROW_COUNT;
@@ -308,10 +342,10 @@ def _functions() -> list[str]:
             RETURN deleted;
         END
         $$
-        """,
+        """,  # noqa: S608 - só as constantes deste módulo
         # Os nomes das partições são os de rapa_ensure_event_partitions
         # (run_events_AAAA_MM, de um mês cada, em UTC); a mesma trava consultiva dela.
-        """
+        f"""
         CREATE FUNCTION rapa_drop_event_partitions(older_than_days integer) RETURNS integer
             LANGUAGE plpgsql SECURITY DEFINER
             SET search_path = pg_catalog, public
@@ -319,6 +353,7 @@ def _functions() -> list[str]:
         AS $$
         DECLARE
             part text;
+            month_start timestamptz;
             month_end timestamptz;
             dropped integer := 0;
         BEGIN
@@ -327,24 +362,39 @@ def _functions() -> list[str]:
                     MESSAGE = 'older_than_days deve estar entre 1 e 36500';
             END IF;
             PERFORM pg_advisory_xact_lock(7103, 0);
-            FOR part IN
-                SELECT c.relname
-                  FROM pg_inherits i
-                  JOIN pg_class c ON c.oid = i.inhrelid
-                 WHERE i.inhparent = 'public.run_events'::regclass
-                   AND c.relname ~ '^run_events_[0-9]{4}_[0-9]{2}$'
-                 ORDER BY c.relname
-            LOOP
-                month_end := to_timestamp(substr(part, 12, 7), 'YYYY_MM') + interval '1 month';
-                IF month_end <= now() - make_interval(days => older_than_days) THEN
-                    EXECUTE format('DROP TABLE public.%I', part);
-                    dropped := dropped + 1;
-                END IF;
-            END LOOP;
+            PERFORM set_config('rapa.retention', 'run_events', true);
+            BEGIN
+                FOR part IN
+                    SELECT c.relname
+                      FROM pg_inherits i
+                      JOIN pg_class c ON c.oid = i.inhrelid
+                     WHERE i.inhparent = 'public.run_events'::regclass
+                       AND c.relname ~ '^run_events_[0-9]{{4}}_[0-9]{{2}}$'
+                     ORDER BY c.relname
+                LOOP
+                    month_start := to_timestamp(substr(part, 12, 7), 'YYYY_MM');
+                    month_end := month_start + interval '1 month';
+                    -- Uma partição com algum evento de empresa congelada fica (a exportação
+                    -- da saída da empresa ainda precisa dele).
+                    IF month_end <= now() - make_interval(days => older_than_days)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM public.run_events AS o
+                             WHERE o.at >= month_start AND o.at < month_end AND {_FROZEN}
+                        )
+                    THEN
+                        EXECUTE format('DROP TABLE public.%I', part);
+                        dropped := dropped + 1;
+                    END IF;
+                END LOOP;
+            EXCEPTION WHEN OTHERS THEN
+                PERFORM set_config('rapa.retention', '', true);
+                RAISE;
+            END;
+            PERFORM set_config('rapa.retention', '', true);
             RETURN dropped;
         END
         $$
-        """,
+        """,  # noqa: S608 - só as constantes deste módulo
         *(f"REVOKE ALL ON FUNCTION {function} FROM PUBLIC" for function in _FUNCTIONS),
     ]
 
@@ -368,6 +418,10 @@ def downgrade() -> None:
             f"DROP POLICY IF EXISTS retention_sweep_read ON {table}",
             f"DROP POLICY IF EXISTS retention_sweep_delete ON {table}",
         ]
+    statements += [
+        "DROP POLICY IF EXISTS retention_sweep_read ON companies",
+        "DROP POLICY IF EXISTS retention_sweep_read ON run_events",
+    ]
     statements += [
         "DROP TRIGGER run_snapshots_append_only ON run_snapshots",
         """

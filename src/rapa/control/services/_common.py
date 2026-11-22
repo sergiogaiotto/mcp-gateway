@@ -110,10 +110,13 @@ async def ensure_company_active(session: AsyncSession, company_id: UUID) -> None
     É a função única da regra "congelada: lê tudo, mas nada novo acontece", chamada no
     começo de toda escrita: enfileirar execuções (``enqueue_run`` e ``enqueue_many``,
     que cobrem REST, MCP, interface, agenda, webhook e lote), criar, validar e publicar
-    versões, criar e mudar agendas, webhooks e lotes, abrir sessão de gravação e pedir
-    conserto. Sem a empresa, ``NotFound`` (falha fechada). No banco, o gatilho
-    ``rapa_company_active_guard`` recusa a linha nova dessas tabelas mesmo de um caminho
-    que esqueça esta chamada (migração 0007).
+    versões (cada aprovação, no certificado A1), criar e mudar agendas, webhooks e lotes,
+    abrir sessão de gravação, pedir conserto e, no certificado A1, registrar e renovar
+    credenciais e autorizar robôs. O que só diminui o acesso (revogar uma credencial ou
+    uma autorização, tirar papéis) toma só :func:`lock_company_status`. Sem a empresa,
+    ``NotFound`` (falha fechada). No banco, o gatilho ``rapa_company_active_guard`` recusa
+    a linha nova dessas tabelas mesmo de um caminho que esqueça esta chamada (migração
+    0007).
     """
     status = await lock_company_status(session, company_id)
     if status is None:

@@ -4,6 +4,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from rapa.control.db import Database
@@ -14,6 +15,7 @@ from rapa.core.contracts import Principal, Role
 __all__ = [
     "audit_actions",
     "company_counts",
+    "copy_row",
     "freeze",
     "person",
     "set_company_rows",
@@ -94,3 +96,48 @@ async def set_company_rows(
         if bypass_guards:
             await conn.execute(text("SET LOCAL session_replication_role = replica"))
         await conn.execute(text(statement), params)
+
+
+#: Qual linha copiar, quando nem toda linha da tabela pode ser incluída de novo: uma
+#: versão nova sempre nasce rascunho (o gatilho das aprovações da revisão 0006 recusa
+#: incluir uma versão já publicada antes de a chave primária ser conferida), e só uma
+#: versão validada recebe aprovações.
+_COPYABLE = {
+    "robot_versions": "status = 'draft'",
+    "version_approvals": (
+        "EXISTS (SELECT 1 FROM robot_versions v WHERE v.company_id = version_approvals.company_id"
+        " AND v.robot_id = version_approvals.robot_id"
+        " AND v.version_no = version_approvals.version_no AND v.status = 'validated')"
+    ),
+}
+
+
+async def copy_row(db: Database, company: Any, table: str) -> tuple[str | None, str]:
+    """Inclui, como a aplicação e sem os serviços, a cópia de uma linha da empresa.
+
+    Devolve o código do erro (``None`` se passou) e a mensagem. A cópia repete a chave
+    primária: numa empresa ativa, quem recusa é a chave (23505); o gatilho da empresa
+    congelada roda antes dela (23514).
+    """
+    where = f"AND {_COPYABLE[table]} " if table in _COPYABLE else ""
+    async with db.tenant_session(company) as probe:
+        columns = await probe.scalar(
+            text(
+                "SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum) FROM pg_attribute "
+                "WHERE attrelid = to_regclass('public.' || :t) AND attnum > 0 "
+                "AND NOT attisdropped AND attgenerated = ''"
+            ),
+            {"t": table},
+        )
+    try:
+        async with db.tenant_session(company) as session:
+            await session.execute(
+                text(
+                    f"INSERT INTO {table} ({columns}) SELECT {columns} FROM {table} "  # noqa: S608
+                    f"WHERE company_id = :c {where}LIMIT 1"
+                ),
+                {"c": company},
+            )
+    except DBAPIError as exc:
+        return getattr(exc.orig, "sqlstate", None), str(exc.orig)
+    return None, ""

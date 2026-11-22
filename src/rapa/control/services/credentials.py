@@ -32,7 +32,10 @@ Regras:
   por credencial e dia.
 
 Outra empresa ou outra área: ``NotFound``. Toda mudança entra na auditoria, sem o
-caminho no cofre.
+caminho no cofre. Empresa congelada
+(:func:`rapa.control.services._common.ensure_company_active`): registrar, renovar e
+autorizar são recusados (``CompanyFrozen``); revogar a credencial ou uma autorização
+continua valendo (só tira acesso); ler também.
 """
 
 import builtins
@@ -57,7 +60,13 @@ from rapa.control.db.schema import (
 )
 from rapa.control.db.session import Database
 from rapa.control.services import audit
-from rapa.control.services._common import PgService, now_utc, visible_areas
+from rapa.control.services._common import (
+    PgService,
+    ensure_company_active,
+    lock_company_status,
+    now_utc,
+    visible_areas,
+)
 from rapa.control.services.a1 import (
     ALERT_BATCH,
     DEFAULT_WARN_DAYS,
@@ -357,6 +366,7 @@ class PgCredentials(PgService):
             )
         credential_id = new_id()
         async with self.db.tenant_session(company_id) as session:
+            await ensure_company_active(session, company_id)
             area = await session.scalar(
                 select(areas.c.id).where(areas.c.id == area_id, areas.c.company_id == company_id)
             )
@@ -481,6 +491,7 @@ class PgCredentials(PgService):
             errors.append(str(exc))
         _check_not_after(not_after, now, errors)
         async with self.db.tenant_session(principal.company_id) as session:
+            await ensure_company_active(session, principal.company_id)
             row = await self._load(session, principal, credential_id, lock=True)
             if not self._is_custodian(principal, row):
                 raise Forbidden("só o custodiante do certificado renova a validade")
@@ -525,9 +536,14 @@ class PgCredentials(PgService):
         return self._info(principal, row, now)
 
     async def revoke(self, principal: Principal, credential_id: UUID) -> CredentialInfo:
-        """Revoga a credencial (custodiante ou administrador da área) e as autorizações dela."""
+        """Revoga a credencial (custodiante ou administrador da área) e as autorizações dela.
+
+        Vale também com a empresa congelada: revogar só tira acesso.
+        """
         now = self.clock()
         async with self.db.tenant_session(principal.company_id) as session:
+            # Só a trava da situação (a ordem de sempre das travas), sem recusar a congelada.
+            await lock_company_status(session, principal.company_id)
             row = await self._load(session, principal, credential_id, lock=True)
             if not (
                 self._is_custodian(principal, row)
@@ -603,6 +619,7 @@ class PgCredentials(PgService):
         company_id = principal.company_id
         now = self.clock()
         async with self.db.tenant_session(company_id) as session:
+            await ensure_company_active(session, company_id)
             robot = await self._robot(session, principal, robot_id, lock=True)
             area_id: UUID = robot["area_id"]
             credential = (
@@ -755,11 +772,13 @@ class PgCredentials(PgService):
     ) -> A1AuthorizationInfo:
         """Revoga a autorização (o custodiante do certificado ou quem administra a área).
 
-        Com ``robot_id``, a autorização precisa ser desse robô (senão, ``NotFound``).
+        Com ``robot_id``, a autorização precisa ser desse robô (senão, ``NotFound``). Vale
+        também com a empresa congelada: revogar só tira acesso.
         """
         company_id = principal.company_id
         now = self.clock()
         async with self.db.tenant_session(company_id) as session:
+            await lock_company_status(session, company_id)
             row = (
                 (
                     await session.execute(

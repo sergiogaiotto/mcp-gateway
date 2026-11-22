@@ -39,7 +39,7 @@ from tests.control.publishing.support import (
 from tests.control.sessions.support import FakeLauncher
 from tests.repair.support import login_page
 
-from .support import audit_actions, freeze
+from .support import audit_actions, copy_row, freeze
 
 pytestmark = pytest.mark.database
 
@@ -415,7 +415,8 @@ async def test_freeze_waits_for_writes_in_progress(
         await world.platform.start(a.operator, SLUG, PROTOCOLO_INPUTS, RunTrigger.REST)
 
 
-#: As tabelas em que o banco recusa uma linha nova de empresa congelada.
+#: As tabelas em que o banco recusa uma linha nova de empresa congelada (as do
+#: certificado A1, da revisão 0006, ficam em ``test_parts.py``).
 _FROZEN_GUARDED = (
     "runs",
     "robots",
@@ -426,38 +427,6 @@ _FROZEN_GUARDED = (
     "recording_sessions",
     "repair_proposals",
 )
-
-
-async def _copy_row(db: Database, company: Any, table: str) -> tuple[str | None, str]:
-    """Inclui, como a aplicação e sem os serviços, a cópia de uma linha da empresa.
-
-    Devolve o código do erro (``None`` se passou) e a mensagem. A cópia repete a chave
-    primária: numa empresa ativa, quem recusa é a chave (23505); o gatilho da empresa
-    congelada roda antes dela (23514).
-    """
-    from sqlalchemy.exc import DBAPIError
-
-    async with db.tenant_session(company) as probe:
-        columns = await probe.scalar(
-            text(
-                "SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum) FROM pg_attribute "
-                "WHERE attrelid = to_regclass('public.' || :t) AND attnum > 0 "
-                "AND NOT attisdropped AND attgenerated = ''"
-            ),
-            {"t": table},
-        )
-    try:
-        async with db.tenant_session(company) as session:
-            await session.execute(
-                text(
-                    f"INSERT INTO {table} ({columns}) SELECT {columns} FROM {table} "  # noqa: S608
-                    "WHERE company_id = :c LIMIT 1"
-                ),
-                {"c": company},
-            )
-    except DBAPIError as exc:
-        return getattr(exc.orig, "sqlstate", None), str(exc.orig)
-    return None, ""
 
 
 async def test_database_refuses_new_rows_of_a_frozen_company(
@@ -483,6 +452,8 @@ async def test_database_refuses_new_rows_of_a_frozen_company(
     )
     await world.webhooks.create_webhook(a.operator, robot, WebhookSpec(title="ERP"))
     await world.batches.create_batch(a.operator, robot, "lote.csv", protocol_sheet())
+    # Um rascunho (a versão que se copia: uma versão nova nasce rascunho).
+    await world.platform.create_version(a.creator, a.area_id, protocolo())
     async with superuser_engine.begin() as conn:
         await conn.execute(
             text(
@@ -495,15 +466,15 @@ async def test_database_refuses_new_rows_of_a_frozen_company(
         )
     # Ativa, a cópia só esbarra na chave primária: nenhuma outra trava recusa antes.
     for table in _FROZEN_GUARDED:
-        assert (await _copy_row(app_db, a.company_id, table))[0] == "23505", table
+        assert (await copy_row(app_db, a.company_id, table))[0] == "23505", table
     await freeze(owner_engine, a.company_id)
     for table in _FROZEN_GUARDED:
-        code, message = await _copy_row(app_db, a.company_id, table)
+        code, message = await copy_row(app_db, a.company_id, table)
         assert code == "23514", table
         assert "a empresa está congelada" in message, table
     # A outra empresa nem percebe.
     await world.platform.start(b.operator, SLUG, PROTOCOLO_INPUTS, RunTrigger.REST)
-    assert (await _copy_row(app_db, b.company_id, "runs"))[0] == "23505"
+    assert (await copy_row(app_db, b.company_id, "runs"))[0] == "23505"
 
 
 async def test_database_guard_waits_for_a_freeze_in_progress(
@@ -537,7 +508,7 @@ async def test_database_guard_waits_for_a_freeze_in_progress(
             ),
             {"c": a.company_id},
         )
-        inserting = asyncio.create_task(_copy_row(app_db, a.company_id, "runs"))
+        inserting = asyncio.create_task(copy_row(app_db, a.company_id, "runs"))
         await asyncio.sleep(0.3)
         assert not inserting.done()  # espera a trava de quem congela
     code, message = await inserting

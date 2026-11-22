@@ -68,8 +68,10 @@ async def test_retention_policies_are_only_for_the_owner_reading_and_deleting(
 ) -> None:
     """As únicas políticas fora do isolamento por empresa: as da retenção (revisão 0008).
 
-    Só nas duas tabelas que as funções da retenção apagam, só para ler e apagar (nunca
-    incluir nem mudar), só para o dono das tabelas e só com a marca da função.
+    Nas duas tabelas que as funções da retenção apagam, só para ler e apagar (nunca
+    incluir nem mudar); em ``companies`` e ``run_events``, só para ler (a situação das
+    empresas e os eventos, para pular a empresa congelada). Sempre só para o dono das
+    tabelas e só com a marca de uma das funções.
     """
     async with superuser_engine.connect() as conn:
         rows = (
@@ -84,13 +86,19 @@ async def test_retention_policies_are_only_for_the_owner_reading_and_deleting(
             )
         ).all()
     assert [(row[0], row[1], row[2]) for row in rows] == [
+        ("companies", "retention_sweep_read", "r"),
         ("idempotency_keys", "retention_sweep_delete", "d"),
         ("idempotency_keys", "retention_sweep_read", "r"),
+        ("run_events", "retention_sweep_read", "r"),
         ("run_snapshots", "retention_sweep_delete", "d"),
         ("run_snapshots", "retention_sweep_read", "r"),
     ]
+    markers = "ARRAY['run_snapshots'::text, 'idempotency_keys'::text, 'run_events'::text]"
     for table, _name, _cmd, qual, no_check, roles in rows:
-        assert qual == f"(current_setting('rapa.retention'::text, true) = '{table}'::text)"
+        if table == "companies":
+            assert qual == f"(current_setting('rapa.retention'::text, true) = ANY ({markers}))"
+        else:
+            assert qual == f"(current_setting('rapa.retention'::text, true) = '{table}'::text)"
         assert no_check
         assert roles == [pg_database.owner]
 

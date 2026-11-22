@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from rapa.control.db.schema import (
     a1_authorizations,
+    companies,
     credential_alerts,
     credentials,
     robot_versions,
@@ -36,7 +37,7 @@ from rapa.control.db.schema import (
     users,
 )
 from rapa.control.services import audit
-from rapa.core.contracts import CertificateBlocked, RunnerJob, uses_a1
+from rapa.core.contracts import CertificateBlocked, CompanyStatus, RunnerJob, uses_a1
 from rapa.core.cron import DEFAULT_TIMEZONE, load_zone
 from rapa.core.robot import CredentialKind, CredentialRef, Manifest
 
@@ -313,7 +314,9 @@ async def record_expiry_alerts(
 
     Roda na sessão do despachante (todas as empresas). Cada aviso novo entra na
     auditoria da empresa (``credencial.a1_vencendo`` ou ``credencial.a1_vencida``) e no
-    log, só com o nome da credencial e a data.
+    log, só com o nome da credencial e a data. Empresa congelada não recebe aviso (nada
+    novo acontece nela, nem a renovação que o aviso pede); ao descongelar, o aviso do
+    dia volta na volta seguinte.
     """
     horizon = now + timedelta(days=within_days)
     day = now.astimezone(_ZONE).date()
@@ -349,6 +352,11 @@ async def record_expiry_alerts(
                     credentials.c.revoked_at.is_(None),
                     or_(credentials.c.not_after.is_(None), credentials.c.not_after <= horizon),
                     ~alerted,
+                    credentials.c.company_id.not_in(
+                        select(companies.c.id).where(
+                            companies.c.status == CompanyStatus.FROZEN.value
+                        )
+                    ),
                 )
                 .order_by(credentials.c.not_after.asc().nulls_first(), credentials.c.id)
                 .limit(limit)

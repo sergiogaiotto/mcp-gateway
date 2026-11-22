@@ -34,6 +34,14 @@ Cada execução expirada (as capturas ou tudo) e cada retrato apagado entram na
 auditoria da empresa; a
 remoção de uma partição de eventos, que não é de nenhuma empresa, vai só para o log,
 e as chaves de idempotência vencidas (que já não valiam para nada) só são contadas.
+
+Empresa congelada fica de fora de tudo: nada dela expira enquanto está congelada (as
+evidências ficam para a exportação da saída da empresa, ``docs/OPERACAO.md``). Os
+artefatos são conferidos sob a trava da situação da empresa (a mesma que congelar
+toma), então um congelamento no meio do lote espera ou já é visto; os retratos e as
+chaves, pelas funções do banco, que pulam a empresa congelada; e uma partição de
+eventos com algum evento de empresa congelada não é removida até ela sair dessa
+situação (descongelada ou apagada).
 """
 
 import asyncio
@@ -48,17 +56,17 @@ from sqlalchemy import Column, RowMapping, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rapa.control.artifacts import ArtifactStore
-from rapa.control.db.schema import runs
+from rapa.control.db.schema import companies, runs
 from rapa.control.db.session import Database
 from rapa.control.services import audit
-from rapa.control.services._common import now_utc
+from rapa.control.services._common import lock_company_status, now_utc
 from rapa.control.services.queue import (
     DEFAULT_MAINTENANCE_LOCK_TIMEOUT,
     DEFAULT_MAINTENANCE_STATEMENT_TIMEOUT,
     DISPATCHER_ACTOR,
 )
 from rapa.core.artifacts import is_capture, valid_artifact_name
-from rapa.core.contracts import RunState
+from rapa.core.contracts import CompanyStatus, RunState
 
 __all__ = [
     "MAX_RETENTION_DAYS",
@@ -240,7 +248,12 @@ class Retention:
         mark: Column[Any] = (
             runs.c.captures_expired_at if captures_only else runs.c.artifacts_expired_at
         )
-        pending = [runs.c.artifacts_expired_at.is_(None), mark.is_(None)]
+        frozen = select(companies.c.id).where(companies.c.status == CompanyStatus.FROZEN.value)
+        pending = [
+            runs.c.artifacts_expired_at.is_(None),
+            mark.is_(None),
+            runs.c.company_id.not_in(frozen),
+        ]
         skip = list(report.failed)
         async with self.db.dispatcher_session() as session:
             await self._limit(session)
@@ -254,8 +267,18 @@ class Retention:
             if skip:
                 query = query.where(runs.c.id.not_in(skip))
             rows = (await session.execute(query)).mappings().all()
+            # A empresa congelada depois da busca: a trava da situação (compartilhada, a
+            # que congelar toma exclusiva) espera o congelamento em andamento, e a
+            # situação lida depois dela decide. As linhas da congelada ficam como estão.
+            allowed = {
+                company
+                for company in sorted({row["company_id"] for row in rows})
+                if await lock_company_status(session, company) is CompanyStatus.ACTIVE
+            }
             expired: list[Any] = []
             for row in rows:
+                if row["company_id"] not in allowed:
+                    continue
                 keep = _downloads(row) if captures_only else ()
                 try:
                     await self.store.delete_run(row["company_id"], row["id"], keep=keep)

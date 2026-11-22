@@ -1,7 +1,7 @@
 """Operação por empresa: situação, vínculo com a organização, consumo e saída.
 
 Revisão: 0007
-Anterior: 0005 (durante o desenvolvimento; a integração encadeia 0006 → 0007 → 0008)
+Anterior: 0006
 
 - ``companies`` ganha a situação (``status``: ``active`` ou ``frozen``, com o motivo
   e o momento da mudança) e o vínculo com a organização do provedor de identidade
@@ -21,7 +21,8 @@ Anterior: 0005 (durante o desenvolvimento; a integração encadeia 0006 → 0007
   de empresa congelada.
 - Empresa congelada também no banco: ``rapa_company_active_guard`` (``BEFORE INSERT``)
   recusa linha nova de empresa congelada em execuções, robôs, versões, agendas,
-  webhooks, lotes, sessões de gravação e consertos, mesmo de um caminho que esqueceu
+  webhooks, lotes, sessões de gravação, consertos e, da revisão 0006, credenciais,
+  autorizações do custodiante e aprovações de versões, mesmo de um caminho que esqueceu
   ``ensure_company_active``. Antes de ler a situação, toma a mesma trava consultiva
   (compartilhada, classe 7130) que toda escrita toma: espera um congelamento em
   andamento e vê a empresa já congelada. A linha só é lida se for visível (a da
@@ -39,11 +40,13 @@ Anterior: 0005 (durante o desenvolvimento; a integração encadeia 0006 → 0007
   tabela). Sem isolamento por empresa e sem permissão para os papéis da aplicação e
   do despachante: só o dono lê e escreve. Só aceita inclusões.
 - Apagar uma empresa: as travas de "só inclusões" (auditoria, gravações, ocorrências,
-  entregas, lotes, retratos, consertos) e as que proíbem apagar (versões, sessões de
-  gravação, agendas, webhooks) passam a aceitar a exclusão de uma linha só quando a
-  transação é do dono da tabela e marcou ``SET LOCAL rapa.purge_company`` com a
-  empresa da linha (``rapa_purge_allowed``). Nada muda para os papéis da aplicação e
-  do despachante, que nem são donos das tabelas.
+  entregas, lotes, retratos, consertos e, da 0006, aprovações e avisos de vencimento) e
+  as que proíbem apagar (versões, sessões de gravação, agendas, webhooks e as
+  autorizações do custodiante da 0006) passam a aceitar a exclusão de uma linha só
+  quando a transação é do dono da tabela e marcou ``SET LOCAL rapa.purge_company`` com
+  a empresa da linha (``rapa_purge_allowed``). Nada muda para os papéis da aplicação e
+  do despachante, que nem são donos das tabelas. (A trava própria dos retratos, da
+  revisão 0008, segue a mesma regra.)
 - O consumo mensal lê ``runs`` pelo índice ``runs_company_created`` e ``batches`` por
   ``batches_company_created``; as sessões de gravação ganham
   ``recording_sessions_company_created``.
@@ -56,7 +59,7 @@ from alembic import op
 from rapa.control.db.roles import RoleNames, company_grants_sql, company_revoke_sql
 
 revision: str = "0007"
-down_revision: str | None = "0005"
+down_revision: str | None = "0006"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -216,6 +219,39 @@ def _delete_guard(message: str, *, purge: bool) -> str:
             END IF;"""
 
 
+def _a1_authorizations_guard(*, purge: bool) -> str:
+    """A trava das autorizações do custodiante (revisão 0006), com a saída da empresa."""
+    start = _delete_guard(
+        "autorizações do certificado A1 não podem ser apagadas; revogue-as", purge=purge
+    )
+    return f"""
+        CREATE OR REPLACE FUNCTION rapa_a1_authorizations_guard() RETURNS trigger
+            LANGUAGE plpgsql AS $$
+        BEGIN{start}
+            IF NEW.company_id IS DISTINCT FROM OLD.company_id
+                OR NEW.id IS DISTINCT FROM OLD.id
+                OR NEW.area_id IS DISTINCT FROM OLD.area_id
+                OR NEW.robot_id IS DISTINCT FROM OLD.robot_id
+                OR NEW.credential_id IS DISTINCT FROM OLD.credential_id
+                OR NEW.origin IS DISTINCT FROM OLD.origin
+                OR NEW.fingerprint_sha256 IS DISTINCT FROM OLD.fingerprint_sha256
+                OR NEW.authorized_by IS DISTINCT FROM OLD.authorized_by
+                OR NEW.created_at IS DISTINCT FROM OLD.created_at
+                OR NEW.revoked_at IS NULL
+            THEN
+                RAISE EXCEPTION USING ERRCODE = 'check_violation',
+                    MESSAGE = 'uma autorização do certificado A1 só muda para ser revogada';
+            END IF;
+            IF OLD.revoked_at IS NOT NULL THEN
+                RAISE EXCEPTION USING ERRCODE = 'check_violation',
+                    MESSAGE = 'uma autorização do certificado A1 revogada não muda mais';
+            END IF;
+            RETURN NEW;
+        END
+        $$
+        """
+
+
 def _robot_versions_guard(*, purge: bool) -> str:
     start = _delete_guard("versões de robô não podem ser apagadas", purge=purge)
     return f"""
@@ -349,6 +385,9 @@ def _webhooks_guard(*, purge: bool) -> str:
 
 
 #: Tabelas em que uma linha nova é "algo novo acontecendo" (recusada com a empresa congelada).
+#: As três últimas são as do certificado A1 (revisão 0006): registrar uma credencial,
+#: autorizar um robô e aprovar uma versão. Os avisos de vencimento (``credential_alerts``)
+#: não entram: o despachante só não os registra para a empresa congelada.
 _FROZEN_GUARDED = (
     "runs",
     "robots",
@@ -358,6 +397,9 @@ _FROZEN_GUARDED = (
     "batches",
     "recording_sessions",
     "repair_proposals",
+    "credentials",
+    "a1_authorizations",
+    "version_approvals",
 )
 
 
@@ -475,12 +517,14 @@ def _drop_company_guards() -> list[str]:
 
 
 def _guards(*, purge: bool) -> list[str]:
+    """As travas que aceitam a saída da empresa (``purge``) ou, na volta, as de antes."""
     return [
         _append_only(purge=purge),
         _robot_versions_guard(purge=purge),
         _recording_sessions_guard(purge=purge),
         _schedules_guard(purge=purge),
         _webhooks_guard(purge=purge),
+        _a1_authorizations_guard(purge=purge),
     ]
 
 

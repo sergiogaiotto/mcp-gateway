@@ -12,11 +12,12 @@ from uuid import UUID, uuid4
 import psycopg
 import pytest
 from alembic import command
+from alembic.script import ScriptDirectory
 from psycopg import sql
 from sqlalchemy.pool import NullPool
 
 from rapa.control.db import Database, create_engine
-from rapa.control.db.migrate import alembic_config, apply_grants, main, upgrade
+from rapa.control.db.migrate import MIGRATIONS_DIR, alembic_config, apply_grants, main, upgrade
 from rapa.control.db.roles import RoleNames
 from rapa.control.services import PgCredentials, PgPlatform, PgRunQueue
 from rapa.core.contracts import CredentialStatus, Principal, Role, RunTrigger
@@ -81,6 +82,122 @@ def test_downgrade_and_upgrade_again(pg_database: PgDatabase) -> None:
         assert _objects(pg_database, name) == (0, 0)
         upgrade(url, roles=pg_database.roles)
         assert _objects(pg_database, name) == (tables, functions)
+
+
+#: A cadeia das revisões, na ordem: cada uma vem da anterior (uma ponta só).
+_REVISIONS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008")
+
+
+def test_revisions_form_a_single_chain() -> None:
+    script = ScriptDirectory.from_config(alembic_config("postgresql://ninguem@localhost/x"))
+    assert script.get_heads() == [_REVISIONS[-1]]
+    assert [rev.revision for rev in reversed(list(script.walk_revisions()))] == list(_REVISIONS)
+    for previous, current in zip((None, *_REVISIONS), _REVISIONS, strict=False):
+        revision = script.get_revision(current)
+        assert revision is not None and revision.down_revision == previous, current
+    assert {path.name[1:5] for path in (MIGRATIONS_DIR / "versions").glob("v*.py")} == set(
+        _REVISIONS
+    )
+
+
+def _catalog(pg: PgDatabase, database: str) -> dict[str, set[tuple[Any, ...]]]:
+    """O que a migração cria, para comparar duas revisões: tabelas, colunas, restrições,
+    índices, gatilhos, funções (o corpo sem os brancos), políticas e permissões dos papéis
+    de execução."""
+    roles = [pg.roles.app, pg.roles.dispatcher]
+    queries = {
+        "tables": (
+            "SELECT relname, relkind, relrowsecurity, relforcerowsecurity FROM pg_class "
+            "WHERE relnamespace = 'public'::regnamespace AND relkind IN ('r', 'p', 'v') "
+            "AND relname <> 'alembic_version'"
+        ),
+        "columns": (
+            "SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, "
+            "pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a "
+            "JOIN pg_class c ON c.oid = a.attrelid "
+            "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+            "WHERE c.relnamespace = 'public'::regnamespace AND c.relkind IN ('r', 'p') "
+            "AND a.attnum > 0 AND NOT a.attisdropped AND c.relname <> 'alembic_version'"
+        ),
+        "constraints": (
+            "SELECT c.relname, k.conname, pg_get_constraintdef(k.oid), k.convalidated "
+            "FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid "
+            "WHERE c.relnamespace = 'public'::regnamespace AND c.relname <> 'alembic_version'"
+        ),
+        "indexes": (
+            "SELECT indexname, indexdef FROM pg_indexes "
+            "WHERE schemaname = 'public' AND tablename <> 'alembic_version'"
+        ),
+        "triggers": (
+            "SELECT c.relname, t.tgname, pg_get_triggerdef(t.oid) FROM pg_trigger t "
+            "JOIN pg_class c ON c.oid = t.tgrelid "
+            "WHERE c.relnamespace = 'public'::regnamespace AND NOT t.tgisinternal"
+        ),
+        "functions": (
+            "SELECT proname, pg_get_function_identity_arguments(oid), prosecdef, "
+            "coalesce(array_to_string(proconfig, ','), ''), "
+            "md5(regexp_replace(prosrc, '\\s+', '', 'g')), "
+            "coalesce((SELECT string_agg(r.rolname || ':' || a.privilege_type, ',' "
+            "ORDER BY r.rolname, a.privilege_type) FROM aclexplode(proacl) a "
+            "JOIN pg_roles r ON r.oid = a.grantee WHERE r.rolname = ANY(%(roles)s)), '') "
+            "FROM pg_proc WHERE pronamespace = 'public'::regnamespace"
+        ),
+        "policies": (
+            "SELECT c.relname, p.polname, p.polcmd, p.polpermissive, "
+            "array_to_string(array(SELECT pg_get_userbyid(r) FROM unnest(p.polroles) r "
+            "ORDER BY 1), ','), pg_get_expr(p.polqual, p.polrelid), "
+            "pg_get_expr(p.polwithcheck, p.polrelid) FROM pg_policy p "
+            "JOIN pg_class c ON c.oid = p.polrelid"
+        ),
+        "table_grants": (
+            "SELECT c.relname, r.rolname, a.privilege_type "
+            "FROM pg_class c, aclexplode(c.relacl) a JOIN pg_roles r ON r.oid = a.grantee "
+            "WHERE c.relnamespace = 'public'::regnamespace AND r.rolname = ANY(%(roles)s)"
+        ),
+        "column_grants": (
+            "SELECT c.relname, att.attname, r.rolname, a.privilege_type "
+            "FROM pg_attribute att JOIN pg_class c ON c.oid = att.attrelid, "
+            "aclexplode(att.attacl) a JOIN pg_roles r ON r.oid = a.grantee "
+            "WHERE c.relnamespace = 'public'::regnamespace AND att.attacl IS NOT NULL "
+            "AND NOT att.attisdropped AND r.rolname = ANY(%(roles)s)"
+        ),
+    }
+    with pg.server.connect(database) as conn:
+        return {
+            name: {tuple(row) for row in conn.execute(query, {"roles": roles}).fetchall()}
+            for name, query in queries.items()
+        }
+
+
+def test_every_revision_goes_back_exactly_and_up_again(pg_database: PgDatabase) -> None:
+    """De 0001 a 0008, um passo de cada vez: cada volta deixa o banco exatamente como na
+    revisão anterior (tabelas, colunas, restrições, índices, gatilhos, corpos das funções,
+    políticas e permissões), e subir de novo dá o mesmo de antes."""
+    with _scratch_database(pg_database) as name:
+        url = pg_database.server.url(
+            name, pg_database.owner, pg_database.passwords[pg_database.owner]
+        )
+        config = alembic_config(url, pg_database.roles)
+        seen = {"base": _catalog(pg_database, name)}
+        for revision in _REVISIONS:
+            command.upgrade(config, revision)
+            seen[revision] = _catalog(pg_database, name)
+        for previous, revision in reversed(
+            list(zip(("base", *_REVISIONS), _REVISIONS, strict=False))
+        ):
+            command.downgrade(config, previous)
+            back = _catalog(pg_database, name)
+            for part, expected in seen[previous].items():
+                assert back[part] == expected, (
+                    f"{revision} -> {previous}: {part}",
+                    sorted(back[part] ^ expected),
+                )
+            command.upgrade(config, revision)
+            assert _catalog(pg_database, name) == seen[revision], revision
+            command.downgrade(config, previous)
+        assert _objects(pg_database, name) == (0, 0)
+        upgrade(url, roles=pg_database.roles)
+        assert _catalog(pg_database, name) == seen[_REVISIONS[-1]]
 
 
 def test_grants_skip_missing_roles_and_cli_reapplies(pg_database: PgDatabase) -> None:
@@ -657,7 +774,8 @@ _COMPANY_FUNCTIONS = (
     "rapa_platform_events_guard",
     "rapa_purge_allowed",
 )
-#: Os gatilhos da empresa congelada (linhas novas) e do último company_admin ativo.
+#: Os gatilhos da empresa congelada (linhas novas, também nas tabelas do A1 da 0006) e
+#: do último company_admin ativo.
 _COMPANY_TRIGGERS = tuple(
     sorted(
         (
@@ -672,6 +790,9 @@ _COMPANY_TRIGGERS = tuple(
                     "batches",
                     "recording_sessions",
                     "repair_proposals",
+                    "credentials",
+                    "a1_authorizations",
+                    "version_approvals",
                 )
             ),
             "memberships_keep_company_admin",
@@ -766,13 +887,26 @@ def _owner_purges_audit(pg: PgDatabase, database: str, company: str) -> str | No
     return None
 
 
+def _a1_guard_accepts_purge(pg: PgDatabase, database: str) -> bool | None:
+    """Se a trava das autorizações do A1 (revisão 0006) aceita a saída da empresa."""
+    with pg.server.connect(database) as conn:
+        row = conn.execute(
+            "SELECT prosrc LIKE '%%rapa_purge_allowed%%' FROM pg_proc "
+            "WHERE proname = 'rapa_a1_authorizations_guard'"
+        ).fetchone()
+    return None if row is None else bool(row[0])
+
+
 def test_company_operation_migrates_back_and_forth(pg_database: PgDatabase) -> None:
     with _scratch_database(pg_database) as name:
         url = pg_database.server.url(
             name, pg_database.owner, pg_database.passwords[pg_database.owner]
         )
-        upgrade(url, roles=pg_database.roles)
+        config = alembic_config(url, pg_database.roles)
+        # Só a 0007, sobre a 0006 (a 0008 tem o próprio teste).
+        command.upgrade(config, "0007")
         head = _company_schema(pg_database, name)
+        assert _a1_guard_accepts_purge(pg_database, name) is True
         assert head == {
             "columns": list(_COMPANY_COLUMNS),
             "functions": list(_COMPANY_FUNCTIONS),
@@ -795,9 +929,11 @@ def test_company_operation_migrates_back_and_forth(pg_database: PgDatabase) -> N
                 (company, "0" * 64),
             )
             conn.commit()
-        # Na 0007, o dono com a marca apaga; de volta na 0005, a trava antiga recusa.
+        # Na 0007, o dono com a marca apaga; de volta na 0006, a trava antiga recusa.
         assert _owner_purges_audit(pg_database, name, company) is None
-        command.downgrade(alembic_config(url, pg_database.roles), "0005")
+        command.downgrade(config, "0006")
+        # A trava das autorizações do A1 volta a ser a da 0006 (nunca apaga).
+        assert _a1_guard_accepts_purge(pg_database, name) is False
         assert _company_schema(pg_database, name) == {
             "columns": [],
             "functions": [],
@@ -809,8 +945,9 @@ def test_company_operation_migrates_back_and_forth(pg_database: PgDatabase) -> N
             "grants": None,
         }
         assert _owner_purges_audit(pg_database, name, company) == "23514"
-        upgrade(url, roles=pg_database.roles)
+        command.upgrade(config, "0007")
         assert _company_schema(pg_database, name) == head
+        assert _a1_guard_accepts_purge(pg_database, name) is True
         assert _owner_purges_audit(pg_database, name, company) is None
 
 
@@ -901,14 +1038,15 @@ async def test_retention_migrates_back_and_forth_and_takes_paths_out(
                 "rapa_runs_artifacts_guard",
             ],
             "definer": 3,
-            "policies": 4,
+            # Ler e apagar os retratos e as chaves; ler a situação das empresas e os eventos.
+            "policies": 6,
             "snapshot_guard": "rapa_run_snapshots_append_only",
             # Só o despachante executa as funções, e ninguém ganha DELETE nos retratos.
             "execute": (True, False, False),
         }
         run_id = await _legacy_run(pg_database, name)
 
-        command.downgrade(alembic_config(url, pg_database.roles), "0005")
+        command.downgrade(alembic_config(url, pg_database.roles), "0007")
         assert _retention_schema(pg_database, name) == {
             "columns": 0,
             "functions": [],

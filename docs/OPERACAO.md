@@ -42,7 +42,7 @@ A saída é sempre nesta ordem: congelar, exportar, entregar o arquivo, apagar.
 uv run python -m rapa.control.admin empresa congelar ID_DA_EMPRESA --motivo "contrato encerrado"
 ```
 
-Daí em diante a empresa lê tudo, mas nada novo começa (a API responde 423, `empresa_congelada`): nem execução (REST, MCP, interface, agenda, webhook, lote), nem versão, publicação, agenda, webhook, lote, sessão de gravação ou conserto. O banco também recusa a linha nova nessas tabelas, mesmo de um caminho que não passe pelos serviços. As execuções que estavam na fila são canceladas (código `empresa_congelada`); as que estavam rodando terminam normalmente. As agendas registram cada ocorrência como pulada (`empresa_congelada`). Para voltar:
+Daí em diante a empresa lê tudo, mas nada novo começa (a API responde 423, `empresa_congelada`): nem execução (REST, MCP, interface, agenda, webhook, lote), nem versão, publicação (também a aprovação de um robô com certificado A1), agenda, webhook, lote, sessão de gravação ou conserto, nem registrar, renovar ou autorizar um certificado. O banco também recusa a linha nova nessas tabelas, mesmo de um caminho que não passe pelos serviços. Revogar uma credencial ou uma autorização do custodiante continua valendo (só tira acesso), e as evidências continuam abertas para quem vê a execução. As execuções que estavam na fila são canceladas (código `empresa_congelada`); as que estavam rodando terminam normalmente (o despachante nem pega o que sobrar na fila: a conferência do certificado A1 nem chega a rodar). As agendas registram cada ocorrência como pulada (`empresa_congelada`). Enquanto estiver congelada, nada da empresa expira na retenção (telas, vídeos, arquivos baixados, retratos, chaves de idempotência e a partição de eventos em que ela tem eventos) e ela não recebe aviso de vencimento do certificado: tudo fica como estava para a exportação. Para voltar:
 
 ```bash
 uv run python -m rapa.control.admin empresa descongelar ID_DA_EMPRESA
@@ -54,7 +54,7 @@ uv run python -m rapa.control.admin empresa descongelar ID_DA_EMPRESA
 uv run python -m rapa.control.admin empresa exportar ID_DA_EMPRESA --saida empresa.tar.gz
 ```
 
-O arquivo nasce com permissão 0600 e nunca sobrescreve outro. Links simbólicos nas pastas da empresa nunca são seguidos (nem um arquivo trocado por um link no meio da exportação), e o que entra no arquivo é exatamente o que o manifesto confere. Dentro dele: `manifesto.json` (o SHA-256 e o número de linhas de cada arquivo), `tabelas/<tabela>.jsonl` (uma linha por registro, de toda tabela com `company_id`, mais a da empresa) e os arquivos da empresa em `arquivos/` e `artefatos/` (de `RAPA_PASTA_ARQUIVOS/<empresa>` e `RAPA_PASTA_ARTEFATOS/<empresa>`, ou de `--pasta-arquivos` e `--pasta-artefatos`). Material de chave nunca sai: o sal dos webhooks vem como `null`. Confira o manifesto antes de entregar:
+O arquivo nasce com permissão 0600 e nunca sobrescreve outro. Links simbólicos nas pastas da empresa nunca são seguidos (nem um arquivo trocado por um link no meio da exportação), e o que entra no arquivo é exatamente o que o manifesto confere. Dentro dele: `manifesto.json` (o SHA-256 e o número de linhas de cada arquivo), `tabelas/<tabela>.jsonl` (uma linha por registro, de toda tabela com `company_id`, mais a da empresa: também as credenciais, as autorizações do custodiante, as aprovações e os avisos de vencimento do A1, e as execuções com as marcas de artefatos expirados) e os arquivos da empresa em `arquivos/` e `artefatos/` (de `RAPA_PASTA_ARQUIVOS/<empresa>` e `RAPA_PASTA_ARTEFATOS/<empresa>`, ou de `--pasta-arquivos` e `--pasta-artefatos`: as telas, os vídeos e os arquivos baixados que a retenção ainda não apagou). Material de chave nunca sai: o sal dos webhooks vem como `null`; de uma credencial sai só a referência ao cofre e os metadados (o valor nunca passa pelo RaPA). Confira o manifesto antes de entregar:
 
 ```bash
 tar -xzf empresa.tar.gz && sha256sum tabelas/*.jsonl
@@ -68,7 +68,7 @@ Só uma empresa congelada, sem execuções rodando nem sessões de gravação ab
 uv run python -m rapa.control.admin empresa apagar ID_DA_EMPRESA --confirmar "Nome da empresa"
 ```
 
-Antes de apagar, o comando grava em `platform_events` o registro `empresa.apagada` (o id, o SHA-256 do nome, as contagens por tabela, quem pediu e quando). Depois apaga todas as linhas da empresa, das tabelas filhas para as mães, e por fim a empresa, numa transação só; em seguida os arquivos e os artefatos dela, e as chaves próprias (o `KeyDestroyer`; sem o cofre, só registra). Não tem volta: a exportação é a única cópia.
+Antes de apagar, o comando grava em `platform_events` o registro `empresa.apagada` (o id, o SHA-256 do nome, as contagens por tabela, quem pediu e quando). Depois apaga todas as linhas da empresa, das tabelas filhas para as mães (inclusive as do certificado A1 e as das evidências), e por fim a empresa, numa transação só; em seguida os arquivos e os artefatos dela, e as chaves próprias (o `KeyDestroyer`; sem o cofre, só registra). Não tem volta: a exportação é a única cópia.
 
 Para conferir depois:
 
@@ -82,3 +82,5 @@ SELECT at, action, actor, data FROM platform_events ORDER BY id DESC LIMIT 5;
 - Uma organização que ainda não estava ligada fica "não ligada" no cache de cada processo por até 60 segundos.
 - As travas do banco aceitam apagar só pelo dono das tabelas com a marca `rapa.purge_company`: quem tem a senha do dono continua podendo apagar à mão (como sempre pôde, desligando as travas).
 - Sem o cofre (parte E), nenhuma chave por empresa existe para destruir; as chaves dos webhooks derivadas do sal somem com as linhas.
+- A exportação e a exclusão leem e apagam as pastas locais (`RAPA_PASTA_ARQUIVOS` e `RAPA_PASTA_ARTEFATOS`), a disposição do store local de artefatos; com o store de objetos da parte E, elas passam a usar o store.
+- Uma empresa que fica congelada por muito tempo segura a remoção das partições de eventos em que tem eventos (as das outras empresas ficam junto, porque a partição é de todas).
