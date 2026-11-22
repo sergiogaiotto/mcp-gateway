@@ -4,6 +4,19 @@ Mesmas regras de :class:`rapa.fixtures.memory.MemoryPlatform`: tudo é filtrado
 pela empresa do principal (e pelo isolamento por linha do banco), um robô só é
 visível para quem tem papel na área dele, violações de política impedem a
 validação e quem criou uma versão não pode publicá-la.
+
+Publicar é aprovar: cada aprovação fica em ``version_approvals``. Uma versão
+precisa de uma aprovação, ou de duas, de pessoas diferentes, quando o manifesto
+declara um certificado digital A1 (:func:`rapa.core.contracts.required_approvals`).
+Cada aprovador tem o papel de aprovação na área, não criou a versão e não aprovou
+antes. Num robô com A1, o aprovador também não é o custodiante de nenhum dos
+certificados dele, nem a versão foi criada por um desses custodiantes (separação de
+funções: a autorização do custodiante é do robô, e valeria para uma versão que ele
+mesmo escreveu); e cada certificado precisa estar pronto para uso
+(:func:`rapa.control.services.a1.a1_problems`) antes de a aprovação contar. Enquanto
+faltar aprovação, a versão continua validada; a última aprovação publica. O banco
+confere de novo (os gatilhos ``rapa_version_approvals_check`` e
+``rapa_robot_versions_approvals``).
 """
 
 import re
@@ -15,11 +28,20 @@ from sqlalchemy import RowMapping, Select, and_, func, insert, literal_column, s
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from rapa.control.db.schema import areas, robot_versions, robots
+from rapa.control.db.schema import areas, robot_versions, robots, version_approvals
 from rapa.control.services import audit
-from rapa.control.services._common import PgService, summary, version_info, visible_areas
+from rapa.control.services._common import (
+    PgService,
+    ensure_company_active,
+    now_utc,
+    summary,
+    version_info,
+    visible_areas,
+)
+from rapa.control.services.a1 import BLOCKED_MESSAGE, a1_custodians, a1_problems, a1_refs
 from rapa.core import policy
 from rapa.core.contracts import (
+    CertificateBlocked,
     Conflict,
     Forbidden,
     InvalidInput,
@@ -31,13 +53,18 @@ from rapa.core.contracts import (
     RobotVersionInfo,
     Role,
     VersionStatus,
+    required_approvals,
 )
 from rapa.core.ids import new_id
 from rapa.core.robot import Manifest
 
 __all__ = [
+    "ALREADY_APPROVED",
+    "CUSTODIAN_APPROVER",
+    "CUSTODIAN_CREATOR",
     "PgRobotAdmin",
     "PgRobotCatalog",
+    "approvers_of",
     "company_published_query",
     "fold_text",
     "insert_version",
@@ -55,6 +82,19 @@ _VERSION_COLUMNS = (
     robot_versions.c.created_by,
     robot_versions.c.approved_by,
     robot_versions.c.created_at,
+)
+
+#: Mesma pessoa aprovando a mesma versão de novo.
+ALREADY_APPROVED = "você já aprovou esta versão; falta a aprovação de outra pessoa"
+#: O custodiante de um certificado A1 do robô tentando aprovar (separação de funções).
+CUSTODIAN_APPROVER = (
+    "quem guarda um certificado A1 do robô (o custodiante) não pode aprovar a versão: "
+    "a aprovação é de outra pessoa (separação de funções)"
+)
+#: Uma versão criada pelo custodiante de um certificado A1 do robô (separação de funções).
+CUSTODIAN_CREATOR = (
+    "esta versão foi criada por quem guarda um certificado A1 do robô (o custodiante) e "
+    "não pode ser aprovada: outra pessoa precisa criar a versão (separação de funções)"
 )
 
 _MAX_SEARCH_TERMS = 16
@@ -120,6 +160,30 @@ async def published_robot(
     return row
 
 
+async def approvers_of(
+    session: AsyncSession, company_id: UUID, robot_id: UUID, version_no: int | None = None
+) -> dict[int, list[tuple[str, Any]]]:
+    """Os aprovadores de cada versão do robô (ou só de ``version_no``), na ordem."""
+    query = (
+        select(
+            version_approvals.c.version_no,
+            version_approvals.c.approved_by,
+            version_approvals.c.approved_at,
+        )
+        .where(
+            version_approvals.c.company_id == company_id,
+            version_approvals.c.robot_id == robot_id,
+        )
+        .order_by(version_approvals.c.approved_at, version_approvals.c.approved_by)
+    )
+    if version_no is not None:
+        query = query.where(version_approvals.c.version_no == version_no)
+    out: dict[int, list[tuple[str, Any]]] = {}
+    for number, who, when in (await session.execute(query)).all():
+        out.setdefault(int(number), []).append((str(who), when))
+    return out
+
+
 async def insert_version(
     session: AsyncSession, principal: Principal, area_id: UUID, manifest: Manifest
 ) -> RobotVersionInfo:
@@ -128,10 +192,11 @@ async def insert_version(
     O mesmo caminho para quem grava, para a revisão da gravação e para o conserto:
     só quem cria robôs na área cria versões, o portão de política roda e as violações
     ficam na versão (que então não pode ser validada), e a criação entra na auditoria.
-    Quem criou a versão nunca a publica.
+    Quem criou a versão nunca a publica. Empresa congelada não ganha versão nova.
     """
     if not principal.has_role(Role.CREATOR, area_id):
         raise Forbidden("só quem cria robôs nesta área pode criar versões")
+    await ensure_company_active(session, principal.company_id)
     violations = [v.message for v in policy.check(manifest)]
     fingerprint = manifest.fingerprint()
     company_id = principal.company_id
@@ -279,7 +344,8 @@ class PgRobotAdmin(PgService):
                 row = await self._version(session, robot_id, version_no)
             except NotFound:
                 return None
-        return version_info(robot_id, row)
+            approvers = await approvers_of(session, principal.company_id, robot_id, version_no)
+        return version_info(robot_id, row, [who for who, _ in approvers.get(version_no, [])])
 
     async def list_versions(self, principal: Principal, robot_id: UUID) -> list[RobotVersionInfo]:
         async with self.db.tenant_session(principal.company_id) as session:
@@ -295,12 +361,19 @@ class PgRobotAdmin(PgService):
                 .mappings()
                 .all()
             )
-        return [version_info(robot_id, row) for row in rows]
+            approvers = await approvers_of(session, principal.company_id, robot_id)
+        return [
+            version_info(
+                robot_id, row, [who for who, _ in approvers.get(int(row["version_no"]), [])]
+            )
+            for row in rows
+        ]
 
     async def mark_validated(
         self, principal: Principal, robot_id: UUID, version_no: int
     ) -> RobotVersionInfo:
         async with self.db.tenant_session(principal.company_id) as session:
+            await ensure_company_active(session, principal.company_id)
             robot = await self._robot(session, principal, robot_id, lock=True)
             if not (
                 principal.has_role(Role.CREATOR, robot["area_id"])
@@ -339,15 +412,75 @@ class PgRobotAdmin(PgService):
     async def publish(
         self, principal: Principal, robot_id: UUID, version_no: int
     ) -> RobotVersionInfo:
-        async with self.db.tenant_session(principal.company_id) as session:
+        """Registra a aprovação de quem chama; a última aprovação exigida publica."""
+        company_id = principal.company_id
+        async with self.db.tenant_session(company_id) as session:
+            await ensure_company_active(session, company_id)
             robot = await self._robot(session, principal, robot_id, lock=True)
-            if not principal.has_role(Role.APPROVER, robot["area_id"]):
+            area_id: UUID = robot["area_id"]
+            if not principal.has_role(Role.APPROVER, area_id):
                 raise Forbidden("só quem aprova nesta área pode publicar")
             version = await self._version(session, robot_id, version_no, lock=True)
             if version["created_by"] == principal.subject:
                 raise Forbidden("quem criou a versão não pode aprová-la")
             if version["status"] != VersionStatus.VALIDATED.value:
                 raise Conflict("a versão precisa estar validada antes de publicar")
+            manifest = Manifest.model_validate(version["manifest"])
+            required = required_approvals(manifest)
+            earlier = [
+                who
+                for who, _ in (await approvers_of(session, company_id, robot_id, version_no)).get(
+                    version_no, []
+                )
+            ]
+            if principal.subject in earlier:
+                raise Conflict(ALREADY_APPROVED)
+            refs = a1_refs(manifest)
+            if refs:
+                custodians = await a1_custodians(
+                    session, company_id=company_id, area_id=area_id, names=[r.name for r in refs]
+                )
+                if principal.subject in custodians:
+                    raise Forbidden(CUSTODIAN_APPROVER)
+                # A autorização do custodiante é do robô, não da versão: uma versão que ele
+                # mesmo escreveu rodaria com a autorização dele. Ela não é aprovada.
+                if version["created_by"] in custodians:
+                    raise Forbidden(CUSTODIAN_CREATOR)
+                problems = await a1_problems(
+                    session,
+                    company_id=company_id,
+                    area_id=area_id,
+                    robot_id=robot_id,
+                    manifest=manifest,
+                    now=now_utc(),
+                )
+                if problems:
+                    raise CertificateBlocked(
+                        f"{BLOCKED_MESSAGE}; a aprovação não foi registrada", problems
+                    )
+            await session.execute(
+                insert(version_approvals).values(
+                    company_id=company_id,
+                    robot_id=robot_id,
+                    version_no=version_no,
+                    approved_by=principal.subject,
+                )
+            )
+            approvals = [*earlier, principal.subject]
+            if len(approvals) < required:
+                await audit.append(
+                    session,
+                    company_id=company_id,
+                    actor=principal.subject,
+                    action="robo.versao_aprovada",
+                    target=f"robo:{robot_id}/versao:{version_no}",
+                    payload={
+                        "impressao": version["fingerprint"],
+                        "aprovacoes": len(approvals),
+                        "exigidas": required,
+                    },
+                )
+                return version_info(robot_id, version, approvals)
             await session.execute(
                 update(robot_versions)
                 .where(
@@ -379,13 +512,17 @@ class PgRobotAdmin(PgService):
             )
             await audit.append(
                 session,
-                company_id=principal.company_id,
+                company_id=company_id,
                 actor=principal.subject,
                 action="robo.versao_publicada",
                 target=f"robo:{robot_id}/versao:{version_no}",
-                payload={"impressao": version["fingerprint"], "criada_por": version["created_by"]},
+                payload={
+                    "impressao": version["fingerprint"],
+                    "criada_por": version["created_by"],
+                    "aprovadores": approvals,
+                },
             )
-        return version_info(robot_id, row)
+        return version_info(robot_id, row, approvals)
 
 
 class PgRobotCatalog(PgService):

@@ -15,6 +15,9 @@ from fastapi import APIRouter, Depends, Header, Path, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from rapa.control.api.artifacts import add_artifact_routes
+from rapa.control.api.company import add_company_routes
+from rapa.control.api.credentials import add_credential_routes
 from rapa.control.api.errors import error_response
 from rapa.control.api.openapi_robots import build_robots_openapi
 from rapa.control.api.publishing import PublishingServices, add_publishing_routes
@@ -26,6 +29,9 @@ from rapa.control.sessions.service import RecordingSessions
 from rapa.control.validation import InputValidator, InvalidSchemaError
 from rapa.core.contracts import (
     MAX_RUNS_LISTED,
+    ArtifactService,
+    CompanyAdminService,
+    CredentialService,
     InvalidInput,
     NotFound,
     Principal,
@@ -95,6 +101,13 @@ class ApiServices:
     publishing: PublishingServices = field(default_factory=PublishingServices)
     #: O conserto assistido; sem ele, ``/v1/execucoes/{id}/conserto`` responde 503.
     repairs: RepairService | None = None
+    #: Credenciais e as regras do certificado A1; sem elas, ``/v1/credenciais`` responde 503.
+    credentials: CredentialService | None = None
+    #: A administração da empresa por ela mesma; sem ela, ``/v1/empresa`` responde 503.
+    company: CompanyAdminService | None = None
+    #: As evidências (artefatos) das execuções; sem elas, ``/v1/execucoes/{id}/artefatos``
+    #: responde 503.
+    artifacts: ArtifactService | None = None
 
 
 def check_idempotency_key(key: str | None) -> str | None:
@@ -216,6 +229,10 @@ def create_api_router(services: ApiServices) -> APIRouter:
             raise NotFound("execução não encontrada")
         return status
 
+    # -- evidências ----------------------------------------------------------------
+
+    add_artifact_routes(router, services.artifacts, current_principal)
+
     # -- consertar ----------------------------------------------------------------
 
     add_repair_routes(router, services.repairs, current_principal)
@@ -263,6 +280,12 @@ def create_api_router(services: ApiServices) -> APIRouter:
     async def publish_robot_version(
         robot_id: UUID, n: Annotated[int, Path(ge=1)], principal: Annotated[Principal, caller_dep]
     ) -> RobotVersionInfo:
+        """Registra a aprovação de quem chama; a última aprovação exigida publica.
+
+        Um robô com certificado A1 precisa de duas aprovações: depois da primeira, a
+        versão continua validada (``approvals`` e ``approvals_required`` dizem quantas
+        faltam).
+        """
         return await services.admin.publish(principal, robot_id, n)
 
     # -- sessões de gravação ------------------------------------------------
@@ -274,6 +297,13 @@ def create_api_router(services: ApiServices) -> APIRouter:
     # -- publicar: agendas, webhooks e lotes ----------------------------------------
 
     add_publishing_routes(router, services.publishing, current_principal, check_idempotency_key)
+
+    # -- credenciais e o certificado A1 ----------------------------------------------
+
+    add_credential_routes(router, services.credentials, current_principal)
+    # -- a empresa: usuários e papéis, áreas e consumo ------------------------------
+
+    add_company_routes(router, services.company, current_principal)
 
     # -- OpenAPI dos robôs --------------------------------------------------
 

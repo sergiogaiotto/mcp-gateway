@@ -5,6 +5,22 @@ O token de acesso vem do Keycloak. Daqui sai só a identidade verificada: quem
 do token: o :class:`PrincipalResolver` busca o :class:`Principal` no nosso
 banco. O token recebido nunca é repassado a outro serviço.
 
+A empresa do token sai da Organização: pelo mapa estático
+(``organization_aliases``), pelo vínculo guardado no banco
+(``companies.idp_organization``, consultado por um :class:`OrganizationDirectory`
+com cache curto, :class:`CachedOrganizationDirectory`: uma empresa nova entra sem
+reiniciar o serviço) ou, como antes, pelo identificador do objeto do Keycloak quando
+ele é o próprio identificador da empresa. Se o mapa e o banco discordam, recusa.
+
+O vínculo guarda o id ou o apelido, e o formato diz qual é: um valor no formato de
+UUID é sempre o id da organização (guardado na forma canônica), e um apelido nunca
+tem esse formato. Por isso o id do token só é procurado como id e o apelido só como
+apelido: uma organização cujo apelido é o id de outra não chega à empresa da outra.
+
+No primeiro login de uma pessoa de uma organização ligada a uma empresa (pelo mapa
+ou pelo banco), um :class:`UserProvisioner` cria o usuário sem nenhum papel; um
+usuário desativado continua sem entrar.
+
 Há um modo de desenvolvimento e testes com tokens fixos
 (:class:`StaticTokenVerifier`), que só funciona quando ligado explicitamente
 nas configurações da aplicação HTTP.
@@ -34,13 +50,16 @@ __all__ = [
     "AuthUnavailable",
     "Authenticator",
     "BearerVerifier",
+    "CachedOrganizationDirectory",
     "DevTokenVerifier",
     "JwksClient",
     "JwtSettings",
+    "OrganizationDirectory",
     "PrincipalResolver",
     "StaticTokenVerifier",
     "TokenVerifier",
     "Unauthenticated",
+    "UserProvisioner",
     "VerifiedToken",
     "bearer_token",
 ]
@@ -53,6 +72,9 @@ SUPPORTED_ALGORITHMS = frozenset({"RS256", "ES256"})
 _BEARER = re.compile(r"^[Bb][Ee][Aa][Rr][Ee][Rr] +([A-Za-z0-9\-._~+/]+=*) *$")
 _MAX_JWKS_BYTES = 256 * 1024
 _MAX_JWKS_KEYS = 50
+#: Tamanho máximo do nome tirado do token para um usuário criado no primeiro login.
+_MAX_DISPLAY_NAME = 200
+_UNKNOWN_COMPANY = "empresa do token não reconhecida"
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +124,66 @@ class PrincipalResolver(Protocol):
     async def resolve(self, subject: str, company_id: UUID) -> Principal | None: ...
 
 
+class UserProvisioner(Protocol):
+    """Cria, no primeiro login, o usuário que ainda não existe (sem nenhum papel).
+
+    Devolve ``None`` quando não pode criar (empresa inexistente ou congelada, sujeito
+    já existente e desativado, ou de outra empresa): o acesso é negado. Se o usuário
+    ativo desta empresa acabou de ser criado por outro login do mesmo sujeito, devolve
+    o principal dele.
+    """
+
+    async def provision(
+        self, subject: str, company_id: UUID, display_name: str = ""
+    ) -> Principal | None: ...
+
+
+class OrganizationDirectory(Protocol):
+    """A empresa ligada a uma organização do provedor (id ou apelido), ou ``None``."""
+
+    async def company_for(self, organization: str) -> UUID | None: ...
+
+
+class CachedOrganizationDirectory:
+    """Cache curto (60 s por padrão) na memória sobre outro :class:`OrganizationDirectory`.
+
+    Guarda também a resposta "não ligada": uma organização desconhecida não vai ao banco
+    a cada pedido. Uma empresa nova (ou um vínculo trocado) passa a valer em até
+    ``ttl_s`` segundos, sem reiniciar. Um erro do banco nunca fica no cache.
+    """
+
+    def __init__(
+        self,
+        inner: OrganizationDirectory,
+        *,
+        ttl_s: float = 60.0,
+        max_entries: int = 10_000,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if ttl_s < 0 or max_entries < 1:
+            raise ValueError("o cache das organizações precisa de prazo e tamanho positivos")
+        self.inner = inner
+        self.ttl_s = ttl_s
+        self.max_entries = max_entries
+        self._clock = clock
+        self._entries: dict[str, tuple[float, UUID | None]] = {}
+
+    async def company_for(self, organization: str) -> UUID | None:
+        now = self._clock()
+        cached = self._entries.get(organization)
+        if cached is not None and now - cached[0] < self.ttl_s:
+            return cached[1]
+        found = await self.inner.company_for(organization)
+        if len(self._entries) >= self.max_entries:
+            self._entries = {
+                key: entry for key, entry in self._entries.items() if now - entry[0] < self.ttl_s
+            }
+            if len(self._entries) >= self.max_entries:
+                self._entries.clear()
+        self._entries[organization] = (now, found)
+        return found
+
+
 @dataclass(frozen=True, slots=True)
 class VerifiedToken:
     """Identidade extraída de um token verificado."""
@@ -112,6 +194,11 @@ class VerifiedToken:
     expires_at: int | None = None
     #: Só no modo de tokens fixos: o principal já configurado no servidor.
     principal: Principal | None = None
+    #: Nome da pessoa no token (``name`` ou ``preferred_username``), para o primeiro login.
+    display_name: str | None = None
+    #: A empresa veio de um vínculo explícito (o mapa estático ou o banco): só assim o
+    #: primeiro login cria o usuário.
+    organization_linked: bool = False
 
 
 class BearerVerifier(Protocol):
@@ -133,11 +220,23 @@ def bearer_token(authorization: str | None) -> str:
 
 
 class Authenticator:
-    """Junta a verificação do token com a busca do principal no banco."""
+    """Junta a verificação do token com a busca do principal no banco.
 
-    def __init__(self, verifier: BearerVerifier, resolver: PrincipalResolver) -> None:
+    Com ``provisioner``, o primeiro login de quem ainda não existe numa empresa ligada
+    explicitamente à organização do token cria o usuário sem papéis (ele só vê o pedido
+    para um administrador dar um papel).
+    """
+
+    def __init__(
+        self,
+        verifier: BearerVerifier,
+        resolver: PrincipalResolver,
+        *,
+        provisioner: UserProvisioner | None = None,
+    ) -> None:
         self.verifier = verifier
         self.resolver = resolver
+        self.provisioner = provisioner
 
     async def authenticate(self, authorization: str | None) -> Principal:
         token = bearer_token(authorization)
@@ -145,6 +244,10 @@ class Authenticator:
         principal = verified.principal
         if principal is None:
             principal = await self.resolver.resolve(verified.subject, verified.company_id)
+            if principal is None and self.provisioner is not None and verified.organization_linked:
+                principal = await self.provisioner.provision(
+                    verified.subject, verified.company_id, verified.display_name or ""
+                )
             if principal is None:
                 raise AccessDenied("usuário sem acesso ao RaPA nesta empresa")
         if principal.company_id != verified.company_id or principal.subject != verified.subject:
@@ -386,8 +489,16 @@ class TokenVerifier:
     (``{"acme": {"id": "<uuid>"}}``). Exige exatamente uma organização.
     """
 
-    def __init__(self, settings: JwtSettings, *, jwks: JwksClient | None = None) -> None:
+    def __init__(
+        self,
+        settings: JwtSettings,
+        *,
+        jwks: JwksClient | None = None,
+        organizations: OrganizationDirectory | None = None,
+    ) -> None:
         self.settings = settings
+        #: Vínculos organização → empresa guardados no banco (sem ele, só o mapa estático).
+        self.organizations = organizations
         self.jwks = jwks or JwksClient(
             settings.jwks_url,
             algorithms=settings.algorithms,
@@ -429,7 +540,7 @@ class TokenVerifier:
             raise Unauthenticated(
                 "token sem identificação do usuário", bearer_error="invalid_token"
             )
-        company_id = self._company(claims)
+        company_id, linked = await self._company(claims)
         azp = claims.get("azp")
         exp = claims.get("exp")
         return VerifiedToken(
@@ -437,6 +548,8 @@ class TokenVerifier:
             company_id=company_id,
             client_id=azp if isinstance(azp, str) and azp else None,
             expires_at=int(exp) if isinstance(exp, int | float) else None,
+            display_name=_display_name(claims),
+            organization_linked=linked,
         )
 
     def _decode(self, token: str, key: jwt.PyJWK, alg: str) -> dict[str, Any]:
@@ -480,7 +593,25 @@ class TokenVerifier:
         except jwt.PyJWTError:
             raise Unauthenticated("token inválido", bearer_error="invalid_token") from None
 
-    def _company(self, claims: Mapping[str, Any]) -> UUID:
+    async def _linked(self, keys: list[str]) -> list[UUID]:
+        """As empresas que o banco liga ao id e ao apelido da organização."""
+        if self.organizations is None:
+            return []
+        found: list[UUID] = []
+        for key in keys:
+            try:
+                company = await self.organizations.company_for(key)
+            except Exception as exc:  # o banco fora do ar: falha fechada, sem detalhes
+                logger.warning("falha ao conferir a organização do token: %s", type(exc).__name__)
+                raise AuthUnavailable(
+                    "não foi possível conferir a empresa agora; tente de novo em instantes"
+                ) from None
+            if company is not None:
+                found.append(company)
+        return found
+
+    async def _company(self, claims: Mapping[str, Any]) -> tuple[UUID, bool]:
+        """A empresa do token e se ela veio de um vínculo explícito (mapa ou banco)."""
         raw = claims.get(self.settings.organization_claim)
         entries: list[tuple[str, Any]]
         if isinstance(raw, str):
@@ -501,18 +632,50 @@ class TokenVerifier:
         if len(entries) != 1:
             raise AccessDenied("o usuário precisa pertencer a exatamente uma empresa")
         alias, raw_id = entries[0]
+        organization_id: UUID | None = None
+        if raw_id is not None:
+            if not isinstance(raw_id, str):
+                raise AccessDenied("identificador de empresa inválido no token")
+            organization_id = _as_uuid(raw_id)
+            if organization_id is None:
+                raise AccessDenied("identificador de empresa inválido no token")
         mapped = self.settings.organization_aliases.get(alias)
-        if raw_id is None:
+        # O id só como id (a forma canônica) e o apelido só como apelido: um apelido no
+        # formato de UUID nunca é procurado no banco (lá, esse formato é sempre um id).
+        keys = [str(organization_id)] if organization_id is not None else []
+        if _as_uuid(alias) is None:
+            keys.append(alias)
+        linked = await self._linked(keys)
+        candidates = set(linked) | ({mapped} if mapped is not None else set())
+        if len(candidates) > 1:
+            logger.warning("organização do token com empresas diferentes no mapa e no banco")
+            raise AccessDenied(_UNKNOWN_COMPANY)
+        if linked:
+            return linked[0], True
+        if organization_id is None:
             if mapped is None:
-                raise AccessDenied("empresa do token não reconhecida")
-            return mapped
-        if not isinstance(raw_id, str):
-            raise AccessDenied("identificador de empresa inválido no token")
-        try:
-            company_id = UUID(raw_id)
-        except ValueError:
-            raise AccessDenied("identificador de empresa inválido no token") from None
-        if mapped is not None and mapped != company_id:
+                raise AccessDenied(_UNKNOWN_COMPANY)
+            return mapped, True
+        if mapped is not None and mapped != organization_id:
             logger.warning("organização do token diverge do mapeamento configurado")
-            raise AccessDenied("empresa do token não reconhecida")
-        return company_id
+            raise AccessDenied(_UNKNOWN_COMPANY)
+        return organization_id, mapped is not None
+
+
+def _as_uuid(value: str) -> UUID | None:
+    """O UUID de ``value`` (em qualquer forma que o ``UUID`` aceita), ou ``None``."""
+    try:
+        return UUID(value)
+    except ValueError:
+        return None
+
+
+def _display_name(claims: Mapping[str, Any]) -> str | None:
+    """O nome da pessoa no token, sem controles e cortado (só para o primeiro login)."""
+    for claim in ("name", "preferred_username"):
+        value = claims.get(claim)
+        if isinstance(value, str):
+            cleaned = " ".join("".join(c for c in value if c.isprintable()).split())
+            if cleaned:
+                return cleaned[:_MAX_DISPLAY_NAME]
+    return None

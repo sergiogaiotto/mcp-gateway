@@ -14,12 +14,13 @@ from rapa.ui.auth import LOGIN_PATH
 from rapa.ui.backend import BackendError, NotAuthenticated, describe_error
 from rapa.ui.context import Viewer
 from rapa.ui.labels import EFFECT_COLORS, EFFECT_LABELS, RUN_STATE_COLORS, RUN_STATE_LABELS
-from rapa.ui.permissions import can_record
+from rapa.ui.permissions import can_open_company, can_record
 
 __all__ = [
     "NAV_ITEMS",
     "effect_badge",
     "error_box",
+    "no_role_frame",
     "notify_error",
     "page_frame",
     "run_action",
@@ -35,9 +36,11 @@ NAV_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("agendas", "Agendas", "/agendas"),
     ("webhooks", "Webhooks", "/webhooks"),
     ("lotes", "Lotes", "/lotes"),
+    ("credenciais", "Credenciais", "/credenciais"),
+    ("empresa", "Empresa", "/empresa"),
 )
 #: Itens que só aparecem para quem pode usá-los (o servidor confere de novo).
-_NAV_RULES = {"gravar": can_record}
+_NAV_RULES = {"gravar": can_record, "empresa": can_open_company}
 
 
 def page_frame(viewer: Viewer, active: str) -> ui.column:
@@ -62,6 +65,23 @@ def page_frame(viewer: Viewer, active: str) -> ui.column:
                 "flat color=white"
             ).mark("sair")
     return ui.column().classes("w-full max-w-6xl mx-auto p-4 gap-4")
+
+
+def no_role_frame(viewer: Viewer) -> None:
+    """Quem ainda não tem papel nenhum (o primeiro login) só vê este pedido."""
+    settings = viewer.ctx.settings
+    with ui.header().classes("items-center justify-between bg-blue-grey-9"):
+        ui.label(settings.title).classes("text-h6 text-white")
+        with ui.row().classes("items-center gap-2"):
+            ui.label(viewer.display_name).classes("text-white").mark("usuario-logado")
+            ui.button("Sair", on_click=lambda: ui.navigate.to("/auth/sair")).props(
+                "flat color=white"
+            ).mark("sair")
+    with ui.column().classes("w-full max-w-xl mx-auto p-6 gap-4").mark("sem-papel"):
+        ui.label("Você ainda não tem um papel no RaPA").classes("text-h5")
+        ui.label(
+            "Peça a um administrador da empresa para dar um papel. Depois disso, entre de novo."
+        )
 
 
 def effect_badge(effect: Effect) -> ui.badge:

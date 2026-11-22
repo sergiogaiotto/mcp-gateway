@@ -10,7 +10,7 @@ protocolo :class:`Backend`, com duas implementações:
   acesso da sessão, guardado no servidor da interface.
 
 Os erros de negócio chegam como as exceções de :mod:`rapa.core.contracts`
-(``NotFound``, ``Forbidden``, ``Conflict``, ``InvalidInput``,
+(``NotFound``, ``Forbidden``, ``Conflict``, ``Gone``, ``InvalidInput``,
 ``QuotaExceeded``), com a mensagem em pt-BR; problemas de sessão e de rede
 viram :class:`NotAuthenticated` e :class:`BackendUnavailable`.
 """
@@ -20,6 +20,7 @@ import logging
 import math
 import re
 from collections.abc import Mapping
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import quote
 from uuid import UUID
@@ -27,18 +28,30 @@ from uuid import UUID
 import httpx2
 from pydantic import TypeAdapter, ValidationError
 
+from rapa.core.artifacts import valid_artifact_name
 from rapa.core.contracts import (
+    A1AuthorizationInfo,
+    AreaInfo,
+    ArtifactContent,
+    ArtifactService,
     BatchFile,
     BatchFormat,
     BatchInfo,
     BatchPreview,
     BatchRow,
     BatchService,
+    CompanyAdminService,
+    CompanyFrozen,
+    CompanyInfo,
+    CompanyUser,
     Conflict,
     ContractError,
+    CredentialInfo,
+    CredentialService,
     DraftChoices,
     Forbidden,
     GeneralizationProposals,
+    Gone,
     InvalidInput,
     NotFound,
     Principal,
@@ -53,6 +66,8 @@ from rapa.core.contracts import (
     RobotInfo,
     RobotSummary,
     RobotVersionInfo,
+    RoleGrant,
+    RunArtifact,
     RunService,
     RunStatus,
     RunTrigger,
@@ -61,6 +76,8 @@ from rapa.core.contracts import (
     ScheduleOccurrence,
     ScheduleService,
     ScheduleSpec,
+    UsageReport,
+    VersionApprovals,
     ViewerTicket,
     WebhookChanges,
     WebhookInfo,
@@ -68,13 +85,16 @@ from rapa.core.contracts import (
     WebhookService,
     WebhookSpec,
 )
-from rapa.core.robot import SLUG_PATTERN, Manifest
+from rapa.core.robot import SLUG_PATTERN, CredentialKind, Manifest
 
 if TYPE_CHECKING:
     from rapa.ui.auth import UiSession
 
 __all__ = [
+    "ARTIFACTS_OFF",
     "BATCHES_OFF",
+    "COMPANY_OFF",
+    "CREDENTIALS_OFF",
     "REPAIRS_OFF",
     "SCHEDULES_OFF",
     "SESSIONS_OFF",
@@ -223,7 +243,72 @@ class Backend(Protocol):
 
     async def create_repair(self, run_id: UUID, candidate_id: str) -> RepairProposalInfo: ...
 
+    # -- credenciais e o certificado A1 --------------------------------------------------
 
+    async def list_credentials(self, area_id: UUID | None = None) -> list[CredentialInfo]: ...
+
+    async def register_credential(
+        self,
+        area_id: UUID,
+        *,
+        name: str,
+        kind: CredentialKind,
+        origin: str,
+        vault_path: str,
+        custodian_subject: str | None = None,
+        not_after: datetime | None = None,
+        fingerprint: str | None = None,
+    ) -> CredentialInfo: ...
+
+    async def renew_credential(
+        self, credential_id: UUID, not_after: datetime, fingerprint: str | None = None
+    ) -> CredentialInfo: ...
+
+    async def revoke_credential(self, credential_id: UUID) -> CredentialInfo: ...
+
+    async def expiring_credentials(
+        self, within_days: int | None = None
+    ) -> list[CredentialInfo]: ...
+
+    async def list_a1_authorizations(self, robot_id: UUID) -> list[A1AuthorizationInfo]: ...
+
+    async def authorize_a1(self, robot_id: UUID, credential_name: str) -> A1AuthorizationInfo: ...
+
+    async def revoke_a1_authorization(
+        self, robot_id: UUID, authorization_id: UUID
+    ) -> A1AuthorizationInfo: ...
+
+    async def version_approvals(self, robot_id: UUID, version_no: int) -> VersionApprovals: ...
+
+    # -- a empresa: usuários e papéis, áreas e consumo -------------------------------
+
+    async def get_company(self) -> CompanyInfo: ...
+
+    async def list_company_users(self) -> list[CompanyUser]: ...
+
+    async def set_user_roles(self, user_id: UUID, roles: list[RoleGrant]) -> CompanyUser: ...
+
+    async def deactivate_user(self, user_id: UUID) -> CompanyUser: ...
+
+    async def reactivate_user(self, user_id: UUID) -> CompanyUser: ...
+
+    async def list_company_areas(self) -> list[AreaInfo]: ...
+
+    async def create_company_area(self, name: str) -> AreaInfo: ...
+
+    async def rename_company_area(self, area_id: UUID, name: str) -> AreaInfo: ...
+
+    async def company_usage(self, month: str | None = None) -> UsageReport: ...
+
+    # -- evidências -------------------------------------------------------------------
+
+    async def list_artifacts(self, run_id: UUID) -> list[RunArtifact]: ...
+
+    async def open_artifact(self, run_id: UUID, name: str) -> ArtifactContent: ...
+
+
+#: Mensagem quando este servidor não oferece as evidências das execuções.
+ARTIFACTS_OFF = "as evidências das execuções não estão disponíveis neste servidor"
 #: Mensagem quando este servidor não oferece a gravação de demonstrações.
 SESSIONS_OFF = "a gravação de demonstrações não está disponível neste servidor"
 #: Mensagens quando este servidor não oferece agendas, webhooks ou lotes.
@@ -232,6 +317,10 @@ WEBHOOKS_OFF = "os webhooks não estão disponíveis neste servidor"
 BATCHES_OFF = "os lotes por planilha não estão disponíveis neste servidor"
 #: Mensagem quando este servidor não oferece o conserto assistido.
 REPAIRS_OFF = "o conserto assistido não está disponível neste servidor"
+#: Mensagem quando este servidor não oferece as credenciais (e as regras do A1).
+CREDENTIALS_OFF = "as credenciais não estão disponíveis neste servidor"
+#: Mensagem quando este servidor não oferece a administração da empresa.
+COMPANY_OFF = "a administração da empresa não está disponível neste servidor"
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +419,9 @@ class ContractsBackend:
         webhooks: WebhookService | None = None,
         batches: BatchService | None = None,
         repairs: RepairService | None = None,
+        credentials: CredentialService | None = None,
+        company: CompanyAdminService | None = None,
+        artifacts: ArtifactService | None = None,
     ) -> None:
         self._catalog = catalog
         self._runs = runs
@@ -340,6 +432,9 @@ class ContractsBackend:
         self._webhooks = webhooks
         self._batches = batches
         self._repairs = repairs
+        self._credentials = credentials
+        self._company = company
+        self._artifacts = artifacts
 
     def __repr__(self) -> str:
         return f"ContractsBackend(subject={self._principal.subject!r})"
@@ -525,6 +620,118 @@ class ContractsBackend:
     async def create_repair(self, run_id: UUID, candidate_id: str) -> RepairProposalInfo:
         return await self._repair_service().create_repair(self._principal, run_id, candidate_id)
 
+    # -- credenciais e o certificado A1 --------------------------------------------------
+
+    def _credential_service(self) -> CredentialService:
+        if self._credentials is None:
+            raise BackendUnavailable(CREDENTIALS_OFF)
+        return self._credentials
+
+    async def list_credentials(self, area_id: UUID | None = None) -> list[CredentialInfo]:
+        return await self._credential_service().list(self._principal, area_id)
+
+    async def register_credential(
+        self,
+        area_id: UUID,
+        *,
+        name: str,
+        kind: CredentialKind,
+        origin: str,
+        vault_path: str,
+        custodian_subject: str | None = None,
+        not_after: datetime | None = None,
+        fingerprint: str | None = None,
+    ) -> CredentialInfo:
+        return await self._credential_service().register(
+            self._principal,
+            area_id,
+            name=name,
+            kind=kind,
+            origin=origin,
+            vault_path=vault_path,
+            custodian_subject=custodian_subject,
+            not_after=not_after,
+            fingerprint=fingerprint,
+        )
+
+    async def renew_credential(
+        self, credential_id: UUID, not_after: datetime, fingerprint: str | None = None
+    ) -> CredentialInfo:
+        return await self._credential_service().renew(
+            self._principal, credential_id, not_after=not_after, fingerprint=fingerprint
+        )
+
+    async def revoke_credential(self, credential_id: UUID) -> CredentialInfo:
+        return await self._credential_service().revoke(self._principal, credential_id)
+
+    async def expiring_credentials(self, within_days: int | None = None) -> list[CredentialInfo]:
+        return await self._credential_service().expiring(self._principal, within_days)
+
+    async def list_a1_authorizations(self, robot_id: UUID) -> list[A1AuthorizationInfo]:
+        return await self._credential_service().list_authorizations(self._principal, robot_id)
+
+    async def authorize_a1(self, robot_id: UUID, credential_name: str) -> A1AuthorizationInfo:
+        return await self._credential_service().authorize(
+            self._principal, robot_id, credential_name
+        )
+
+    async def revoke_a1_authorization(
+        self, robot_id: UUID, authorization_id: UUID
+    ) -> A1AuthorizationInfo:
+        return await self._credential_service().revoke_authorization(
+            self._principal, authorization_id, robot_id=robot_id
+        )
+
+    async def version_approvals(self, robot_id: UUID, version_no: int) -> VersionApprovals:
+        return await self._credential_service().approvals(self._principal, robot_id, version_no)
+
+    # -- a empresa ------------------------------------------------------------------------
+
+    def _company_service(self) -> CompanyAdminService:
+        if self._company is None:
+            raise BackendUnavailable(COMPANY_OFF)
+        return self._company
+
+    async def get_company(self) -> CompanyInfo:
+        return await self._company_service().get_company(self._principal)
+
+    async def list_company_users(self) -> list[CompanyUser]:
+        return await self._company_service().list_users(self._principal)
+
+    async def set_user_roles(self, user_id: UUID, roles: list[RoleGrant]) -> CompanyUser:
+        return await self._company_service().set_roles(self._principal, user_id, roles)
+
+    async def deactivate_user(self, user_id: UUID) -> CompanyUser:
+        return await self._company_service().deactivate_user(self._principal, user_id)
+
+    async def reactivate_user(self, user_id: UUID) -> CompanyUser:
+        return await self._company_service().reactivate_user(self._principal, user_id)
+
+    async def list_company_areas(self) -> list[AreaInfo]:
+        return await self._company_service().list_areas(self._principal)
+
+    async def create_company_area(self, name: str) -> AreaInfo:
+        return await self._company_service().create_area(self._principal, name)
+
+    async def rename_company_area(self, area_id: UUID, name: str) -> AreaInfo:
+        return await self._company_service().rename_area(self._principal, area_id, name)
+
+    async def company_usage(self, month: str | None = None) -> UsageReport:
+        return await self._company_service().usage(self._principal, month)
+
+    # -- evidências -------------------------------------------------------------------
+
+    def _artifact_service(self) -> ArtifactService:
+        if self._artifacts is None:
+            raise BackendUnavailable(ARTIFACTS_OFF)
+        return self._artifacts
+
+    async def list_artifacts(self, run_id: UUID) -> list[RunArtifact]:
+        return await self._artifact_service().list_artifacts(self._principal, run_id)
+
+    async def open_artifact(self, run_id: UUID, name: str) -> ArtifactContent:
+        return await self._artifact_service().open_artifact(self._principal, run_id, name)
+
 
 class _Platform(RobotCatalog, RunService, RobotAdmin, Protocol):
     """Um objeto que segue os três contratos (como a plataforma em memória)."""
@@ -544,6 +751,9 @@ class ContractsBackendFactory:
         webhooks: WebhookService | None = None,
         batches: BatchService | None = None,
         repairs: RepairService | None = None,
+        credentials: CredentialService | None = None,
+        company: CompanyAdminService | None = None,
+        artifacts: ArtifactService | None = None,
     ) -> None:
         self._catalog = catalog
         self._runs = runs
@@ -553,6 +763,9 @@ class ContractsBackendFactory:
         self._webhooks = webhooks
         self._batches = batches
         self._repairs = repairs
+        self._credentials = credentials
+        self._company = company
+        self._artifacts = artifacts
 
     @classmethod
     def from_platform(
@@ -564,6 +777,9 @@ class ContractsBackendFactory:
         webhooks: WebhookService | None = None,
         batches: BatchService | None = None,
         repairs: RepairService | None = None,
+        credentials: CredentialService | None = None,
+        company: CompanyAdminService | None = None,
+        artifacts: ArtifactService | None = None,
     ) -> ContractsBackendFactory:
         return cls(
             platform,
@@ -574,6 +790,9 @@ class ContractsBackendFactory:
             webhooks=webhooks,
             batches=batches,
             repairs=repairs,
+            credentials=credentials,
+            company=company,
+            artifacts=artifacts,
         )
 
     def __call__(self, session: UiSession) -> ContractsBackend:
@@ -587,6 +806,9 @@ class ContractsBackendFactory:
             webhooks=self._webhooks,
             batches=self._batches,
             repairs=self._repairs,
+            credentials=self._credentials,
+            company=self._company,
+            artifacts=self._artifacts,
         )
 
 
@@ -617,6 +839,20 @@ _BATCHES: TypeAdapter[list[BatchInfo]] = TypeAdapter(list[BatchInfo])
 _BATCH_ROWS: TypeAdapter[list[BatchRow]] = TypeAdapter(list[BatchRow])
 _REPAIR: TypeAdapter[RepairView] = TypeAdapter(RepairView)
 _REPAIR_PROPOSAL: TypeAdapter[RepairProposalInfo] = TypeAdapter(RepairProposalInfo)
+_CREDENTIAL: TypeAdapter[CredentialInfo] = TypeAdapter(CredentialInfo)
+_CREDENTIALS: TypeAdapter[list[CredentialInfo]] = TypeAdapter(list[CredentialInfo])
+_A1_AUTHORIZATION: TypeAdapter[A1AuthorizationInfo] = TypeAdapter(A1AuthorizationInfo)
+_A1_AUTHORIZATIONS: TypeAdapter[list[A1AuthorizationInfo]] = TypeAdapter(list[A1AuthorizationInfo])
+_APPROVALS: TypeAdapter[VersionApprovals] = TypeAdapter(VersionApprovals)
+_COMPANY: TypeAdapter[CompanyInfo] = TypeAdapter(CompanyInfo)
+_COMPANY_USER: TypeAdapter[CompanyUser] = TypeAdapter(CompanyUser)
+_COMPANY_USERS: TypeAdapter[list[CompanyUser]] = TypeAdapter(list[CompanyUser])
+_AREA: TypeAdapter[AreaInfo] = TypeAdapter(AreaInfo)
+_AREAS: TypeAdapter[list[AreaInfo]] = TypeAdapter(list[AreaInfo])
+_USAGE: TypeAdapter[UsageReport] = TypeAdapter(UsageReport)
+_ARTIFACTS: TypeAdapter[list[RunArtifact]] = TypeAdapter(list[RunArtifact])
+#: Tipos que a interface aceita mostrar na própria página (o resto vai como anexo).
+_INLINE_TYPES = frozenset({"image/png", "video/webm"})
 
 _MAX_MESSAGE = 500
 _MAX_DETAILS = 50
@@ -663,8 +899,12 @@ def _api_error(response: httpx2.Response) -> Exception:
             return NotFound(_clean(message, "não encontrado"))
         case 409:
             return Conflict(_clean(message, "a operação conflita com o estado atual"))
+        case 410:
+            return Gone(_clean(message, "o recurso passou do prazo de retenção"))
         case 422:
             return InvalidInput(_clean(message, "dados inválidos"), [d for d in details if d])
+        case 423:
+            return CompanyFrozen(_clean(message, "a empresa está congelada"))
         case 429:
             return QuotaExceeded(
                 _clean(message, "limite de uso atingido; tente de novo mais tarde"),
@@ -1026,6 +1266,160 @@ class RestBackend:
             "POST", f"/v1/execucoes/{run_id}/conserto", json_body={"candidato": candidate_id}
         )
         return self._parse(_REPAIR_PROPOSAL, data)
+
+    # -- credenciais e o certificado A1 --------------------------------------------------
+
+    async def list_credentials(self, area_id: UUID | None = None) -> list[CredentialInfo]:
+        params = {"area_id": str(area_id)} if area_id is not None else None
+        return self._parse(_CREDENTIALS, await self._send("GET", "/v1/credenciais", params=params))
+
+    async def register_credential(
+        self,
+        area_id: UUID,
+        *,
+        name: str,
+        kind: CredentialKind,
+        origin: str,
+        vault_path: str,
+        custodian_subject: str | None = None,
+        not_after: datetime | None = None,
+        fingerprint: str | None = None,
+    ) -> CredentialInfo:
+        body = {
+            "area_id": str(area_id),
+            "nome": name,
+            "tipo": CredentialKind(kind).value,
+            "origem": origin,
+            "caminho_cofre": vault_path,
+            "custodiante": custodian_subject,
+            "validade": not_after.isoformat() if not_after is not None else None,
+            "impressao": fingerprint,
+        }
+        data = await self._send("POST", "/v1/credenciais", json_body=body)
+        return self._parse(_CREDENTIAL, data)
+
+    async def renew_credential(
+        self, credential_id: UUID, not_after: datetime, fingerprint: str | None = None
+    ) -> CredentialInfo:
+        body = {"validade": not_after.isoformat(), "impressao": fingerprint}
+        data = await self._send("PATCH", f"/v1/credenciais/{credential_id}", json_body=body)
+        return self._parse(_CREDENTIAL, data)
+
+    async def revoke_credential(self, credential_id: UUID) -> CredentialInfo:
+        data = await self._send("POST", f"/v1/credenciais/{credential_id}/revogar")
+        return self._parse(_CREDENTIAL, data)
+
+    async def expiring_credentials(self, within_days: int | None = None) -> list[CredentialInfo]:
+        params = {"dias": str(within_days)} if within_days is not None else None
+        data = await self._send("GET", "/v1/credenciais/vencimentos", params=params)
+        return self._parse(_CREDENTIALS, data)
+
+    async def list_a1_authorizations(self, robot_id: UUID) -> list[A1AuthorizationInfo]:
+        data = await self._send("GET", f"/v1/robos/{robot_id}/autorizacoes-a1")
+        return self._parse(_A1_AUTHORIZATIONS, data)
+
+    async def authorize_a1(self, robot_id: UUID, credential_name: str) -> A1AuthorizationInfo:
+        data = await self._send(
+            "POST",
+            f"/v1/robos/{robot_id}/autorizacoes-a1",
+            json_body={"credencial": credential_name},
+        )
+        return self._parse(_A1_AUTHORIZATION, data)
+
+    async def revoke_a1_authorization(
+        self, robot_id: UUID, authorization_id: UUID
+    ) -> A1AuthorizationInfo:
+        data = await self._send(
+            "POST", f"/v1/robos/{robot_id}/autorizacoes-a1/{authorization_id}/revogar"
+        )
+        return self._parse(_A1_AUTHORIZATION, data)
+
+    async def version_approvals(self, robot_id: UUID, version_no: int) -> VersionApprovals:
+        data = await self._send("GET", f"/v1/robos/{robot_id}/versoes/{version_no}/aprovacoes")
+        return self._parse(_APPROVALS, data)
+
+    # -- a empresa ------------------------------------------------------------------------
+
+    async def get_company(self) -> CompanyInfo:
+        return self._parse(_COMPANY, await self._send("GET", "/v1/empresa"))
+
+    async def list_company_users(self) -> list[CompanyUser]:
+        return self._parse(_COMPANY_USERS, await self._send("GET", "/v1/empresa/usuarios"))
+
+    async def set_user_roles(self, user_id: UUID, roles: list[RoleGrant]) -> CompanyUser:
+        body = {
+            "papeis": [
+                {"papel": g.role.value, "area_id": str(g.area_id) if g.area_id else None}
+                for g in roles
+            ]
+        }
+        data = await self._send("PUT", f"/v1/empresa/usuarios/{user_id}/papeis", json_body=body)
+        return self._parse(_COMPANY_USER, data)
+
+    async def deactivate_user(self, user_id: UUID) -> CompanyUser:
+        data = await self._send("POST", f"/v1/empresa/usuarios/{user_id}/desativar")
+        return self._parse(_COMPANY_USER, data)
+
+    async def reactivate_user(self, user_id: UUID) -> CompanyUser:
+        data = await self._send("POST", f"/v1/empresa/usuarios/{user_id}/reativar")
+        return self._parse(_COMPANY_USER, data)
+
+    async def list_company_areas(self) -> list[AreaInfo]:
+        return self._parse(_AREAS, await self._send("GET", "/v1/empresa/areas"))
+
+    async def create_company_area(self, name: str) -> AreaInfo:
+        data = await self._send("POST", "/v1/empresa/areas", json_body={"nome": name})
+        return self._parse(_AREA, data)
+
+    async def rename_company_area(self, area_id: UUID, name: str) -> AreaInfo:
+        data = await self._send("PATCH", f"/v1/empresa/areas/{area_id}", json_body={"nome": name})
+        return self._parse(_AREA, data)
+
+    async def company_usage(self, month: str | None = None) -> UsageReport:
+        params = {"mes": month} if month else None
+        return self._parse(_USAGE, await self._send("GET", "/v1/empresa/consumo", params=params))
+
+    # -- evidências -------------------------------------------------------------------
+
+    async def list_artifacts(self, run_id: UUID) -> list[RunArtifact]:
+        data = await self._send("GET", f"/v1/execucoes/{run_id}/artefatos")
+        return self._parse(_ARTIFACTS, data)
+
+    async def open_artifact(self, run_id: UUID, name: str) -> ArtifactContent:
+        """Abre o arquivo pela API, em pedaços (a resposta fica aberta até ler tudo)."""
+        if not valid_artifact_name(name):
+            raise NotFound("arquivo não encontrado nesta execução")
+        request = self._client.build_request(
+            "GET",
+            f"/v1/execucoes/{run_id}/artefatos/{quote(name, safe='')}",
+            headers={"Authorization": f"Bearer {self._token}"},
+        )
+        try:
+            response = await self._client.send(request, stream=True)
+        except httpx2.TimeoutException:
+            raise BackendUnavailable(_UNAVAILABLE) from None
+        except httpx2.HTTPError as exc:
+            logger.warning("falha ao chamar a API do RaPA: %s", type(exc).__name__)
+            raise BackendUnavailable(_UNAVAILABLE) from None
+        if not response.is_success:
+            try:
+                await response.aread()
+            finally:
+                await response.aclose()
+            raise _api_error(response)
+        media_type = response.headers.get("content-type", "application/octet-stream")
+        media_type = media_type.split(";", 1)[0].strip().lower() or "application/octet-stream"
+        disposition = response.headers.get("content-disposition", "")
+        length = response.headers.get("content-length", "")
+        return ArtifactContent(
+            name=name,
+            media_type=media_type,
+            # Só abre na página o que a API mandou abrir e que é tela ou vídeo.
+            inline=disposition.startswith("inline") and media_type in _INLINE_TYPES,
+            size=int(length) if length.isdigit() else None,
+            chunks=response.aiter_bytes(),
+            close=response.aclose,
+        )
 
     @staticmethod
     def _json(response: httpx2.Response) -> Any:

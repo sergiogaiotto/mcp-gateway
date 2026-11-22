@@ -17,13 +17,15 @@ from rapa.core.contracts import (
     RepairView,
     RunState,
     RunStatus,
+    uses_a1,
 )
+from rapa.core.robot import Manifest
 from rapa.core.snapshot import SNAPSHOT_ERROR_CODES
 from rapa.ui.context import Viewer
 from rapa.ui.layout import effect_badge, run_action, simple_table
 from rapa.ui.permissions import can_create
 
-__all__ = ["can_repair", "repair_page"]
+__all__ = ["can_repair", "can_repair_code", "repair_page"]
 
 _SUGGESTION_COLORS = {
     RepairSuggestionStatus.CHOSEN: "bg-green-1",
@@ -43,9 +45,18 @@ _LOCATOR_LABELS = {
 }
 
 
-def can_repair(status: RunStatus) -> bool:
-    """Se a execução falhou de um jeito que o conserto assistido trata (o servidor confere)."""
+def can_repair_code(status: RunStatus) -> bool:
+    """Se a execução falhou num código que o conserto assistido trata."""
     return status.state is RunState.FAILED and status.error_code in SNAPSHOT_ERROR_CODES
+
+
+def can_repair(status: RunStatus, manifest: Manifest | None) -> bool:
+    """Se a execução falhou de um jeito que o conserto assistido trata (o servidor confere).
+
+    ``manifest`` é o da versão da execução: robô com certificado A1 nunca tem conserto
+    assistido, e sem o manifesto o botão não aparece (falha fechada).
+    """
+    return can_repair_code(status) and manifest is not None and not uses_a1(manifest)
 
 
 def _parse_uuid(value: str) -> UUID | None:

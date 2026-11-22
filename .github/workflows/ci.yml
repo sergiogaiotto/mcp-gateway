@@ -16,7 +16,8 @@ jobs:
   testes:
     name: Lint, tipos e testes
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # A suíte inteira (com o ponta a ponta e os testes que filmam) leva perto de 27 minutos.
+    timeout-minutes: 45
     # Debian 13 (trixie): o mesmo Chromium de código aberto usado na imagem do executor.
     container:
       image: python:3.14-slim-trixie
@@ -33,11 +34,14 @@ jobs:
     env:
       RAPA_CHROMIUM_PATH: /usr/bin/chromium
       RAPA_TEST_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+      # Os testes que filmam a execução (vídeo da falha) usam o ffmpeg do Debian e aqui
+      # nunca são pulados: sem ele, falham.
+      RAPA_TEST_VIDEO_OBRIGATORIO: "1"
     steps:
-      - name: Instalar o Chromium do Debian e utilitários
+      - name: Instalar o Chromium e o ffmpeg do Debian e utilitários
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends chromium git ca-certificates fonts-liberation
+          apt-get install -y --no-install-recommends chromium ffmpeg git ca-certificates fonts-liberation
       - uses: actions/checkout@v4
       - name: Instalar o uv
         run: pip install --no-cache-dir "uv>=0.11"

@@ -56,6 +56,7 @@ __all__ = [
     "VisibleCondition",
     "WaitForStep",
     "max_effect",
+    "normalize_origin",
 ]
 
 SCHEMA_VERSION: Literal[1] = 1
@@ -548,23 +549,32 @@ class CredentialRef(_Model):
     @field_validator("origin")
     @classmethod
     def _check_origin(cls, value: str) -> str:
-        parts = urlsplit(value)
-        host = (parts.hostname or "").lower()
-        # http só no domínio reservado para testes (RFC 2606).
-        if not host or not (
-            parts.scheme == "https" or (parts.scheme == "http" and host.endswith(".test"))
-        ):
-            raise ValueError("a origem da credencial deve ser https://host")
-        if parts.path not in ("", "/") or parts.query or parts.fragment or parts.username:
-            raise ValueError("a origem da credencial não pode ter caminho, consulta ou usuário")
-        try:
-            port = parts.port
-        except ValueError:
-            raise ValueError("a porta da origem da credencial é inválida") from None
-        # Mesma forma que o navegador usa para a origem: sem a porta padrão do esquema.
-        if port is None or port == {"https": 443, "http": 80}[parts.scheme]:
-            return f"{parts.scheme}://{host}"
-        return f"{parts.scheme}://{host}:{port}"
+        return normalize_origin(value)
+
+
+def normalize_origin(value: str) -> str:
+    """A origem de uma credencial na forma que o navegador usa (``esquema://host[:porta]``).
+
+    Levanta ``ValueError`` (com a mensagem em pt-BR) para o que não é uma origem: o
+    mesmo validador do manifesto (:class:`CredentialRef`) e do registro de credenciais.
+    """
+    parts = urlsplit(value)
+    host = (parts.hostname or "").lower()
+    # http só no domínio reservado para testes (RFC 2606).
+    if not host or not (
+        parts.scheme == "https" or (parts.scheme == "http" and host.endswith(".test"))
+    ):
+        raise ValueError("a origem da credencial deve ser https://host")
+    if parts.path not in ("", "/") or parts.query or parts.fragment or parts.username:
+        raise ValueError("a origem da credencial não pode ter caminho, consulta ou usuário")
+    try:
+        port = parts.port
+    except ValueError:
+        raise ValueError("a porta da origem da credencial é inválida") from None
+    # Mesma forma que o navegador usa para a origem: sem a porta padrão do esquema.
+    if port is None or port == {"https": 443, "http": 80}[parts.scheme]:
+        return f"{parts.scheme}://{host}"
+    return f"{parts.scheme}://{host}:{port}"
 
 
 def _check_hostname(host: str) -> str:

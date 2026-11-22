@@ -11,9 +11,19 @@ Funções para o despachante, todas recebendo uma sessão sem empresa (papel
 - :func:`ingest_events` grava eventos do executor, idempotente por
   ``(run_id, seq)``;
 - :func:`finish` grava o resultado do executor (e, numa falha do alvo de um
-  passo, o retrato da página que o executor tirou, em ``run_snapshots``);
+  passo, o retrato da página que o executor tirou, em ``run_snapshots``); os
+  artefatos ficam em ``runs.artifacts`` sem o caminho do disco, com a tentativa e a
+  data (ver :mod:`rapa.control.artifacts`);
 - :func:`reap_expired` recolhe concessões vencidas: volta para a fila só o que
-  não começou nenhum passo que grava (ver a regra abaixo).
+  não começou nenhum passo que grava (ver a regra abaixo);
+- :meth:`PgRunQueue.a1_block` confere, logo antes de lançar o executor, se o
+  certificado A1 de um robô ainda pode ser usado
+  (:func:`rapa.control.services.a1.launch_block`).
+
+Empresa congelada (``companies.status = 'frozen'``): :func:`claim_next` não pega as
+execuções dela (nem conta a fila dela na admissão), e o recolhedor cancela, em vez de
+devolver à fila, a execução dela que perdeu o executor sem ter gravado nada (código
+``empresa_congelada``). As que estão rodando terminam normalmente.
 
 Escritas de uma tentativa antiga (``attempt`` diferente do atual, ou execução
 já devolvida à fila) são recusadas com :class:`StaleAttempt`.
@@ -75,7 +85,9 @@ from sqlalchemy import (
 from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from rapa.control.artifacts import ArtifactInfo
 from rapa.control.db.schema import (
+    companies,
     company_quotas,
     platform_settings,
     recording_sessions,
@@ -86,9 +98,11 @@ from rapa.control.db.schema import (
 )
 from rapa.control.db.session import Database
 from rapa.control.services import audit
-from rapa.control.services._common import INTERACTIVE_PRIORITY, now_utc
+from rapa.control.services._common import INTERACTIVE_PRIORITY, lock_company_status, now_utc
+from rapa.control.services.a1 import launch_block
 from rapa.control.services.admission import Capacity, CompanyLoad, plan
 from rapa.core.contracts import (
+    CompanyStatus,
     Conflict,
     InvalidInput,
     NotFound,
@@ -101,6 +115,8 @@ from rapa.core.robot import Effect, Manifest
 from rapa.core.snapshot import MAX_SNAPSHOT_BYTES, SNAPSHOT_ERROR_CODES, PageSnapshot
 
 __all__ = [
+    "COMPANY_FROZEN_CODE",
+    "COMPANY_FROZEN_RUN_MESSAGE",
     "DEFAULT_LEASE",
     "DEFAULT_MAX_ATTEMPTS",
     "DEFAULT_MAX_DURATION",
@@ -115,6 +131,7 @@ __all__ = [
     "claim_next",
     "ensure_event_partitions",
     "finish",
+    "frozen_companies",
     "heartbeat",
     "ingest_events",
     "reap_expired",
@@ -151,6 +168,11 @@ _WROTE_BEFORE_STOPPING = (
 )
 #: Situações de uma sessão de gravação que ainda ocupa um navegador.
 _LIVE_SESSIONS = ("starting", "active")
+#: Código da execução cancelada porque a empresa foi congelada antes de ela começar.
+COMPANY_FROZEN_CODE = "empresa_congelada"
+COMPANY_FROZEN_RUN_MESSAGE = (
+    "A empresa foi congelada antes de a execução começar; ela foi cancelada sem rodar."
+)
 
 
 class StaleAttempt(Conflict):
@@ -170,18 +192,6 @@ class EventConflict(StaleAttempt):
     """
 
     code = "evento_conflitante"
-
-
-class ArtifactInfo(BaseModel):
-    """Arquivo guardado pela execução (mesma forma do RESULT.json do executor)."""
-
-    model_config = ConfigDict(extra="ignore", frozen=True)
-
-    kind: str = Field(min_length=1, max_length=40)
-    name: str = Field(min_length=1, max_length=255)
-    path: str = Field(min_length=1, max_length=4000)
-    size: int = Field(ge=0)
-    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class RunnerOutcome(BaseModel):
@@ -211,6 +221,8 @@ class ReapReport:
     requeued: list[UUID] = field(default_factory=list)
     indeterminate: list[UUID] = field(default_factory=list)
     failed: list[UUID] = field(default_factory=list)
+    #: Não gravaram nada, mas a empresa está congelada: canceladas em vez de voltar à fila.
+    cancelled: list[UUID] = field(default_factory=list)
 
 
 def _utc(value: datetime) -> datetime:
@@ -244,10 +256,25 @@ async def _capacity(session: AsyncSession) -> Capacity | None:
     return Capacity(int(row[0]), Decimal(row[1]))
 
 
+async def frozen_companies(
+    session: AsyncSession, among: Collection[UUID] | None = None
+) -> set[UUID]:
+    """As empresas congeladas (entre ``among``, quando informado)."""
+    query = select(companies.c.id).where(companies.c.status == CompanyStatus.FROZEN.value)
+    if among is not None:
+        if not among:
+            return set()
+        query = query.where(companies.c.id.in_(list(among)))
+    return set((await session.scalars(query)).all())
+
+
 async def _loads(
-    session: AsyncSession,
+    session: AsyncSession, frozen: Collection[UUID] = ()
 ) -> tuple[dict[UUID, CompanyLoad], int, frozenset[UUID]]:
-    """Uso não interativo por empresa, interativos rodando e empresas com interativo na fila."""
+    """Uso não interativo por empresa, interativos rodando e empresas com interativo na fila.
+
+    A fila das empresas em ``frozen`` (congeladas) não conta: elas não recebem vaga.
+    """
     interactive = (runs.c.priority == INTERACTIVE_PRIORITY).label("interactive")
     queued = (runs.c.state == RunState.QUEUED.value).label("queued")
     rows = (
@@ -262,6 +289,8 @@ async def _loads(
     interactive_running = 0
     interactive_waiting: set[UUID] = set()
     for company_id, is_interactive, is_queued, count in rows:
+        if is_queued and company_id in frozen:
+            continue
         if is_interactive:
             if is_queued:
                 interactive_waiting.add(company_id)
@@ -322,7 +351,8 @@ async def claim_next(
     capacity = await _capacity(session)
     if capacity is None:
         return None
-    loads, interactive_running, interactive_waiting = await _loads(session)
+    frozen = await frozen_companies(session)
+    loads, interactive_running, interactive_waiting = await _loads(session, frozen)
     admission = plan(capacity, loads, interactive_running, interactive_waiting)
     conditions = []
     interactive = runs.c.priority == INTERACTIVE_PRIORITY
@@ -338,6 +368,10 @@ async def claim_next(
         )
     if not conditions:
         return None
+    where = [runs.c.state == RunState.QUEUED.value, or_(*conditions)]
+    if frozen:
+        # Empresa congelada: nada dela começa (a fila foi cancelada ao congelar).
+        where.append(runs.c.company_id.not_in(list(frozen)))
     # Na mesma prioridade, quem está dentro da garantia vem antes de quem pede emprestado.
     borrowing_last = (
         case(
@@ -355,7 +389,7 @@ async def claim_next(
     )
     candidates = (
         select(runs.c.id, runs.c.company_id, runs.c.version_id, runs.c.inputs, runs.c.mode)
-        .where(runs.c.state == RunState.QUEUED.value, or_(*conditions))
+        .where(*where)
         .order_by(runs.c.priority, borrowing_last, runs.c.queued_at, runs.c.id)
         .limit(1)
         .with_for_update(skip_locked=True)
@@ -736,6 +770,13 @@ def _snapshot_row(outcome: RunnerOutcome, state: RunState) -> dict[str, Any] | N
     }
 
 
+def _artifact_row(artifact: ArtifactInfo, attempt: int, now: datetime) -> dict[str, Any]:
+    """O artefato como fica em ``runs.artifacts``: sem caminho, com a tentativa e a data."""
+    return artifact.model_copy(
+        update={"attempt": artifact.attempt or attempt, "created_at": artifact.created_at or now}
+    ).model_dump(mode="json")
+
+
 def _final_state(reported: RunState, irreversible: bool) -> RunState:
     if reported is RunState.SUCCEEDED:
         return RunState.SUCCEEDED
@@ -802,7 +843,7 @@ async def finish(
         "error_message": error_message[:_MAX_ERROR_MESSAGE] if error_message else None,
         "failed_step_id": outcome.failed_step_id,
         "steps_done": func.greatest(runs.c.steps_done, outcome.steps_done),
-        "artifacts": [artifact.model_dump(mode="json") for artifact in outcome.artifacts],
+        "artifacts": [_artifact_row(artifact, attempt, now) for artifact in outcome.artifacts],
         "finished_at": now,
         "lease_expires_at": None,
     }
@@ -881,6 +922,16 @@ async def reap_expired(
         .all()
     )
     report = ReapReport()
+    # A situação lida sob a trava da situação da empresa (compartilhada; congelar a toma
+    # exclusiva): um congelamento em andamento termina antes, e o que começa depois espera
+    # esta transação e já acha a execução de volta na fila (e a cancela). Sem a trava, um
+    # congelamento confirmado entre a leitura e o fim desta transação deixaria a execução
+    # na fila da empresa congelada, para rodar quando ela fosse descongelada.
+    frozen = {
+        company
+        for company in sorted({row["company_id"] for row in expired})
+        if await lock_company_status(session, company) is CompanyStatus.FROZEN
+    }
     for row in expired:
         run_id: UUID = row["id"]
         if row["irreversible_started_at"] is not None:
@@ -922,6 +973,17 @@ async def reap_expired(
             }
             action = "execucao.falhou"
             report.failed.append(run_id)
+        elif row["company_id"] in frozen:
+            # Nada gravou, mas a empresa está congelada: não volta para a fila.
+            values = {
+                "state": RunState.CANCELLED.value,
+                "finished_at": now,
+                "lease_expires_at": None,
+                "error_code": COMPANY_FROZEN_CODE,
+                "error_message": COMPANY_FROZEN_RUN_MESSAGE,
+            }
+            action = "execucao.cancelada"
+            report.cancelled.append(run_id)
         else:
             values = {
                 "state": RunState.QUEUED.value,
@@ -1043,3 +1105,8 @@ class PgRunQueue:
         async with self.db.dispatcher_session() as session:
             await self._limit_maintenance(session)
             return await ensure_event_partitions(session, months_ahead)
+
+    async def a1_block(self, job: RunnerJob, *, now: datetime | None = None) -> str | None:
+        """Por que o executor desta execução não pode ser lançado agora (certificado A1)."""
+        async with self.db.dispatcher_session() as session:
+            return await launch_block(session, job, now or self.clock())

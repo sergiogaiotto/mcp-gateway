@@ -25,10 +25,24 @@ from rapa.control.api.publishing import PublishingServices
 from rapa.control.api.ratelimit import RateLimiter
 from rapa.control.api.routes import ApiServices, create_api_router
 from rapa.control.api.sessions import live_origins
-from rapa.control.auth import Authenticator, BearerVerifier, PrincipalResolver, StaticTokenVerifier
+from rapa.control.auth import (
+    Authenticator,
+    BearerVerifier,
+    PrincipalResolver,
+    StaticTokenVerifier,
+    UserProvisioner,
+)
 from rapa.control.mcp.server import McpGateway, McpSettings
 from rapa.control.validation import InputValidator
-from rapa.core.contracts import RepairService, RobotAdmin, RobotCatalog, RunService
+from rapa.core.contracts import (
+    ArtifactService,
+    CompanyAdminService,
+    CredentialService,
+    RepairService,
+    RobotAdmin,
+    RobotCatalog,
+    RunService,
+)
 
 if TYPE_CHECKING:
     from rapa.control.sessions.service import RecordingSessions
@@ -208,13 +222,21 @@ def create_http_app(
     sessions: RecordingSessions | None = None,
     publishing: PublishingServices | None = None,
     repairs: RepairService | None = None,
+    credentials: CredentialService | None = None,
+    company: CompanyAdminService | None = None,
+    provisioner: UserProvisioner | None = None,
+    artifacts: ArtifactService | None = None,
 ) -> FastAPI:
     """Monta a aplicação FastAPI com REST, MCP, saúde e as proteções comuns.
 
     ``sessions`` liga as sessões de gravação (``/v1/sessoes`` e a visão ao vivo);
     elas não entram no MCP, que só executa robôs publicados. ``publishing`` liga
-    as agendas, os webhooks e os lotes por planilha (também fora do MCP), e
-    ``repairs``, o conserto assistido (``/v1/execucoes/{id}/conserto``).
+    as agendas, os webhooks e os lotes por planilha (também fora do MCP),
+    ``repairs``, o conserto assistido (``/v1/execucoes/{id}/conserto``),
+    ``credentials``, as credenciais e as regras do certificado A1 (``/v1/credenciais``),
+    ``company``, a administração da empresa (``/v1/empresa``), e ``artifacts``, as
+    evidências das execuções (``/v1/execucoes/{id}/artefatos``). ``provisioner`` cria,
+    no primeiro login, o usuário (sem papéis) de uma organização ligada a uma empresa.
     """
     settings = settings or HttpSettings()
     publishing = publishing or PublishingServices()
@@ -223,7 +245,7 @@ def create_http_app(
             "tokens fixos só valem em desenvolvimento; ligue allow_static_tokens explicitamente"
         )
     version = _version()
-    authenticator = Authenticator(verifier, resolver)
+    authenticator = Authenticator(verifier, resolver, provisioner=provisioner)
     limiter = (
         RateLimiter(settings.rate_limit_per_s, settings.rate_limit_burst)
         if settings.rate_limit_per_s is not None
@@ -275,6 +297,9 @@ def create_http_app(
         live_origins=live_origins(public_url, settings.live_allowed_origins),
         publishing=publishing,
         repairs=repairs,
+        credentials=credentials,
+        company=company,
+        artifacts=artifacts,
     )
     app.include_router(create_api_router(services))
     app.router.routes.append(Route("/mcp", endpoint=gateway, include_in_schema=False))

@@ -34,6 +34,26 @@ O disparo das agendas fica no mesmo laço, antes de pegar execuções, mas com t
 limitado por volta (``Scheduler.max_tick_s``): muitas agendas vencidas atrasam o
 despacho no máximo esse tanto. Quando o agendador fica para trás, a volta seguinte
 começa sem esperar ``poll_interval``, e o despacho roda entre uma volta e outra.
+
+Certificado A1: logo antes de lançar o executor de um robô que declara um
+certificado A1, o despachante confere de novo se ele ainda pode ser usado
+(:meth:`PgRunQueue.a1_block`: registrado, não revogado, não vencido e com a
+autorização do custodiante na impressão atual) e se a versão tem as duas aprovações
+de quem não a criou nem é custodiante. Se não puder, nada é lançado e a
+execução termina ``failed`` com o código ``certificado_a1_bloqueado``; se a
+conferência falhar (banco fora do ar), também não lança (falha fechada). Com
+``alerts``, uma etapa da manutenção (``"certificates"``, a cada 6 horas) registra os
+avisos de vencimento dos certificados.
+
+A retenção (:class:`rapa.control.services.retention.Retention`, a etapa
+``"retention"``) roda uma vez por hora, também com tempo limitado por volta; se
+ficar para trás, volta em ``retention_catch_up`` segundos.
+
+Com um :class:`rapa.control.artifacts.ArtifactStore`, os artefatos do resultado
+(as telas, os arquivos baixados e o vídeo da falha) são registrados por ele antes
+de gravar o resultado: só o que o store aceita (no lugar certo, sem caminho) vai
+para ``runs.artifacts``. Um artefato recusado fica de fora; o resultado é gravado
+do mesmo jeito.
 """
 
 import asyncio
@@ -41,17 +61,29 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Protocol
 from uuid import UUID
 
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy.exc import DataError, DBAPIError, IntegrityError
 
+from rapa.control.artifacts import ArtifactStore
 from rapa.control.services._common import now_utc
 from rapa.control.services.queue import PgRunQueue, StaleAttempt
-from rapa.core.contracts import InvalidInput, RunMode, RunnerJob, RunState
+from rapa.core.contracts import InvalidInput, RunMode, RunnerJob, RunState, uses_a1
 from rapa.core.robot import Effect
+from rapa.runner.errors import ErrorCode
 
-__all__ = ["Dispatcher", "Launcher", "Ticker", "WorkerNotStarted", "failure_result"]
+__all__ = [
+    "Dispatcher",
+    "ExpiryWatch",
+    "Launcher",
+    "RetentionTicker",
+    "Ticker",
+    "WorkerNotStarted",
+    "failure_result",
+]
 
 logger = logging.getLogger("rapa.control.dispatcher")
 
@@ -67,8 +99,17 @@ _STEPS = {
     "partitions": "criação das partições de eventos",
     "reap": "recolhimento das concessões vencidas",
     "schedules": "disparo das agendas",
+    "certificates": "aviso de vencimento dos certificados A1",
+    "retention": "retenção das evidências e dos dados antigos",
     "claim": "despacho de execuções",
 }
+#: Mensagem quando não deu para conferir o certificado A1 antes de lançar.
+_A1_UNCHECKED = (
+    "Não foi possível conferir o certificado A1 do robô antes de lançar; nada foi aberto "
+    "no navegador."
+)
+#: Artefatos registrados, no máximo, por resultado (o que passar disso fica de fora).
+_MAX_ARTIFACTS = 10_000
 
 
 class Ticker(Protocol):
@@ -86,6 +127,38 @@ class Ticker(Protocol):
         o que não couber fica para a próxima, com :attr:`behind` verdadeiro.
         """
         ...
+
+
+class ExpiryWatch(Protocol):
+    """O aviso de vencimento dos certificados A1, visto do laço
+    (:class:`rapa.control.services.credentials.CredentialAlerts`)."""
+
+    async def check(self, now: datetime | None = None) -> int:
+        """Registra os avisos do dia que faltam; devolve quantos registrou."""
+        ...
+
+
+class RetentionTicker(Protocol):
+    """A retenção (:class:`rapa.control.services.retention.Retention`), vista do laço."""
+
+    @property
+    def behind(self) -> bool:
+        """A última volta parou no limite de tempo com coisa vencida para apagar."""
+        ...
+
+    async def tick(self, now: datetime | None = None) -> object:
+        """Apaga o que passou do prazo, em lotes pequenos e com tempo limitado."""
+        ...
+
+
+class _ReportedArtifact(BaseModel):
+    """Um artefato como o executor informa no RESULT.json (o caminho é local)."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    kind: str = Field(min_length=1, max_length=40)
+    name: str = Field(min_length=1, max_length=255)
+    path: str = Field(min_length=1, max_length=4000)
 
 
 class WorkerNotStarted(Exception):
@@ -163,6 +236,12 @@ class Dispatcher:
         unhealthy_after_s: float = 60.0,
         scheduler: Ticker | None = None,
         schedule_interval: float = 5.0,
+        alerts: ExpiryWatch | None = None,
+        alerts_interval: float = 6 * 3600.0,
+        artifacts: ArtifactStore | None = None,
+        retention: RetentionTicker | None = None,
+        retention_interval: float = 3600.0,
+        retention_catch_up: float = 60.0,
         clock: Callable[[], datetime] = now_utc,
     ) -> None:
         """``finish_retry_s`` é a primeira espera entre tentativas de gravar o
@@ -175,6 +254,15 @@ class Dispatcher:
         do agendador tem tempo limitado; quando ele fica para trás
         (``scheduler.behind``), a volta seguinte do laço vem sem esperar o intervalo,
         e o despacho continua rodando entre uma e outra.
+
+        Com ``alerts``, a manutenção registra os avisos de vencimento dos
+        certificados A1 a cada ``alerts_interval`` segundos (a etapa
+        ``"certificates"``).
+
+        Com ``artifacts``, os artefatos de cada resultado são registrados pelo store
+        antes de o resultado ser gravado. Com ``retention``, a etapa ``"retention"``
+        roda a cada ``retention_interval`` segundos (uma hora), ou a cada
+        ``retention_catch_up`` enquanto ficar para trás.
 
         Uma etapa da manutenção que falha é repetida depois de ``poll_interval``,
         espera que dobra a cada falha seguida, até 60 s. ``unhealthy_after_s`` é
@@ -198,6 +286,12 @@ class Dispatcher:
         self.unhealthy_after_s = unhealthy_after_s
         self.scheduler = scheduler
         self.schedule_interval = schedule_interval
+        self.alerts = alerts
+        self.alerts_interval = alerts_interval
+        self.artifacts = artifacts
+        self.retention = retention
+        self.retention_interval = retention_interval
+        self.retention_catch_up = retention_catch_up
         self.clock = clock
         self._tasks: dict[asyncio.Task[None], RunnerJob] = {}
         self._steps = {name: _StepState() for name in _STEPS}
@@ -206,6 +300,8 @@ class Dispatcher:
         self._loop_started: datetime | None = None
         #: O agendador ficou para trás na última volta: a próxima não espera.
         self._schedules_behind = False
+        #: A retenção ficou para trás: a próxima volta dela vem em ``retention_catch_up``.
+        self._retention_behind = False
 
     @property
     def in_flight(self) -> int:
@@ -216,7 +312,9 @@ class Dispatcher:
         """Etapas do laço que falharam na última vez, com o início das falhas seguidas.
 
         As etapas são ``"partitions"`` (partições de eventos), ``"reap"``
-        (recolhimento das concessões vencidas) e ``"claim"`` (pegar execuções).
+        (recolhimento das concessões vencidas), ``"schedules"`` (agendas),
+        ``"certificates"`` (avisos de vencimento do A1), ``"retention"`` (retenção) e
+        ``"claim"`` (pegar execuções).
         """
         return {
             name: state.failing_since
@@ -326,12 +424,14 @@ class Dispatcher:
                 self._failed("reap", now, exc, backoff=True)
             else:
                 self._succeeded("reap", now)
-                if report.requeued or report.indeterminate or report.failed:
+                if report.requeued or report.indeterminate or report.failed or report.cancelled:
                     logger.warning(
-                        "concessões vencidas: %d de volta à fila, %d indeterminadas, %d falharam",
+                        "concessões vencidas: %d de volta à fila, %d indeterminadas, %d falharam, "
+                        "%d canceladas (empresa congelada)",
                         len(report.requeued),
                         len(report.indeterminate),
                         len(report.failed),
+                        len(report.cancelled),
                     )
         if self.scheduler is not None and (
             self._schedules_behind or self._due("schedules", now, self.schedule_interval)
@@ -344,6 +444,24 @@ class Dispatcher:
             else:
                 self._succeeded("schedules", now)
                 self._schedules_behind = bool(self.scheduler.behind)
+        if self.alerts is not None and self._due("certificates", now, self.alerts_interval):
+            try:
+                await self.alerts.check(now)
+            except Exception as exc:  # banco fora, erro inesperado: tenta de novo depois
+                self._failed("certificates", now, exc, backoff=True)
+            else:
+                self._succeeded("certificates", now)
+        retention_every = (
+            self.retention_catch_up if self._retention_behind else self.retention_interval
+        )
+        if self.retention is not None and self._due("retention", now, retention_every):
+            try:
+                await self.retention.tick(now)
+            except Exception as exc:  # banco fora, trava ocupada, disco: tenta de novo depois
+                self._failed("retention", now, exc, backoff=True)
+            else:
+                self._succeeded("retention", now)
+                self._retention_behind = bool(self.retention.behind)
 
     async def run_once(self) -> int:
         """Pega execuções até encher a concorrência; devolve quantas lançou."""
@@ -433,7 +551,27 @@ class Dispatcher:
                 launch_task.cancel()
                 return
 
+    async def _a1_blocked(self, job: RunnerJob) -> str | None:
+        """Por que não lançar o executor (certificado A1); ``None`` para os outros robôs."""
+        if not uses_a1(job.manifest):
+            return None
+        try:
+            return await self.queue.a1_block(job, now=self.clock())
+        except Exception as exc:  # banco fora: não lança sem conferir (falha fechada)
+            logger.error("conferência do certificado A1 falhou: %s", _error_name(exc))
+            return _A1_UNCHECKED
+
     async def _handle(self, job: RunnerJob) -> None:
+        blocked = await self._a1_blocked(job)
+        if blocked is not None:
+            logger.warning("execução %s não lançada: certificado A1 bloqueado", job.run_id)
+            await self._finish(
+                job,
+                failure_result(
+                    job, ErrorCode.CERTIFICADO_A1_BLOQUEADO.value, blocked, started=False
+                ),
+            )
+            return
         launch_task: asyncio.Task[Mapping[str, Any]] = asyncio.create_task(
             _call(self.launch, job), name=f"lancamento-{job.run_id}"
         )
@@ -461,12 +599,52 @@ class Dispatcher:
                 result = failure_result(
                     job, "falha_no_lancador", "O executor terminou sem entregar o resultado."
                 )
-            # A concessão segue renovada até o resultado ser gravado.
+            # A concessão segue renovada até os artefatos e o resultado serem gravados.
+            result = await self._register_artifacts(job, result)
             await self._finish(job, result)
         finally:
             beats.cancel()
             # Erros da renovação já foram registrados; não impedem gravar o resultado.
             await asyncio.gather(beats, return_exceptions=True)
+
+    async def _register_artifacts(
+        self, job: RunnerJob, result: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """Registra os artefatos do resultado pelo store; o que ele recusa fica de fora.
+
+        Sem store, o resultado segue como veio (a fila guarda os artefatos sem o
+        caminho). Um erro do store nunca impede gravar o resultado: só o tipo do erro
+        vai para o log, nunca o nome do arquivo (que pode trazer dados da execução).
+        """
+        store = self.artifacts
+        reported = result.get("artifacts")
+        if store is None or not isinstance(reported, list) or not reported:
+            return result
+        registered: list[dict[str, Any]] = []
+        refused = 0
+        for raw in reported[:_MAX_ARTIFACTS]:
+            try:
+                item = _ReportedArtifact.model_validate(raw)
+                info = await store.put(
+                    job.company_id, job.run_id, job.attempt, item.name, item.kind, Path(item.path)
+                )
+            except (ValidationError, ValueError, OSError) as exc:
+                refused += 1
+                logger.warning(
+                    "artefato de %s recusado pelo armazenamento: %s", job.run_id, type(exc).__name__
+                )
+                continue
+            except Exception as exc:  # store fora do ar: o resultado é gravado sem ele
+                refused += 1
+                logger.error(
+                    "falha ao registrar um artefato de %s: %s", job.run_id, _error_name(exc)
+                )
+                continue
+            registered.append(info.model_dump(mode="json"))
+        refused += max(0, len(reported) - _MAX_ARTIFACTS)
+        if refused:
+            logger.warning("%d artefato(s) de %s ficaram de fora", refused, job.run_id)
+        return {**result, "artifacts": registered}
 
     async def _finish(self, job: RunnerJob, result: Mapping[str, Any]) -> None:
         """Grava o resultado, repetindo com espera crescente enquanto o banco falhar.

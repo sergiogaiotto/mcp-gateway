@@ -5,7 +5,8 @@ API. A entrega de um webhook (``POST /v1/webhooks/{id}``) é a exceção: chega 
 token e é autenticada só pela assinatura (:mod:`rapa.control.services.webhooks`),
 com o limite por webhook. Ela responde 202 com a execução (a mesma para a mesma
 entrega), 401 para qualquer problema de assinatura (sem dizer qual), 409 para
-webhook desligado, robô não publicado ou entrega repetida com outro corpo, 422
+webhook desligado, robô não publicado ou entrega repetida com outro corpo, 423 para
+empresa congelada (só depois de conferida a assinatura), 422
 para entradas inválidas e 429 acima do limite do webhook, para um endereço de
 origem com recusas demais ou com leituras demais no processo (os dois últimos
 antes de qualquer consulta ao banco; veja

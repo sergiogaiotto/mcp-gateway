@@ -32,6 +32,7 @@ from rapa.core.contracts import (
     RunStatus,
     RunTrigger,
     VersionStatus,
+    required_approvals,
 )
 from rapa.core.ids import new_id
 from rapa.core.robot import Manifest
@@ -75,6 +76,7 @@ class _Version:
     created_at: datetime
     violations: list[str]
     approved_by: str | None = None
+    approvals: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -142,6 +144,8 @@ class MemoryPlatform:
             approved_by=version.approved_by,
             created_at=version.created_at,
             violations=version.violations,
+            approvals=list(version.approvals),
+            approvals_required=required_approvals(version.manifest),
         )
 
     @staticmethod
@@ -261,6 +265,12 @@ class MemoryPlatform:
             raise Forbidden("quem criou a versão não pode aprová-la")
         if version.status is not VersionStatus.VALIDATED:
             raise Conflict("a versão precisa estar validada antes de publicar")
+        # Como no banco: cada aprovação conta uma vez; o robô com A1 precisa de duas.
+        if principal.subject in version.approvals:
+            raise Conflict("você já aprovou esta versão; falta a aprovação de outra pessoa")
+        version.approvals.append(principal.subject)
+        if len(version.approvals) < required_approvals(version.manifest):
+            return self._version_info(robot, version)
         previous = robot.published()
         if previous is not None:
             previous.status = VersionStatus.SUPERSEDED

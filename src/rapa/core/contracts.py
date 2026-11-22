@@ -5,6 +5,8 @@ persistência só por estes protocolos. Assim cada parte pode ser testada com
 implementações em memória.
 """
 
+import builtins
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal, Protocol
@@ -13,14 +15,31 @@ from uuid import UUID
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from rapa.core.cron import DEFAULT_TIMEZONE
-from rapa.core.robot import NAME_PATTERN, SLUG_PATTERN, Effect, Locator, Manifest, Target
+from rapa.core.robot import (
+    NAME_PATTERN,
+    SLUG_PATTERN,
+    CredentialKind,
+    Effect,
+    Locator,
+    Manifest,
+    Target,
+)
 
 __all__ = [
+    "A1_APPROVALS",
     "AUTOMATION_ROLES",
+    "COMPANY_FROZEN_MESSAGE",
     "MAX_BATCHES_LISTED",
     "MAX_OCCURRENCES_LISTED",
     "MAX_RUNS_LISTED",
     "MAX_SESSIONS_LISTED",
+    "A1AuthorizationInfo",
+    "ApprovalInfo",
+    "AreaInfo",
+    "AreaUsage",
+    "ArtifactContent",
+    "ArtifactService",
+    "ArtifactStatus",
     "BatchColumn",
     "BatchFile",
     "BatchFormat",
@@ -29,14 +48,24 @@ __all__ = [
     "BatchRow",
     "BatchRowError",
     "BatchService",
+    "CertificateBlocked",
     "CheckProposal",
+    "CompanyAdminService",
+    "CompanyFrozen",
+    "CompanyInfo",
+    "CompanyStatus",
+    "CompanyUser",
     "Conflict",
     "ContractError",
+    "CredentialInfo",
+    "CredentialService",
+    "CredentialStatus",
     "DraftChoices",
     "EffectChoice",
     "EffectProposal",
     "Forbidden",
     "GeneralizationProposals",
+    "Gone",
     "InvalidInput",
     "NotFound",
     "ParameterChoice",
@@ -67,6 +96,8 @@ __all__ = [
     "RobotSummary",
     "RobotVersionInfo",
     "Role",
+    "RoleGrant",
+    "RunArtifact",
     "RunMode",
     "RunService",
     "RunState",
@@ -84,6 +115,9 @@ __all__ = [
     "StepNameChoice",
     "StepNameProposal",
     "StepOverview",
+    "TriggerUsage",
+    "UsageReport",
+    "VersionApprovals",
     "VersionStatus",
     "ViewerTicket",
     "WebhookChanges",
@@ -94,6 +128,8 @@ __all__ = [
     "WebhookService",
     "WebhookSpec",
     "can_automate",
+    "required_approvals",
+    "uses_a1",
 ]
 
 
@@ -190,6 +226,24 @@ class RobotInfo(_Model):
     created_at: datetime
 
 
+#: Aprovações exigidas para publicar uma versão que declara um certificado digital A1.
+A1_APPROVALS = 2
+
+
+def uses_a1(manifest: Manifest) -> bool:
+    """Se o manifesto declara alguma credencial do tipo certificado digital A1."""
+    return any(c.kind is CredentialKind.PFX_A1 for c in manifest.credentials)
+
+
+def required_approvals(manifest: Manifest) -> int:
+    """Quantas pessoas diferentes aprovam a versão antes de ela ser publicada.
+
+    Duas para um robô com certificado A1 (a mesma conta do gatilho do banco, que
+    olha ``manifest->'credentials'``), uma para os outros.
+    """
+    return A1_APPROVALS if uses_a1(manifest) else 1
+
+
 class RobotVersionInfo(_Model):
     robot_id: UUID
     version_id: UUID
@@ -201,6 +255,10 @@ class RobotVersionInfo(_Model):
     approved_by: str | None
     created_at: datetime
     violations: list[str] = Field(default_factory=list)
+    #: Quem já aprovou a versão, na ordem (o último publica).
+    approvals: list[str] = Field(default_factory=list)
+    #: Quantas aprovações a versão precisa para ser publicada (2 com certificado A1).
+    approvals_required: int = Field(default=1, ge=1)
 
 
 class RunState(StrEnum):
@@ -308,6 +366,16 @@ class InvalidInput(ContractError):
         self.errors = errors or []
 
 
+class CertificateBlocked(InvalidInput):
+    """O certificado A1 de um robô não pode ser usado agora; ``errors`` diz o que falta.
+
+    Registro na área, revogação, validade e a autorização do custodiante para o robô
+    (com a impressão atual do certificado). Nada sigiloso entra na lista.
+    """
+
+    code = "certificado_a1_bloqueado"
+
+
 class SignatureInvalid(ContractError):
     """Pedido sem token cuja assinatura não confere (a entrega de um webhook).
 
@@ -322,6 +390,26 @@ class ServiceUnavailable(ContractError):
     """Um recurso da plataforma não está disponível agora (por exemplo, o navegador da gravação)."""
 
     code = "indisponivel"
+
+
+class CompanyFrozen(Conflict):
+    """A empresa está congelada: lê tudo, mas nada novo começa (HTTP 423).
+
+    É um :class:`Conflict`, então quem já trata conflitos (a interface, o MCP) mostra a
+    mensagem sem saber dela; a API responde 423 com o código ``empresa_congelada``.
+    """
+
+    code = "empresa_congelada"
+
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(message or COMPANY_FROZEN_MESSAGE)
+
+
+#: Mensagem de toda recusa por empresa congelada.
+COMPANY_FROZEN_MESSAGE = (
+    "a empresa está congelada: nada novo pode ser criado nem executado até a plataforma "
+    "descongelá-la"
+)
 
 
 class QuotaExceeded(ContractError):
@@ -1118,3 +1206,346 @@ class RepairService(Protocol):
     async def create_repair(
         self, principal: Principal, run_id: UUID, candidate_id: str
     ) -> RepairProposalInfo: ...
+
+
+# ---------------------------------------------------------------------------
+# Credenciais do cofre e as regras do certificado A1
+# ---------------------------------------------------------------------------
+
+
+class CredentialStatus(StrEnum):
+    """Situação de uma credencial registrada."""
+
+    ACTIVE = "ativa"
+    #: Certificado A1 que vence dentro do prazo do aviso.
+    EXPIRING = "vencendo"
+    #: Certificado A1 vencido (ou sem a validade registrada: conta como vencido).
+    EXPIRED = "vencida"
+    REVOKED = "revogada"
+
+
+class CredentialInfo(_Model):
+    """Uma credencial registrada: só a referência ao cofre e os metadados, nunca o valor."""
+
+    credential_id: UUID
+    area_id: UUID
+    name: str
+    kind: CredentialKind
+    origin: str
+    custodian_subject: str | None = None
+    custodian_name: str | None = None
+    #: Validade do certificado (só A1).
+    not_after: datetime | None = None
+    #: Impressão SHA-256 do certificado (64 hexadecimais minúsculos).
+    fingerprint_sha256: str | None = None
+    status: CredentialStatus
+    created_at: datetime
+    updated_at: datetime
+    revoked_at: datetime | None = None
+    revoked_by: str | None = None
+    #: Caminho no cofre; só para quem administra a área e para o custodiante.
+    vault_path: str | None = None
+
+
+class A1AuthorizationInfo(_Model):
+    """A autorização do custodiante para um robô usar um certificado A1 num portal."""
+
+    authorization_id: UUID
+    robot_id: UUID
+    area_id: UUID
+    credential_id: UUID
+    credential_name: str
+    origin: str
+    #: A impressão do certificado no momento da autorização.
+    fingerprint_sha256: str | None = None
+    authorized_by: str
+    created_at: datetime
+    revoked_at: datetime | None = None
+    revoked_by: str | None = None
+    #: Ativa e com a impressão atual do certificado (a que vale para rodar).
+    current: bool = False
+
+
+class ApprovalInfo(_Model):
+    approved_by: str
+    approved_at: datetime
+
+
+class VersionApprovals(_Model):
+    """As aprovações de uma versão: quem aprovou, quantas faltam e o que impede."""
+
+    robot_id: UUID
+    version_no: int
+    status: VersionStatus
+    required: int
+    approvals: list[ApprovalInfo] = Field(default_factory=list)
+    missing: int = 0
+    #: O que falta no certificado A1 para contar a próxima aprovação (sem segredos).
+    problems: list[str] = Field(default_factory=list)
+
+
+class CredentialService(Protocol):
+    """Credenciais registradas (referências ao cofre) e as regras do certificado A1."""
+
+    async def register(
+        self,
+        principal: Principal,
+        area_id: UUID,
+        *,
+        name: str,
+        kind: CredentialKind,
+        origin: str,
+        vault_path: str,
+        custodian_subject: str | None = None,
+        not_after: datetime | None = None,
+        fingerprint: str | None = None,
+    ) -> CredentialInfo: ...
+
+    async def renew(
+        self,
+        principal: Principal,
+        credential_id: UUID,
+        *,
+        not_after: datetime,
+        fingerprint: str | None = None,
+    ) -> CredentialInfo: ...
+
+    async def revoke(self, principal: Principal, credential_id: UUID) -> CredentialInfo: ...
+
+    async def list(
+        self, principal: Principal, area_id: UUID | None = None
+    ) -> builtins.list[CredentialInfo]: ...
+
+    async def expiring(
+        self, principal: Principal, within_days: int | None = None
+    ) -> builtins.list[CredentialInfo]: ...
+
+    async def authorize(
+        self, principal: Principal, robot_id: UUID, credential_name: str
+    ) -> A1AuthorizationInfo: ...
+
+    async def revoke_authorization(
+        self, principal: Principal, authorization_id: UUID, *, robot_id: UUID | None = None
+    ) -> A1AuthorizationInfo: ...
+
+    async def list_authorizations(
+        self, principal: Principal, robot_id: UUID
+    ) -> builtins.list[A1AuthorizationInfo]: ...
+
+    async def approvals(
+        self, principal: Principal, robot_id: UUID, version_no: int
+    ) -> VersionApprovals: ...
+
+
+# ---------------------------------------------------------------------------
+# Operação por empresa: situação, usuários e papéis, áreas e consumo
+# ---------------------------------------------------------------------------
+
+
+class CompanyStatus(StrEnum):
+    """Situação de uma empresa na plataforma."""
+
+    ACTIVE = "active"
+    #: Congelada: lê tudo, mas nada novo começa (a saída da empresa começa por aqui).
+    FROZEN = "frozen"
+
+
+class CompanyInfo(_Model):
+    """A empresa de quem está chamando."""
+
+    company_id: UUID
+    name: str
+    status: CompanyStatus
+    #: Por que a plataforma congelou a empresa; só para quem administra ou audita.
+    status_reason: str | None = None
+    status_changed_at: datetime | None = None
+    created_at: datetime
+
+
+class AreaInfo(_Model):
+    area_id: UUID
+    name: str
+    created_at: datetime
+
+
+class RoleGrant(_Model):
+    """Um papel de um usuário: na empresa inteira (``area_id`` nulo) ou numa área."""
+
+    role: Role
+    area_id: UUID | None = None
+
+
+class CompanyUser(_Model):
+    """Um usuário da empresa com os papéis que quem pergunta pode ver."""
+
+    user_id: UUID
+    subject: str
+    display_name: str
+    active: bool
+    created_at: datetime
+    roles: list[RoleGrant] = Field(default_factory=list)
+
+
+class TriggerUsage(_Model):
+    """Consumo de uma área por uma origem (``trigger``) num mês."""
+
+    trigger: RunTrigger
+    runs: int
+    #: Execuções por situação (só as situações que aparecem).
+    runs_by_state: dict[RunState, int] = Field(default_factory=dict)
+    #: Minutos de navegador: do início ao fim de cada execução que começou.
+    browser_minutes: float = 0.0
+
+
+class AreaUsage(_Model):
+    area_id: UUID
+    area_name: str
+    runs: int = 0
+    browser_minutes: float = 0.0
+    by_trigger: list[TriggerUsage] = Field(default_factory=list)
+    #: Sessões de gravação abertas no mês e os minutos delas (do início ao fim).
+    sessions: int = 0
+    session_minutes: float = 0.0
+    batches: int = 0
+    batch_rows: int = 0
+
+
+class UsageReport(_Model):
+    """Consumo mensal da empresa, por área e por origem, no fuso ``America/Sao_Paulo``."""
+
+    company_id: UUID
+    #: O mês, ``AAAA-MM``.
+    month: str
+    timezone: str
+    period_start: datetime
+    period_end: datetime
+    areas: list[AreaUsage] = Field(default_factory=list)
+    runs: int = 0
+    browser_minutes: float = 0.0
+    sessions: int = 0
+    session_minutes: float = 0.0
+    batches: int = 0
+    batch_rows: int = 0
+
+
+class CompanyAdminService(Protocol):
+    """Administração da empresa por ela mesma: usuários e papéis, áreas e consumo.
+
+    Quem administra a empresa faz tudo; quem administra uma área só lista os usuários
+    e dá e tira os papéis da área dele (nunca ``company_admin`` nem
+    ``platform_admin``); o consumo é de quem administra a empresa e de quem audita.
+    ``platform_admin`` nunca é dado por aqui, e ninguém tira o último
+    ``company_admin`` ativo nem desativa a si mesmo.
+    """
+
+    async def get_company(self, principal: Principal) -> CompanyInfo: ...
+
+    async def list_users(self, principal: Principal) -> list[CompanyUser]: ...
+
+    async def set_roles(
+        self, principal: Principal, user_id: UUID, roles: list[RoleGrant]
+    ) -> CompanyUser: ...
+
+    async def deactivate_user(self, principal: Principal, user_id: UUID) -> CompanyUser: ...
+
+    async def reactivate_user(self, principal: Principal, user_id: UUID) -> CompanyUser: ...
+
+    async def list_areas(self, principal: Principal) -> list[AreaInfo]: ...
+
+    async def create_area(self, principal: Principal, name: str) -> AreaInfo: ...
+
+    async def rename_area(self, principal: Principal, area_id: UUID, name: str) -> AreaInfo: ...
+
+    async def usage(self, principal: Principal, month: str | None = None) -> UsageReport: ...
+
+
+# ---------------------------------------------------------------------------
+# Evidências (os artefatos de uma execução)
+# ---------------------------------------------------------------------------
+
+
+class Gone(ContractError):
+    """O recurso existiu, mas o prazo de retenção acabou (HTTP 410)."""
+
+    code = "expirado"
+
+
+class ArtifactStatus(StrEnum):
+    """Se o arquivo de um artefato ainda pode ser lido."""
+
+    AVAILABLE = "disponivel"
+    #: O prazo de retenção acabou: o arquivo foi apagado e não é mais servido.
+    EXPIRED = "expirado"
+
+
+class RunArtifact(_Model):
+    """Um arquivo que a execução guardou: tela, arquivo baixado ou vídeo da falha.
+
+    ``name`` é o identificador do artefato na execução (o mesmo das saídas de um
+    download); o caminho no disco nunca aparece.
+    """
+
+    name: str
+    kind: str
+    size: int = Field(ge=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    media_type: str
+    created_at: datetime | None = None
+    status: ArtifactStatus = ArtifactStatus.AVAILABLE
+
+
+class ArtifactContent:
+    """Um artefato aberto para leitura, em pedaços (quem lê fecha com :meth:`aclose`)."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        media_type: str,
+        inline: bool,
+        chunks: AsyncIterator[bytes],
+        size: int | None = None,
+        close: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        self.name = name
+        self.media_type = media_type
+        self.inline = inline
+        self.size = size
+        self._chunks = chunks
+        self._close = close
+
+    def __repr__(self) -> str:
+        return f"ArtifactContent(name={self.name!r}, media_type={self.media_type!r})"
+
+    async def iterate(self) -> AsyncIterator[bytes]:
+        """Os bytes do arquivo; fecha a leitura no fim (também se quem lê desistir)."""
+        try:
+            async for chunk in self._chunks:
+                yield chunk
+        finally:
+            await self.aclose()
+
+    async def read(self) -> bytes:
+        """O arquivo inteiro (para arquivos pequenos, como uma tela)."""
+        return b"".join([chunk async for chunk in self.iterate()])
+
+    async def aclose(self) -> None:
+        close, self._close = self._close, None
+        if close is not None:
+            await close()
+
+
+class ArtifactService(Protocol):
+    """As evidências de uma execução: quem vê a execução vê os artefatos dela."""
+
+    async def list_artifacts(self, principal: Principal, run_id: UUID) -> list[RunArtifact]:
+        """Os artefatos da execução; :class:`NotFound` se ela não existe para o principal."""
+        ...
+
+    async def open_artifact(self, principal: Principal, run_id: UUID, name: str) -> ArtifactContent:
+        """Abre um artefato da lista da execução.
+
+        :class:`NotFound` para outra empresa ou área, nome inválido ou fora da lista;
+        :class:`Gone` quando o prazo de retenção acabou.
+        """
+        ...

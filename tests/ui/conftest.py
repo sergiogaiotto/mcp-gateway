@@ -31,7 +31,14 @@ from nicegui.storage import Storage
 from nicegui.testing import User
 from nicegui.testing.general import nicegui_reset_globals
 
-from rapa.core.contracts import Principal, RecordingService, RepairService, Role
+from rapa.core.contracts import (
+    ArtifactService,
+    CredentialService,
+    Principal,
+    RecordingService,
+    RepairService,
+    Role,
+)
 from rapa.core.ids import new_id
 from rapa.fixtures.memory import MemoryPlatform
 from rapa.fixtures.robots import baixar_notas, emitir_protocolo
@@ -92,6 +99,10 @@ class World:
     sessions: RecordingService | None = None
     #: O conserto assistido (a tela "Consertar este passo").
     repairs: RepairService | None = None
+    #: As credenciais e as regras do certificado A1 (a tela Credenciais).
+    credentials: CredentialService | None = None
+    #: As evidências das execuções (telas, vídeo da falha e arquivos baixados).
+    artifacts: ArtifactService | None = None
 
     def auth(self) -> UiAuth:
         profiles = [
@@ -117,7 +128,11 @@ class World:
         create_ui(
             app,
             backend_factory=ContractsBackendFactory.from_platform(
-                self.platform, sessions=self.sessions, repairs=self.repairs
+                self.platform,
+                sessions=self.sessions,
+                repairs=self.repairs,
+                credentials=self.credentials,
+                artifacts=self.artifacts,
             ),
             auth=self.auth(),
             settings=self.settings(),

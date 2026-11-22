@@ -35,10 +35,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from rapa.control.api.publishing import PublishingServices
+from rapa.control.artifacts import ArtifactStore, LocalArtifactStore
 from rapa.control.auth import (
     Authenticator,
     AuthError,
     BearerVerifier,
+    CachedOrganizationDirectory,
     DevTokenVerifier,
     JwtSettings,
     TokenVerifier,
@@ -53,19 +55,27 @@ from rapa.control.launcher import (
     StaticSecretSource,
 )
 from rapa.control.services import (
+    CredentialAlerts,
     Dispatcher,
     HubRepairAssistant,
+    PgArtifacts,
     PgBatches,
+    PgCompanyAdmin,
+    PgCredentials,
+    PgOrganizationDirectory,
     PgPlatform,
     PgPrincipalResolver,
     PgRepairs,
     PgRunQueue,
     PgSchedules,
     PgWebhooks,
+    Retention,
+    RetentionPolicy,
     Scheduler,
     WebhookKeys,
 )
 from rapa.control.services.queue import DEFAULT_MAX_DURATION
+from rapa.control.services.retention import SUCCESS_AFTER_FAILURE
 from rapa.control.services.sessions import PgSessionStore
 from rapa.control.services.sheets import SheetLimits
 from rapa.control.services.webhooks import WebhookGate
@@ -78,11 +88,15 @@ from rapa.control.sessions import (
     SessionLimits,
 )
 from rapa.core.contracts import Principal
+from rapa.runner.video import ffmpeg_installed
 
 __all__ = [
     "AuthenticatorLoginResolver",
     "DispatcherSupervisor",
     "ServerSettings",
+    "build_artifact_store",
+    "build_artifacts",
+    "build_credentials",
     "build_publishing",
     "build_repairs",
     "build_scheduler",
@@ -183,6 +197,16 @@ class ServerSettings(BaseModel):
     batch_max_bytes: int = Field(default=5 * 1024 * 1024, ge=1024, le=100 * 1024 * 1024)
     #: Quantos candidatos o conserto assistido mostra (e o modelo vê) para o passo que quebrou.
     repair_candidates: int = Field(default=8, ge=1, le=20)
+    #: Quantos dias antes do vencimento de um certificado A1 o aviso começa.
+    a1_warn_days: int = Field(default=30, ge=1, le=3650)
+    #: Filma cada execução e guarda o vídeo só quando ela falha ou fica indeterminada.
+    video_on_failure: bool = True
+    #: Prazos de retenção, em dias (a validar com o jurídico): telas e vídeos de execuções
+    #: que deram certo; evidências (todos os artefatos de falhas e indeterminadas e os
+    #: arquivos baixados das que deram certo) e retratos das falhas; partições de eventos.
+    retention_success_days: int = Field(default=7, ge=1, le=36_500)
+    retention_failure_days: int = Field(default=90, ge=1, le=36_500)
+    retention_events_days: int = Field(default=400, ge=1, le=36_500)
 
     @model_validator(mode="after")
     def _check(self) -> ServerSettings:
@@ -207,6 +231,8 @@ class ServerSettings(BaseModel):
             )
         if self.session_idle_s > self.session_max_s:
             raise ValueError("o tempo sem atividade de uma sessão não pode passar do prazo máximo")
+        if self.retention_success_days > self.retention_failure_days:
+            raise ValueError(SUCCESS_AFTER_FAILURE)
         oidc = (self.oidc_client_id, self.oidc_redirect_uri)
         if any(oidc) and not all(oidc):
             raise ValueError("para o login OIDC, informe o cliente e o endereço de retorno")
@@ -266,7 +292,21 @@ class ServerSettings(BaseModel):
         - consertar: ``RAPA_CONSERTO_CANDIDATOS`` (quantos candidatos o conserto
           assistido mostra para o passo que quebrou, e o modelo vê; de 1 a 20, padrão
           8). O modelo que escolhe entre eles é o mesmo hub da revisão
-          (``RAPA_LLM_*``); sem ele, a pessoa escolhe sozinha, com um aviso.
+          (``RAPA_LLM_*``); sem ele, a pessoa escolhe sozinha, com um aviso;
+        - certificado A1: ``RAPA_A1_AVISO_DIAS`` (quantos dias antes do vencimento o
+          aviso começa, na interface, no REST e na auditoria; de 1 a 3650, padrão 30);
+        - evidências: ``RAPA_VIDEO_EM_FALHAS`` (1 ou 0; liga por padrão: cada execução
+          é filmada e o vídeo fica só quando ela falha ou fica indeterminada, e só se o
+          robô não digita credencial fora de um campo de senha; precisa do ``ffmpeg`` do
+          Playwright no executor, e sem ele a execução roda sem vídeo, com um aviso no
+          log ao subir) e os prazos de retenção, em dias, **a validar com o jurídico**:
+          ``RAPA_RETENCAO_SUCESSO_DIAS`` (telas e vídeos de execuções que deram certo ou
+          foram canceladas; padrão 7), ``RAPA_RETENCAO_FALHAS_DIAS`` (as evidências:
+          todos os artefatos de falhas e indeterminadas, os arquivos baixados das que
+          deram certo, e os retratos das falhas; padrão 90) e
+          ``RAPA_RETENCAO_EVENTOS_DIAS`` (partições de eventos; padrão 400). Todos têm
+          no mínimo 1 dia, e ``RAPA_RETENCAO_SUCESSO_DIAS`` não passa de
+          ``RAPA_RETENCAO_FALHAS_DIAS`` (o servidor não sobe).
         """
         env = os.environ if env is None else env
         data: dict[str, Any] = {
@@ -295,6 +335,7 @@ class ServerSettings(BaseModel):
             "llm_api_key": env.get("RAPA_LLM_API_KEY") or None,
             "llm_capabilities_file": _path(env, "RAPA_LLM_CAPACIDADES"),
             "webhook_key": env.get("RAPA_CHAVE_WEBHOOKS") or None,
+            "video_on_failure": _flag(env, "RAPA_VIDEO_EM_FALHAS", True),
         }
         for key, name, kind in (
             ("sessions_per_company", "RAPA_SESSOES_POR_EMPRESA", int),
@@ -308,6 +349,10 @@ class ServerSettings(BaseModel):
             ("batch_max_rows", "RAPA_LOTE_MAX_LINHAS", int),
             ("batch_max_bytes", "RAPA_LOTE_MAX_BYTES", int),
             ("repair_candidates", "RAPA_CONSERTO_CANDIDATOS", int),
+            ("a1_warn_days", "RAPA_A1_AVISO_DIAS", int),
+            ("retention_success_days", "RAPA_RETENCAO_SUCESSO_DIAS", int),
+            ("retention_failure_days", "RAPA_RETENCAO_FALHAS_DIAS", int),
+            ("retention_events_days", "RAPA_RETENCAO_EVENTOS_DIAS", int),
         ):
             if raw := env.get(name, "").strip():
                 data[key] = kind(raw)
@@ -397,15 +442,18 @@ def _secret_source(settings: ServerSettings) -> SecretSource:
     return NoSecrets()
 
 
-def _verifier(settings: ServerSettings) -> BearerVerifier:
+def _verifier(settings: ServerSettings, db: Database) -> BearerVerifier:
     if settings.jwt_issuer and settings.jwt_audience and settings.jwks_url:
+        # A empresa da organização também vem do banco (companies.idp_organization), com
+        # cache curto: uma empresa nova entra sem reiniciar o serviço.
         return TokenVerifier(
             JwtSettings(
                 issuer=settings.jwt_issuer,
                 audience=settings.jwt_audience,
                 jwks_url=settings.jwks_url,
                 organization_aliases=settings.organization_aliases,
-            )
+            ),
+            organizations=CachedOrganizationDirectory(PgOrganizationDirectory(db)),
         )
     if settings.dev_tokens_file is None:  # pragma: no cover - barrado pela validação
         raise ValueError("sem verificação de tokens configurada")
@@ -420,6 +468,9 @@ def _mount_ui(
     sessions: RecordingSessions | None = None,
     publishing: PublishingServices | None = None,
     repairs: PgRepairs | None = None,
+    credentials: PgCredentials | None = None,
+    company: PgCompanyAdmin | None = None,
+    artifacts: PgArtifacts | None = None,
 ) -> None:
     from rapa.ui.app import create_ui
     from rapa.ui.auth import DevLogin, DevProfile, OidcLogin, OidcSettings, UiAuth
@@ -463,6 +514,9 @@ def _mount_ui(
             webhooks=publishing.webhooks if publishing else None,
             batches=publishing.batches if publishing else None,
             repairs=repairs,
+            credentials=credentials,
+            company=company,
+            artifacts=artifacts,
         ),
         # A interface age direto nos serviços, então a sessão confere de novo no banco
         # (conta ativa e papéis), como a API faz a cada pedido.
@@ -665,9 +719,32 @@ class _DispatcherHealth:
         await self.app(scope, receive, send)
 
 
+def build_artifact_store(settings: ServerSettings) -> ArtifactStore:
+    """Onde ficam os artefatos: a pasta local de ``RAPA_PASTA_ARTEFATOS`` (a parte E troca)."""
+    return LocalArtifactStore(settings.artifacts_dir)
+
+
+def build_artifacts(settings: ServerSettings, db: Database) -> PgArtifacts:
+    """As evidências das execuções (REST e interface), lidas pelo store dos artefatos."""
+    return PgArtifacts(db, build_artifact_store(settings))
+
+
 def build_dispatcher(settings: ServerSettings, db: Database) -> Dispatcher:
-    """Despachante com o lançador local, sobre o banco do papel do despachante."""
+    """Despachante com o lançador local, sobre o banco do papel do despachante.
+
+    Registra os artefatos de cada resultado pelo store e roda a retenção uma vez por
+    hora, com os prazos de ``RAPA_RETENCAO_*``.
+    """
     queue = PgRunQueue(db)
+    store = build_artifact_store(settings)
+    if settings.video_on_failure and ffmpeg_installed() is False:
+        # O worker roda sem vídeo quando ele não abre; sem este aviso, só a falta dos
+        # vídeos de falha mostraria que nada está sendo filmado.
+        logger.warning(
+            "RAPA_VIDEO_EM_FALHAS está ligado, mas o ffmpeg do Playwright não está "
+            "instalado: as execuções rodam sem vídeo (instale com 'playwright install "
+            "ffmpeg', ou desligue com RAPA_VIDEO_EM_FALHAS=0)"
+        )
     launcher = LocalProcessLauncher(
         queue,
         LocalLauncherSettings(
@@ -676,11 +753,26 @@ def build_dispatcher(settings: ServerSettings, db: Database) -> Dispatcher:
             chromium=settings.chromium,
             browser_args=settings.browser_args,
             files_dir=settings.files_dir,
+            video_on_failure=settings.video_on_failure,
         ),
         _secret_source(settings),
     )
+    retention = Retention(
+        db,
+        store,
+        RetentionPolicy(
+            success_days=settings.retention_success_days,
+            failure_days=settings.retention_failure_days,
+            events_days=settings.retention_events_days,
+        ),
+    )
     return Dispatcher(
-        queue, launcher, concurrency=settings.concurrency, poll_interval=settings.poll_interval_s
+        queue,
+        launcher,
+        concurrency=settings.concurrency,
+        poll_interval=settings.poll_interval_s,
+        artifacts=store,
+        retention=retention,
     )
 
 
@@ -743,6 +835,11 @@ def build_repairs(settings: ServerSettings, db: Database) -> PgRepairs:
         )
         assistant = HubRepairAssistant(lambda: _hub_client(settings), capabilities)
     return PgRepairs(db, assistant=assistant, candidates=settings.repair_candidates)
+
+
+def build_credentials(settings: ServerSettings, db: Database) -> PgCredentials:
+    """As credenciais registradas e as regras do certificado A1, sobre o banco da aplicação."""
+    return PgCredentials(db, warn_days=settings.a1_warn_days)
 
 
 def build_sessions(
@@ -828,7 +925,10 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
     )
     platform = PgPlatform(db)
     resolver = PgPrincipalResolver(db)
-    verifier = _verifier(settings) if settings.http else None
+    company = PgCompanyAdmin(db)
+    verifier = _verifier(settings, db) if settings.http else None
+    # O primeiro login cria o usuário (sem papéis) só com os tokens do Keycloak.
+    provisioner = resolver if isinstance(verifier, TokenVerifier) else None
     sessions, session_launcher = (
         build_sessions(settings, db, platform, dispatcher_db)
         if settings.http and settings.sessions
@@ -836,6 +936,8 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
     )
     publishing = build_publishing(settings, db)
     repairs = build_repairs(settings, db)
+    credentials = build_credentials(settings, db)
+    artifacts = build_artifacts(settings, db)
     if verifier is not None:
         app = create_http_app(
             catalog=platform,
@@ -854,6 +956,10 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
             sessions=sessions,
             publishing=publishing,
             repairs=repairs,
+            credentials=credentials,
+            company=company,
+            provisioner=provisioner,
+            artifacts=artifacts,
         )
     else:
         app = FastAPI(title="RaPA (despachante)", docs_url=None, redoc_url=None, openapi_url=None)
@@ -868,6 +974,9 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
             # As agendas vencidas viram execuções numa etapa do mesmo laço.
             dispatcher.scheduler = build_scheduler(settings, db, dispatcher_db)
             dispatcher.schedule_interval = settings.schedule_interval_s
+        if dispatcher.alerts is None:
+            # Os avisos de vencimento do certificado A1 são outra etapa do mesmo laço.
+            dispatcher.alerts = CredentialAlerts(dispatcher_db, warn_days=settings.a1_warn_days)
     supervisor = DispatcherSupervisor(dispatcher) if dispatcher else None
     if supervisor is not None:
         app.add_middleware(_DispatcherHealth, supervisor=supervisor)
@@ -876,6 +985,8 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
     app.state.sessions = sessions
     app.state.publishing = publishing
     app.state.repairs = repairs
+    app.state.credentials = credentials
+    app.state.artifacts = artifacts
     if settings.http and settings.ui:
         # Antes de envolver o lifespan: o NiceGUI (ui.run_with) envolve o que encontrar
         # com a subida e o encerramento dele, e esse conjunto fica dentro do nosso.
@@ -883,10 +994,13 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
             app,
             settings,
             platform,
-            Authenticator(verifier, resolver),  # type: ignore[arg-type]
+            Authenticator(verifier, resolver, provisioner=provisioner),  # type: ignore[arg-type]
             sessions,
             publishing,
             repairs,
+            credentials,
+            company,
+            artifacts,
         )
     inner = app.router.lifespan_context
     started = False

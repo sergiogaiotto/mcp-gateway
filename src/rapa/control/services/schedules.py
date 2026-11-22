@@ -47,7 +47,11 @@ que sobrar fica para a volta seguinte, que então não espera o intervalo
    está publicado (``robo_indisponivel``), quando as entradas não valem para a
    versão publicada (``entradas_invalidas``), quando a execução anterior da
    agenda ainda não terminou (``anterior_em_andamento``: uma agenda nunca se
-   sobrepõe a ela mesma) e quando a fila da empresa está cheia (``fila_cheia``);
+   sobrepõe a ela mesma), quando a fila da empresa está cheia (``fila_cheia``),
+   quando o certificado A1 do robô não pode ser usado agora (``certificado_bloqueado``:
+   revogado, vencido ou sem a autorização do custodiante) e quando a empresa está
+   congelada (``empresa_congelada``: a ocorrência fica registrada, e nada roda até a
+   plataforma descongelar a empresa);
 5. ``next_run_at`` passa para a ocorrência seguinte depois de agora.
 
 Nada é repetido: uma execução da agenda que falhar fica como falhou, e a próxima
@@ -70,12 +74,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from rapa.control.db.schema import robots, runs, schedule_occurrences, schedules
 from rapa.control.db.session import Database
 from rapa.control.services import audit
-from rapa.control.services._common import PgService, clean_title, now_utc, visible_areas
+from rapa.control.services._common import (
+    PgService,
+    clean_title,
+    ensure_company_active,
+    lock_company_status,
+    now_utc,
+    visible_areas,
+)
 from rapa.control.services.inputs import validate_inputs
 from rapa.control.services.robots import published_robot
 from rapa.control.services.runs import enqueue_run, request_hash
 from rapa.core.contracts import (
     MAX_OCCURRENCES_LISTED,
+    CertificateBlocked,
+    CompanyFrozen,
+    CompanyStatus,
     Conflict,
     Forbidden,
     InvalidInput,
@@ -136,6 +150,9 @@ class SkipReason:
     INVALID_INPUTS = "entradas_invalidas"
     PREVIOUS_RUNNING = "anterior_em_andamento"
     QUEUE_FULL = "fila_cheia"
+    #: O certificado A1 do robô não pode ser usado agora (``CertificateBlocked``).
+    CERTIFICATE_BLOCKED = "certificado_bloqueado"
+    COMPANY_FROZEN = "empresa_congelada"
 
 
 def _cron(text: str, timezone: str) -> tuple[CronExpression, Any]:
@@ -297,6 +314,7 @@ class PgSchedules(PgService):
         company_id = principal.company_id
         schedule_id = new_id()
         async with self.db.tenant_session(company_id) as session:
+            await ensure_company_active(session, company_id)
             robot = await self._robot(session, principal, spec.robot_id)
             self._check_manage(principal, robot["area_id"])
             published = await _published(session, company_id, spec.robot_id)
@@ -341,6 +359,7 @@ class PgSchedules(PgService):
     ) -> ScheduleInfo:
         company_id = principal.company_id
         async with self.db.tenant_session(company_id) as session:
+            await ensure_company_active(session, company_id)
             row = await self._schedule(session, principal, schedule_id, lock=True)
             self._check_manage(principal, row["area_id"])
             cron_text = changes.cron if changes.cron is not None else row["cron"]
@@ -572,6 +591,9 @@ class Scheduler:
     async def _fire(self, company_id: UUID, schedule_id: UUID, now: datetime) -> int | None:
         """Como :meth:`fire`, mas ``None`` quando a agenda não estava mais para tratar."""
         async with self.app_db.tenant_session(company_id) as session:
+            # Primeiro a trava da situação da empresa (antes da linha da agenda): congelar
+            # ou apagar a empresa espera esta ocorrência, e a ordem das travas é a de sempre.
+            frozen = await lock_company_status(session, company_id) is CompanyStatus.FROZEN
             row = (
                 (
                     await session.execute(
@@ -618,7 +640,7 @@ class Scheduler:
             created = 0
             if recent:
                 chosen = handled = recent[-1]
-                reason = await self._enqueue(session, row, chosen)
+                reason = await self._enqueue(session, row, chosen, frozen=frozen)
                 if reason is None:
                     created = 1
                 elif reason != _ALREADY_HANDLED:
@@ -635,7 +657,9 @@ class Scheduler:
             )
             return created
 
-    async def _enqueue(self, session: AsyncSession, row: RowMapping, at: datetime) -> str | None:
+    async def _enqueue(
+        self, session: AsyncSession, row: RowMapping, at: datetime, *, frozen: bool = False
+    ) -> str | None:
         """Põe a ocorrência na fila; devolve o motivo se ela foi ignorada."""
         company_id: UUID = row["company_id"]
         schedule_id: UUID = row["id"]
@@ -650,6 +674,8 @@ class Scheduler:
         )
         if handled:
             return _ALREADY_HANDLED
+        if frozen:
+            return SkipReason.COMPANY_FROZEN
         robot = await _published(session, company_id, row["robot_id"])
         if robot is None:
             return SkipReason.ROBOT_UNAVAILABLE
@@ -688,8 +714,12 @@ class Scheduler:
                 scope=SCHEDULE_SCOPE,
                 audit_extra={"agenda": str(schedule_id), "ocorrencia": at.isoformat()},
             )
+        except CompanyFrozen:
+            return SkipReason.COMPANY_FROZEN
         except QuotaExceeded:
             return SkipReason.QUEUE_FULL
+        except CertificateBlocked:
+            return SkipReason.CERTIFICATE_BLOCKED
         # A chave primária (agenda, horário) garante: uma ocorrência, uma execução.
         await session.execute(
             insert(schedule_occurrences).values(

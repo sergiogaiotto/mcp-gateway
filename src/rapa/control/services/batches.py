@@ -36,7 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from rapa.control.db.schema import batch_rows, batches, robot_versions, robots, runs
 from rapa.control.db.session import Database
 from rapa.control.services import audit
-from rapa.control.services._common import PgService, visible_areas
+from rapa.control.services._common import PgService, ensure_company_active, visible_areas
 from rapa.control.services.robots import published_robot
 from rapa.control.services.runs import enqueue_many, lock_company_starts
 from rapa.control.services.sheets import (
@@ -222,6 +222,8 @@ class PgBatches(PgService):
             if done is not None:
                 return done
         async with self.db.tenant_session(company_id) as session:
+            # Empresa congelada: recusa antes de ler a planilha.
+            await ensure_company_active(session, company_id)
             robot = await self._published_for(session, principal, robot_id)
         sheet = await self._read(file_name, data)
         manifest = Manifest.model_validate(robot["manifest"])
@@ -231,6 +233,7 @@ class PgBatches(PgService):
         batch_id = new_id()
         name = clean_file_name(file_name)
         async with self.db.tenant_session(company_id) as session:
+            await ensure_company_active(session, company_id)
             await lock_company_starts(session, company_id)
             if idempotency_key is not None:
                 done = await self._existing_in(

@@ -22,7 +22,7 @@ _TENANT_TABLES_SQL = text(
            coalesce(array_agg(pg_get_expr(p.polwithcheck, p.polrelid)) FILTER (WHERE p.oid IS NOT NULL), '{}')
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
-      LEFT JOIN pg_policy p ON p.polrelid = c.oid
+      LEFT JOIN pg_policy p ON p.polrelid = c.oid AND p.polname NOT LIKE 'retention_sweep_%'
      WHERE n.nspname = 'public'
        AND c.relkind IN ('r', 'p')
        AND EXISTS (
@@ -61,6 +61,46 @@ async def test_every_company_table_has_forced_rls_and_policy(
             assert "rapa.company_id" in expression, f"{relname}: política inesperada"
         assert checks, f"{relname} sem WITH CHECK"
     assert companies == (True, True)
+
+
+async def test_retention_policies_are_only_for_the_owner_reading_and_deleting(
+    superuser_engine: AsyncEngine, pg_database: PgDatabase
+) -> None:
+    """As únicas políticas fora do isolamento por empresa: as da retenção (revisão 0008).
+
+    Nas duas tabelas que as funções da retenção apagam, só para ler e apagar (nunca
+    incluir nem mudar); em ``companies`` e ``run_events``, só para ler (a situação das
+    empresas e os eventos, para pular a empresa congelada). Sempre só para o dono das
+    tabelas e só com a marca de uma das funções.
+    """
+    async with superuser_engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT c.relname, p.polname, p.polcmd, pg_get_expr(p.polqual, p.polrelid), "
+                    "p.polwithcheck IS NULL, array(SELECT pg_get_userbyid(r) FROM "
+                    "unnest(p.polroles) AS r) "
+                    "FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid "
+                    "WHERE p.polname LIKE 'retention_sweep_%' ORDER BY c.relname, p.polname"
+                )
+            )
+        ).all()
+    assert [(row[0], row[1], row[2]) for row in rows] == [
+        ("companies", "retention_sweep_read", "r"),
+        ("idempotency_keys", "retention_sweep_delete", "d"),
+        ("idempotency_keys", "retention_sweep_read", "r"),
+        ("run_events", "retention_sweep_read", "r"),
+        ("run_snapshots", "retention_sweep_delete", "d"),
+        ("run_snapshots", "retention_sweep_read", "r"),
+    ]
+    markers = "ARRAY['run_snapshots'::text, 'idempotency_keys'::text, 'run_events'::text]"
+    for table, _name, _cmd, qual, no_check, roles in rows:
+        if table == "companies":
+            assert qual == f"(current_setting('rapa.retention'::text, true) = ANY ({markers}))"
+        else:
+            assert qual == f"(current_setting('rapa.retention'::text, true) = '{table}'::text)"
+        assert no_check
+        assert roles == [pg_database.owner]
 
 
 async def test_runtime_roles_are_not_privileged(
@@ -108,8 +148,21 @@ async def test_metadata_matches_migrated_tables(superuser_engine: AsyncEngine) -
 
 async def test_dispatcher_cannot_touch_tenant_admin_tables(dispatcher_db: Database) -> None:
     for statement in (
-        "SELECT count(*) FROM users",
-        "SELECT count(*) FROM credentials",
+        # Dos usuários, das credenciais e das aprovações, o despachante só lê o que a
+        # conferência do A1 precisa (quem é custodiante e quem aprovou a versão).
+        "SELECT display_name FROM users",
+        "SELECT active FROM users",
+        "SELECT * FROM users",
+        "UPDATE users SET active = false",
+        "SELECT count(*) FROM memberships",
+        "SELECT vault_path FROM credentials",
+        "SELECT * FROM credentials",
+        "UPDATE credentials SET revoked_at = now()",
+        "SELECT authorized_by FROM a1_authorizations",
+        "UPDATE a1_authorizations SET revoked_at = now(), revoked_by = 'x'",
+        "SELECT approved_at FROM version_approvals",
+        "SELECT * FROM version_approvals",
+        "DELETE FROM credential_alerts",
         "INSERT INTO companies (id, name) VALUES (gen_random_uuid(), 'x')",
         "UPDATE platform_settings SET total_browser_slots = 1",
         "DELETE FROM run_events",
@@ -185,7 +238,8 @@ async def test_tables_without_company_are_known(superuser_engine: AsyncEngine) -
                 )
             ).all()
         )
-    assert tables == {"companies", "platform_settings", "alembic_version"}
+    # platform_events (revisão 0007): registros da plataforma, só o dono lê e escreve.
+    assert tables == {"companies", "platform_settings", "platform_events", "alembic_version"}
 
 
 async def test_partitions_are_only_reachable_through_parent(

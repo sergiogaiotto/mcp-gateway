@@ -18,6 +18,7 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from rapa.core.contracts import (
+    CompanyFrozen,
     Conflict,
     QuotaExceeded,
     RecordingSessionInfo,
@@ -95,6 +96,10 @@ class SessionStore(Protocol):
     """Armazenamento das sessões de gravação (sempre dentro da empresa informada)."""
 
     async def area_exists(self, company_id: UUID, area_id: UUID) -> bool: ...
+
+    async def company_frozen(self, company_id: UUID) -> bool:
+        """Se a empresa está congelada (a revisão não pergunta ao modelo de linguagem)."""
+        ...
 
     async def interactive_reserve(self) -> int | None:
         """Vagas da reserva interativa da plataforma (``None`` se não configurada)."""
@@ -188,6 +193,8 @@ class MemorySessionStore:
     #: Execuções interativas (validações) rodando na reserva, para os testes.
     interactive_runs: int = 0
     areas: set[tuple[UUID, UUID]] = field(default_factory=set)
+    #: Empresas congeladas: não abrem sessão, e a revisão não pergunta ao modelo.
+    frozen: set[UUID] = field(default_factory=set)
     sessions: dict[tuple[UUID, UUID], SessionRecord] = field(default_factory=dict)
     recordings: dict[tuple[UUID, UUID], tuple[UUID, dict[str, Any]]] = field(default_factory=dict)
     audit: list[_Audit] = field(default_factory=list)
@@ -198,10 +205,15 @@ class MemorySessionStore:
     async def area_exists(self, company_id: UUID, area_id: UUID) -> bool:
         return (company_id, area_id) in self.areas
 
+    async def company_frozen(self, company_id: UUID) -> bool:
+        return company_id in self.frozen
+
     async def interactive_reserve(self) -> int | None:
         return self.reserve
 
     async def insert(self, record: SessionRecord, *, company_limit: int) -> None:
+        if record.company_id in self.frozen:
+            raise CompanyFrozen()
         live = [
             s
             for s in self.sessions.values()

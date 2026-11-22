@@ -24,10 +24,19 @@ from rapa.core.contracts import (
     VersionStatus,
 )
 from rapa.core.ids import new_id
-from rapa.core.robot import Effect
+from rapa.core.robot import CredentialRef, Effect
 from rapa.fixtures.robots import emitir_protocolo
 
-from .support import BASE, PROTOCOLO_INPUTS, make_tenant, notas, protocolo, publish
+from .support import (
+    BASE,
+    PROTOCOLO_INPUTS,
+    TENANT_AUDIT_ROWS,
+    make_tenant,
+    notas,
+    protocolo,
+    publish,
+    without_provisioning,
+)
 
 pytestmark = pytest.mark.database
 
@@ -94,7 +103,10 @@ async def test_full_lifecycle(app_db: Database) -> None:
     async with app_db.tenant_session(tenant.company_id) as session:
         actions = (await session.scalars(text("SELECT action FROM audit_log ORDER BY seq"))).all()
         chain = await verify_chain(session, tenant.company_id)
-    assert actions == [
+    # Primeiro o cadastro da empresa (auditado também), depois o ciclo de vida.
+    assert len(actions) - len(without_provisioning(actions)) == TENANT_AUDIT_ROWS
+    assert actions[0] == "empresa.criada"
+    assert without_provisioning(actions) == [
         "robo.versao_criada",
         "robo.versao_validada",
         "robo.versao_publicada",
@@ -357,3 +369,43 @@ async def test_list_versions_and_recent_runs_respect_areas(app_db: Database) -> 
     assert await platform.list_recent(other.admin) == []
     assert await platform.get(tenant.outsider, runs[0].run_id) is None
     assert await platform.get(other.admin, runs[0].run_id) is None
+
+
+async def test_provisioning_is_audited(app_db: Database) -> None:
+    """Cada passo do cadastro (``PgProvisioning``) fica na auditoria, com quem pediu."""
+    provisioning = PgProvisioning(app_db, requested_by="automação  do cadastro")
+    company = await provisioning.create_company("Cadastro auditado", guaranteed_slots=2)
+    await provisioning.set_quota(company, guaranteed_slots=3, max_borrow_factor=1.5, max_queued=9)
+    area = await provisioning.create_area(company, "Fiscal")
+    user = await provisioning.create_user(company, f"ana-{new_id()}@empresa", "Ana")
+    await provisioning.add_membership(company, user, Role.PLATFORM_ADMIN)
+    await provisioning.add_membership(company, user, Role.CREATOR, area)
+    await provisioning.register_credential(
+        company,
+        area,
+        CredentialRef(name="portal", kind="password", origin="https://portal.rapa.test"),
+        vault_path=f"empresas/{company}/portal",
+    )
+    async with app_db.tenant_session(company) as session:
+        rows = (
+            await session.execute(text("SELECT action, actor, target FROM audit_log ORDER BY seq"))
+        ).all()
+        chain = await verify_chain(session, company)
+    assert chain.ok, chain.problems
+    assert [row[0] for row in rows] == [
+        "empresa.criada",
+        "empresa.cota_alterada",
+        "area.criada",
+        "usuario.criado",
+        "usuario.papeis_alterados",
+        "usuario.papeis_alterados",
+        "credencial.registrada",
+    ]
+    assert {row[1] for row in rows} == {"plataforma:automação do cadastro"}
+    assert rows[0][2] == f"empresa:{company}" and rows[2][2] == f"area:{area}"
+    assert rows[4][2] == rows[5][2] == f"usuario:{user}"
+    # A cota de uma empresa que não existe: nada muda, nada é auditado.
+    with pytest.raises(NotFound):
+        await provisioning.set_quota(
+            new_id(), guaranteed_slots=1, max_borrow_factor=2, max_queued=1
+        )

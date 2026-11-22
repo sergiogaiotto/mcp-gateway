@@ -15,6 +15,14 @@ uso único com gVisor. Para cada tentativa, o lançador:
 4. no fim (ou no prazo, com SIGTERM e depois SIGKILL), lê RESULT.json e o
    devolve ao despachante.
 
+Os artefatos ficam em ``<artifacts_dir>/<empresa>/<execução>/<tentativa>``
+(:func:`rapa.control.artifacts.attempt_dir`, a disposição do
+:class:`rapa.control.artifacts.LocalArtifactStore`); o despachante os registra pelo
+store no fim. Com ``video_on_failure``, o worker filma a execução numa pasta da
+tentativa (``<trabalho>/video``, apagada no fim) e guarda o vídeo só se ela não der
+certo (ver :mod:`rapa.runner.video`); o limite para fechar o vídeo
+(``video_close_s``) entra na folga antes de interromper o worker.
+
 Os arquivos de entrada também são separados por empresa: o worker só recebe a
 pasta ``<files_dir>/<uuid da empresa>``, com a empresa tirada da tarefa (que vem
 do token, nunca das entradas). Assim o identificador de arquivo escolhido por
@@ -42,12 +50,14 @@ from uuid import UUID
 
 from pydantic import ValidationError
 
+from rapa.control.artifacts import attempt_dir
 from rapa.control.services.dispatcher import WorkerNotStarted, failure_result
 from rapa.control.services.queue import StaleAttempt
 from rapa.core.contracts import RunnerJob
 from rapa.core.events import RunEvent
 from rapa.runner.ports import SECRET_FIELDS, ack_path, waits_for_ack
 from rapa.runner.result import RunResult
+from rapa.runner.video import VIDEO_CLOSE_TIMEOUT_S
 
 __all__ = [
     "EventIngestor",
@@ -201,6 +211,10 @@ class LocalLauncherSettings:
     deadline_grace_s: float = 15.0
     #: Mantém a pasta de trabalho depois do fim (só para depuração).
     keep_work_dir: bool = False
+    #: Filma a execução e guarda o vídeo só se ela não der certo (``RAPA_VIDEO_EM_FALHAS``).
+    video_on_failure: bool = False
+    #: Limite para o worker fechar e guardar o vídeo, somado à folga depois do prazo.
+    video_close_s: float = VIDEO_CLOSE_TIMEOUT_S
 
 
 class _EventTail:
@@ -286,10 +300,24 @@ class LocalProcessLauncher:
     async def __call__(self, job: RunnerJob) -> dict[str, Any]:
         return await self.launch(job)
 
+    @property
+    def grace_s(self) -> float:
+        """Folga além do prazo da execução antes de interromper o worker.
+
+        Com o vídeo ligado, o limite para fechá-lo depois do fim da execução entra nela.
+        """
+        grace = self.settings.deadline_grace_s
+        if self.settings.video_on_failure:
+            grace += self.settings.video_close_s
+        return grace
+
     def _paths(self, job: RunnerJob) -> tuple[Path, Path]:
-        work = self.settings.work_dir / f"{job.run_id}-{job.attempt}"
-        artifacts = (
-            self.settings.artifacts_dir / str(job.company_id) / str(job.run_id) / str(job.attempt)
+        # Caminhos absolutos: o worker roda com a pasta da tentativa como diretório atual,
+        # e uma pasta relativa da configuração seria lida a partir dela (os artefatos
+        # iriam para dentro da pasta de trabalho, que some no fim).
+        work = self.settings.work_dir.absolute() / f"{job.run_id}-{job.attempt}"
+        artifacts = attempt_dir(
+            self.settings.artifacts_dir.absolute(), job.company_id, job.run_id, job.attempt
         )
         return work, artifacts
 
@@ -315,12 +343,15 @@ class LocalProcessLauncher:
         ]
         if with_secrets:
             command += ["--secrets", str(work / "secrets.json")]
+        if settings.video_on_failure:
+            # Dentro da pasta da tentativa: some com ela no fim, guardado ou não.
+            command += ["--video-dir", str(work / "video")]
         if settings.chromium:
             command += ["--chromium", settings.chromium]
         if settings.files_dir is not None:
             # Só a pasta da empresa da tarefa: a execução de uma empresa nunca vê os
             # arquivos de outra, seja qual for o identificador pedido nas entradas.
-            command += ["--files-dir", str(settings.files_dir / str(job.company_id))]
+            command += ["--files-dir", str(settings.files_dir.absolute() / str(job.company_id))]
         command += [f"--browser-arg={arg}" for arg in settings.browser_args]
         return command
 
@@ -373,7 +404,7 @@ class LocalProcessLauncher:
         tail = _EventTail(work / "events.jsonl")
         pending: list[dict[str, Any]] = []
         stderr = asyncio.create_task(self._drain_stderr(process))
-        limit = (job.deadline - datetime.now(UTC)).total_seconds() + self.settings.deadline_grace_s
+        limit = (job.deadline - datetime.now(UTC)).total_seconds() + self.grace_s
         loop = asyncio.get_running_loop()
         give_up = loop.time() + max(limit, 1.0)
         try:

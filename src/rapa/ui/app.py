@@ -6,7 +6,8 @@ Uso::
     create_ui(app, backend_factory=RestBackendFactory("https://api.rapa"), auth=UiAuth(oidc=...))
 
 As rotas ``/auth/*`` (login, retorno do OIDC, saída) entram na própria
-aplicação FastAPI, porque precisam gravar cookies; as páginas entram no NiceGUI,
+aplicação FastAPI, porque precisam gravar cookies, assim como os arquivos das
+evidências (``/execucoes/{id}/artefatos/{nome}``); as páginas entram no NiceGUI,
 montado em ``/``. Chame ``create_ui`` depois de registrar as outras rotas da
 aplicação: a montagem em ``/`` atende tudo o que vier depois.
 
@@ -23,6 +24,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from rapa.ui.auth import HOME_PATH, UiAuth
 from rapa.ui.context import BackendFactory, UiContext, UiSettings
+from rapa.ui.evidence import evidence_router
 from rapa.ui.pages import register_pages
 from rapa.ui.recording import STATIC_DIR, STATIC_PATH
 
@@ -79,6 +81,8 @@ def create_ui(
     settings = settings or UiSettings()
     ctx = UiContext(backend_factory, auth, settings)
     app.include_router(auth.router())
+    # Os arquivos das evidências (telas, vídeo, downloads), pela sessão do cookie.
+    app.include_router(evidence_router(ctx))
     register_pages(ctx)
     # Só o JavaScript que o time mantém (a visão ao vivo); nada com dados.
     nicegui_app.add_static_files(STATIC_PATH, STATIC_DIR, max_cache_age=300)

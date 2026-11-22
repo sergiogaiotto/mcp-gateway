@@ -30,7 +30,10 @@ from rapa.core.robot import Effect, Manifest
 from rapa.ui import describe
 from rapa.ui.auth import BINDING_COOKIE, HOME_PATH, LOGIN_ERRORS, LoginError, safe_return_path
 from rapa.ui.backend import BackendError, BackendUnavailable, NotAuthenticated
+from rapa.ui.company import company_page
 from rapa.ui.context import UiContext, Viewer
+from rapa.ui.credentials import A1Context, a1_card, credentials_page, expiry_banner, load_a1
+from rapa.ui.evidence import evidence_card
 from rapa.ui.forms import SchemaForm
 from rapa.ui.labels import (
     ROBOT_STATUS_LABELS,
@@ -41,6 +44,7 @@ from rapa.ui.labels import (
 from rapa.ui.layout import (
     effect_badge,
     error_box,
+    no_role_frame,
     notify_error,
     page_frame,
     run_action,
@@ -51,6 +55,7 @@ from rapa.ui.permissions import (
     can_create_anywhere,
     can_run,
     creator_areas,
+    has_any_role,
     publish_block_reason,
     validate_block_reason,
 )
@@ -62,7 +67,7 @@ from rapa.ui.publishing import (
     webhooks_page,
 )
 from rapa.ui.recording import live_page, record_page, review_page
-from rapa.ui.repair import can_repair, repair_page
+from rapa.ui.repair import can_repair, can_repair_code, repair_page
 
 #: Quantas execuções a tela Execuções mostra.
 RECENT_RUNS = 50
@@ -94,11 +99,16 @@ async def _protected(ctx: UiContext, request: Request, active: str, body: _Body)
         return None
     if viewer is None:
         return ctx.login_redirect(request)
+    if not has_any_role(viewer.principal):
+        # O primeiro login cria a pessoa sem papel: ela só vê o pedido para ganhar um.
+        no_role_frame(viewer)
+        return None
     main = page_frame(viewer, active)
     with main:
         content = ui.column().classes("w-full gap-4")
     try:
         with content:
+            await expiry_banner(viewer)
             await body(viewer)
     except NotAuthenticated:
         return ctx.login_redirect(request, expired=True)
@@ -196,9 +206,17 @@ def register_pages(ctx: UiContext) -> None:
     async def batches(request: Request) -> Response | None:
         return await _protected(ctx, request, "lotes", batches_page)
 
+    @ui.page("/empresa", title=f"Empresa · {name}", response_timeout=timeout)
+    async def company(request: Request, mes: str = "") -> Response | None:
+        return await _protected(ctx, request, "empresa", lambda v: company_page(v, mes))
+
     @ui.page("/lotes/{batch_id}", title=f"Lote · {name}", response_timeout=timeout)
     async def batch(request: Request, batch_id: str) -> Response | None:
         return await _protected(ctx, request, "lotes", lambda v: batch_page(v, batch_id))
+
+    @ui.page("/credenciais", title=f"Credenciais · {name}", response_timeout=timeout)
+    async def credentials(request: Request) -> Response | None:
+        return await _protected(ctx, request, "credenciais", credentials_page)
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +442,10 @@ async def _robot(viewer: Viewer, robot_id: str, versao: str) -> None:
         _not_found("Versão não encontrada.")
         return
     _versions_card(robot, versions, selected)
-    _approval_card(viewer, robot, selected)
+    a1 = await load_a1(viewer, robot, selected)
+    _approval_card(viewer, robot, selected, a1)
+    if a1 is not None:
+        a1_card(viewer, robot, selected, a1)
     base = _diff_base(robot, versions, selected)
     _diff_card(base, selected)
     _steps_card(selected.manifest)
@@ -447,6 +468,7 @@ def _versions_card(
                     f"Versão {version.version_no} · {VERSION_STATUS_LABELS[version.status]} · "
                     f"criada por {version.created_by} em {format_datetime(version.created_at)}"
                     + (f" · aprovada por {version.approved_by}" if version.approved_by else "")
+                    + _approvals_text(version)
                 ).classes("text-weight-bold" if current else "")
                 if not current:
                     ui.button(
@@ -457,7 +479,18 @@ def _versions_card(
                     ).props("flat dense").mark(f"ver-versao-{version.version_no}")
 
 
-def _approval_card(viewer: Viewer, robot: RobotInfo, version: RobotVersionInfo) -> None:
+def _approvals_text(version: RobotVersionInfo) -> str:
+    """O trecho "1 de 2 aprovações" de uma versão validada que ainda espera aprovação."""
+    if version.status is not VersionStatus.VALIDATED or not (
+        version.approvals or version.approvals_required > 1
+    ):
+        return ""
+    return f" · {len(version.approvals)} de {version.approvals_required} aprovações"
+
+
+def _approval_card(
+    viewer: Viewer, robot: RobotInfo, version: RobotVersionInfo, a1: A1Context | None = None
+) -> None:
     principal = viewer.principal
     number = version.version_no
     with ui.card().classes("w-full").mark("aprovacao"):
@@ -482,8 +515,13 @@ def _approval_card(viewer: Viewer, robot: RobotInfo, version: RobotVersionInfo) 
 
         async def publish() -> None:
             backend = await viewer.backend()
-            await backend.publish_version(robot.robot_id, number)
-            ui.notify(f"Versão {number} publicada.", type="positive")
+            info = await backend.publish_version(robot.robot_id, number)
+            if info.status is VersionStatus.PUBLISHED:
+                ui.notify(f"Versão {number} publicada.", type="positive")
+            else:
+                ui.notify(
+                    "Aprovação registrada; falta a aprovação de outra pessoa.", type="positive"
+                )
             ui.navigate.to(f"/robos/{robot.robot_id}?versao={number}")
 
         if version.status is VersionStatus.DRAFT:
@@ -499,14 +537,29 @@ def _approval_card(viewer: Viewer, robot: RobotInfo, version: RobotVersionInfo) 
             else:
                 ui.label(reason).classes("text-warning").mark("motivo-validar")
         elif version.status is VersionStatus.VALIDATED:
-            reason = publish_block_reason(principal, robot.area_id, version)
+            required = version.approvals_required
+            ui.label(f"{len(version.approvals)} de {required} aprovações").mark(
+                "contagem-aprovacoes"
+            )
+            if version.approvals:
+                ui.label(f"Aprovada até agora por: {', '.join(version.approvals)}").classes(
+                    "text-caption"
+                ).mark("aprovadores")
+            custodians = a1.custodians if a1 is not None else set()
+            problems = a1.problems if a1 is not None else []
+            reason = publish_block_reason(principal, robot.area_id, version, custodians, problems)
             if reason is None:
+                last = len(version.approvals) + 1 >= required
                 ui.label(
                     "Ao publicar, o robô vira ferramenta MCP e endpoint REST para quem tem acesso à área."
+                    if last
+                    else "Esta versão precisa da aprovação de mais uma pessoa depois da sua."
                 ).classes("text-caption")
-                ui.button("Publicar", on_click=lambda: run_action(publish), color="positive").mark(
-                    "publicar"
-                )
+                ui.button(
+                    "Publicar" if last else "Aprovar",
+                    on_click=lambda: run_action(publish),
+                    color="positive",
+                ).mark("publicar")
             else:
                 ui.label(reason).classes("text-warning").mark("motivo-publicar")
 
@@ -716,11 +769,21 @@ def _format_output(value: Any) -> str:
 
 
 class RunPanel:
-    """Estado de uma execução, atualizado periodicamente até terminar."""
+    """Estado de uma execução, atualizado periodicamente até terminar.
 
-    def __init__(self, viewer: Viewer, status: RunStatus) -> None:
+    ``on_finished`` é chamado uma vez quando a execução termina enquanto a página está
+    aberta (a tela da execução mostra as evidências nessa hora).
+    """
+
+    def __init__(
+        self,
+        viewer: Viewer,
+        status: RunStatus,
+        on_finished: Callable[[RunStatus], Awaitable[None]] | None = None,
+    ) -> None:
         self.viewer = viewer
         self.status = status
+        self.on_finished = on_finished
         self.container: ui.column | None = None
         self.notice: ui.label | None = None
         self.timer: ui.timer | None = None
@@ -803,6 +866,9 @@ class RunPanel:
             self._render()
         if status.state.finished:
             self._stop()
+            if self.on_finished is not None:
+                finished, self.on_finished = self.on_finished, None
+                await finished(status)
 
     def _stop(self) -> None:
         if self.timer is not None:
@@ -856,6 +922,16 @@ async def _runs(viewer: Viewer) -> None:
                 ).props("flat").mark(f"detalhes-{status.run_id}")
 
 
+async def _run_manifest(viewer: Viewer, status: RunStatus) -> Manifest | None:
+    """O manifesto da versão da execução (``None`` se o robô não é visível)."""
+    backend = await viewer.backend()
+    robot = next((r for r in await backend.list_robots() if r.slug == status.robot_slug), None)
+    if robot is None:
+        return None
+    version = await backend.get_version(robot.robot_id, status.version_no)
+    return version.manifest if version is not None else None
+
+
 async def _run_detail(viewer: Viewer, run_id: str) -> None:
     run_uuid = _parse_uuid(run_id)
     backend = await viewer.backend()
@@ -864,8 +940,22 @@ async def _run_detail(viewer: Viewer, run_id: str) -> None:
         _not_found("Execução não encontrada.")
         return
     ui.label("Execução").classes("text-h5")
-    RunPanel(viewer, status).build()
-    if can_repair(status):
+    panel = RunPanel(viewer, status)
+    panel.build()
+    # As evidências (telas, vídeo da falha, arquivos) quando a execução termina.
+    evidence = ui.column().classes("w-full")
+
+    async def show_evidence(final: RunStatus) -> None:
+        evidence.clear()
+        with evidence:
+            await evidence_card(viewer, final)
+
+    if status.state.finished:
+        await show_evidence(status)
+    else:
+        panel.on_finished = show_evidence
+    manifest = await _run_manifest(viewer, status) if can_repair_code(status) else None
+    if can_repair(status, manifest):
         with ui.row().classes("items-center gap-2"):
             ui.button(
                 "Consertar este passo",

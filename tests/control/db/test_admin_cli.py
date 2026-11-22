@@ -5,6 +5,7 @@ import asyncio
 from uuid import UUID
 
 import pytest
+from sqlalchemy import text
 
 from rapa.control.admin import main, parse_role
 from rapa.control.db import Database
@@ -30,12 +31,28 @@ async def _resolve(url: str, subject: str, company: UUID) -> object:
         await db.dispose()
 
 
+async def _audit(url: str, company: UUID) -> list[tuple[str, str]]:
+    db = Database.from_url(url)
+    try:
+        async with db.tenant_session(company) as session:
+            rows = await session.execute(
+                text("SELECT action, actor FROM audit_log WHERE company_id = :c ORDER BY seq"),
+                {"c": company},
+            )
+            return [(row[0], row[1]) for row in rows]
+    finally:
+        await db.dispose()
+
+
 def test_company_area_and_user_with_roles(
     pg_database: PgDatabase, capsys: pytest.CaptureFixture[str]
 ) -> None:
     url = ["--url", pg_database.app_url]
-    company = _created(capsys, [*url, "empresa", "Empresa da linha de comando", "--vagas", "2"])
-    area = _created(capsys, [*url, "area", str(company), "Fiscal"])
+    company = _created(
+        capsys,
+        [*url, "empresa", "Empresa da linha de comando", "--vagas", "2", "--por", "operadora"],
+    )
+    area = _created(capsys, [*url, "area", str(company), "Fiscal", "--por", "operadora"])
     _created(
         capsys,
         [
@@ -49,12 +66,25 @@ def test_company_area_and_user_with_roles(
             "operator",
             "--papel",
             f"creator:{area}",
+            "--por",
+            "operadora",
         ],
     )
     principal = asyncio.run(_resolve(pg_database.app_url, "ana@empresa", company))
     assert principal is not None
     assert principal.company_roles == {Role.OPERATOR}  # type: ignore[attr-defined]
     assert principal.area_roles == {area: {Role.CREATOR}}  # type: ignore[attr-defined]
+    # Os comandos antigos também ficam na auditoria, com quem pediu.
+    assert asyncio.run(_audit(pg_database.app_url, company)) == [
+        (action, "plataforma:operadora")
+        for action in (
+            "empresa.criada",
+            "area.criada",
+            "usuario.criado",
+            "usuario.papeis_alterados",
+            "usuario.papeis_alterados",
+        )
+    ]
 
     # Repetir o mesmo usuário na mesma empresa é recusado sem rastro de exceção.
     assert main([*url, "usuario", str(company), "ana@empresa"]) == 1

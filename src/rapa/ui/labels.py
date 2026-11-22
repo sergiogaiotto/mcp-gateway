@@ -4,8 +4,10 @@ from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from rapa.core.contracts import (
+    CompanyStatus,
     RecordingSessionStatus,
     RobotStatus,
+    Role,
     RunState,
     RunTrigger,
     VersionStatus,
@@ -13,6 +15,7 @@ from rapa.core.contracts import (
 from rapa.core.robot import CredentialKind, Effect, FieldType
 
 __all__ = [
+    "COMPANY_STATUS_LABELS",
     "CREDENTIAL_KIND_LABELS",
     "EFFECT_COLORS",
     "EFFECT_LABELS",
@@ -23,6 +26,7 @@ __all__ = [
     "RECORDING_STATUS_COLORS",
     "RECORDING_STATUS_LABELS",
     "ROBOT_STATUS_LABELS",
+    "ROLE_LABELS",
     "RUN_STATE_COLORS",
     "RUN_STATE_LABELS",
     "SECRET_FIELD_LABELS",
@@ -140,6 +144,29 @@ OCCURRENCE_REASON_LABELS: dict[str, str] = {
     "entradas_invalidas": "Não rodou: as entradas da agenda não valem para a versão publicada.",
     "anterior_em_andamento": "Não rodou: a execução anterior da agenda ainda não tinha terminado.",
     "fila_cheia": "Não rodou: a fila de execuções da empresa estava cheia.",
+    "certificado_bloqueado": (
+        "Não rodou: o certificado A1 do robô estava revogado, vencido ou sem a autorização "
+        "do custodiante."
+    ),
+    "empresa_congelada": "Não rodou: a empresa estava congelada.",
+}
+
+#: Nome, em pt-BR, de cada papel.
+ROLE_LABELS: dict[Role, str] = {
+    Role.PLATFORM_ADMIN: "Administração da plataforma",
+    Role.COMPANY_ADMIN: "Administração da empresa",
+    Role.AREA_ADMIN: "Administração da área",
+    Role.CREATOR: "Criação de robôs",
+    Role.APPROVER: "Aprovação",
+    Role.OPERATOR: "Operação",
+    Role.AUDITOR: "Auditoria",
+    Role.VIEWER: "Leitura",
+    Role.CREDENTIAL_CUSTODIAN: "Custódia de credenciais",
+}
+
+COMPANY_STATUS_LABELS: dict[CompanyStatus, str] = {
+    CompanyStatus.ACTIVE: "Ativa",
+    CompanyStatus.FROZEN: "Congelada",
 }
 
 #: Tipos que uma entrada criada na revisão pode ter, na ordem do seletor.

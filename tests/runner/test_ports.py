@@ -8,6 +8,7 @@ from pathlib import Path
 import pyotp
 import pytest
 
+from rapa.core.artifacts import valid_artifact_name
 from rapa.core.contracts import RunState
 from rapa.core.events import RunEvent, RunEventKind
 from rapa.core.ids import new_id
@@ -154,10 +155,41 @@ async def test_local_file_provider(tmp_path: Path) -> None:
         ("  .bashrc  ", "bashrc"),
         ("...", "arquivo"),
         ("a" * 300 + ".pdf", "a" * 116 + ".pdf"),
+        # Pontos seguidos viram um só: o plano de controle recusa ".." num nome.
+        ("nota..pdf", "nota.pdf"),
+        ("Relatório 2026...xlsx", "Relatorio_2026.xlsx"),
+        ("a._..b", "a._.b"),
+        # O corte do nome comprido não deixa ".." antes da extensão.
+        ("a" * 115 + "." + "b" * 20 + ".pdf", "a" * 115 + ".pdf"),
     ],
 )
 def test_sanitize_filename(name: str, expected: str) -> None:
     assert sanitize_filename(name) == expected
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "nota..pdf",
+        "..nota..",
+        "Relatório 2026...xlsx",
+        "a" * 115 + "." + "b" * 20 + ".pdf",
+        "x" * 300,
+        "._-._-",
+        "C:\\pasta\\..\\arquivo....txt",
+        "ação  –  nota fiscal (cópia).PDF",
+        "\u0000\u202e.png",
+    ],
+)
+async def test_sanitized_names_are_artifact_names(tmp_path: Path, name: str) -> None:
+    """O nome que o executor dá a um artefato é o identificador dele no plano de controle
+    e na API: precisa passar pela mesma regra (também com o sufixo de nome repetido)."""
+    assert valid_artifact_name(sanitize_filename(name)), sanitize_filename(name)
+    sink = DirectoryArtifactSink(tmp_path / "artefatos")
+    first = await sink.save_bytes("download", name, b"um")
+    second = await sink.save_bytes("download", name, b"dois")
+    for ref in (first, second):
+        assert valid_artifact_name(ref.name), ref.name
 
 
 async def test_directory_sink_saves_with_hash_and_unique_names(tmp_path: Path) -> None:

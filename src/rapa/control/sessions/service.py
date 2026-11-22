@@ -32,7 +32,9 @@ Segue o protocolo :class:`rapa.core.contracts.RecordingService`. As regras:
   com a sessão parada e a auditoria, na mesma transação.
 - **Generalizar.** As propostas vêm da compilação determinística da gravação e,
   se o hub estiver de pé, do modelo (:mod:`rapa.compiler.review`); sem o hub, as
-  sugestões das regras continuam lá, com um aviso. O rascunho aplica só o que a
+  sugestões das regras continuam lá, com um aviso. Numa empresa congelada ("lê tudo,
+  mas nada novo acontece"), o modelo não é perguntado: só as sugestões das regras, com
+  o aviso (e o rascunho é recusado pelo serviço de robôs). O rascunho aplica só o que a
   pessoa confirmou e entra pelo serviço de robôs (:class:`RobotAdmin`), com toda a
   validação e o portão de política de sempre; o criador da versão é a dona da
   sessão, que por isso nunca a aprova.
@@ -109,6 +111,11 @@ _MODEL_OFF = (
 _MODEL_DOWN = (
     "As propostas do modelo estão indisponíveis agora (o hub não respondeu). Você ainda pode "
     "confirmar as sugestões automáticas; tente de novo mais tarde para ver as do modelo."
+)
+_MODEL_FROZEN = (
+    "A empresa está congelada: o modelo de linguagem não é consultado, e nenhum rascunho "
+    "novo pode ser criado até a plataforma descongelá-la. As sugestões automáticas abaixo "
+    "ficam só para consulta."
 )
 #: Quanto tempo uma falha do modelo fica guardada antes de perguntar de novo.
 _MODEL_RETRY_S = 60.0
@@ -644,9 +651,15 @@ class RecordingSessions:
             compiled = lower(recording, name=name, title=title, description=description)
         except CompileError as exc:
             raise InvalidInput("a gravação não pôde virar um robô", [str(exc)]) from None
-        ops, message = await self._model_ops(
-            (session_id, recording_id), compiled.manifest, compiled.observed_texts
-        )
+        ops: list[EditOp] | None
+        message: str | None
+        if await self.store.company_frozen(record.company_id):
+            # Lê tudo, mas nada novo acontece: a pergunta ao modelo também não.
+            ops, message = None, _MODEL_FROZEN
+        else:
+            ops, message = await self._model_ops(
+                (session_id, recording_id), compiled.manifest, compiled.observed_texts
+            )
         return build_proposals(
             compiled,
             session_id=session_id,

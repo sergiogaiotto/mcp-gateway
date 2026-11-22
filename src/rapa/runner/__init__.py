@@ -8,9 +8,10 @@ Módulos:
 - :mod:`rapa.runner.result`: o resultado de uma execução (RESULT.json);
 - :mod:`rapa.runner.errors`: códigos de erro estáveis;
 - :mod:`rapa.runner.totp`: códigos TOTP só com a biblioteca padrão;
+- :mod:`rapa.runner.video`: quando o vídeo da execução pode ser guardado;
 - :mod:`rapa.runner.worker`: linha de comando ``python -m rapa.runner.worker``.
 
-``result``, ``errors``, ``ports`` e ``totp`` não dependem do Playwright, para que o
+``result``, ``errors``, ``ports``, ``totp`` e ``video`` não dependem do Playwright, para que o
 plano de controle leia resultados sem instalar o navegador. Este pacote não importa
 nada de propósito.
 """

@@ -21,10 +21,16 @@ class ArtifactKind(StrEnum):
 
     SCREENSHOT = "screenshot"
     DOWNLOAD = "download"
+    #: O vídeo da execução que não deu certo (ver :mod:`rapa.runner.video`).
+    VIDEO = "video"
 
 
 class ArtifactRef(BaseModel):
-    """Arquivo guardado pela execução (tela ou download)."""
+    """Arquivo guardado pela execução (tela, download ou o vídeo da falha).
+
+    O caminho só vai do executor para o plano de controle: nunca chega a uma resposta da
+    API nem às saídas da execução, que usam o nome (o identificador do artefato).
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 

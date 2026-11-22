@@ -19,6 +19,7 @@ from rapa.control.sessions import (
 )
 from rapa.control.sessions.service import company_cap
 from rapa.core.contracts import (
+    CompanyFrozen,
     Conflict,
     DraftChoices,
     Forbidden,
@@ -305,6 +306,42 @@ async def test_failed_stop_is_reported_and_the_session_fails(world: SessionsWorl
 class _DownAssistant:
     async def propose(self, manifest: Manifest, observed_texts: set[str]) -> list[EditOp]:
         raise AssistantUnavailable("o hub do modelo de linguagem não respondeu")
+
+
+class _CountingAssistant:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def propose(self, manifest: Manifest, observed_texts: set[str]) -> list[EditOp]:
+        self.calls += 1
+        return []
+
+
+async def test_frozen_company_reviews_without_asking_the_model() -> None:
+    """Congelada: lê tudo, mas nada novo acontece. A revisão mostra as sugestões das regras
+    e não pergunta ao modelo; descongelada, pergunta de novo."""
+    assistant = _CountingAssistant()
+    world = build_world(assistant=assistant, recording=demo_recording(TWO_PEOPLE))
+    try:
+        owner = world.people["criadora"]
+        info = await world.service.create_session(owner, world.area_a, URL, "Cadastrar pessoas")
+        await world.service.stop_session(owner, info.session_id)
+        world.store.frozen.add(world.company_a)
+        proposals = await world.service.get_proposals(owner, info.session_id)
+        assert assistant.calls == 0
+        assert not proposals.model_available
+        assert proposals.model_message is not None
+        assert "congelada" in proposals.model_message
+        assert {p.name for p in proposals.parameters} >= {"nome", "cpf"}
+        # Nem uma sessão nova abre.
+        with pytest.raises(CompanyFrozen):
+            await world.service.create_session(owner, world.area_a, URL)
+        world.store.frozen.discard(world.company_a)
+        again = await world.service.get_proposals(owner, info.session_id)
+        assert assistant.calls == 1 and again.model_available
+    finally:
+        await world.service.aclose()
+        await world.launcher.aclose()
 
 
 async def test_hub_down_still_offers_the_rule_suggestions() -> None:

@@ -622,7 +622,16 @@ async def test_finish_maps_runner_result(
             )
         ).one()
     assert row[0] is irreversible
-    assert row[1] == [artifact]
+    # O caminho no disco nunca vai para o banco: fica o artefato, a tentativa e a data.
+    [stored] = row[1]
+    assert stored.pop("created_at")
+    assert stored == {
+        "kind": "screenshot",
+        "name": "tela.png",
+        "size": 10,
+        "sha256": "a" * 64,
+        "attempt": 1,
+    }
     assert row[3] is None
     if reported != "succeeded":
         assert row[2] == "emitir"
