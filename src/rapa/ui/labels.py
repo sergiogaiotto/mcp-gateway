@@ -18,6 +18,7 @@ __all__ = [
     "EFFECT_LABELS",
     "END_REASON_LABELS",
     "FIELD_TYPE_LABELS",
+    "OCCURRENCE_REASON_LABELS",
     "PARAMETER_TYPES",
     "RECORDING_STATUS_COLORS",
     "RECORDING_STATUS_LABELS",
@@ -129,6 +130,16 @@ END_REASON_LABELS: dict[str, str] = {
     "parada_falhou": "Não foi possível fechar a gravação; grave de novo.",
     "gravacao_invalida": "A gravação chegou inválida; grave de novo.",
     "erro": "O navegador da gravação teve um erro; grave de novo.",
+}
+
+#: Por que uma ocorrência de agenda não virou execução.
+OCCURRENCE_REASON_LABELS: dict[str, str] = {
+    "perdida": "Não rodou: o serviço estava fora do ar no horário (passou da tolerância).",
+    "substituida": "Não rodou: uma ocorrência mais nova, atrasada junto, rodou no lugar.",
+    "robo_indisponivel": "Não rodou: o robô não estava publicado.",
+    "entradas_invalidas": "Não rodou: as entradas da agenda não valem para a versão publicada.",
+    "anterior_em_andamento": "Não rodou: a execução anterior da agenda ainda não tinha terminado.",
+    "fila_cheia": "Não rodou: a fila de execuções da empresa estava cheia.",
 }
 
 #: Tipos que uma entrada criada na revisão pode ter, na ordem do seletor.

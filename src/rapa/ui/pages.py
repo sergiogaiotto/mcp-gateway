@@ -54,6 +54,13 @@ from rapa.ui.permissions import (
     publish_block_reason,
     validate_block_reason,
 )
+from rapa.ui.publishing import (
+    batch_page,
+    batches_page,
+    schedule_page,
+    schedules_page,
+    webhooks_page,
+)
 from rapa.ui.recording import live_page, record_page, review_page
 
 #: Quantas execuções a tela Execuções mostra.
@@ -167,6 +174,26 @@ def register_pages(ctx: UiContext) -> None:
     @ui.page("/gravar/{session_id}/revisar", title=f"Revisar · {name}", response_timeout=timeout)
     async def record_review(request: Request, session_id: str) -> Response | None:
         return await _protected(ctx, request, "gravar", lambda v: review_page(v, session_id))
+
+    @ui.page("/agendas", title=f"Agendas · {name}", response_timeout=timeout)
+    async def schedules(request: Request) -> Response | None:
+        return await _protected(ctx, request, "agendas", schedules_page)
+
+    @ui.page("/agendas/{schedule_id}", title=f"Agenda · {name}", response_timeout=timeout)
+    async def schedule(request: Request, schedule_id: str) -> Response | None:
+        return await _protected(ctx, request, "agendas", lambda v: schedule_page(v, schedule_id))
+
+    @ui.page("/webhooks", title=f"Webhooks · {name}", response_timeout=timeout)
+    async def webhooks(request: Request) -> Response | None:
+        return await _protected(ctx, request, "webhooks", webhooks_page)
+
+    @ui.page("/lotes", title=f"Lotes · {name}", response_timeout=timeout)
+    async def batches(request: Request) -> Response | None:
+        return await _protected(ctx, request, "lotes", batches_page)
+
+    @ui.page("/lotes/{batch_id}", title=f"Lote · {name}", response_timeout=timeout)
+    async def batch(request: Request, batch_id: str) -> Response | None:
+        return await _protected(ctx, request, "lotes", lambda v: batch_page(v, batch_id))
 
 
 # ---------------------------------------------------------------------------

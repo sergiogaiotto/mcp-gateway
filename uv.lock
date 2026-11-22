@@ -426,12 +426,30 @@ wheels = [
 ]
 
 [[package]]
+name = "defusedxml"
+version = "0.7.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0f/d5/c66da9b79e5bdb124974bfe172b4daf3c984ebd9c2a06e2b8a4dc7331c72/defusedxml-0.7.1.tar.gz", hash = "sha256:1bb3032db185915b62d7c6209c5a8792be6a32ab2fedacc84e01b52c51aa3e69", size = 75520, upload-time = "2021-03-08T10:59:26.269Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/07/6c/aa3f2f849e01cb6a001cd8554a88d4c77c5c1a31c95bdf1cf9301e6d9ef4/defusedxml-0.7.1-py2.py3-none-any.whl", hash = "sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61", size = 25604, upload-time = "2021-03-08T10:59:24.45Z" },
+]
+
+[[package]]
 name = "docutils"
 version = "0.23"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/39/a4/5180d9afc57e8fca05601dd652bdff19604c218814037fe90ffc7625a50a/docutils-0.23.tar.gz", hash = "sha256:746f5060322511280a1e50eb76846ed6bf2342984b2ac04dc42caa1a8d78799e", size = 2303823, upload-time = "2026-05-27T17:41:06.934Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/32/91/30151a39f7570f448ed84529390628a651d7f27c87d73c9b887f8189695e/docutils-0.23-py3-none-any.whl", hash = "sha256:25d013af9bf23bc1c7b2b093dff4208166c53a94786c9e447808335ef1185fea", size = 634701, upload-time = "2026-05-27T17:40:58.442Z" },
+]
+
+[[package]]
+name = "et-xmlfile"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d3/38/af70d7ab1ae9d4da450eeec1fa3918940a5fafb9055e934af8d6eb0c2313/et_xmlfile-2.0.0.tar.gz", hash = "sha256:dab3f4764309081ce75662649be815c4c9081e88f0837825f90fd28317d4da54", size = 17234, upload-time = "2024-10-25T17:25:40.039Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c1/8b/5fe2cc11fee489817272089c4203e679c63b570a5aaeb18d852ae3cbba6a/et_xmlfile-2.0.0-py3-none-any.whl", hash = "sha256:7a91720bc756843502c3b7504c77b8fe44217c85c537d85037f0f536151b2caa", size = 18059, upload-time = "2024-10-25T17:25:39.051Z" },
 ]
 
 [[package]]
@@ -1156,6 +1174,18 @@ wheels = [
 ]
 
 [[package]]
+name = "openpyxl"
+version = "3.1.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "et-xmlfile" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3d/f9/88d94a75de065ea32619465d2f77b29a0469500e99012523b91cc4141cd1/openpyxl-3.1.5.tar.gz", hash = "sha256:cf0e3cf56142039133628b5acffe8ef0c12bc902d2aadd3e0fe5878dc08d1050", size = 186464, upload-time = "2024-06-28T14:03:44.161Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c0/da/977ded879c29cbd04de313843e76868e6e13408a94ed6b987245dc7c8506/openpyxl-3.1.5-py2.py3-none-any.whl", hash = "sha256:5282c12b107bffeef825f4617dc029afaf41d0ea60823bbb665ef3079dc79de2", size = 250910, upload-time = "2024-06-28T14:03:41.161Z" },
+]
+
+[[package]]
 name = "opentelemetry-api"
 version = "1.45.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1633,13 +1663,17 @@ dependencies = [
 [package.optional-dependencies]
 control = [
     { name = "alembic" },
+    { name = "defusedxml" },
     { name = "fastapi" },
     { name = "httpx2" },
     { name = "jsonschema-rs" },
     { name = "mcp" },
+    { name = "openpyxl" },
     { name = "psycopg", extra = ["binary", "pool"] },
     { name = "pyjwt", extra = ["crypto"] },
+    { name = "python-multipart" },
     { name = "sqlalchemy", extra = ["asyncio"] },
+    { name = "tzdata" },
     { name = "uvicorn" },
     { name = "websockets" },
 ]
@@ -1674,6 +1708,7 @@ dev = [
 requires-dist = [
     { name = "alembic", marker = "extra == 'control'", specifier = ">=1.20" },
     { name = "authlib", marker = "extra == 'ui'", specifier = ">=1.9" },
+    { name = "defusedxml", marker = "extra == 'control'", specifier = ">=0.7.1" },
     { name = "fastapi", marker = "extra == 'control'", specifier = ">=0.164" },
     { name = "fastapi", marker = "extra == 'fixtures'", specifier = ">=0.164" },
     { name = "httpx2", marker = "extra == 'control'", specifier = ">=2.16,<3" },
@@ -1682,13 +1717,16 @@ requires-dist = [
     { name = "jsonschema-rs", marker = "extra == 'control'", specifier = ">=0.61" },
     { name = "mcp", marker = "extra == 'control'", specifier = "==2.3.0" },
     { name = "nicegui", marker = "extra == 'ui'", specifier = "==4.0.0" },
+    { name = "openpyxl", marker = "extra == 'control'", specifier = ">=3.1.5" },
     { name = "playwright", marker = "extra == 'runner'", specifier = "==1.65.2" },
     { name = "psycopg", extras = ["binary", "pool"], marker = "extra == 'control'", specifier = ">=3.3.9,<3.4" },
     { name = "pydantic", specifier = ">=2.14,<3" },
     { name = "pyjwt", extras = ["crypto"], marker = "extra == 'control'", specifier = ">=2.15.1" },
     { name = "pyotp", marker = "extra == 'fixtures'", specifier = ">=2.12" },
+    { name = "python-multipart", marker = "extra == 'control'", specifier = ">=0.0.34" },
     { name = "python-multipart", marker = "extra == 'fixtures'", specifier = ">=0.0.34" },
     { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'control'", specifier = ">=2.1.9,<2.2" },
+    { name = "tzdata", marker = "extra == 'control'", specifier = ">=2026.1" },
     { name = "uvicorn", marker = "extra == 'control'", specifier = ">=0.54" },
     { name = "uvicorn", marker = "extra == 'fixtures'", specifier = ">=0.54" },
     { name = "websockets", marker = "extra == 'control'", specifier = ">=17.4,<18" },

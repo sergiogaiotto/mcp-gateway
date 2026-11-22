@@ -15,6 +15,9 @@ from tests.control.db.conftest import app_db, pg_database, superuser_engine  # n
 from tests.control.db.support import PgDatabase, Tenant, make_tenant, reset_queue
 from tests.e2e.support import SECRETS, TOKENS
 
+#: Chave dos webhooks do serviço de ponta a ponta (só de teste).
+WEBHOOK_KEY = "chave-dos-webhooks-de-ponta-a-ponta-com-32-caracteres"
+
 
 @pytest.fixture
 async def platform_app(
@@ -25,6 +28,38 @@ async def platform_app(
     chromium_path: str,
     tmp_path: Path,
 ) -> AsyncIterator[tuple[FastAPI, Tenant, Tenant]]:
+    yield await _platform(app_db, pg_database, superuser_engine, chromium_path, tmp_path)
+
+
+@pytest.fixture
+async def publishing_app(
+    app_db: Database,  # noqa: F811
+    pg_database: PgDatabase,  # noqa: F811
+    superuser_engine: Any,  # noqa: F811
+    portal_v1: RunningPortal,
+    chromium_path: str,
+    tmp_path: Path,
+) -> AsyncIterator[tuple[FastAPI, Tenant, Tenant]]:
+    """O serviço com webhooks ligados e o agendador olhando as agendas a cada 0,2 s."""
+    yield await _platform(
+        app_db,
+        pg_database,
+        superuser_engine,
+        chromium_path,
+        tmp_path,
+        webhook_key=WEBHOOK_KEY,
+        schedule_interval_s=0.2,
+    )
+
+
+async def _platform(
+    app_db: Database,  # noqa: F811
+    pg_database: PgDatabase,  # noqa: F811
+    superuser_engine: Any,  # noqa: F811
+    chromium_path: str,
+    tmp_path: Path,
+    **extra: Any,
+) -> tuple[FastAPI, Tenant, Tenant]:
     await reset_queue(superuser_engine, total_slots=4)
     tenant = await make_tenant(app_db, "Ponta a ponta")
     other = await make_tenant(app_db, "Outra empresa")
@@ -57,7 +92,8 @@ async def platform_app(
         chromium=chromium_path,
         browser_args=(HOST_RESOLVER_ARG,),
         sessions_dir=tmp_path / "sessoes",
+        **extra,
     )
     # O lifespan (gateway MCP e despachante) roda dentro do teste: o SDK do MCP
     # exige abrir e fechar o grupo de tarefas na mesma tarefa.
-    yield create_server_app(settings), tenant, other
+    return create_server_app(settings), tenant, other

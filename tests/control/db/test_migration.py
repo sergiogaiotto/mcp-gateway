@@ -107,6 +107,74 @@ def test_grants_skip_missing_roles_and_cli_reapplies(pg_database: PgDatabase) ->
         # As permissões das tabelas das sessões de gravação (revisão 0003) também.
         assert _app_can_read_runs(pg_database, name, "recording_sessions")
         assert _app_can_read_runs(pg_database, name, "recordings")
+        # E as da publicação (revisão 0004).
+        for table in _PUBLISHING_TABLES:
+            assert _app_can_read_runs(pg_database, name, table), table
+
+
+_PUBLISHING_TABLES = (
+    "schedules",
+    "schedule_occurrences",
+    "webhooks",
+    "webhook_deliveries",
+    "batches",
+    "batch_rows",
+)
+
+
+def _publishing_schema(pg: PgDatabase, database: str) -> dict[str, Any]:
+    with pg.server.connect(database) as conn:
+        tables = conn.execute(
+            "SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class "
+            "WHERE relnamespace = 'public'::regnamespace AND relname = ANY(%s) ORDER BY relname",
+            (list(_PUBLISHING_TABLES),),
+        ).fetchall()
+        privileges = (
+            conn.execute(
+                "SELECT has_table_privilege(%s, 'schedules', 'INSERT'), "
+                "has_table_privilege(%s, 'schedules', 'DELETE'), "
+                "has_column_privilege(%s, 'schedules', 'next_run_at', 'SELECT'), "
+                "has_column_privilege(%s, 'schedules', 'inputs', 'SELECT'), "
+                "has_table_privilege(%s, 'webhooks', 'SELECT')",
+                (
+                    pg.roles.app,
+                    pg.roles.app,
+                    pg.roles.dispatcher,
+                    pg.roles.dispatcher,
+                    pg.roles.dispatcher,
+                ),
+            ).fetchone()
+            if tables
+            else None
+        )
+    return {
+        "tables": [tuple(row) for row in tables],
+        "privileges": tuple(privileges) if privileges else None,
+    }
+
+
+def test_publishing_tables_migrate_back_and_forth(pg_database: PgDatabase) -> None:
+    with _scratch_database(pg_database) as name:
+        url = pg_database.server.url(
+            name, pg_database.owner, pg_database.passwords[pg_database.owner]
+        )
+        upgrade(url, roles=pg_database.roles)
+        head = _publishing_schema(pg_database, name)
+        assert head == {
+            "tables": sorted((t, True, True) for t in _PUBLISHING_TABLES),
+            # A aplicação inclui (nunca apaga); o despachante só lê a fila das agendas.
+            "privileges": (True, False, True, False, False),
+        }
+        command.downgrade(alembic_config(url, pg_database.roles), "0003")
+        assert _publishing_schema(pg_database, name) == {"tables": [], "privileges": None}
+        with pg_database.server.connect(name) as conn:
+            guards = conn.execute(
+                "SELECT count(*) FROM pg_proc WHERE proname IN "
+                "('rapa_schedules_guard', 'rapa_webhooks_guard')"
+            ).fetchone()
+        assert guards is not None and guards[0] == 0
+        upgrade(url, roles=pg_database.roles)
+        assert _publishing_schema(pg_database, name) == head
 
 
 def test_offline_sql_is_generated(pg_database: PgDatabase) -> None:

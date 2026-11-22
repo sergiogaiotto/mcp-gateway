@@ -20,6 +20,7 @@ from rapa.core.contracts import (
     QuotaExceeded,
     RobotSummary,
     ServiceUnavailable,
+    SignatureInvalid,
 )
 from rapa.core.ids import new_id
 from tests.control.api.support import (
@@ -40,6 +41,7 @@ def test_status_for_every_contract_error() -> None:
     assert status_for(InvalidInput("x", ["a"])) == 422
     assert status_for(QuotaExceeded("x", 3)) == 429
     assert status_for(ServiceUnavailable("x")) == 503
+    assert status_for(SignatureInvalid("x")) == 401
     assert status_for(ContractError("x")) == 400
 
 

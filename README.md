@@ -22,6 +22,7 @@ Fase 0, que não depende do AWS Outposts:
 - [x] Interface em NiceGUI (`rapa.ui`)
 - [x] Montagem num serviço só (`python -m rapa.server`), cadastro pela linha de comando (`python -m rapa.control.admin`) e teste ponta a ponta: publicar pelo REST, chamar pelo MCP e pelo REST, executar no portal de teste
 - [x] Demonstrar e Generalizar pela interface (`rapa.session`, `rapa.control.sessions`, tela Gravar): a pessoa grava a tarefa num navegador na nuvem que vê ao vivo (imagem, mouse e teclado com acentos, por um websocket com bilhete de uso único), para, revisa as propostas (entradas, nomes dos passos e repetições, das regras e, com o hub de pé, do modelo) e cria o rascunho do robô; sessões e gravações em tabelas próprias com isolamento por linha, limite por empresa e na reserva interativa, e auditoria
+- [x] Publicar com agenda, webhook e lote por planilha (`rapa.core.cron`, `rapa.control.services.schedules`, `webhooks`, `batches` e `sheets`; telas Agendas, Webhooks e Lotes; `/v1/agendas`, `/v1/robos/{id}/webhooks`, `/v1/webhooks/{id}` e `/v1/lotes`): agendas cron num fuso (`America/Sao_Paulo` por padrão), disparadas pelo despachante uma vez por ocorrência, com tolerância para atrasos e as ocorrências ignoradas registradas; webhooks sem token, assinados com HMAC-SHA256 sobre o horário, o identificador da entrega e o corpo, com proteção contra repetição e limite por webhook, e a chave mostrada uma vez (derivada de `RAPA_CHAVE_WEBHOOKS`, nunca guardada); lotes de xlsx (sem fórmulas) ou CSV, conferidos linha a linha antes de criar qualquer coisa (tudo ou nada), com andamento e resultado em CSV ou xlsx; prioridades do plano (interativo, MCP e API, agenda e webhook, lote), seis tabelas novas com isolamento por linha (migração 0004) e auditoria
 
 ## Estrutura
 
@@ -33,7 +34,7 @@ src/rapa/
   session/    hospedeiro da sessão de gravação ao vivo (python -m rapa.session.host)
   compiler/   compilação da gravação em robô
   llm/        cliente do hub de LLM, sonda (python -m rapa.llm.probe) e generalização
-  control/    banco, fila, despachante, lançador, API REST e gateway MCP
+  control/    banco, fila, despachante, agendas, webhooks, lotes, lançador, API REST e gateway MCP
   ui/         interface em NiceGUI (python -m rapa.ui para o modo de desenvolvimento)
   server.py   o serviço num processo só: REST, MCP, interface e despachante
   fixtures/   portais de teste e robôs de exemplo
@@ -105,12 +106,14 @@ uv run python -m rapa.control.admin usuario EMPRESA bruno@empresa --papel approv
 5. Suba o serviço:
 
 ```bash
-RAPA_DEV=1 RAPA_COOKIE_SEGURO=0 RAPA_TOKENS_DEV=tokens.json RAPA_SEGREDOS_DEV=segredos.json RAPA_DISPATCHER_DATABASE_URL=postgresql://rapa_dispatcher:SENHA@localhost/rapa uv run python -m rapa.server --port 8000
+RAPA_DEV=1 RAPA_COOKIE_SEGURO=0 RAPA_TOKENS_DEV=tokens.json RAPA_SEGREDOS_DEV=segredos.json RAPA_CHAVE_WEBHOOKS=CHAVE_DOS_WEBHOOKS RAPA_DISPATCHER_DATABASE_URL=postgresql://rapa_dispatcher:SENHA@localhost/rapa uv run python -m rapa.server --port 8000
 ```
 
 A interface fica em http://127.0.0.1:8000, a API REST em `/v1` e o gateway MCP em `/mcp`, com `Authorization: Bearer token-ana`. Um robô criado por uma pessoa precisa ser publicado por outra, com o papel de aprovador.
 
 Para gravar um robô, entre como quem tem o papel de criação e abra **Gravar**: informe a área e o endereço inicial, faça a tarefa na tela ao vivo e clique em **Parar e revisar**. Cada gravação abre um processo `python -m rapa.session.host` com um Chromium completo (`RAPA_CHROMIUM_PATH`, `RAPA_ARGS_NAVEGADOR`), cuja saída passa por uma guarda que recusa a própria máquina e o metadata da nuvem (as redes privadas do plano de controle ficam com a NetworkPolicy do deploy); os limites e prazos vêm de `RAPA_SESSOES_POR_EMPRESA`, `RAPA_SESSOES_MAX`, `RAPA_SESSAO_OCIOSA_S` e `RAPA_SESSAO_MAX_S`. Com `RAPA_PUBLIC_URL`, o websocket da visão ao vivo só aceita a origem da interface (mais as de `RAPA_ORIGENS_AO_VIVO`). As regras estão em [docs/CONTRIBUINDO.md](docs/CONTRIBUINDO.md). Com o hub de LLM configurado (`RAPA_LLM_BASE_URL`, `RAPA_LLM_MODEL`, `RAPA_LLM_API_KEY` e a matriz da sonda em `RAPA_LLM_CAPACIDADES`, gravada por `python -m rapa.llm.probe --out`), a revisão também mostra as propostas do modelo; sem ele, só as sugestões das regras, com um aviso.
+
+Um robô publicado também roda por **Agendas** (expressão cron e fuso; o despachante dispara as ocorrências vencidas a cada `RAPA_AGENDA_INTERVALO_S` segundos e ainda roda uma ocorrência atrasada até `RAPA_AGENDA_TOLERANCIA_S`; até `RAPA_AGENDAS_POR_EMPRESA` agendas ligadas por empresa), por **Webhooks** (outro sistema faz `POST /v1/webhooks/{id}` com as entradas em JSON e os cabeçalhos `X-RaPA-Timestamp`, `X-RaPA-Delivery` (sem ponto) e `X-RaPA-Signature`; as leituras de webhook antes da assinatura ficam em `RAPA_WEBHOOKS_POR_SEGUNDO` por processo; ligue com `RAPA_CHAVE_WEBHOOKS`, um texto aleatório de pelo menos 32 caracteres, gerado uma vez, por exemplo com `openssl rand -hex 32`, e guardado como segredo: trocá-lo invalida as chaves de todos os webhooks) e por **Lotes** (uma planilha .xlsx ou .csv, uma execução por linha; limites em `RAPA_LOTE_MAX_LINHAS` e `RAPA_LOTE_MAX_BYTES`). Só quem opera (ou administra) a área cria agendas, webhooks e lotes.
 
 Os arquivos de entrada (para robôs que enviam arquivos) ficam em `RAPA_PASTA_ARQUIVOS`, numa subpasta por empresa: `<RAPA_PASTA_ARQUIVOS>/<uuid da empresa>/<arquivo>`. Cada execução só enxerga a subpasta da própria empresa; arquivos soltos na raiz não valem. `/saude` responde 503 enquanto o despachante do processo estiver parado.
 

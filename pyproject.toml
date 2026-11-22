@@ -33,6 +33,12 @@ control = [
     "jsonschema-rs>=0.61",
     "httpx2>=2.16,<3",
     "websockets>=17.4,<18",
+    # Lote por planilha: envio do arquivo (multipart), leitura de xlsx sem avaliar
+    # fórmulas (openpyxl, com defusedxml contra XML malicioso) e fusos das agendas.
+    "python-multipart>=0.0.34",
+    "openpyxl>=3.1.5",
+    "defusedxml>=0.7.1",
+    "tzdata>=2026.1",
 ]
 # Interface web em Python.
 ui = [
@@ -93,7 +99,15 @@ mypy_path = "src"
 packages = ["rapa"]
 
 [[tool.mypy.overrides]]
-module = ["pyotp.*", "playwright.*", "nicegui.*", "authlib.*", "jsonschema_rs.*"]
+module = [
+    "pyotp.*",
+    "playwright.*",
+    "nicegui.*",
+    "authlib.*",
+    "jsonschema_rs.*",
+    "openpyxl.*",
+    "defusedxml.*",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

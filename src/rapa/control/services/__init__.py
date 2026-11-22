@@ -7,16 +7,20 @@ plataforma em memória (:mod:`rapa.fixtures.memory`):
   :class:`PgPlatform`, que junta os três num objeto só;
 - :class:`PgPrincipalResolver` (protocolo ``PrincipalResolver`` da camada HTTP);
 - :class:`PgProvisioning`, cadastro de empresas, áreas, usuários e vínculos;
-- :mod:`~rapa.control.services.queue` e :class:`Dispatcher`, fila e despacho.
+- :mod:`~rapa.control.services.queue` e :class:`Dispatcher`, fila e despacho;
+- publicar: :class:`PgSchedules` e :class:`Scheduler` (agendas), :class:`PgWebhooks`
+  (webhooks) e :class:`PgBatches` (lote por planilha).
 """
 
 from typing import TYPE_CHECKING
 
 from rapa.control.db.session import Database
 from rapa.control.services.audit import ChainReport, verify_chain
+from rapa.control.services.batches import PgBatches
 from rapa.control.services.dispatcher import (
     Dispatcher,
     Launcher,
+    Ticker,
     WorkerNotStarted,
     failure_result,
 )
@@ -31,13 +35,24 @@ from rapa.control.services.queue import (
 )
 from rapa.control.services.robots import PgRobotAdmin, PgRobotCatalog
 from rapa.control.services.runs import PgRunService
-from rapa.core.contracts import RobotAdmin, RobotCatalog, RunService
+from rapa.control.services.schedules import PgSchedules, Scheduler
+from rapa.control.services.webhooks import PgWebhooks, WebhookKeys
+from rapa.core.contracts import (
+    BatchService,
+    RobotAdmin,
+    RobotCatalog,
+    RunService,
+    ScheduleService,
+    WebhookReceiver,
+    WebhookService,
+)
 
 __all__ = [
     "ChainReport",
     "Dispatcher",
     "EventConflict",
     "Launcher",
+    "PgBatches",
     "PgPlatform",
     "PgPrincipalResolver",
     "PgProvisioning",
@@ -45,9 +60,14 @@ __all__ = [
     "PgRobotCatalog",
     "PgRunQueue",
     "PgRunService",
+    "PgSchedules",
+    "PgWebhooks",
     "ReapReport",
     "RunnerOutcome",
+    "Scheduler",
     "StaleAttempt",
+    "Ticker",
+    "WebhookKeys",
     "WorkerNotStarted",
     "failure_result",
     "set_platform_capacity",
@@ -69,3 +89,9 @@ if TYPE_CHECKING:
 
     def _platform_conforms(platform: PgPlatform) -> tuple[RobotAdmin, RobotCatalog, RunService]:
         return platform, platform, platform
+
+    def _publishing_conforms(
+        db: Database, keys: WebhookKeys
+    ) -> tuple[ScheduleService, WebhookService, WebhookReceiver, BatchService, Ticker]:
+        webhooks = PgWebhooks(db, keys)
+        return PgSchedules(db), webhooks, webhooks, PgBatches(db), Scheduler(db, db)

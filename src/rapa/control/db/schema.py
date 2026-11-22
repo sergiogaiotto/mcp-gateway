@@ -13,6 +13,7 @@ from sqlalchemy import (
     Computed,
     DateTime,
     Integer,
+    LargeBinary,
     MetaData,
     Numeric,
     SmallInteger,
@@ -27,6 +28,8 @@ __all__ = [
     "TENANT_TABLES",
     "areas",
     "audit_log",
+    "batch_rows",
+    "batches",
     "companies",
     "company_quotas",
     "credentials",
@@ -40,7 +43,11 @@ __all__ = [
     "robots",
     "run_events",
     "runs",
+    "schedule_occurrences",
+    "schedules",
     "users",
+    "webhook_deliveries",
+    "webhooks",
 ]
 
 metadata = MetaData()
@@ -269,6 +276,96 @@ recordings = Table(
     _ts("created_at", nullable=False, server_default=True),
 )
 
+schedules = Table(
+    "schedules",
+    metadata,
+    Column("company_id", Uuid, primary_key=True),
+    Column("id", Uuid, primary_key=True),
+    Column("robot_id", Uuid, nullable=False),
+    Column("title", Text, nullable=False),
+    Column("cron", Text, nullable=False),
+    Column("timezone", Text, nullable=False),
+    Column("inputs", JSONB, nullable=False),
+    Column("enabled", Boolean, nullable=False),
+    _ts("next_run_at"),
+    _ts("last_occurrence_at"),
+    Column("created_by", Text, nullable=False),
+    Column("updated_by", Text, nullable=False),
+    _ts("created_at", nullable=False, server_default=True),
+    _ts("updated_at", nullable=False, server_default=True),
+    _ts("archived_at"),
+)
+
+schedule_occurrences = Table(
+    "schedule_occurrences",
+    metadata,
+    Column("company_id", Uuid, primary_key=True),
+    Column("schedule_id", Uuid, primary_key=True),
+    Column("scheduled_for", DateTime(timezone=True), primary_key=True),
+    Column("status", Text, nullable=False),
+    Column("reason", Text, nullable=True),
+    Column("run_id", Uuid, nullable=True),
+    _ts("created_at", nullable=False, server_default=True),
+)
+
+webhooks = Table(
+    "webhooks",
+    metadata,
+    Column("company_id", Uuid, primary_key=True),
+    Column("id", Uuid, primary_key=True),
+    Column("robot_id", Uuid, nullable=False),
+    Column("title", Text, nullable=False),
+    #: Sal da chave de assinatura; a chave é derivada dele com a chave do servidor.
+    Column("key_salt", LargeBinary, nullable=False),
+    Column("key_version", Integer, nullable=False),
+    Column("enabled", Boolean, nullable=False),
+    Column("rate_per_minute", Integer, nullable=False),
+    Column("created_by", Text, nullable=False),
+    Column("updated_by", Text, nullable=False),
+    _ts("created_at", nullable=False, server_default=True),
+    _ts("updated_at", nullable=False, server_default=True),
+    _ts("rotated_at"),
+    _ts("archived_at"),
+)
+
+webhook_deliveries = Table(
+    "webhook_deliveries",
+    metadata,
+    Column("company_id", Uuid, primary_key=True),
+    Column("webhook_id", Uuid, primary_key=True),
+    Column("delivery_id", Text, primary_key=True),
+    Column("body_sha256", Text, nullable=False),
+    Column("run_id", Uuid, nullable=False),
+    _ts("received_at", nullable=False, server_default=True),
+)
+
+batches = Table(
+    "batches",
+    metadata,
+    Column("company_id", Uuid, primary_key=True),
+    Column("id", Uuid, primary_key=True),
+    Column("robot_id", Uuid, nullable=False),
+    Column("version_id", Uuid, nullable=False),
+    Column("file_name", Text, nullable=False),
+    Column("file_format", Text, nullable=False),
+    Column("file_sha256", Text, nullable=False),
+    Column("total_rows", Integer, nullable=False),
+    Column("columns", JSONB, nullable=False),
+    Column("request_key", Text, nullable=True),
+    Column("created_by", Text, nullable=False),
+    _ts("created_at", nullable=False, server_default=True),
+)
+
+batch_rows = Table(
+    "batch_rows",
+    metadata,
+    Column("company_id", Uuid, primary_key=True),
+    Column("batch_id", Uuid, primary_key=True),
+    Column("row_no", Integer, primary_key=True),
+    Column("line_no", Integer, nullable=False),
+    Column("run_id", Uuid, nullable=False),
+)
+
 #: Tabelas com dados de empresa (todas com isolamento por linha).
 TENANT_TABLES: tuple[Table, ...] = (
     companies,
@@ -285,4 +382,10 @@ TENANT_TABLES: tuple[Table, ...] = (
     audit_log,
     recording_sessions,
     recordings,
+    schedules,
+    schedule_occurrences,
+    webhooks,
+    webhook_deliveries,
+    batches,
+    batch_rows,
 )
