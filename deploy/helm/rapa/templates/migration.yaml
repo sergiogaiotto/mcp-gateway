@@ -1,0 +1,93 @@
+{{- if and .Values.app.enabled .Values.migration.enabled }}
+{{- $v := .Values -}}
+{{- $sel := dict "root" . "component" "migracao" -}}
+{{/*
+A migração do banco, como o dono das tabelas, antes de instalar ou atualizar a release
+(hook pre-install,pre-upgrade; no Argo CD, PreSync). Um Job que falha fica para conferir
+(até ttlSecondsAfterFinished) e segura a atualização.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "rapa.component" $sel }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rapa.componentLabels" $sel | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: {{ $v.migration.backoffLimit }}
+  activeDeadlineSeconds: {{ $v.migration.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: {{ $v.migration.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "rapa.componentLabels" $sel | nindent 8 }}
+    spec:
+      {{- include "rapa.migrationPod" (dict "root" . "args" (list "python" "-m" "rapa.control.db.migrate")) | nindent 6 }}
+{{- if $v.migration.grantsJob.enabled }}
+---
+{{- $grants := dict "root" . "component" "permissoes" }}
+{{/* Só reaplica as permissões (por exemplo, depois de criar os papéis). */}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "rapa.component" $grants }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rapa.componentLabels" $grants | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: {{ $v.migration.backoffLimit }}
+  activeDeadlineSeconds: {{ $v.migration.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: {{ $v.migration.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "rapa.componentLabels" (dict "root" . "component" "migracao") | nindent 8 }}
+    spec:
+      {{- include "rapa.migrationPod" (dict "root" . "args" (list "python" "-m" "rapa.control.db.migrate" "--somente-permissoes")) | nindent 6 }}
+{{- end }}
+{{- end }}
+
+{{- define "rapa.migrationPod" -}}
+{{- $v := .root.Values -}}
+restartPolicy: Never
+automountServiceAccountToken: false
+enableServiceLinks: false
+securityContext:
+  {{- include "rapa.podSecurityContext" .root | nindent 2 }}
+{{- include "rapa.imagePullSecrets" .root }}
+containers:
+  - name: migracao
+    image: {{ include "rapa.controlImage" .root | quote }}
+    imagePullPolicy: {{ $v.images.control.pullPolicy }}
+    args:
+      {{- toYaml .args | nindent 6 }}
+    env:
+      {{- include "rapa.databaseEnv" (dict "root" .root "role" "owner" "var" "RAPA_DATABASE_URL") | nindent 6 }}
+      - name: RAPA_DB_APP_ROLE
+        value: {{ $v.database.roles.app.name | quote }}
+      - name: RAPA_DB_DISPATCHER_ROLE
+        value: {{ $v.database.roles.dispatcher.name | quote }}
+      - name: RAPA_LOG_JSON
+        value: {{ ternary "1" "0" $v.observability.logJson | quote }}
+    resources:
+      {{- toYaml $v.migration.resources | nindent 6 }}
+    securityContext:
+      {{- include "rapa.containerSecurityContext" .root | nindent 6 }}
+    volumeMounts:
+      - name: tmp
+        mountPath: /tmp
+      {{- include "rapa.databaseMount" .root | nindent 6 }}
+volumes:
+  - name: tmp
+    emptyDir:
+      sizeLimit: 256Mi
+  {{- include "rapa.databaseVolume" .root | nindent 2 }}
+{{- end -}}

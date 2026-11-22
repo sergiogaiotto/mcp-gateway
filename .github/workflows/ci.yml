@@ -16,8 +16,9 @@ jobs:
   testes:
     name: Lint, tipos e testes
     runs-on: ubuntu-latest
-    # A suíte inteira (com o ponta a ponta e os testes que filmam) leva perto de 27 minutos.
-    timeout-minutes: 45
+    # A suíte inteira (com o ponta a ponta, os testes que filmam e os do PR E) leva perto de
+    # 35 minutos.
+    timeout-minutes: 60
     # Debian 13 (trixie): o mesmo Chromium de código aberto usado na imagem do executor.
     container:
       image: python:3.14-slim-trixie
@@ -37,21 +38,205 @@ jobs:
       # Os testes que filmam a execução (vídeo da falha) usam o ffmpeg do Debian e aqui
       # nunca são pulados: sem ele, falham.
       RAPA_TEST_VIDEO_OBRIGATORIO: "1"
+      # O teste das políticas contra o OpenBao de verdade (bao server -dev, com o binário
+      # oficial instalado abaixo) também nunca é pulado aqui.
+      RAPA_TEST_BAO_OBRIGATORIO: "1"
     steps:
       - name: Instalar o Chromium e o ffmpeg do Debian e utilitários
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends chromium ffmpeg git ca-certificates fonts-liberation
+          apt-get install -y --no-install-recommends chromium ffmpeg git ca-certificates curl fonts-liberation
       - uses: actions/checkout@v4
+      - name: Instalar o OpenBao (versão e SHA-256 fixos)
+        run: bash deploy/ci/instalar-bao.sh /usr/local/bin
       - name: Instalar o uv
         run: pip install --no-cache-dir "uv>=0.11"
       - name: Instalar dependências
         run: uv sync --all-extras --frozen
       - name: Lint
         run: |
-          uv run ruff check src tests
-          uv run ruff format --check src tests
+          uv run ruff check src tests deploy docs
+          uv run ruff format --check src tests deploy docs
       - name: Tipos
         run: uv run mypy
+      # Primeiro, sozinho: as políticas e o preparar.sh contra o bao server -dev, cada papel
+      # com um token só da política dele (falha aqui é a mensagem mais clara).
+      - name: OpenBao de verdade (políticas e preparar.sh)
+        timeout-minutes: 5
+        run: uv run pytest -q "tests/control/vault/test_openbao_files.py::test_everything_against_bao_server_dev"
       - name: Testes
-        run: uv run pytest -q
+        run: uv run pytest -q -o faulthandler_timeout=300
+
+  # O chart sem cluster: helm lint, helm template (valores padrão, de kind e de produção de
+  # exemplo, e as releases só do banco) e kubeconform -strict com os esquemas do Kubernetes e
+  # dos CRDs (CloudNativePG, Gateway API, Envoy Gateway, Argo CD, VictoriaMetrics), mais as
+  # regras dos manifestos em Python. Aqui os testes do chart nunca são pulados.
+  chart:
+    name: Chart (helm e kubeconform)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RAPA_TEST_CHART_OBRIGATORIO: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+      - name: Instalar o kubeconform
+        run: |
+          curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.7.0/kubeconform-linux-amd64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin kubeconform
+          kubeconform -v
+      - uses: astral-sh/setup-uv@v6
+      - name: Instalar dependências
+        run: uv sync --all-extras --frozen
+      # O que precisa de navegador e de banco (os auxiliares do CI contra o serviço de verdade)
+      # roda no job de testes.
+      - name: Chart, regras do Dockerfile, Argo CD, Keycloak e CI
+        env:
+          RAPA_KUBECONFORM_CACHE: ${{ runner.temp }}/kubeconform
+        run: uv run pytest -q tests/deploy -m "not browser and not database"
+
+  # As duas imagens construídas de verdade (sem push), a de controle contra um PostgreSQL de
+  # serviço e a do executor com o worker de verdade contra o portal de teste, e o trivy só
+  # informativo (não reprova o job).
+  imagens:
+    name: Imagens (controle e executor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Construir a imagem de controle
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: controle
+          tags: rapa-controle:ci
+          load: true
+          push: false
+          build-args: |
+            REVISAO=${{ github.sha }}
+            FONTE=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=controle
+          cache-to: type=gha,mode=max,scope=controle
+      - name: Construir a imagem do executor
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: executor
+          tags: rapa-executor:ci
+          load: true
+          push: false
+          build-args: |
+            REVISAO=${{ github.sha }}
+            FONTE=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=executor
+          cache-to: type=gha,mode=max,scope=executor
+      - uses: astral-sh/setup-uv@v6
+      - name: Instalar dependências (para o trabalho de teste)
+        run: uv sync --all-extras --frozen
+      - name: Imagem de controle (migração, CLI, servidor e /saude/pronto)
+        run: deploy/ci/testar-controle.sh rapa-controle:ci
+      - name: Imagem do executor (o worker contra o portal de teste)
+        run: deploy/ci/testar-executor.sh rapa-executor:ci rapa-controle:ci
+      - name: Trivy na imagem de controle (informativo)
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: rapa-controle:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
+      - name: Trivy na imagem do executor (informativo)
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: rapa-executor:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
+
+  # O RaPA num cluster kind: o operador do CloudNativePG, o OpenBao em modo dev, um SeaweedFS
+  # de um nó, o portal de teste e o chart com values-kind.yaml (execuções em pods, sem
+  # RuntimeClass); uma empresa pelo CLI, um robô publicado e executado pela REST até
+  # succeeded, e o artefato cifrado no S3 e lido de volta pela API.
+  kind:
+    name: Kubernetes (kind)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Construir a imagem de controle
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: controle
+          tags: rapa-controle:ci
+          load: true
+          push: false
+          cache-from: type=gha,scope=controle
+      - name: Construir a imagem do executor
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: executor
+          tags: rapa-executor:ci
+          load: true
+          push: false
+          cache-from: type=gha,scope=executor
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: rapa
+          config: deploy/kind/cluster.yaml
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+      - uses: astral-sh/setup-uv@v6
+      - name: Instalar dependências (para o teste ponta a ponta)
+        run: uv sync --all-extras --frozen
+      # O preparar.sh roda aqui, no runner, contra o OpenBao do cluster (pelo port-forward):
+      # a imagem do OpenBao não tem o bash.
+      - name: Instalar o OpenBao (versão e SHA-256 fixos)
+        run: |
+          bash deploy/ci/instalar-bao.sh "$RUNNER_TEMP/bao"
+          echo "$RUNNER_TEMP/bao" >>"$GITHUB_PATH"
+      - name: Instalar o RaPA no kind
+        timeout-minutes: 30
+        run: deploy/kind/instalar.sh
+      # A execução roda num pod de uso único (RAPA_EXECUTOR=kubernetes, sem RuntimeClass):
+      # o script confere que o pod do executor existiu e que nada ficou para trás.
+      - name: Publicar e executar um robô pela REST
+        timeout-minutes: 20
+        run: deploy/kind/testar.sh
+      - name: Recolher os logs
+        if: failure()
+        run: deploy/kind/recolher-logs.sh logs-kind
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: logs-kind
+          path: logs-kind
+          retention-days: 7

@@ -230,6 +230,52 @@ async def test_missing_file_and_delete_run(tmp_path: Path) -> None:
     await store.delete_run(COMPANY, RUN)  # sem nada, não faz nada
 
 
+async def test_list_and_delete_company_follow_the_layout_and_never_a_link(
+    tmp_path: Path,
+) -> None:
+    """A exportação lista e a exclusão apaga pelo store: só a disposição dele, sem atalhos."""
+    store = LocalArtifactStore(tmp_path / "artefatos")
+    company, other, second = new_id(), new_id(), new_id()
+    for who, run, attempt, name in (
+        (company, RUN, 1, "tela.png"),
+        (company, RUN, 2, "nota.pdf"),
+        (company, second, 1, "video.webm"),
+        (other, RUN, 1, "tela.png"),
+    ):
+        folder = attempt_dir(store.root, who, run, attempt)
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / name).write_bytes(DATA)
+    base = store.root / str(company)
+    # Fora da disposição (nome de pasta, tentativa e arquivo fora da regra) ou um atalho
+    # (para a pasta da outra empresa): nada disso é listado.
+    (base / "solto.png").write_bytes(DATA)
+    (base / "nao-e-uuid" / "1").mkdir(parents=True)
+    (base / "nao-e-uuid" / "1" / "x.png").write_bytes(DATA)
+    (base / str(RUN) / "01").mkdir()
+    (base / str(RUN) / "1" / ".oculto").write_bytes(DATA)
+    (base / str(new_id())).symlink_to(store.root / str(other) / str(RUN))
+    (base / str(RUN) / "1" / "atalho.png").symlink_to(
+        store.root / str(other) / str(RUN) / "1" / "tela.png"
+    )
+    listed = [item async for item in store.list_company(company)]
+    assert [(item.run_id, item.attempt, item.name) for item in listed] == sorted(
+        [(RUN, 1, "tela.png"), (RUN, 2, "nota.pdf"), (second, 1, "video.webm")]
+    )
+    assert [item async for item in store.list_company(new_id())] == []
+    # Apagar a empresa: os arquivos dela (sem contar os atalhos) e nada da outra.
+    assert await store.delete_company(company) == 6
+    assert not base.exists()
+    assert (store.root / str(other) / str(RUN) / "1" / "tela.png").read_bytes() == DATA
+    assert await store.delete_company(company) == 0
+    # Um atalho no lugar da pasta da empresa: some só ele, nunca o destino.
+    (store.root / str(company)).symlink_to(store.root / str(other))
+    assert [item async for item in store.list_company(company)] == []
+    assert await store.delete_company(company) == 0
+    assert not (store.root / str(company)).is_symlink()
+    assert (store.root / str(other) / str(RUN) / "1" / "tela.png").exists()
+    assert await LocalArtifactStore(tmp_path / "nao-existe").delete_company(company) == 0
+
+
 def test_launcher_writes_where_the_store_reads(tmp_path: Path) -> None:
     """O lançador e o store local usam a mesma pasta da tentativa."""
     launcher = LocalProcessLauncher(

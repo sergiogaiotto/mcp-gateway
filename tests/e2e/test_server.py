@@ -1,15 +1,18 @@
 """Configuração do serviço e o processo ``python -m rapa.server`` de verdade."""
 
 import asyncio
+import gzip
 import json
 import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -17,13 +20,26 @@ from uuid import UUID
 import httpx2
 import pytest
 from fastapi import FastAPI
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind
 from playwright.async_api import async_playwright, expect
+from sentry_sdk.envelope import Envelope
+from sentry_sdk.transport import Transport
 from sqlalchemy import text
 
 from rapa.control.auth import TokenVerifier
 from rapa.control.db import Database
 from rapa.control.http_app import SWAGGER_UI_DIR
 from rapa.control.mcp import McpGateway
+from rapa.control.observability import glitchtip as glitchtip_module
+from rapa.control.observability import tracing as tracing_module
+from rapa.control.observability.glitchtip import (
+    OMITTED_MESSAGE,
+    configure_glitchtip,
+    report_unhandled,
+)
+from rapa.control.observability.metrics import MeteredWebhooks, serve_metrics
+from rapa.control.observability.tracing import RunSpans, Tracing, activate_tracing
 from rapa.control.services import Dispatcher, PgPlatform, ReapReport
 from rapa.core.contracts import Forbidden, Role, RunnerJob, VersionStatus
 from rapa.core.ids import new_id
@@ -42,6 +58,7 @@ from rapa.ui.backend import NotAuthenticated
 from rapa.ui.context import UiContext, UiSettings, Viewer
 from tests.control.api.support import asgi_client, running
 from tests.control.db.support import PgDatabase, make_tenant, protocolo
+from tests.control.observability.support import leaked
 
 DB = "postgresql://rapa_app:senha@banco:5432/rapa"
 
@@ -153,7 +170,9 @@ def test_publishing_configuration(tmp_path: Path) -> None:
         ServerSettings.from_env({**base, "RAPA_UI": "0", "RAPA_CHAVE_WEBHOOKS": key})
     )
     publishing = app.state.publishing
-    assert publishing.webhooks is publishing.receiver is not None
+    # A entrega passa pelas métricas (contada pelo resultado) e chega ao mesmo serviço.
+    assert isinstance(publishing.receiver, MeteredWebhooks)
+    assert publishing.webhooks is publishing.receiver.inner is not None
     assert publishing.batches is not None and publishing.batch_max_bytes == 5 * 1024 * 1024
     # Os limites novos chegam aos serviços.
     app = create_server_app(
@@ -442,7 +461,7 @@ async def test_dispatcher_supervisor_waits_longer_after_each_crash() -> None:
 async def test_health_reports_a_stopped_dispatcher(monkeypatch: pytest.MonkeyPatch) -> None:
     fakes: list[FakeDispatcher] = []
 
-    def build(settings: ServerSettings, db: Any) -> FakeDispatcher:
+    def build(settings: ServerSettings, db: Any, *_: Any) -> FakeDispatcher:
         fakes.append(FakeDispatcher(crashes=1000 if len(fakes) == 0 else 0))
         return fakes[-1]
 
@@ -567,7 +586,7 @@ def _record_closing(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 async def test_service_starts_only_once(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeDispatcher(crashes=0)
-    monkeypatch.setattr("rapa.server.build_dispatcher", lambda settings, db: fake)
+    monkeypatch.setattr("rapa.server.build_dispatcher", lambda settings, db, *_: fake)
     closed = _record_closing(monkeypatch)
     app = _full_service()
     async with running(app), asgi_client(app) as client:
@@ -649,7 +668,7 @@ async def test_full_service_health_follows_the_dispatcher(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake = ScriptedDispatcher()
-    monkeypatch.setattr("rapa.server.build_dispatcher", lambda settings, db: fake)
+    monkeypatch.setattr("rapa.server.build_dispatcher", lambda settings, db, *_: fake)
     closed = _record_closing(monkeypatch)
     app = _full_service()
     supervisor: DispatcherSupervisor = app.state.dispatcher_supervisor
@@ -719,7 +738,7 @@ async def test_service_with_ui_starts_only_once_and_closes_databases_last(
 ) -> None:
     events = _record_closing(monkeypatch)
     fake = _RecordingDispatcher(events)
-    monkeypatch.setattr("rapa.server.build_dispatcher", lambda settings, db: fake)
+    monkeypatch.setattr("rapa.server.build_dispatcher", lambda settings, db, *_: fake)
     app = _service_with_ui(monkeypatch, events)
     async with running(app), asgi_client(app) as client:
         await fake.running.wait()
@@ -874,7 +893,7 @@ async def test_full_service_shutdown_drains_runs_before_closing_databases(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dispatcher = _CrashingDispatcher(Fatal())
-    monkeypatch.setattr("rapa.server.build_dispatcher", lambda settings, db: dispatcher)
+    monkeypatch.setattr("rapa.server.build_dispatcher", lambda settings, db, *_: dispatcher)
     closed = _record_closing(monkeypatch)
     app = _full_service()
     supervisor: DispatcherSupervisor = app.state.dispatcher_supervisor
@@ -995,10 +1014,17 @@ def _free_port() -> int:
 
 
 @pytest.fixture
+def metrics_port() -> int:
+    """A porta das métricas do processo (livre: nunca a 9100 de um outro serviço da máquina)."""
+    return _free_port()
+
+
+@pytest.fixture
 def server_process(
     pg_database: PgDatabase,
     tmp_path: Path,
     tokens: dict[str, Any],
+    metrics_port: int,
 ) -> Iterator[str]:
     port = _free_port()
     env = {
@@ -1016,6 +1042,7 @@ def server_process(
             "RAPA_TOKENS_DEV": str(_tokens(tmp_path, tokens)),
             "RAPA_PASTA_TRABALHO": str(tmp_path / "trabalho"),
             "RAPA_PASTA_ARTEFATOS": str(tmp_path / "artefatos"),
+            "RAPA_METRICAS_PORTA": str(metrics_port),
         }
     )
     process = subprocess.Popen(  # noqa: S603 - comando fixo, sem shell
@@ -1062,7 +1089,9 @@ async def tokens(app_db: Any) -> dict[str, Any]:
 
 
 @pytest.mark.database
-def test_server_process_serves_api_mcp_and_ui(server_process: str, tokens: dict[str, Any]) -> None:
+def test_server_process_serves_api_mcp_and_ui(
+    server_process: str, tokens: dict[str, Any], metrics_port: int
+) -> None:
     operator = tokens["token-operadora"]
     me = httpx2.get(
         f"{server_process}/v1/eu", headers={"Authorization": "Bearer token-operadora"}, timeout=5
@@ -1094,6 +1123,617 @@ def test_server_process_serves_api_mcp_and_ui(server_process: str, tokens: dict[
     assert page.status_code == 200
     assert page.url.path == "/entrar"
     assert "RaPA" in page.text
+    # Pronto: o banco, o do despachante e o despachante respondem.
+    ready = httpx2.get(f"{server_process}/saude/pronto", timeout=5)
+    assert ready.status_code == 200 and ready.json() == {"estado": "pronto"}
+    # As métricas ficam na porta própria, nunca na do serviço.
+    assert httpx2.get(f"{server_process}/metrics", timeout=5).status_code == 404
+    metrics = ""
+    for _ in range(100):
+        metrics = httpx2.get(f"http://127.0.0.1:{metrics_port}/metrics", timeout=5).text
+        # A primeira leitura da fila pelo despachante sai logo na subida.
+        if "rapa_fila_execucoes " in metrics:
+            break
+        time.sleep(0.1)
+    assert "rapa_fila_execucoes " in metrics
+    assert "rapa_despachante_saudavel 1.0" in metrics
+    assert 'rapa_despachante_etapa_ok{etapa="claim"} 1.0' in metrics
+    assert 'rota="/v1/eu"' in metrics and operator["empresa"] not in metrics
+
+
+# ---------------------------------------------------------------------------
+# Observabilidade e saúde
+# ---------------------------------------------------------------------------
+
+#: Um banco que recusa a conexão na hora (porta fechada).
+DOWN_DB = "postgresql://rapa_app:senha-que-nao-aparece@127.0.0.1:1/rapa"
+DOWN_DISPATCHER_DB = "postgresql://rapa_dispatcher:senha-que-nao-aparece@127.0.0.1:1/rapa"
+
+
+def test_observability_configuration(tmp_path: Path) -> None:
+    base = {"RAPA_DATABASE_URL": DB, "RAPA_DEV": "1", "RAPA_TOKENS_DEV": str(_tokens(tmp_path))}
+    defaults = ServerSettings.from_env(base)
+    assert (defaults.metrics_port, defaults.metrics_per_company, defaults.log_json) == (
+        9100,
+        False,
+        False,
+    )
+    assert defaults.otel_endpoint is None and defaults.glitchtip_dsn is None
+    dsn = "https://chave-do-projeto@glitchtip.exemplo/3"
+    settings = ServerSettings.from_env(
+        {
+            **base,
+            "RAPA_METRICAS_PORTA": "0",
+            "RAPA_METRICAS_POR_EMPRESA": "1",
+            "RAPA_LOG_JSON": "1",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "http://coletor.exemplo:4318",
+            "OTEL_SERVICE_NAME": "rapa-api",
+            "RAPA_GLITCHTIP_DSN": dsn,
+        }
+    )
+    assert settings.metrics_port == 0 and settings.metrics_per_company and settings.log_json
+    assert settings.otel_endpoint == "http://coletor.exemplo:4318"
+    assert settings.otel_service_name == "rapa-api"
+    # O DSN tem a chave do projeto: nunca na representação.
+    assert settings.glitchtip_dsn == dsn and "chave-do-projeto" not in repr(settings)
+    for env, message in (
+        ({"RAPA_METRICAS_PORTA": "70000"}, "metrics_port"),
+        ({"RAPA_METRICAS_PORTA": "-1"}, "metrics_port"),
+        ({"RAPA_LOG_JSON": "talvez"}, "1 ou 0"),
+        ({"OTEL_EXPORTER_OTLP_ENDPOINT": "coletor:4318"}, "OTEL_EXPORTER_OTLP_ENDPOINT"),
+        ({"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "http://c/v1/traces"}, "só liga com"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            ServerSettings.from_env({**base, **env})
+
+
+#: Segredos da configuração: nenhum pedaço deles pode aparecer numa recusa.
+KEY = "Kq7vZx93WmPd"
+PASSWORD = "Hj5Rt2Lw9Bnq"
+WEBHOOK_KEY = "Zp4Yt8QsXcGe"
+LLM_KEY = "Mv6Nb3Ty7UeA"
+OIDC_SECRET = "Fw2Dk8Pm4RsC"
+
+
+def test_configuration_errors_never_carry_secrets(tmp_path: Path) -> None:
+    base = {
+        "RAPA_DATABASE_URL": f"postgresql://rapa_app:{PASSWORD}@banco:5432/rapa",
+        "RAPA_DISPATCHER_DATABASE_URL": f"postgresql://rapa_dispatcher:{PASSWORD}@banco/rapa",
+        "RAPA_DEV": "1",
+        "RAPA_TOKENS_DEV": str(_tokens(tmp_path)),
+        "RAPA_LLM_API_KEY": LLM_KEY,
+        "RAPA_OIDC_CLIENT_SECRET": OIDC_SECRET,
+        "RAPA_GLITCHTIP_DSN": f"https://{KEY}@glitchtip.exemplo/3",
+    }
+    assert ServerSettings.from_env(base).glitchtip_dsn == base["RAPA_GLITCHTIP_DSN"]
+    for extra, message in (
+        # O DSN recusado pela forma (o sentry_sdk recusaria ao ligar).
+        ({"RAPA_GLITCHTIP_DSN": f"ftp://{KEY}@glitchtip.exemplo/3"}, "http:// ou https://"),
+        ({"RAPA_GLITCHTIP_DSN": f"https://{KEY}@glitchtip.exemplo/"}, "número do projeto"),
+        ({"RAPA_GLITCHTIP_DSN": "https://glitchtip.exemplo/3"}, "chave do projeto"),
+        # Uma regra do modelo que nada tem com os segredos: o pydantic punha na mensagem
+        # o fim do dicionário inteiro, com o DSN.
+        ({"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "http://c/v1/traces"}, "só liga com"),
+        ({"RAPA_LLM_BASE_URL": "http://hub.exemplo"}, "hub de LLM"),
+        # Um campo recusado: o pydantic punha o valor.
+        ({"RAPA_CHAVE_WEBHOOKS": WEBHOOK_KEY}, "webhook_key"),
+    ):
+        with pytest.raises(ValueError, match=message) as refused:
+            ServerSettings.from_env({**base, **extra})
+        detail = str(refused.value)
+        for secret in (KEY, PASSWORD, WEBHOOK_KEY, LLM_KEY, OIDC_SECRET):
+            assert not leaked(secret, detail), (extra, detail)
+    # Montada direto (sem as variáveis), a mesma coisa.
+    with pytest.raises(ValueError, match="não teria o que fazer") as refused:
+        ServerSettings(database_url=f"postgresql://rapa_app:{PASSWORD}@banco/rapa", http=False)
+    assert not leaked(PASSWORD, str(refused.value))
+
+
+def test_metrics_are_wired_into_the_queue_dispatcher_sessions_and_webhooks(tmp_path: Path) -> None:
+    key = "chave-dos-webhooks-que-nunca-aparece-em-lugar-nenhum"
+    app = create_server_app(
+        ServerSettings(
+            database_url=DOWN_DB,
+            dispatcher_database_url=DOWN_DISPATCHER_DB,
+            dev=True,
+            dev_tokens_file=_tokens(tmp_path),
+            ui=False,
+            webhook_key=key,
+            metrics_per_company=True,
+        )
+    )
+    metrics = app.state.metrics
+    assert metrics.per_company
+    # Cada execução concluída pela fila conta nas métricas do processo.
+    assert app.state.dispatcher.queue.observer is metrics
+    assert isinstance(app.state.publishing.receiver, MeteredWebhooks)
+    assert app.state.publishing.receiver.metrics is metrics
+    assert metrics._dispatcher.supervisor is app.state.dispatcher_supervisor
+    assert metrics._sessions.sessions is app.state.sessions is not None
+    # Sem OTEL_EXPORTER_OTLP_ENDPOINT, nada de rastreio.
+    assert app.state.tracing is None and app.state.dispatcher.tracer is None
+    assert {check.name for check in app.state.readiness.checks} == {
+        "banco",
+        "banco_despachante",
+        "despachante",
+    }
+
+
+async def test_readiness_names_what_is_down_while_liveness_stays_up(tmp_path: Path) -> None:
+    app = create_server_app(
+        ServerSettings(database_url=DOWN_DB, dev=True, dev_tokens_file=_tokens(tmp_path), ui=False)
+    )
+    async with running(app), asgi_client(app) as client:
+        # Vivo: o processo atende (o banco fora não derruba a sonda de vida).
+        assert (await client.get("/saude")).status_code == 200
+        response = await client.get("/saude/pronto")
+        assert response.status_code == 503
+        assert response.json() == {"estado": "nao_pronto", "falhas": ["banco"]}
+        assert response.headers["cache-control"] == "no-store"
+        assert "senha-que-nao-aparece" not in response.text
+        # A porta das métricas é outra: a aplicação pública não tem /metrics.
+        assert (await client.get("/metrics")).status_code == 404
+    metrics = app.state.metrics.render().decode()
+    assert 'codigo="503",metodo="GET",rota="/saude/pronto"' in metrics
+
+
+async def test_readiness_of_a_dispatcher_process_follows_the_dispatcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "rapa.server.build_dispatcher", lambda settings, db, *_: FakeDispatcher(crashes=1000)
+    )
+    app = create_server_app(
+        ServerSettings(database_url=DOWN_DB, dispatcher_database_url=DOWN_DISPATCHER_DB, http=False)
+    )
+    supervisor: DispatcherSupervisor = app.state.dispatcher_supervisor
+    async with running(app), asgi_client(app) as client:
+        await _until(lambda: not supervisor.healthy)
+        response = await client.get("/saude/pronto")
+        assert response.status_code == 503
+        assert response.json() == {
+            "estado": "nao_pronto",
+            "falhas": ["banco", "banco_despachante", "despachante"],
+        }
+
+
+@pytest.mark.database
+async def test_readiness_is_ready_with_the_database_up(
+    pg_database: PgDatabase, tmp_path: Path
+) -> None:
+    app = create_server_app(
+        ServerSettings(
+            database_url=pg_database.app_url,
+            dev=True,
+            dev_tokens_file=_tokens(tmp_path),
+            ui=False,
+            sessions=False,
+        )
+    )
+    async with running(app), asgi_client(app) as client:
+        response = await client.get("/saude/pronto")
+    assert response.status_code == 200 and response.json() == {"estado": "pronto"}
+
+
+def _main_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **extra: str) -> None:
+    for name in list(os.environ):
+        if name.startswith(("RAPA_", "OTEL_")):
+            monkeypatch.delenv(name)
+    env = {
+        "RAPA_DATABASE_URL": DOWN_DB,
+        "RAPA_DEV": "1",
+        "RAPA_TOKENS_DEV": str(_tokens(tmp_path)),
+        "RAPA_UI": "0",
+        "RAPA_SESSOES": "0",
+        "RAPA_VIDEO_EM_FALHAS": "0",
+        **extra,
+    }
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_main_refuses_metrics_on_the_service_port(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from rapa.server import main
+
+    _main_env(monkeypatch, tmp_path, RAPA_METRICAS_PORTA="8123")
+    assert main(["--port", "8123"]) == 2
+    assert "RAPA_METRICAS_PORTA não pode ser a porta do serviço" in capsys.readouterr().err
+
+
+def test_main_does_not_start_without_the_metrics_port(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from rapa.server import main
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as busy:
+        busy.bind(("0.0.0.0", 0))
+        busy.listen()
+        port = busy.getsockname()[1]
+        _main_env(monkeypatch, tmp_path, RAPA_METRICAS_PORTA=str(port))
+        assert main(["--port", str(_free_port())]) == 2
+    assert f"não foi possível abrir a porta {port} das métricas: OSError" in caplog.text
+
+
+def test_main_refuses_a_malformed_dsn_cleanly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from rapa.server import main
+
+    for dsn in (
+        f"ftp://{KEY}@glitchtip.exemplo/1",
+        f"https://{KEY}@glitchtip.exemplo/",
+        "https://glitchtip.exemplo/1",
+    ):
+        _main_env(monkeypatch, tmp_path, RAPA_GLITCHTIP_DSN=dsn, RAPA_LOG_JSON="1")
+        # A saída limpa de configuração inválida, nunca a pilha do BadDsn.
+        assert main(["--port", str(_free_port())]) == 2
+        err = capsys.readouterr().err
+        assert err.startswith("rapa.server: configuração inválida:"), err
+        assert "RAPA_GLITCHTIP_DSN" in err and "Traceback" not in err
+        assert not leaked(KEY, err), err
+    assert not glitchtip_module._enabled
+
+
+class _Envelopes(Transport):
+    """Guarda os envelopes do GlitchTip em memória."""
+
+    def __init__(self, dsn: str) -> None:
+        super().__init__({"dsn": dsn})
+        self.envelopes: list[Envelope] = []
+
+    def capture_envelope(self, envelope: Envelope) -> None:
+        self.envelopes.append(envelope)
+
+    def events(self) -> list[dict[str, Any]]:
+        return [
+            item.payload.json
+            for envelope in self.envelopes
+            for item in envelope.items
+            if item.type == "event" and isinstance(item.payload.json, dict)
+        ]
+
+
+@pytest.fixture
+def memory_tracing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[tuple[list[dict[str, Any]], InMemorySpanExporter]]:
+    """``activate_tracing`` do servidor com um exportador em memória (guarda as chamadas)."""
+    exporter = InMemorySpanExporter()
+    calls: list[dict[str, Any]] = []
+    created: list[Tracing] = []
+
+    def activate(**options: Any) -> Tracing:
+        calls.append(options)
+        tracing = activate_tracing(**options, exporter=exporter)
+        created.append(tracing)
+        return tracing
+
+    monkeypatch.setattr("rapa.server.activate_tracing", activate)
+    try:
+        yield calls, exporter
+    finally:
+        for tracing in created:
+            if tracing_module._process is tracing:
+                tracing.shutdown()
+
+
+async def test_tracing_is_wired_into_requests_and_the_dispatcher(
+    tmp_path: Path, memory_tracing: tuple[list[dict[str, Any]], InMemorySpanExporter]
+) -> None:
+    calls, exporter = memory_tracing
+    settings = {
+        "database_url": DOWN_DB,
+        "dev": True,
+        "dev_tokens_file": _tokens(tmp_path),
+        "ui": False,
+        "sessions": False,
+        "otel_endpoint": "http://coletor.exemplo:4318",
+        "otel_traces_endpoint": "http://coletor.exemplo:4318/traces",
+        "otel_service_name": "rapa-api",
+    }
+    app = create_server_app(ServerSettings(**settings, dispatcher_database_url=DOWN_DISPATCHER_DB))
+    # A configuração chega ao rastreio, e o despachante ganha os spans das execuções.
+    assert [
+        {key: call[key] for key in ("endpoint", "traces_endpoint", "service_name")}
+        for call in calls
+    ] == [
+        {
+            "endpoint": "http://coletor.exemplo:4318",
+            "traces_endpoint": "http://coletor.exemplo:4318/traces",
+            "service_name": "rapa-api",
+        }
+    ]
+    tracing = app.state.tracing
+    assert isinstance(tracing, Tracing)
+    tracer = app.state.dispatcher.tracer
+    assert isinstance(tracer, RunSpans)
+    job = RunnerJob(
+        run_id=new_id(),
+        company_id=new_id(),
+        attempt=1,
+        manifest=protocolo(),
+        inputs={},
+        deadline=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    with tracer.run(job) as span:
+        span.finished({"state": "succeeded"})
+    # Os pedidos da aplicação de verdade (sem o despachante, que não sobe aqui).
+    served = create_server_app(ServerSettings(**settings))
+    assert served.state.tracing is tracing
+    async with running(served), asgi_client(served) as client:
+        assert (await client.get("/v1/eu")).status_code == 401
+        assert (await client.get("/saude")).status_code == 200
+        assert (await client.get("/saude/pronto")).status_code == 503
+    tracing.flush()
+    spans = exporter.get_finished_spans()
+    # A saúde fica de fora; o pedido sai com a rota modelo.
+    servers = [span for span in spans if span.kind is SpanKind.SERVER]
+    assert [(span.attributes or {}).get("http.route") for span in servers] == ["/v1/eu"]
+    [run_span] = [span for span in spans if span.name == "execucao"]
+    assert (run_span.attributes or {})["rapa.execucao.id"] == str(job.run_id)
+
+
+def test_main_wires_glitchtip_tracing_and_the_metrics_port(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    memory_tracing: tuple[list[dict[str, Any]], InMemorySpanExporter],
+) -> None:
+    import uvicorn
+
+    from rapa.server import _version, main
+
+    calls, _ = memory_tracing
+    dsn = f"https://{KEY}@glitchtip.exemplo/3"
+    transport = _Envelopes(dsn)
+    configured: list[tuple[str, str | None]] = []
+
+    def configure(value: str, *, release: str | None = None) -> Any:
+        configured.append((value, release))
+        return configure_glitchtip(value, release=release, transport=transport)
+
+    monkeypatch.setattr("rapa.server.configure_glitchtip", configure)
+    metrics_port = _free_port()
+    seen: dict[str, Any] = {}
+
+    def run(app: FastAPI, **options: Any) -> None:
+        seen["app"], seen["options"] = app, options
+        # Com o serviço de pé: o GlitchTip ligado e as métricas na porta própria.
+        seen["enabled"] = glitchtip_module._enabled
+        report_unhandled(LookupError(f"falha com {PASSWORD}"))
+        scraped = httpx2.get(f"http://127.0.0.1:{metrics_port}/metrics", timeout=5)
+        seen["metrics"] = scraped.status_code
+
+    monkeypatch.setattr(uvicorn, "run", run)
+    _main_env(
+        monkeypatch,
+        tmp_path,
+        RAPA_DISPATCHER_DATABASE_URL=DOWN_DISPATCHER_DB,
+        RAPA_GLITCHTIP_DSN=dsn,
+        OTEL_EXPORTER_OTLP_ENDPOINT="http://coletor.exemplo:4318",
+        RAPA_METRICAS_PORTA=str(metrics_port),
+    )
+    assert main(["--port", str(_free_port())]) == 0
+    assert configured == [(dsn, f"rapa@{_version()}")]
+    assert [call["endpoint"] for call in calls] == ["http://coletor.exemplo:4318"]
+    app = seen["app"]
+    # O rastreio que o main ligou é o da aplicação e o do despachante.
+    assert isinstance(app.state.tracing, Tracing)
+    assert isinstance(app.state.dispatcher.tracer, RunSpans)
+    assert seen["enabled"] and seen["metrics"] == 200
+    [event] = transport.events()
+    [exception] = event["exception"]["values"]
+    assert exception["type"] == "LookupError" and exception["value"] == OMITTED_MESSAGE
+    assert event["release"] == f"rapa@{_version()}"
+    assert PASSWORD not in json.dumps(event)
+    # No fim, tudo desligado: o GlitchTip, o rastreio e a porta das métricas.
+    assert not glitchtip_module._enabled and tracing_module._process is None
+    with pytest.raises(httpx2.TransportError):
+        httpx2.get(f"http://127.0.0.1:{metrics_port}/metrics", timeout=1)
+
+
+@pytest.mark.parametrize(("argv", "host"), [([], "127.0.0.1"), (["--host", "0.0.0.0"], "0.0.0.0")])
+def test_the_metrics_port_listens_where_the_service_does(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, argv: list[str], host: str
+) -> None:
+    import uvicorn
+
+    from rapa.server import main
+
+    hosts: list[str | None] = []
+
+    def serve(metrics: Any, port: int, host: str | None = None) -> Any:
+        hosts.append(host)  # None: o main não disse onde (o padrão da função)
+        return serve_metrics(metrics, port) if host is None else serve_metrics(metrics, port, host)
+
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr("rapa.server.serve_metrics", serve)
+    monkeypatch.setattr(uvicorn, "run", lambda app, **options: seen.update(options))
+    _main_env(monkeypatch, tmp_path, RAPA_METRICAS_PORTA=str(_free_port()))
+    assert main([*argv, "--port", str(_free_port())]) == 0
+    # Com o padrão, nada fica aberto na rede: as métricas seguem o --host do serviço.
+    assert hosts == [host] and seen["host"] == host
+
+
+class _FakeCollector(BaseHTTPRequestHandler):
+    """Um GlitchTip e um coletor OTLP falsos: guarda o caminho, os cabeçalhos e o corpo."""
+
+    received: list[tuple[str, dict[str, str], bytes]]
+
+    def do_POST(self) -> None:
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        if self.headers.get("Content-Encoding") == "gzip":
+            body = gzip.decompress(body)
+        type(self).received.append((self.path, dict(self.headers), body))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+
+def test_server_process_sends_clean_errors_and_traces(tmp_path: Path) -> None:
+    """O processo de verdade, com ``RAPA_GLITCHTIP_DSN`` e ``OTEL_EXPORTER_OTLP_ENDPOINT``."""
+    _FakeCollector.received = []
+    collector = ThreadingHTTPServer(("127.0.0.1", 0), _FakeCollector)
+    thread = threading.Thread(target=collector.serve_forever, daemon=True)
+    thread.start()
+    collector_port = collector.server_address[1]
+    port = _free_port()
+    token = "token-do-glitchtip-que-nao-sai"
+    cookie = "cookie-que-nao-sai"
+    query = "consulta-que-nao-sai"
+    tokens = _tokens(tmp_path, {token: {"sujeito": "ana", "empresa": str(new_id())}})
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in {"PATH", "HOME", "LANG", "TMPDIR"} or key.startswith("PLAYWRIGHT_")
+    }
+    env.update(
+        {
+            "RAPA_DATABASE_URL": DOWN_DB,
+            "RAPA_DEV": "1",
+            "RAPA_TOKENS_DEV": str(tokens),
+            "RAPA_UI": "0",
+            "RAPA_SESSOES": "0",
+            "RAPA_VIDEO_EM_FALHAS": "0",
+            "RAPA_METRICAS_PORTA": "0",
+            "RAPA_GLITCHTIP_DSN": f"http://{KEY}@127.0.0.1:{collector_port}/7",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": f"http://127.0.0.1:{collector_port}",
+            "OTEL_BSP_SCHEDULE_DELAY": "100",
+        }
+    )
+    process = subprocess.Popen(  # noqa: S603 - comando fixo, sem shell
+        [sys.executable, "-m", "rapa.server", "--port", str(port)],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    base = f"http://127.0.0.1:{port}"
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            assert process.poll() is None, "o servidor saiu antes de responder"
+            try:
+                if httpx2.get(f"{base}/saude", timeout=1).status_code == 200:
+                    break
+            except httpx2.TransportError:
+                pass
+            assert time.monotonic() < deadline, "o servidor não respondeu em 30 s"
+            time.sleep(0.2)
+        # Com o banco fora, o pedido autenticado cai no último recurso da API: 500.
+        failed = httpx2.get(
+            f"{base}/v1/eu?busca={query}",
+            headers={"Authorization": f"Bearer {token}", "Cookie": f"sessao={cookie}"},
+            timeout=10,
+        )
+        assert failed.status_code == 500
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            paths = [path for path, _, _ in _FakeCollector.received]
+            if "/api/7/envelope/" in paths and "/v1/traces" in paths:
+                break
+            time.sleep(0.1)
+    finally:
+        process.terminate()
+        try:
+            _, stderr = process.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            _, stderr = process.communicate()
+        collector.shutdown()
+        collector.server_close()
+    received = list(_FakeCollector.received)
+    envelopes = [body for path, _, body in received if path == "/api/7/envelope/"]
+    traces = [body for path, _, body in received if path == "/v1/traces"]
+    assert envelopes, stderr.decode()[-2000:]
+    assert traces, stderr.decode()[-2000:]
+    # O GlitchTip recebe a exceção sem a mensagem, sem o pedido e sem os dados dele.
+    events = [
+        json.loads(line)
+        for body in envelopes
+        for line in body.decode().splitlines()
+        if line.startswith("{") and '"exception"' in line
+    ]
+    assert events
+    for event in events:
+        for item in event["exception"]["values"]:
+            assert item["value"] == OMITTED_MESSAGE
+        assert not {"request", "user", "extra", "breadcrumbs", "tags"} & set(event)
+    sent = b"".join(envelopes + traces)
+    for secret in (token, cookie, query, "senha-que-nao-aparece"):
+        assert secret.encode() not in sent
+    # O coletor recebe os spans dos pedidos, pela rota modelo.
+    assert b"/v1/eu" in b"".join(traces)
+
+
+def test_server_process_without_database_logs_json_and_serves_metrics(tmp_path: Path) -> None:
+    """O processo de verdade: logs em JSON, métricas na porta própria e prontidão 503."""
+    port, metrics_port = _free_port(), _free_port()
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in {"PATH", "HOME", "LANG", "TMPDIR"} or key.startswith("PLAYWRIGHT_")
+    }
+    env.update(
+        {
+            "RAPA_DATABASE_URL": DOWN_DB,
+            "RAPA_DEV": "1",
+            "RAPA_TOKENS_DEV": str(_tokens(tmp_path)),
+            "RAPA_UI": "0",
+            "RAPA_SESSOES": "0",
+            "RAPA_VIDEO_EM_FALHAS": "0",
+            "RAPA_METRICAS_PORTA": str(metrics_port),
+            "RAPA_LOG_JSON": "1",
+        }
+    )
+    process = subprocess.Popen(  # noqa: S603 - comando fixo, sem shell
+        [sys.executable, "-m", "rapa.server", "--port", str(port)],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    base = f"http://127.0.0.1:{port}"
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            assert process.poll() is None, "o servidor saiu antes de responder"
+            try:
+                if httpx2.get(f"{base}/saude", timeout=1).status_code == 200:
+                    break
+            except httpx2.TransportError:
+                pass
+            assert time.monotonic() < deadline, "o servidor não respondeu em 30 s"
+            time.sleep(0.2)
+        ready = httpx2.get(f"{base}/saude/pronto", timeout=5)
+        assert ready.status_code == 503 and ready.json()["falhas"] == ["banco"]
+        assert httpx2.get(f"{base}/metrics", timeout=5).status_code == 404
+        scraped = httpx2.get(f"http://127.0.0.1:{metrics_port}/metrics", timeout=5)
+        assert scraped.status_code == 200
+        assert 'rapa_http_pedidos_total{codigo="503",metodo="GET",rota="/saude/pronto"} 1.0' in (
+            scraped.text
+        )
+        assert "process_resident_memory_bytes" in scraped.text
+    finally:
+        process.terminate()
+        try:
+            _, stderr = process.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            _, stderr = process.communicate()
+    lines = [line for line in stderr.decode().splitlines() if line.strip()]
+    assert lines, "o servidor não registrou nada"
+    payloads = [json.loads(line) for line in lines]  # toda linha é um objeto JSON
+    for payload in payloads:
+        assert {"hora", "nivel", "logger", "mensagem"} <= set(payload)
+    loggers = {payload["logger"] for payload in payloads}
+    # As linhas do uvicorn e as do serviço, todas no mesmo formato.
+    assert "uvicorn.error" in loggers and "rapa.control.saude" in loggers
+    assert "senha-que-nao-aparece" not in stderr.decode()
 
 
 @pytest.mark.database

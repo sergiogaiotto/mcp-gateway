@@ -1,0 +1,554 @@
+# Valores do chart do RaPA. Nenhum segredo entra aqui: só os nomes de Secrets que já existem
+# no namespace (existingSecret) e as chaves dentro deles. Cada valor diz qual variável do
+# serviço ele preenche (veja docs/OPERACAO.md, "O que cada valor faz").
+
+# Prefixo dos nomes dos recursos: rapa-web, rapa-api, rapa-despachante, rapa-executor...
+nameBase: rapa
+# Domínio do cluster, para os nomes completos dos serviços.
+clusterDomain: cluster.local
+
+# A aplicação (web, api, despachante, migração, rede e RBAC). Desligue numa release que só
+# tem o banco (database.cnpg.enabled): o Job de migração roda antes de qualquer recurso
+# da release, então o banco precisa vir de uma release própria, instalada antes.
+app:
+  enabled: true
+
+images:
+  # Imagem do plano de controle (deploy/docker/Dockerfile, alvo controle).
+  control:
+    repository: registro.exemplo.test/rapa/rapa-controle
+    # Vazio: a appVersion do chart.
+    tag: ""
+    # sha256:...; quando definido, vale no lugar da tag.
+    digest: ""
+    pullPolicy: IfNotPresent
+  # Imagem dos pods de execução e de sessão (alvo executor): RAPA_K8S_IMAGEM_EXECUTOR.
+  executor:
+    repository: registro.exemplo.test/rapa/rapa-executor
+    tag: ""
+    digest: ""
+  # Secrets de registro (kubernetes.io/dockerconfigjson) dos pods do chart; o primeiro
+  # também vai para os pods de execução e de sessão (RAPA_K8S_PULL_SECRET), que precisam
+  # dele no namespace das execuções.
+  pullSecrets: []
+  # Recusa renderizar sem o digest das duas imagens (ligue em produção).
+  requireDigest: false
+
+# Endereço público da interface e da API (RAPA_PUBLIC_URL), sem barra no fim.
+publicUrl: ""
+
+auth:
+  # Modo de desenvolvimento (RAPA_DEV): tokens fixos e login sem senha. Só para kind e
+  # testes; o chart recusa o modo de desenvolvimento junto com o gateway público.
+  dev:
+    enabled: false
+    # Secret com a chave tokens.json (RAPA_TOKENS_DEV).
+    tokensSecret: ""
+    # Secret com a chave segredos.json (RAPA_SEGREDOS_DEV, com vault.mode=dev).
+    secretsSecret: ""
+  # Tokens do Keycloak (RAPA_JWT_ISSUER, RAPA_JWT_AUDIENCE, RAPA_JWKS_URL).
+  jwt:
+    issuer: ""
+    audience: ""
+    jwksUrl: ""
+  # RAPA_ORGANIZATION_ALIASES: {"apelido": "uuid da empresa"} (prefira ligar pelo CLI).
+  organizationAliases: {}
+  # Login da interface (RAPA_OIDC_CLIENT_ID, RAPA_OIDC_REDIRECT_URI e o segredo do cliente,
+  # RAPA_OIDC_CLIENT_SECRET, no Secret existingSecret).
+  oidc:
+    clientId: ""
+    redirectUri: ""
+    existingSecret: ""
+    secretKey: client-secret
+  # RAPA_COOKIE_SEGURO.
+  cookieSecure: true
+  # RAPA_MCP_ORIGENS e RAPA_ORIGENS_AO_VIVO.
+  mcpOrigins: []
+  liveOrigins: []
+  # RAPA_LIMITE_POR_SEGUNDO (por empresa; "0" desliga).
+  rateLimitPerSecond: "20"
+
+database:
+  # Host do serviço de escrita (o -rw do CloudNativePG) ou do Pooler.
+  host: rapa-banco-rw
+  port: 5432
+  name: rapa
+  # sslmode do libpq; verify-full confere o certificado do banco com o CA abaixo. Fora do
+  # desenvolvimento, só verify-full ou verify-ca (require cifra, mas não confere o servidor).
+  sslMode: verify-full
+  # CA do banco (o Secret <cluster>-ca do CloudNativePG), montado para o sslrootcert.
+  caSecret:
+    name: rapa-banco-ca
+    key: ca.crt
+  # Os três papéis (docs em rapa.control.db.roles). Cada Secret é do tipo
+  # kubernetes.io/basic-auth (username e password), o mesmo que o CloudNativePG usa nos
+  # managed.roles. A senha entra na URL do banco: use só caracteres seguros numa URL
+  # (openssl rand -hex 32).
+  roles:
+    owner:
+      name: rapa_owner
+      existingSecret: rapa-banco-dono
+    app:
+      name: rapa_app
+      existingSecret: rapa-banco-app
+    dispatcher:
+      name: rapa_dispatcher
+      existingSecret: rapa-banco-despachante
+  passwordKey: password
+  # Templates do CloudNativePG (numa release só do banco: app.enabled=false). O nome do
+  # Cluster vale nas duas releases: é por ele que as NetworkPolicies da aplicação acham o
+  # banco e o Pooler (cnpg.io/cluster e cnpg.io/poolerName).
+  cnpg:
+    enabled: false
+    name: rapa-banco
+    instances: 3
+    imageName: ""
+    storage:
+      size: 50Gi
+      storageClass: ""
+    walStorage:
+      size: 20Gi
+      storageClass: ""
+    parameters:
+      max_connections: "300"
+      shared_buffers: 1GB
+      effective_cache_size: 3GB
+      work_mem: 16MB
+      maintenance_work_mem: 256MB
+      log_min_duration_statement: "1000"
+      idle_in_transaction_session_timeout: 5min
+    resources:
+      requests:
+        cpu: "1"
+        memory: 4Gi
+      limits:
+        memory: 4Gi
+    # Backups pelo plugin Barman Cloud no S3 (SeaweedFS): ObjectStore, WAL contínuo,
+    # ScheduledBackup diário e retenção.
+    backup:
+      enabled: true
+      destinationPath: s3://rapa-backups/banco
+      endpointURL: https://seaweedfs-s3.armazenamento.svc:8333
+      # Secret com ACCESS_KEY_ID e ACCESS_SECRET_KEY do bucket dos backups.
+      existingSecret: rapa-banco-backup-s3
+      accessKeyKey: ACCESS_KEY_ID
+      secretKeyKey: ACCESS_SECRET_KEY
+      # CA do S3 (opcional): Secret e chave.
+      caSecret:
+        name: ""
+        key: ca.crt
+      retentionPolicy: 30d
+      # Cron do CloudNativePG, com segundos: todo dia às 03:00 (UTC).
+      schedule: "0 0 3 * * *"
+    # Restauração (docs/OPERACAO.md, "Restaurar de verdade"): o Cluster de name nasce dos
+    # backups do Cluster source (o mesmo caminho de backup.destinationPath), até targetTime
+    # (RFC 3339, opcional), com os mesmos papéis. O name precisa ser outro: o WAL do novo vai
+    # para a pasta dele, e o da origem fica como estava.
+    recovery:
+      enabled: false
+      source: ""
+      targetTime: ""
+    # Pooler do PgBouncer em modo sessão (o RaPA usa variáveis de sessão e transações
+    # explícitas). Aponte database.host para rapa-banco-pooler-rw para usá-lo.
+    pooler:
+      enabled: false
+      instances: 2
+      defaultPoolSize: "50"
+      maxClientConn: "500"
+    # Monitoramento: VMPodScrape do VictoriaMetrics para a porta de métricas das instâncias.
+    monitoring:
+      enabled: false
+    # NetworkPolicies das instâncias e do Pooler (o namespace nega tudo quando a release
+    # da aplicação está instalada).
+    networkPolicies:
+      # Quem fala com o banco na porta 5432 (os pods do RaPA, por padrão).
+      clients:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rapa
+      # O operador do CloudNativePG (e o plugin Barman Cloud).
+      operator:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cnpg-system
+      # Saída para o S3 dos backups.
+      s3:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: armazenamento
+      s3Ports:
+        - 8333
+
+# O Job de migração (hook pre-install,pre-upgrade) com a URL do dono das tabelas
+# (python -m rapa.control.db.migrate).
+migration:
+  enabled: true
+  # Job opcional que só reaplica as permissões (--somente-permissoes), depois de instalar.
+  grantsJob:
+    enabled: false
+  backoffLimit: 1
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+# Execuções e sessões em pods de uso único.
+executions:
+  # RAPA_K8S_NAMESPACE_EXECUCOES.
+  namespace: rapa-execucoes
+  # Cria o namespace (com a Pod Security "restricted").
+  createNamespace: true
+  # RAPA_EXECUTOR (no despachante) e RAPA_SESSOES_EXECUTOR (na web) são sempre kubernetes no
+  # cluster: o isolamento é o pod de uso único.
+  # RAPA_K8S_RUNTIME_CLASS ("" = sem RuntimeClass, só para kind e desenvolvimento).
+  runtimeClass: gvisor
+  # RAPA_K8S_CPU e RAPA_K8S_MEMORIA.
+  cpu: "1"
+  memory: 2Gi
+  # RAPA_K8S_SA_EXECUTOR: conta de serviço dos pods de execução (sem permissão nenhuma e sem
+  # token montado).
+  serviceAccount: rapa-executor
+  # RAPA_K8S_NODE_SELECTOR e RAPA_K8S_TOLERATIONS (viram JSON).
+  nodeSelector: {}
+  tolerations: []
+  # O canal do despachante (RAPA_CANAL_PORTA). Cada réplica do despachante guarda os
+  # bilhetes das tentativas que ela lançou, então o endereço do canal (RAPA_CANAL_ENDERECO)
+  # é http://{ip}:<porta>, com {ip} trocado pelo RaPA pelo IP do próprio pod, nunca um
+  # Service que espalhe entre as réplicas (o despachante recusa um endereço sem {ip}).
+  # ipv6: o cluster é IPv6 (pede o bloco IPv6 da VPC em egress.extraInternalNetworks).
+  channel:
+    port: 8081
+    ipv6: false
+  # Porta do WebSocket do host de sessão num pod (o relay da web conecta nela). Fixa no
+  # host de sessão (rapa.control.sessions.launcher): o chart recusa outra.
+  sessionPort: 8765
+  # Rótulos dos pods que o despachante e a web criam (app.kubernetes.io/name).
+  podLabels:
+    run: rapa-executor
+    session: rapa-sessao
+  egress:
+    # RAPA_PROXY_SAIDA: proxy HTTP CONNECT corporativo (ex. http://proxy.interno:3128), e as
+    # redes e a porta dele para a NetworkPolicy. Um proxy com usuário e senha vem inteiro
+    # (a URL com eles) de um Secret: existingSecret e a chave key; a URL nunca leva senha.
+    proxy:
+      url: ""
+      existingSecret: ""
+      key: url
+      cidrs: []
+      port: 3128
+    # RAPA_REDES_INTERNAS_PERMITIDAS: CIDRs internos que os robôs podem acessar (portais
+    # internos). Também abrem a NetworkPolicy. Só CIDRs estreitos (/16 ou mais em IPv4, /48
+    # ou mais em IPv6), longe do loopback, do link-local e do metadata da nuvem.
+    allowedInternalNetworks: []
+    # Redes internas a mais que os pods nunca alcançam, além das fixas do chart (por
+    # exemplo, o bloco IPv6 global da VPC, obrigatório num cluster IPv6, ou uma rede
+    # interna fora da RFC 1918). As de IPv4 também ficam fechadas pelo NAT64.
+    extraInternalNetworks: []
+    # Saída direta para a internet (0.0.0.0/0 e ::/0, menos as redes internas). Desligue
+    # quando a internet só sai pelo proxy.
+    directInternet: true
+    # Regras de saída a mais (NetworkPolicyEgressRule), só em kind e desenvolvimento (o
+    # portal de teste): destinos por namespaceSelector, nunca ipBlock, sempre com portas.
+    extraRules: []
+  # Os pods que a web e o despachante criam no namespace das execuções passam por uma
+  # ValidatingAdmissionPolicy: a imagem do executor, a conta rapa-executor sem token, a
+  # RuntimeClass do gVisor (quando configurada), os rótulos de execução ou de sessão, o
+  # comando do agente ou do host de sessão e só volumes secret e emptyDir. O token de uma
+  # conta que cria pods não cria outra coisa (nem um pod no runc, nem outra imagem).
+  admissionPolicy:
+    enabled: true
+
+# A rede dos pods do chart.
+network:
+  # Endereço em que os processos ouvem ("::" para IPv6, que pede o bloco IPv6 da VPC em
+  # executions.egress.extraInternalNetworks).
+  listenAddress: 0.0.0.0
+  # As NetworkPolicies (desligadas, só com auth.dev.enabled: o chart recusa fora dele).
+  policies:
+    enabled: true
+  # DNS do cluster.
+  dns:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+  # Quem coleta as métricas (vmagent do VictoriaMetrics).
+  metricsCollector:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoramento
+  # Destinos de saída do plano de controle. Sem "to", o destino fica fechado.
+  egress:
+    # O banco: sempre as instâncias e o Pooler do Cluster de database.cnpg.name (o chart põe
+    # os seletores), mais estes destinos (um banco fora do CloudNativePG).
+    database:
+      to: []
+      ports: [5432]
+    vault:
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cofre
+      ports: [8200]
+    # O Keycloak (o JWKS e, na web, o login OIDC). O emissor costuma ter um nome público: no
+    # cluster, esse nome precisa chegar ao Service do Keycloak (deploy/keycloak/README.md,
+    # "O emissor dentro do cluster"), senão o destino depois do DNAT é o Envoy.
+    keycloak:
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: identidade
+      ports: [8443, 443]
+    s3:
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: armazenamento
+      ports: [8333]
+    # O hub do modelo (fora do cluster: informe o CIDR).
+    modelHub:
+      to: []
+      ports: [443]
+    # A API do Kubernetes (os endereços do plano de controle do EKS no Outposts).
+    kubernetesApi:
+      to: []
+      ports: [443]
+    # Coletor OTLP e GlitchTip.
+    observability:
+      to: []
+      ports: [4317, 4318, 443]
+
+# HTTPRoute do Gateway API no Gateway externo do Envoy Gateway (com o TLS).
+gateway:
+  enabled: false
+  parentRefs:
+    - name: rapa-externo
+      namespace: envoy-gateway-system
+      sectionName: https
+  hostnames: []
+  # Os pods do Envoy (para a NetworkPolicy da web e da api).
+  pods:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: envoy-gateway-system
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/component: proxy
+          app.kubernetes.io/managed-by: envoy-gateway
+  # FORWARDED_ALLOW_IPS: as redes dos pods do Envoy, obrigatórias com o gateway (sem elas,
+  # o uvicorn vê o Envoy como origem de todo pedido). CIDRs de IPv4 dentro das redes
+  # privadas dos pods (10/8, 172.16/12, 192.168/16, 100.64/10) ou de IPv6 /48 ou mais
+  # estreitos; nunca "*" nem a internet.
+  trustedNetworks: []
+  # Prazo dos pedidos comuns (as páginas e os envios da interface, a REST, os webhooks e os
+  # metadados do MCP), acima dos 120 s de uma chamada ao hub do modelo. Sem prazo, só os
+  # websockets (/_nicegui_ws e /v1/sessoes/{id}/ao-vivo) e o /mcp (respostas em fluxo).
+  requestTimeout: 180s
+  # Afinidade por cookie da interface no Envoy (BackendTrafficPolicy) quando web.replicas > 1.
+  webAffinityCookie: rapa_afinidade
+
+# RAPA_DOCS_API: a documentação da API REST em /v1/docs (Swagger UI servido pelo próprio
+# serviço) e /v1/openapi.json, na web e na api. Só as rotas e os formatos, nunca dados;
+# ligue onde for útil (homologação, a rede interna). docs/OPERACAO.md, 1.13.
+apiDocs: false
+
+web:
+  # A interface e as sessões ficam na memória do processo: com mais de uma réplica, a
+  # afinidade por cookie no gateway mantém cada navegador na mesma réplica.
+  replicas: 1
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      memory: 2Gi
+  terminationGracePeriodSeconds: 60
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  pdb:
+    maxUnavailable: 1
+  # RAPA_SESSOES_POR_EMPRESA, RAPA_SESSOES_MAX, RAPA_SESSAO_OCIOSA_S e RAPA_SESSAO_MAX_S.
+  sessions:
+    perCompany: 2
+    max: ""
+    idleSeconds: 600
+    maxSeconds: 3600
+
+api:
+  replicas: 2
+  hpa:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 6
+    cpuUtilization: 70
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+  terminationGracePeriodSeconds: 60
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  pdb:
+    maxUnavailable: 1
+
+dispatcher:
+  replicas: 2
+  # Porta da saúde do despachante (/saude e /saude/pronto, só para os probes do kubelet).
+  # O canal dos pods tem o servidor dele, em executions.channel.port.
+  healthPort: 8080
+  # RAPA_CONCORRENCIA: execuções ao mesmo tempo em cada réplica.
+  concurrency: 4
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+  # O encerramento espera as execuções em andamento (até o prazo máximo de uma execução
+  # mais 10 minutos).
+  terminationGracePeriodSeconds: 2400
+  # Pasta de trabalho local (RAPA_PASTA_TRABALHO e RAPA_PASTA_ARTEFATOS) num emptyDir.
+  workSizeLimit: 20Gi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  pdb:
+    maxUnavailable: 1
+
+# Cofre (OpenBao). Só o despachante lê segredos (RAPA_COFRE); a web e a api usam o OpenBao
+# só para as chaves (RAPA_CHAVES=openbao, transit).
+vault:
+  # RAPA_COFRE do despachante: nenhum, dev ou openbao.
+  mode: openbao
+  # RAPA_BAO_ENDERECO.
+  address: https://openbao.cofre.svc:8200
+  # RAPA_BAO_CA: Secret (ou "") com o CA do OpenBao.
+  caSecret:
+    name: rapa-openbao-ca
+    key: ca.crt
+  # RAPA_BAO_KV, RAPA_BAO_TRANSIT e RAPA_BAO_AUTH.
+  kvMount: rapa
+  transitMount: rapa-transit
+  authMethod: kubernetes
+  # RAPA_BAO_PAPEL de cada componente (papéis do método kubernetes, ligados às contas de
+  # serviço rapa-despachante, rapa-web, rapa-api e rapa-operacao). O da operação tem a
+  # política rapa-operacao (deploy/openbao): apagar os segredos e a chave de uma empresa.
+  roles:
+    dispatcher: rapa-despachante
+    web: rapa-web
+    api: rapa-api
+    operation: rapa-operacao
+  # Token projetado da conta de serviço, com audiência própria (RAPA_BAO_TOKEN_SA). O token
+  # em arquivo (RAPA_BAO_TOKEN_ARQUIVO) é só para desenvolvimento fora do cluster.
+  tokenAudience: openbao
+  tokenExpirationSeconds: 3600
+
+# Armazenamento dos artefatos (RAPA_ARMAZENAMENTO): local ou s3 (SeaweedFS).
+storage:
+  mode: s3
+  s3:
+    # RAPA_S3_ENDERECO, RAPA_S3_REGIAO, RAPA_S3_BUCKET e RAPA_S3_ESTILO_CAMINHO.
+    endpoint: https://seaweedfs-s3.armazenamento.svc:8333
+    region: us-east-1
+    bucket: rapa-artefatos
+    pathStyle: true
+    # RAPA_S3_CA (opcional).
+    caSecret:
+      name: ""
+      key: ca.crt
+    # AWS_ACCESS_KEY_ID e AWS_SECRET_ACCESS_KEY vêm deste Secret.
+    existingSecret: rapa-s3
+    accessKeyKey: AWS_ACCESS_KEY_ID
+    secretKeyKey: AWS_SECRET_ACCESS_KEY
+
+# Chaves dos artefatos (RAPA_CHAVES): openbao (transit, uma chave por empresa) ou local
+# (RAPA_CHAVE_ARTEFATOS, só para desenvolvimento e testes).
+keys:
+  mode: openbao
+  localKeySecret:
+    name: ""
+    key: chave
+
+# Observabilidade.
+observability:
+  # RAPA_METRICAS_PORTA (0 desliga) e RAPA_METRICAS_POR_EMPRESA.
+  metricsPort: 9100
+  metricsPerCompany: false
+  # RAPA_LOG_JSON.
+  logJson: true
+  # OTEL_EXPORTER_OTLP_ENDPOINT (OTEL_SERVICE_NAME é o nome de cada componente).
+  otlpEndpoint: ""
+  # RAPA_GLITCHTIP_DSN (Secret e chave; vazio desliga).
+  glitchtip:
+    existingSecret: ""
+    key: dsn
+  # VMPodScrape do VictoriaMetrics para a porta de métricas dos três componentes.
+  vmPodScrape:
+    enabled: false
+
+# Hub do modelo (RAPA_LLM_BASE_URL, RAPA_LLM_MODEL, RAPA_LLM_API_KEY e a matriz da sonda em
+# RAPA_LLM_CAPACIDADES, num ConfigMap).
+modelHub:
+  baseUrl: ""
+  model: ""
+  existingSecret: ""
+  apiKeyKey: api-key
+  # Conteúdo JSON da matriz gravada por python -m rapa.llm.probe --out.
+  capabilities: ""
+
+# O pod da operação (docs/OPERACAO.md, "O CLI no cluster"): o chart guarda um PodTemplate
+# (rapa-operacao) com a conta de serviço e o papel do OpenBao da operação, a URL do dono das
+# tabelas, o S3 e as chaves; quem opera cria um pod dele para congelar, exportar e apagar uma
+# empresa, e o apaga no fim. Nada roda sozinho.
+operation:
+  enabled: true
+  # Onde a exportação é montada (os artefatos decifrados): um emptyDir deste tamanho.
+  workSizeLimit: 50Gi
+  # O pod some sozinho depois deste prazo (segundos).
+  activeDeadlineSeconds: 14400
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
+
+# Publicar.
+publishing:
+  # RAPA_CHAVE_WEBHOOKS (Secret e chave; vazio: os webhooks respondem 503).
+  webhookKey:
+    existingSecret: ""
+    key: chave
+  # RAPA_AGENDA_TOLERANCIA_S, RAPA_AGENDA_INTERVALO_S e RAPA_AGENDAS_POR_EMPRESA.
+  scheduleCatchUpSeconds: 600
+  scheduleIntervalSeconds: 5
+  schedulesPerCompany: 200
+  # RAPA_WEBHOOKS_POR_SEGUNDO, RAPA_LOTE_MAX_LINHAS e RAPA_LOTE_MAX_BYTES.
+  webhookLookupsPerSecond: 200
+  batchMaxRows: 1000
+  batchMaxBytes: 5242880
+
+# RAPA_CONSERTO_CANDIDATOS e RAPA_A1_AVISO_DIAS.
+repairCandidates: 8
+a1WarnDays: 30
+
+# Evidências: RAPA_VIDEO_EM_FALHAS e os prazos (dias) RAPA_RETENCAO_SUCESSO_DIAS,
+# RAPA_RETENCAO_FALHAS_DIAS e RAPA_RETENCAO_EVENTOS_DIAS (a validar com o jurídico).
+evidence:
+  videoOnFailure: true
+  retentionSuccessDays: 7
+  retentionFailureDays: 90
+  retentionEventsDays: 400

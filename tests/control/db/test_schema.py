@@ -66,12 +66,15 @@ async def test_every_company_table_has_forced_rls_and_policy(
 async def test_retention_policies_are_only_for_the_owner_reading_and_deleting(
     superuser_engine: AsyncEngine, pg_database: PgDatabase
 ) -> None:
-    """As únicas políticas fora do isolamento por empresa: as da retenção (revisão 0008).
+    """As únicas políticas fora do isolamento por empresa: as da retenção (revisões 0008 e
+    0009).
 
-    Nas duas tabelas que as funções da retenção apagam, só para ler e apagar (nunca
-    incluir nem mudar); em ``companies`` e ``run_events``, só para ler (a situação das
-    empresas e os eventos, para pular a empresa congelada). Sempre só para o dono das
-    tabelas e só com a marca de uma das funções.
+    Nas três tabelas que as funções da retenção apagam (os retratos, as chaves de
+    idempotência e as chaves das execuções), só para ler e apagar (nunca incluir nem
+    mudar); em ``companies`` e ``run_events``, só para ler (a situação das empresas e os
+    eventos, para pular a empresa congelada), e em ``runs`` só para ler a marca de
+    expirado (as chaves das execuções). Sempre só para o dono das tabelas e só com a
+    marca de uma das funções.
     """
     async with superuser_engine.connect() as conn:
         rows = (
@@ -90,15 +93,22 @@ async def test_retention_policies_are_only_for_the_owner_reading_and_deleting(
         ("idempotency_keys", "retention_sweep_delete", "d"),
         ("idempotency_keys", "retention_sweep_read", "r"),
         ("run_events", "retention_sweep_read", "r"),
+        ("run_keys", "retention_sweep_delete", "d"),
+        ("run_keys", "retention_sweep_read", "r"),
         ("run_snapshots", "retention_sweep_delete", "d"),
         ("run_snapshots", "retention_sweep_read", "r"),
+        ("runs", "retention_sweep_read", "r"),
     ]
-    markers = "ARRAY['run_snapshots'::text, 'idempotency_keys'::text, 'run_events'::text]"
+    markers = (
+        "ARRAY['run_snapshots'::text, 'idempotency_keys'::text, 'run_events'::text, "
+        "'run_keys'::text]"
+    )
     for table, _name, _cmd, qual, no_check, roles in rows:
         if table == "companies":
             assert qual == f"(current_setting('rapa.retention'::text, true) = ANY ({markers}))"
         else:
-            assert qual == f"(current_setting('rapa.retention'::text, true) = '{table}'::text)"
+            marker = "run_keys" if table == "runs" else table
+            assert qual == f"(current_setting('rapa.retention'::text, true) = '{marker}'::text)"
         assert no_check
         assert roles == [pg_database.owner]
 
@@ -149,13 +159,13 @@ async def test_metadata_matches_migrated_tables(superuser_engine: AsyncEngine) -
 async def test_dispatcher_cannot_touch_tenant_admin_tables(dispatcher_db: Database) -> None:
     for statement in (
         # Dos usuários, das credenciais e das aprovações, o despachante só lê o que a
-        # conferência do A1 precisa (quem é custodiante e quem aprovou a versão).
+        # conferência do A1 precisa (quem é custodiante e quem aprovou a versão) e a busca
+        # do segredo no cofre (o caminho no cofre, desde a 0009, é uma referência).
         "SELECT display_name FROM users",
         "SELECT active FROM users",
         "SELECT * FROM users",
         "UPDATE users SET active = false",
         "SELECT count(*) FROM memberships",
-        "SELECT vault_path FROM credentials",
         "SELECT * FROM credentials",
         "UPDATE credentials SET revoked_at = now()",
         "SELECT authorized_by FROM a1_authorizations",
@@ -166,9 +176,32 @@ async def test_dispatcher_cannot_touch_tenant_admin_tables(dispatcher_db: Databa
         "INSERT INTO companies (id, name) VALUES (gen_random_uuid(), 'x')",
         "UPDATE platform_settings SET total_browser_slots = 1",
         "DELETE FROM run_events",
+        # As chaves das execuções: só inclui e lê; apagar é só pela função da retenção.
+        "DELETE FROM run_keys",
+        "UPDATE run_keys SET key_version = 2",
     ):
         with pytest.raises(DBAPIError) as caught:
             async with dispatcher_db.dispatcher_session() as session:
+                await session.execute(text(statement))
+        assert getattr(caught.value.orig, "sqlstate", None) == "42501", statement
+
+
+async def test_dispatcher_reads_the_vault_path_and_the_app_only_reads_run_keys(
+    dispatcher_db: Database, app_db: Database
+) -> None:
+    """Revisão 0009: o caminho no cofre é uma referência que o lançador busca no OpenBao;
+    as chaves das execuções, o despachante inclui e lê, e a aplicação só lê."""
+    async with dispatcher_db.dispatcher_session() as session:
+        await session.execute(text("SELECT name, kind, origin, vault_path FROM credentials"))
+        await session.execute(text("SELECT wrapped_key, key_version FROM run_keys"))
+    for statement in (
+        "INSERT INTO run_keys (company_id, run_id, wrapped_key, key_version) "
+        "VALUES ('00000000-0000-4000-8000-000000000001', gen_random_uuid(), '\\x00', 1)",
+        "UPDATE run_keys SET key_version = 2",
+        "DELETE FROM run_keys",
+    ):
+        with pytest.raises(DBAPIError) as caught:
+            async with app_db.dispatcher_session() as session:
                 await session.execute(text(statement))
         assert getattr(caught.value.orig, "sqlstate", None) == "42501", statement
 

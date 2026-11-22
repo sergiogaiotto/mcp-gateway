@@ -13,7 +13,8 @@ Saída (operação da plataforma: a URL é a do dono das tabelas, em ``--url-don
     python -m rapa.control.admin empresa congelar EMPRESA --motivo "contrato encerrado"
     python -m rapa.control.admin empresa descongelar EMPRESA
     python -m rapa.control.admin empresa exportar EMPRESA --saida empresa.tar.gz
-    python -m rapa.control.admin empresa apagar EMPRESA --confirmar "Nome da empresa"
+    python -m rapa.control.admin empresa apagar EMPRESA --confirmar "Nome da empresa" \\
+        [--segredos-fora-do-openbao]
 
 Os comandos antigos continuam valendo (sem o vínculo com a organização; auditados, como
 os novos)::
@@ -28,7 +29,14 @@ do Keycloak (ou o sujeito de um token de desenvolvimento); ``ORG`` é o id ou o 
 da organização no Keycloak. Um papel sem área vale na empresa toda; ``papel:AREA`` vale
 só naquela área. ``--por`` diz quem pediu (vai para a auditoria; padrão: o usuário do
 sistema). As pastas dos arquivos e dos artefatos vêm de ``--pasta-arquivos`` e
-``--pasta-artefatos`` (padrão: ``RAPA_PASTA_ARQUIVOS`` e ``RAPA_PASTA_ARTEFATOS``).
+``--pasta-artefatos`` (padrão: ``RAPA_PASTA_ARQUIVOS`` e ``RAPA_PASTA_ARTEFATOS``). O
+armazenamento dos artefatos, as chaves e o cofre vêm das mesmas variáveis do servidor
+(``RAPA_ARMAZENAMENTO``, ``RAPA_S3_*``, ``RAPA_CHAVES``, ``RAPA_COFRE``, ``RAPA_BAO_*``;
+:mod:`rapa.control.backends`): no S3, ``exportar`` leva os artefatos decifrados e
+``apagar`` apaga os objetos e, com o OpenBao, os segredos e a chave transit da empresa.
+``apagar`` falha fechado: se a empresa tem artefatos no S3, chaves do transit ou
+credenciais e a configuração não alcança onde eles estão, nada é apagado (os segredos de
+credenciais fora do OpenBao, só com ``--segredos-fora-do-openbao`` ou ``RAPA_COFRE=dev``).
 """
 
 import argparse
@@ -46,6 +54,7 @@ from uuid import UUID
 
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
+from rapa.control.backends import Backends, BackendSettings, VaultKind
 from rapa.control.db import Database, create_engine
 from rapa.control.services import PgProvisioning
 from rapa.control.services.company import company_usage, month_period
@@ -160,6 +169,14 @@ def _parser() -> argparse.ArgumentParser:
     purge = commands.add_parser("empresa apagar", help="apaga uma empresa congelada")
     purge.add_argument("empresa", type=UUID)
     purge.add_argument("--confirmar", required=True, help="o nome exato da empresa")
+    purge.add_argument(
+        "--segredos-fora-do-openbao",
+        action="store_true",
+        help=(
+            "os segredos das credenciais não estão no OpenBao (o arquivo de desenvolvimento): "
+            "apaga sem o cofre configurado (o registro diz quantos ficaram de fora)"
+        ),
+    )
     _owner_options(purge, folders=True)
 
     area = commands.add_parser("area", help="cadastra uma área numa empresa")
@@ -279,31 +296,53 @@ async def _owner_command(args: argparse.Namespace, url: str) -> str:
             changed = await unfreeze_company(engine, args.empresa, requested_by=who)
             return "empresa descongelada" if changed else "a empresa já estava ativa"
         files = _folder(args.pasta_arquivos, "RAPA_PASTA_ARQUIVOS")
-        artifacts = _folder(
-            args.pasta_artefatos,
-            "RAPA_PASTA_ARTEFATOS",
-            Path(tempfile.gettempdir()) / "rapa-artefatos",
+        artifacts = _folder(args.pasta_artefatos, "RAPA_PASTA_ARTEFATOS") or (
+            Path(tempfile.gettempdir()) / "rapa-artefatos"
         )
-        if action == "exportar":
-            exported = await export_company(
-                engine, args.empresa, args.saida, files_dir=files, artifacts_dir=artifacts
+        # O armazenamento, as chaves e o cofre configurados (RAPA_ARMAZENAMENTO, RAPA_CHAVES,
+        # RAPA_COFRE): no S3, a exportação decifra os artefatos e a exclusão apaga os objetos,
+        # os segredos do KV e a chave transit da empresa.
+        try:
+            settings = BackendSettings.from_env()
+        except ValueError as exc:
+            raise InvalidInput("configuração do armazenamento inválida", [str(exc)]) from None
+        backends = Backends(settings)
+        try:
+            store = backends.artifact_store(artifacts, Database(engine))
+            if action == "exportar":
+                exported = await export_company(
+                    engine, args.empresa, args.saida, files_dir=files, artifacts=store
+                )
+                return (
+                    f"{exported.path}: {sum(exported.tables.values())} linhas em "
+                    f"{len(exported.tables)} tabelas e {exported.files} arquivos"
+                )
+            purged = await purge_company(
+                engine,
+                args.empresa,
+                confirm_name=args.confirmar,
+                requested_by=who,
+                files_dir=files,
+                artifacts=store,
+                key_destroyer=backends.key_destroyer(store),
+                # Falha fechada: sem o cofre configurado, uma empresa com credenciais só sai
+                # se quem pede disser que os segredos não estão no OpenBao (ou com o cofre
+                # de desenvolvimento, RAPA_COFRE=dev).
+                secrets_outside_vault=args.segredos_fora_do_openbao
+                or settings.vault is VaultKind.DEV,
             )
+            removed = ", ".join(str(folder) for folder in purged.folders) or "nenhuma"
+            if purged.resumed:
+                return (
+                    "a empresa já tinha saído do banco; "
+                    f"{purged.artifacts} artefatos e pastas apagadas: {removed}"
+                )
             return (
-                f"{exported.path}: {sum(exported.tables.values())} linhas em "
-                f"{len(exported.tables)} tabelas e {exported.files} arquivos"
+                f"empresa apagada: {sum(purged.tables.values())} linhas, "
+                f"{purged.artifacts} artefatos; pastas apagadas: {removed}"
             )
-        purged = await purge_company(
-            engine,
-            args.empresa,
-            confirm_name=args.confirmar,
-            requested_by=who,
-            files_dir=files,
-            artifacts_dir=artifacts,
-        )
-        removed = ", ".join(str(folder) for folder in purged.folders) or "nenhuma"
-        if purged.resumed:
-            return f"a empresa já tinha saído do banco; pastas apagadas: {removed}"
-        return f"empresa apagada: {sum(purged.tables.values())} linhas; pastas apagadas: {removed}"
+        finally:
+            await backends.aclose()
     finally:
         await engine.dispose()
 

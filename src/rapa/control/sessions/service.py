@@ -224,6 +224,11 @@ class RecordingSessions:
     def __repr__(self) -> str:
         return f"RecordingSessions(abertas={len(self._live)})"
 
+    @property
+    def open_count(self) -> int:
+        """Sessões abertas por este processo agora (para as métricas)."""
+        return len(self._live)
+
     # -- abrir -----------------------------------------------------------------
 
     async def create_session(

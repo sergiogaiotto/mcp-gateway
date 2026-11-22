@@ -1,0 +1,20 @@
+apiVersion: v2
+name: rapa
+description: >-
+  RaPA no Kubernetes (EKS no AWS Outposts): a interface (rapa-web), a API REST e MCP
+  (rapa-api), o despachante com os pods de uso único das execuções (rapa-despachante), a
+  migração do banco, a rede (NetworkPolicies e HTTPRoute) e, opcionalmente, o banco no
+  CloudNativePG numa release própria.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.30.0-0"
+home: https://rapa.exemplo.test
+keywords:
+  - rpa
+  - mcp
+annotations:
+  # O chart só configura os componentes externos; cada um é instalado pelo próprio chart.
+  rapa.dev/componentes-externos: >-
+    cloudnative-pg, plugin-barman-cloud, openbao, keycloak, seaweedfs, envoy-gateway,
+    victoria-metrics, glitchtip, argo-cd, gvisor

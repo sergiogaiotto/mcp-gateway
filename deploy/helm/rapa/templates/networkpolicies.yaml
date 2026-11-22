@@ -1,0 +1,301 @@
+{{- if and .Values.app.enabled .Values.network.policies.enabled }}
+{{- $v := .Values -}}
+{{- $ns := .Release.Namespace -}}
+{{- $execNs := $v.executions.namespace -}}
+{{- $metrics := ne (int $v.observability.metricsPort) 0 -}}
+{{- $nsSelector := dict "matchLabels" (dict "kubernetes.io/metadata.name" $ns) -}}
+{{- $execNsSelector := dict "matchLabels" (dict "kubernetes.io/metadata.name" $execNs) -}}
+# Namespace do plano de controle: nega tudo por padrão; as regras abaixo abrem só o preciso.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "rapa.name" . }}-nega-tudo
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rapa.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+{{- range $component := list "web" "api" }}
+---
+# {{ $component }}: recebe só do gateway (e do coletor de métricas).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "rapa.component" (dict "root" $ "component" $component) }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rapa.labels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "rapa.selectorLabels" (dict "root" $ "component" $component) | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  {{- if or $v.gateway.enabled (and $metrics $v.network.metricsCollector) }}
+  ingress:
+    {{- if $v.gateway.enabled }}
+    - from:
+        {{- toYaml $v.gateway.pods | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: http
+    {{- end }}
+    {{- if and $metrics $v.network.metricsCollector }}
+    - from:
+        {{- toYaml $v.network.metricsCollector | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: metricas
+    {{- end }}
+  {{- else }}
+  # Sem gateway (kind): nada entra pela rede; o acesso é pelo kubectl port-forward.
+  ingress: []
+  {{- end }}
+  egress:
+    {{- include "rapa.dnsEgress" $ | nindent 4 }}
+    {{- $destinations := list "database" "keycloak" "s3" "modelHub" "observability" }}
+    {{- if eq $v.keys.mode "openbao" }}
+    {{- $destinations = append $destinations "vault" }}
+    {{- end }}
+    {{- if eq $component "web" }}
+    {{- $destinations = append $destinations "kubernetesApi" }}
+    {{- end }}
+    {{- include "rapa.egressDestinations" (dict "root" $ "names" $destinations) | nindent 4 }}
+    {{- if eq $component "web" }}
+    # O relay da visão ao vivo: a web conecta no WebSocket do host de sessão, no pod dele.
+    - to:
+        - namespaceSelector:
+            {{- toYaml $execNsSelector | nindent 12 }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ $v.executions.podLabels.session }}
+      ports:
+        - protocol: TCP
+          port: {{ $v.executions.sessionPort }}
+    {{- end }}
+{{- end }}
+---
+# despachante: recebe só dos pods de execução, na porta do canal (e do coletor de métricas).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "rapa.component" (dict "root" . "component" "despachante") }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rapa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "rapa.selectorLabels" (dict "root" . "component" "despachante") | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            {{- toYaml $execNsSelector | nindent 12 }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ $v.executions.podLabels.run }}
+      ports:
+        - protocol: TCP
+          port: canal
+    {{- if and $metrics $v.network.metricsCollector }}
+    - from:
+        {{- toYaml $v.network.metricsCollector | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: metricas
+    {{- end }}
+  egress:
+    {{- include "rapa.dnsEgress" . | nindent 4 }}
+    {{- $destinations := list "database" "s3" "kubernetesApi" "observability" }}
+    {{- if or (eq $v.keys.mode "openbao") (eq $v.vault.mode "openbao") }}
+    {{- $destinations = append $destinations "vault" }}
+    {{- end }}
+    {{- include "rapa.egressDestinations" (dict "root" . "names" $destinations) | nindent 4 }}
+---
+# migração: só o banco.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "rapa.component" (dict "root" . "component" "migracao") }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rapa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "rapa.selectorLabels" (dict "root" . "component" "migracao") | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  egress:
+    {{- include "rapa.dnsEgress" . | nindent 4 }}
+    {{- include "rapa.egressDestinations" (dict "root" . "names" (list "database")) | nindent 4 }}
+{{- if $v.operation.enabled }}
+---
+# operação (o pod criado do PodTemplate rapa-operacao): sai só para o banco, o S3 e o OpenBao;
+# nada entra (o kubectl exec e o cp passam pelo kubelet, não pela rede do pod).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "rapa.component" (dict "root" . "component" "operacao") }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rapa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "rapa.operationLabels" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  egress:
+    {{- include "rapa.dnsEgress" . | nindent 4 }}
+    {{- $destinations := list "database" "s3" }}
+    {{- if or (eq $v.keys.mode "openbao") (eq $v.vault.mode "openbao") }}
+    {{- $destinations = append $destinations "vault" }}
+    {{- end }}
+    {{- include "rapa.egressDestinations" (dict "root" . "names" $destinations) | nindent 4 }}
+{{- end }}
+---
+# Namespace das execuções: nega tudo por padrão.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "rapa.name" . }}-nega-tudo
+  namespace: {{ $execNs }}
+  labels:
+    {{- include "rapa.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# Pods de execução: só saem para o DNS, para o canal do despachante e para a internet (menos
+# as redes internas), mais as redes internas permitidas e o proxy de saída. Nada entra.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $v.executions.podLabels.run }}
+  namespace: {{ $execNs }}
+  labels:
+    {{- include "rapa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $v.executions.podLabels.run }}
+  policyTypes: [Ingress, Egress]
+  egress:
+    {{- include "rapa.dnsEgress" . | nindent 4 }}
+    - to:
+        - namespaceSelector:
+            {{- toYaml $nsSelector | nindent 12 }}
+          podSelector:
+            matchLabels:
+              {{- include "rapa.selectorLabels" (dict "root" . "component" "despachante") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ $v.executions.channel.port }}
+    {{- include "rapa.robotEgress" . | nindent 4 }}
+---
+# Pods de sessão: recebem só o relay da web, na porta do WebSocket; saem como os de execução,
+# menos o canal.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $v.executions.podLabels.session }}
+  namespace: {{ $execNs }}
+  labels:
+    {{- include "rapa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $v.executions.podLabels.session }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            {{- toYaml $nsSelector | nindent 12 }}
+          podSelector:
+            matchLabels:
+              {{- include "rapa.selectorLabels" (dict "root" . "component" "web") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ $v.executions.sessionPort }}
+  egress:
+    {{- include "rapa.dnsEgress" . | nindent 4 }}
+    {{- include "rapa.robotEgress" . | nindent 4 }}
+{{- end }}
+
+{{/*
+Os destinos de saída do plano de controle (root, names). Destino sem "to" fica fechado. O
+banco é sempre o Cluster do CloudNativePG de database.cnpg.name e o Pooler dele (o mesmo
+nome nas duas releases: trocar o Cluster, como na restauração, troca a política), mais o
+que estiver em network.egress.database.to (um banco fora do CloudNativePG).
+*/}}
+{{- define "rapa.egressDestinations" -}}
+{{- $v := .root.Values -}}
+{{- $egress := $v.network.egress -}}
+{{- range $name := .names }}
+{{- $dest := index $egress $name }}
+{{- $peers := $dest.to | default list }}
+{{- if eq $name "database" }}
+{{- $cluster := $v.database.cnpg.name }}
+{{- $peers = concat (list (dict "podSelector" (dict "matchLabels" (dict "cnpg.io/cluster" $cluster))) (dict "podSelector" (dict "matchLabels" (dict "cnpg.io/poolerName" (printf "%s-pooler-rw" $cluster))))) $peers }}
+{{- end }}
+{{- if $peers }}
+- to:
+    {{- toYaml $peers | nindent 4 }}
+  ports:
+    {{- include "rapa.tcpPorts" $dest.ports | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+A saída dos robôs: internet menos as redes internas, as internas permitidas e o proxy. Cada
+rede interna a mais de IPv4 também fica fechada dentro do prefixo NAT64 (64:ff9b::/96), por
+onde um cluster com NAT64 e DNS64 a alcançaria em IPv6.
+*/}}
+{{- define "rapa.robotEgress" -}}
+{{- $e := .Values.executions.egress -}}
+{{- $v4 := fromYamlArray (include "rapa.internalIPv4" .) -}}
+{{- $v6 := fromYamlArray (include "rapa.internalIPv6" .) -}}
+{{- range $e.extraInternalNetworks }}
+{{- if contains ":" . }}
+{{- $v6 = append $v6 . }}
+{{- else }}
+{{- $v4 = append $v4 . }}
+{{- $v6 = append $v6 (include "rapa.nat64" (dict "text" .)) }}
+{{- end }}
+{{- end }}
+{{- if $e.directInternet }}
+- to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+          {{- toYaml $v4 | nindent 10 }}
+    - ipBlock:
+        cidr: ::/0
+        except:
+          {{- toYaml $v6 | nindent 10 }}
+{{- end }}
+{{- with $e.allowedInternalNetworks }}
+# RAPA_REDES_INTERNAS_PERMITIDAS: os portais internos que os robôs podem acessar.
+- to:
+    {{- range . }}
+    - ipBlock:
+        cidr: {{ . }}
+    {{- end }}
+{{- end }}
+{{- if or $e.proxy.url $e.proxy.existingSecret }}
+# RAPA_PROXY_SAIDA: o proxy de saída corporativo.
+- to:
+    {{- range $e.proxy.cidrs }}
+    - ipBlock:
+        cidr: {{ . }}
+    {{- end }}
+  ports:
+    - protocol: TCP
+      port: {{ $e.proxy.port }}
+{{- end }}
+{{- with $e.extraRules }}
+# Só em kind e desenvolvimento (a validação recusa fora dele): o portal de teste.
+{{ toYaml . }}
+{{- end }}
+{{- end -}}

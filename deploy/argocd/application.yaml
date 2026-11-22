@@ -1,0 +1,81 @@
+# O RaPA no Argo CD: duas Applications do mesmo chart (deploy/helm/rapa), com os valores do
+# ambiente, filhas da Application raiz (deploy/argocd/raiz.yaml, o "app of apps"). Troque
+# repoURL pelo repositório da plataforma e os valores de exemplo pelos do ambiente (um arquivo
+# por ambiente, no repositório de configuração).
+#
+# - rapa-banco: só o banco (CloudNativePG), com o prune desligado: nada do banco some
+#   sozinho porque saiu do chart.
+# - rapa: a aplicação. O Job de migração é um hook pre-install,pre-upgrade do Helm, que o
+#   Argo CD roda como PreSync: ele precisa do banco já de pé.
+#
+# A ordem: as ondas (sync-wave) só valem dentro do sync de uma Application, aqui o da raiz,
+# que cria rapa-banco (onda -1), espera ela ficar saudável e só então cria rapa (onda 0).
+# "Saudável" de uma Application pede a checagem de saúde de argoproj.io/Application no
+# argocd-cm (o Argo CD não traz uma desde a 1.8), e a dela reflete a do Cluster do
+# CloudNativePG (pronto): as duas estão em deploy/argocd/argocd-cm-saude.yaml. Aplicadas
+# soltas, sem a raiz, as duas Applications sincronizam ao mesmo tempo e a migração só
+# conta com o retry. Depois da primeira instalação, cada filha sincroniza sozinha (o banco
+# já existe); numa troca do banco (a restauração, docs/OPERACAO.md 1.5), pare o sync da
+# aplicação até o Cluster novo ficar pronto.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: rapa-banco
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  project: default
+  source:
+    repoURL: https://git.exemplo.test/plataforma/rapa.git
+    targetRevision: main
+    path: deploy/helm/rapa
+    helm:
+      releaseName: rapa-banco
+      valueFiles:
+        - values-producao-exemplo.yaml
+        - values-banco.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: rapa
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: rapa
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: default
+  source:
+    repoURL: https://git.exemplo.test/plataforma/rapa.git
+    targetRevision: main
+    path: deploy/helm/rapa
+    helm:
+      releaseName: rapa
+      valueFiles:
+        - values-producao-exemplo.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: rapa
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 10m

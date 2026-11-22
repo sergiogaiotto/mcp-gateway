@@ -1,0 +1,11 @@
+# O OpenBao em modo dev para o kind (chart openbao/openbao): um nó, na memória, por http, com
+# o token raiz "root". Nunca use fora do kind.
+server:
+  dev:
+    enabled: true
+    devRootToken: root
+  # O método kubernetes confere os tokens dos pods do RaPA pela TokenReview.
+  authDelegator:
+    enabled: true
+injector:
+  enabled: false

@@ -1,0 +1,23 @@
+{{- if and .Values.app.enabled .Values.observability.vmPodScrape.enabled (ne (int .Values.observability.metricsPort) 0) }}
+# O vmagent do VictoriaMetrics coleta a porta de métricas (RAPA_METRICAS_PORTA) dos três
+# componentes. A porta só ouve no pod; nunca passa pelo gateway.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: {{ include "rapa.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rapa.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rapa
+      app.kubernetes.io/instance: {{ .Release.Name }}
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: [web, api, despachante]
+  podMetricsEndpoints:
+    - port: metricas
+      path: /metrics
+{{- end }}

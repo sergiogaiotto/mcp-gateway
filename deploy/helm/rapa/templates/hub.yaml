@@ -1,0 +1,15 @@
+{{- if and .Values.app.enabled .Values.modelHub.baseUrl }}
+{{- if not .Values.modelHub.capabilities }}
+{{- fail "modelHub.baseUrl precisa de modelHub.capabilities (a matriz da sonda, RAPA_LLM_CAPACIDADES)" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "rapa.name" . }}-hub-capacidades
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rapa.labels" . | nindent 4 }}
+data:
+  # A matriz da sonda (python -m rapa.llm.probe --out): só capacidades, nenhum segredo.
+  capacidades.json: {{ .Values.modelHub.capabilities | quote }}
+{{- end }}

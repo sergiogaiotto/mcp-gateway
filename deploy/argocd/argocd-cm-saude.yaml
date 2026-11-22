@@ -1,0 +1,44 @@
+# As checagens de saúde que a Application raiz (deploy/argocd/raiz.yaml) precisa no argocd-cm,
+# junto do que já está nele (no chart do Argo CD, em configs.cm):
+#
+#   kubectl -n argocd patch configmap argocd-cm --type merge --patch-file deploy/argocd/argocd-cm-saude.yaml
+#
+# - argoproj.io/Application: a saúde de uma Application é a que o Argo CD calculou para ela
+#   (o Argo CD tirou essa checagem na 1.8; sem ela, a raiz não espera o banco ficar pronto
+#   antes de criar a aplicação, e a migração roda contra um banco que ainda não existe).
+# - postgresql.cnpg.io/Cluster: o Cluster do CloudNativePG só é saudável com a condição Ready
+#   (o Argo CD 3.1 já traz uma checagem própria; esta vale também antes dele).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+  namespace: argocd
+data:
+  resource.customizations.health.argoproj.io_Application: |
+    hs = {}
+    hs.status = "Progressing"
+    hs.message = ""
+    if obj.status ~= nil and obj.status.health ~= nil then
+      hs.status = obj.status.health.status
+      if obj.status.health.message ~= nil then
+        hs.message = obj.status.health.message
+      end
+    end
+    return hs
+  resource.customizations.health.postgresql.cnpg.io_Cluster: |
+    hs = {}
+    hs.status = "Progressing"
+    hs.message = "esperando o Cluster ficar pronto"
+    if obj.status ~= nil and obj.status.conditions ~= nil then
+      for _, condition in ipairs(obj.status.conditions) do
+        if condition.type == "Ready" then
+          if condition.status == "True" then
+            hs.status = "Healthy"
+          end
+          if condition.message ~= nil then
+            hs.message = condition.message
+          end
+        end
+      end
+    end
+    return hs

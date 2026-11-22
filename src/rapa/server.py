@@ -5,28 +5,36 @@ Uso::
     python -m rapa.server
 
 A configuração vem de variáveis de ambiente (veja :meth:`ServerSettings.from_env`).
-Em produção, o despachante roda em réplicas próprias (``RAPA_DESPACHANTE=1`` e
-``RAPA_HTTP=0``) e o lançador local dá lugar aos pods de uso único; na Fase 0 e
-em desenvolvimento, tudo cabe num processo.
+Em produção, o despachante roda em réplicas próprias (``RAPA_HTTP=0``, com
+``RAPA_DISPATCHER_DATABASE_URL``) e o lançador local dá lugar aos pods de uso único
+(``RAPA_EXECUTOR=kubernetes``, com o canal do despachante na ``RAPA_CANAL_PORTA``); na
+Fase 0 e em desenvolvimento, tudo cabe num processo.
 
 O esquema do banco é criado antes, com ``python -m rapa.control.db.migrate``.
+
+Observabilidade e saúde (:mod:`rapa.control.observability` e :mod:`rapa.control.health`):
+métricas Prometheus numa porta própria (``RAPA_METRICAS_PORTA``), logs em JSON
+(``RAPA_LOG_JSON``), traços OpenTelemetry (``OTEL_EXPORTER_OTLP_ENDPOINT``), exceções
+não tratadas no GlitchTip (``RAPA_GLITCHTIP_DSN``), ``/saude`` (vivo) e
+``/saude/pronto`` (pronto).
 """
 
 import argparse
 import asyncio
 import contextlib
+import importlib.metadata
 import json
 import logging
 import os
 import shlex
 import sys
 import tempfile
-from collections.abc import AsyncIterator, Coroutine, Mapping, Sequence
+from collections.abc import AsyncIterator, Coroutine, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import FastAPI
@@ -35,7 +43,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from rapa.control.api.publishing import PublishingServices
-from rapa.control.artifacts import ArtifactStore, LocalArtifactStore
+from rapa.control.artifacts import ArtifactStore
 from rapa.control.auth import (
     Authenticator,
     AuthError,
@@ -45,15 +53,48 @@ from rapa.control.auth import (
     JwtSettings,
     TokenVerifier,
 )
+from rapa.control.backends import Backends, BackendSettings, VaultKind
+from rapa.control.channel import Channel, ChannelServer
 from rapa.control.db import Database
+from rapa.control.health import (
+    READY_PATH,
+    DatabaseCheck,
+    DispatcherCheck,
+    Readiness,
+    ReadinessCheck,
+)
 from rapa.control.http_app import HttpSettings, create_http_app
+from rapa.control.kube import (
+    KubeApi,
+    KubeConfig,
+    PodSettings,
+    channel_address,
+    parse_node_selector,
+    parse_tolerations,
+)
 from rapa.control.launcher import (
+    KubernetesLauncher,
+    KubernetesLauncherSettings,
     LocalLauncherSettings,
     LocalProcessLauncher,
-    NoSecrets,
-    SecretSource,
-    StaticSecretSource,
 )
+from rapa.control.observability.glitchtip import (
+    GlitchTip,
+    configure_glitchtip,
+    dsn_problem,
+    report_unhandled,
+)
+from rapa.control.observability.logs import configure_logging, uvicorn_log_config
+from rapa.control.observability.metrics import (
+    DEFAULT_METRICS_PORT,
+    MeteredWebhooks,
+    Metrics,
+    MetricsServer,
+    instrument_http,
+    serve_metrics,
+    watch_platform,
+)
+from rapa.control.observability.tracing import Tracing, activate_tracing
 from rapa.control.services import (
     CredentialAlerts,
     Dispatcher,
@@ -74,6 +115,7 @@ from rapa.control.services import (
     Scheduler,
     WebhookKeys,
 )
+from rapa.control.services._common import now_utc
 from rapa.control.services.queue import DEFAULT_MAX_DURATION
 from rapa.control.services.retention import SUCCESS_AFTER_FAILURE
 from rapa.control.services.sessions import PgSessionStore
@@ -87,8 +129,10 @@ from rapa.control.sessions import (
     RecordingSessions,
     SessionLimits,
 )
+from rapa.control.sessions.launcher import KubernetesSessionLauncher, KubernetesSessionSettings
 from rapa.core.contracts import Principal
 from rapa.runner.video import ffmpeg_installed
+from rapa.session.egress import EgressPolicy
 
 __all__ = [
     "AuthenticatorLoginResolver",
@@ -97,7 +141,9 @@ __all__ = [
     "build_artifact_store",
     "build_artifacts",
     "build_credentials",
+    "build_pod_launcher",
     "build_publishing",
+    "build_readiness_checks",
     "build_repairs",
     "build_scheduler",
     "build_sessions",
@@ -107,6 +153,8 @@ __all__ = [
 ]
 
 logger = logging.getLogger("rapa.server")
+
+_HTTP_URL_PREFIXES = ("http://", "https://")
 
 _TRUE = {"1", "true", "sim", "yes", "on"}
 _FALSE = {"0", "false", "nao", "não", "no", "off", ""}
@@ -129,10 +177,34 @@ def _path(env: Mapping[str, str], name: str) -> Path | None:
     return Path(raw) if raw else None
 
 
+def _json(env: Mapping[str, str], name: str) -> Any:
+    raw = env.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        # Sem repetir o valor: só o nome da variável.
+        raise ValueError(f"{name} precisa ser um JSON válido") from None
+
+
+def _version() -> str:
+    try:
+        return importlib.metadata.version("rapa")
+    except importlib.metadata.PackageNotFoundError:  # pragma: no cover - sempre instalado
+        return "0"
+
+
+type Executor = Literal["local", "kubernetes"]
+
+
 class ServerSettings(BaseModel):
     """Configuração do serviço."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    # Sem a entrada nas mensagens de erro: o pydantic poria nelas o valor recusado (ou um
+    # pedaço do dicionário inteiro, numa regra do modelo), e ali estão as senhas dos
+    # bancos, as chaves dos webhooks e do hub e o DSN do GlitchTip.
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     #: Banco com o papel da aplicação (``rapa_app``, sujeito ao isolamento por linha).
     database_url: str = Field(min_length=1, repr=False)
@@ -209,6 +281,93 @@ class ServerSettings(BaseModel):
     retention_success_days: int = Field(default=7, ge=1, le=36_500)
     retention_failure_days: int = Field(default=90, ge=1, le=36_500)
     retention_events_days: int = Field(default=400, ge=1, le=36_500)
+    #: Onde rodam as execuções: ``local`` (um processo) ou ``kubernetes`` (um pod cada).
+    executor: Executor = "local"
+    #: Onde rodam as sessões de gravação; ``None``: o mesmo das execuções.
+    sessions_executor: Executor | None = None
+    k8s_namespace: str = "rapa-execucoes"
+    k8s_image: str | None = None
+    #: ``None`` (``RAPA_K8S_RUNTIME_CLASS`` vazia) só para kind e desenvolvimento.
+    k8s_runtime_class: str | None = "gvisor"
+    k8s_cpu: str = "1"
+    k8s_memory: str = "2Gi"
+    k8s_service_account: str | None = None
+    k8s_pull_secret: str | None = None
+    k8s_node_selector: dict[str, str] = Field(default_factory=dict)
+    k8s_tolerations: tuple[dict[str, Any], ...] = ()
+    #: Endereço do canal que os pods usam (``{ip}`` vira o IP deste pod).
+    channel_address: str | None = None
+    channel_port: int = Field(default=8081, ge=1, le=65535)
+    #: Proxy HTTP CONNECT de saída para a internet dos navegadores.
+    egress_proxy: str | None = Field(default=None, max_length=2000)
+    #: Redes internas (CIDR) que os navegadores alcançam além da internet.
+    internal_networks: tuple[str, ...] = ()
+
+    @property
+    def sessions_runner(self) -> Executor:
+        """Onde rodam as sessões de gravação (``RAPA_SESSOES_EXECUTOR``, ou o das execuções)."""
+        return self.sessions_executor or self.executor
+
+    @property
+    def egress_guard(self) -> bool:
+        """Se o navegador das execuções (e das sessões) sai pela guarda com a rede interna
+        fechada: nos pods, com redes internas permitidas ou proxy de saída, e sempre fora
+        do modo de desenvolvimento."""
+        return (
+            self.executor == "kubernetes"
+            or bool(self.internal_networks)
+            or self.egress_proxy is not None
+            or not self.dev
+        )
+
+    def egress_policy(self) -> EgressPolicy:
+        """A política da guarda da saída (as redes internas permitidas e o proxy)."""
+        return EgressPolicy.parse(self.internal_networks, self.egress_proxy)
+
+    def local_egress(self) -> EgressPolicy | None:
+        """A guarda dos navegadores locais: ``None`` só no desenvolvimento sem redes nem proxy."""
+        return self.egress_policy() if self.egress_guard else None
+
+    def pod_settings(self) -> PodSettings:
+        """Como rodam os pods de execução e de sessão (``RAPA_K8S_*``)."""
+        return PodSettings(
+            image=self.k8s_image or "",
+            namespace=self.k8s_namespace,
+            runtime_class=self.k8s_runtime_class,
+            cpu=self.k8s_cpu,
+            memory=self.k8s_memory,
+            service_account=self.k8s_service_account,
+            pull_secret=self.k8s_pull_secret,
+            node_selector=dict(self.k8s_node_selector),
+            tolerations=tuple(self.k8s_tolerations),
+        )
+
+    #: O cofre, o armazenamento dos artefatos e as chaves (``RAPA_COFRE``,
+    #: ``RAPA_ARMAZENAMENTO``, ``RAPA_CHAVES`` e os seus; :mod:`rapa.control.backends`).
+    backends: BackendSettings = Field(default_factory=BackendSettings)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _backends_dev(cls, data: Any) -> Any:
+        # Sem a configuração do cofre dada, ela segue o modo de desenvolvimento do serviço.
+        if isinstance(data, dict) and "backends" not in data:
+            return {**data, "backends": BackendSettings(dev=bool(data.get("dev", False)))}
+        return data
+
+    #: Porta do servidor de métricas (só ``GET /metrics``, fora do gateway); 0 desliga.
+    metrics_port: int = Field(default=DEFAULT_METRICS_PORT, ge=0, le=65_535)
+    #: Rótulo ``empresa`` nas execuções concluídas, na fila e nos avisos do A1.
+    metrics_per_company: bool = False
+    #: Logs em JSON, um objeto por linha.
+    log_json: bool = False
+    #: Base do OTLP (``OTEL_EXPORTER_OTLP_ENDPOINT``); sem ela, nada de rastreio.
+    otel_endpoint: str | None = None
+    #: Endereço só dos traços (``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT``), se for outro.
+    otel_traces_endpoint: str | None = None
+    #: Nome do serviço nos traços (``OTEL_SERVICE_NAME``; padrão ``rapa``).
+    otel_service_name: str | None = None
+    #: GlitchTip das exceções não tratadas (o DSN tem a chave do projeto).
+    glitchtip_dsn: str | None = Field(default=None, repr=False)
 
     @model_validator(mode="after")
     def _check(self) -> ServerSettings:
@@ -224,6 +383,15 @@ class ServerSettings(BaseModel):
             )
         if (self.dev_tokens_file or self.dev_secrets_file) and not self.dev:
             raise ValueError("tokens e segredos em arquivo só valem com RAPA_DEV=1")
+        if self.backends.dev != self.dev:
+            raise ValueError("a configuração do cofre e a do serviço discordam sobre RAPA_DEV")
+        if self.dev_secrets_file is not None and self.backends.vault not in (
+            None,
+            VaultKind.DEV,
+        ):
+            raise ValueError("RAPA_SEGREDOS_DEV só vale com RAPA_COFRE=dev")
+        if self.backends.vault is VaultKind.DEV and self.dev_secrets_file is None:
+            raise ValueError("RAPA_COFRE=dev precisa do arquivo RAPA_SEGREDOS_DEV")
         llm = (self.llm_base_url, self.llm_model)
         if any(llm) and not all(llm):
             raise ValueError("para o hub de LLM, informe o endereço e o modelo (RAPA_LLM_*)")
@@ -240,6 +408,34 @@ class ServerSettings(BaseModel):
             raise ValueError("para o login OIDC, informe o cliente e o endereço de retorno")
         if self.ui and self.http and self.oidc_client_id and not self.jwt_issuer:
             raise ValueError("o login OIDC da interface precisa do emissor (RAPA_JWT_ISSUER)")
+        try:
+            self.egress_policy()
+        except ValueError as exc:
+            raise ValueError(f"RAPA_REDES_INTERNAS_PERMITIDAS ou RAPA_PROXY_SAIDA: {exc}") from None
+        if "kubernetes" in (self.executor, self.sessions_runner):
+            if not self.k8s_image:
+                raise ValueError(
+                    "no modo kubernetes, informe a imagem do executor (RAPA_K8S_IMAGEM_EXECUTOR)"
+                )
+            self.pod_settings()  # nomes, quantidades e rótulos no formato do Kubernetes
+        if self.executor == "kubernetes":
+            # Só o formato: o IP deste pod é descoberto ao montar o despachante.
+            channel_address(self.channel_address, self.channel_port, resolve_ip=lambda: "10.0.0.1")
+        for url, name in (
+            (self.otel_endpoint, "OTEL_EXPORTER_OTLP_ENDPOINT"),
+            (self.otel_traces_endpoint, "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"),
+        ):
+            if url is not None and not url.startswith(_HTTP_URL_PREFIXES):
+                raise ValueError(f"{name} precisa ser um endereço http:// ou https://")
+        if self.otel_traces_endpoint and not self.otel_endpoint:
+            raise ValueError(
+                "o rastreio só liga com OTEL_EXPORTER_OTLP_ENDPOINT (o endereço dos traços "
+                "sozinho não basta)"
+            )
+        if self.glitchtip_dsn is not None and (problem := dsn_problem(self.glitchtip_dsn)):
+            # A mesma leitura do sentry_sdk, na partida; sem o valor na mensagem (o DSN
+            # tem a chave do projeto).
+            raise ValueError(f"RAPA_GLITCHTIP_DSN {problem}")
         return self
 
     @classmethod
@@ -312,7 +508,44 @@ class ServerSettings(BaseModel):
           deram certo, e os retratos das falhas; padrão 90) e
           ``RAPA_RETENCAO_EVENTOS_DIAS`` (partições de eventos; padrão 400). Todos têm
           no mínimo 1 dia, e ``RAPA_RETENCAO_SUCESSO_DIAS`` não passa de
-          ``RAPA_RETENCAO_FALHAS_DIAS`` (o servidor não sobe).
+          ``RAPA_RETENCAO_FALHAS_DIAS`` (o servidor não sobe);
+        - execuções e sessões em pods: ``RAPA_EXECUTOR`` (``local``, o padrão, ou
+          ``kubernetes``: cada tentativa num pod de uso único, ver
+          :class:`rapa.control.launcher.KubernetesLauncher`) e ``RAPA_SESSOES_EXECUTOR``
+          (o mesmo para as sessões de gravação; padrão igual a ``RAPA_EXECUTOR``), com
+          ``RAPA_K8S_NAMESPACE_EXECUCOES`` (padrão ``rapa-execucoes``),
+          ``RAPA_K8S_IMAGEM_EXECUTOR`` (obrigatória no modo kubernetes),
+          ``RAPA_K8S_RUNTIME_CLASS`` (padrão ``gvisor``; vazia, sem RuntimeClass, só para
+          kind e desenvolvimento), ``RAPA_K8S_CPU`` (padrão 1), ``RAPA_K8S_MEMORIA``
+          (padrão 2Gi), ``RAPA_K8S_SA_EXECUTOR`` (a conta de serviço dos pods, sem token
+          montado), ``RAPA_K8S_PULL_SECRET``, ``RAPA_K8S_NODE_SELECTOR`` e
+          ``RAPA_K8S_TOLERATIONS`` (JSON); o canal do despachante:
+          ``RAPA_CANAL_PORTA`` (padrão 8081, onde ele escuta) e ``RAPA_CANAL_ENDERECO``
+          (o endereço que os pods usam; padrão ``http://{ip}:<porta>``, e ``{ip}`` vira
+          o IP do pod do despachante: cada réplica recebe os pods que lançou, então um
+          endereço sem ``{ip}``, como o nome de um Service, é recusado na partida);
+        - a guarda da saída dos navegadores: ``RAPA_REDES_INTERNAS_PERMITIDAS`` (CIDRs
+          separados por vírgula que os robôs e as sessões alcançam além da internet, para
+          portais internos; padrão nenhuma) e ``RAPA_PROXY_SAIDA`` (proxy HTTP CONNECT
+          para a internet, ``http://host:porta``, sem usuário e senha). A guarda (só os
+          domínios do robô, a rede interna fechada) vale sempre nos pods e, no lançador
+          local, quando uma das duas está definida e sempre fora de ``RAPA_DEV``;
+        - cofre, armazenamento e chaves (:mod:`rapa.control.backends`): ``RAPA_COFRE``
+          (``nenhum``, ``dev`` ou ``openbao``), ``RAPA_BAO_*``, ``RAPA_ARMAZENAMENTO``
+          (``local`` ou ``s3``), ``RAPA_S3_*`` com ``AWS_ACCESS_KEY_ID`` e
+          ``AWS_SECRET_ACCESS_KEY``, ``RAPA_CHAVES`` (``openbao`` ou ``local``) e
+          ``RAPA_CHAVE_ARTEFATOS``, conferidos na partida;
+        - observabilidade: ``RAPA_METRICAS_PORTA`` (a porta do servidor de métricas,
+          só ``GET /metrics``, no mesmo endereço do serviço, o ``--host``, e que nunca
+          passa pelo gateway; padrão 9100, 0 desliga),
+          ``RAPA_METRICAS_POR_EMPRESA`` (1 ou 0; desligado por padrão: com ele, as
+          execuções concluídas, a fila e os avisos do A1 ganham o rótulo ``empresa``),
+          ``RAPA_LOG_JSON`` (1 ou 0: um objeto JSON por linha, com hora, nível, logger,
+          mensagem e o id de rastreio), ``OTEL_EXPORTER_OTLP_ENDPOINT`` (liga os traços
+          OpenTelemetry por OTLP/HTTP; sem ele, nada é carregado),
+          ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` e ``OTEL_SERVICE_NAME`` (padrão
+          ``rapa``), e ``RAPA_GLITCHTIP_DSN`` (as exceções não tratadas, limpas, no
+          GlitchTip). Os traços e o GlitchTip precisam do extra ``observability``.
         """
         env = os.environ if env is None else env
         data: dict[str, Any] = {
@@ -343,7 +576,42 @@ class ServerSettings(BaseModel):
             "llm_capabilities_file": _path(env, "RAPA_LLM_CAPACIDADES"),
             "webhook_key": env.get("RAPA_CHAVE_WEBHOOKS") or None,
             "video_on_failure": _flag(env, "RAPA_VIDEO_EM_FALHAS", True),
+            "executor": env.get("RAPA_EXECUTOR", "").strip().lower() or "local",
+            "sessions_executor": env.get("RAPA_SESSOES_EXECUTOR", "").strip().lower() or None,
+            "k8s_image": env.get("RAPA_K8S_IMAGEM_EXECUTOR", "").strip() or None,
+            "k8s_service_account": env.get("RAPA_K8S_SA_EXECUTOR", "").strip() or None,
+            "k8s_pull_secret": env.get("RAPA_K8S_PULL_SECRET", "").strip() or None,
+            "k8s_node_selector": parse_node_selector(_json(env, "RAPA_K8S_NODE_SELECTOR")),
+            "k8s_tolerations": parse_tolerations(_json(env, "RAPA_K8S_TOLERATIONS")),
+            "channel_address": env.get("RAPA_CANAL_ENDERECO", "").strip() or None,
+            "egress_proxy": env.get("RAPA_PROXY_SAIDA", "").strip() or None,
+            "internal_networks": tuple(
+                n.strip()
+                for n in env.get("RAPA_REDES_INTERNAS_PERMITIDAS", "").split(",")
+                if n.strip()
+            ),
+            "backends": BackendSettings.from_env(env),
+            "metrics_per_company": _flag(env, "RAPA_METRICAS_POR_EMPRESA", False),
+            "log_json": _flag(env, "RAPA_LOG_JSON", False),
+            "otel_endpoint": env.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip() or None,
+            "otel_traces_endpoint": (
+                env.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip() or None
+            ),
+            "otel_service_name": env.get("OTEL_SERVICE_NAME", "").strip() or None,
+            "glitchtip_dsn": env.get("RAPA_GLITCHTIP_DSN", "").strip() or None,
         }
+        for key, name in (
+            ("k8s_namespace", "RAPA_K8S_NAMESPACE_EXECUCOES"),
+            ("k8s_cpu", "RAPA_K8S_CPU"),
+            ("k8s_memory", "RAPA_K8S_MEMORIA"),
+        ):
+            if raw := env.get(name, "").strip():
+                data[key] = raw
+        if (runtime := env.get("RAPA_K8S_RUNTIME_CLASS")) is not None:
+            # Vazia: sem RuntimeClass (só kind e desenvolvimento, sem o gVisor).
+            data["k8s_runtime_class"] = runtime.strip() or None
+        if raw_port := env.get("RAPA_CANAL_PORTA", "").strip():
+            data["channel_port"] = int(raw_port)
         for key, name, kind in (
             ("sessions_per_company", "RAPA_SESSOES_POR_EMPRESA", int),
             ("sessions_max", "RAPA_SESSOES_MAX", int),
@@ -360,6 +628,7 @@ class ServerSettings(BaseModel):
             ("retention_success_days", "RAPA_RETENCAO_SUCESSO_DIAS", int),
             ("retention_failure_days", "RAPA_RETENCAO_FALHAS_DIAS", int),
             ("retention_events_days", "RAPA_RETENCAO_EVENTOS_DIAS", int),
+            ("metrics_port", "RAPA_METRICAS_PORTA", int),
         ):
             if raw := env.get(name, "").strip():
                 data[key] = kind(raw)
@@ -440,13 +709,6 @@ async def _dev_profiles(
         return out
     finally:
         await db.dispose()
-
-
-def _secret_source(settings: ServerSettings) -> SecretSource:
-    if settings.dev_secrets_file is not None:
-        return StaticSecretSource.from_file(settings.dev_secrets_file)
-    # O cofre (OpenBao) entra na Fase 1; até lá, robôs com credenciais falham sem digitar nada.
-    return NoSecrets()
 
 
 def _verifier(settings: ServerSettings, db: Database) -> BearerVerifier:
@@ -636,6 +898,7 @@ class DispatcherSupervisor:
             except Exception as exc:
                 # Só o tipo: a mensagem de um erro inesperado pode trazer dados.
                 error = type(exc).__name__
+                report_unhandled(exc)
             finally:
                 self._running = False
             if stop.is_set():
@@ -660,6 +923,7 @@ class DispatcherSupervisor:
         error = task.exception()
         if error is not None:
             logger.error("a supervisão do despachante parou: %s", type(error).__name__)
+            report_unhandled(error)
 
 
 async def _stop_dispatcher(
@@ -726,25 +990,37 @@ class _DispatcherHealth:
         await self.app(scope, receive, send)
 
 
-def build_artifact_store(settings: ServerSettings) -> ArtifactStore:
-    """Onde ficam os artefatos: a pasta local de ``RAPA_PASTA_ARTEFATOS`` (a parte E troca)."""
-    return LocalArtifactStore(settings.artifacts_dir)
+def build_artifact_store(
+    settings: ServerSettings, db: Database, backends: Backends | None = None
+) -> ArtifactStore:
+    """Onde ficam os artefatos: a pasta local de ``RAPA_PASTA_ARTEFATOS`` ou, com
+    ``RAPA_ARMAZENAMENTO=s3``, o bucket cifrado (a pasta vira só a de passagem).
+
+    ``db`` é o banco de quem usa o store (as chaves das execuções ficam nele).
+    """
+    return (backends or Backends(settings.backends)).artifact_store(settings.artifacts_dir, db)
 
 
-def build_artifacts(settings: ServerSettings, db: Database) -> PgArtifacts:
+def build_artifacts(
+    settings: ServerSettings, db: Database, backends: Backends | None = None
+) -> PgArtifacts:
     """As evidências das execuções (REST e interface), lidas pelo store dos artefatos."""
-    return PgArtifacts(db, build_artifact_store(settings))
+    return PgArtifacts(db, build_artifact_store(settings, db, backends))
 
 
-def build_dispatcher(settings: ServerSettings, db: Database) -> Dispatcher:
+def build_dispatcher(
+    settings: ServerSettings, db: Database, backends: Backends | None = None
+) -> Dispatcher:
     """Despachante com o lançador local, sobre o banco do papel do despachante.
 
     Registra os artefatos de cada resultado pelo store e roda a retenção uma vez por
-    hora, com os prazos de ``RAPA_RETENCAO_*``.
+    hora, com os prazos de ``RAPA_RETENCAO_*``. Os segredos vêm do cofre configurado
+    (``RAPA_COFRE``).
     """
+    backends = backends or Backends(settings.backends)
     queue = PgRunQueue(db)
-    store = build_artifact_store(settings)
-    if settings.video_on_failure and ffmpeg_installed() is False:
+    store = build_artifact_store(settings, db, backends)
+    if settings.executor == "local" and settings.video_on_failure and ffmpeg_installed() is False:
         # O worker roda sem vídeo quando ele não abre; sem este aviso, só a falta dos
         # vídeos de falha mostraria que nada está sendo filmado.
         logger.warning(
@@ -752,18 +1028,23 @@ def build_dispatcher(settings: ServerSettings, db: Database) -> Dispatcher:
             "instalado: as execuções rodam sem vídeo (instale com 'playwright install "
             "ffmpeg', ou desligue com RAPA_VIDEO_EM_FALHAS=0)"
         )
-    launcher = LocalProcessLauncher(
-        queue,
-        LocalLauncherSettings(
-            work_dir=settings.work_dir,
-            artifacts_dir=settings.artifacts_dir,
-            chromium=settings.chromium,
-            browser_args=settings.browser_args,
-            files_dir=settings.files_dir,
-            video_on_failure=settings.video_on_failure,
-        ),
-        _secret_source(settings),
-    )
+    launcher: LocalProcessLauncher | KubernetesLauncher
+    if settings.executor == "kubernetes":
+        launcher = build_pod_launcher(settings, queue, db, backends)
+    else:
+        launcher = LocalProcessLauncher(
+            queue,
+            LocalLauncherSettings(
+                work_dir=settings.work_dir,
+                artifacts_dir=settings.artifacts_dir,
+                chromium=settings.chromium,
+                browser_args=settings.browser_args,
+                files_dir=settings.files_dir,
+                video_on_failure=settings.video_on_failure,
+                egress=settings.local_egress(),
+            ),
+            backends.secret_source(db, settings.dev_secrets_file),
+        )
     retention = Retention(
         db,
         store,
@@ -783,8 +1064,46 @@ def build_dispatcher(settings: ServerSettings, db: Database) -> Dispatcher:
     )
 
 
-def build_publishing(settings: ServerSettings, db: Database) -> PublishingServices:
-    """Agendas, webhooks (só com ``RAPA_CHAVE_WEBHOOKS``) e lotes sobre o banco da aplicação."""
+def build_pod_launcher(
+    settings: ServerSettings,
+    queue: PgRunQueue,
+    db: Database | None = None,
+    backends: Backends | None = None,
+) -> KubernetesLauncher:
+    """O lançador de pods (``RAPA_EXECUTOR=kubernetes``) com o canal e a API do cluster.
+
+    O canal só abre a porta na subida do serviço (:func:`create_server_app`); o
+    endereço que vai para os pods leva o IP deste pod (``{ip}``) por padrão. Os segredos
+    vêm do cofre configurado (``RAPA_COFRE``), lidos com o banco ``db`` (o do despachante).
+    """
+    backends = backends or Backends(settings.backends)
+    secrets = backends.secret_source(db or queue.db, settings.dev_secrets_file)
+    return KubernetesLauncher(
+        queue,
+        KubernetesLauncherSettings(
+            work_dir=settings.work_dir,
+            artifacts_dir=settings.artifacts_dir,
+            pod=settings.pod_settings(),
+            channel_address=channel_address(settings.channel_address, settings.channel_port),
+            browser_args=settings.browser_args,
+            files_dir=settings.files_dir,
+            egress=settings.egress_policy(),
+            video_on_failure=settings.video_on_failure,
+        ),
+        api=KubeApi(KubeConfig.in_cluster()),
+        channel=Channel(),
+        secrets=secrets,
+        attempts=queue,
+    )
+
+
+def build_publishing(
+    settings: ServerSettings, db: Database, metrics: Metrics | None = None
+) -> PublishingServices:
+    """Agendas, webhooks (só com ``RAPA_CHAVE_WEBHOOKS``) e lotes sobre o banco da aplicação.
+
+    Com ``metrics``, cada entrega de webhook é contada pelo resultado.
+    """
     webhooks = (
         PgWebhooks(
             db,
@@ -794,10 +1113,11 @@ def build_publishing(settings: ServerSettings, db: Database) -> PublishingServic
         if settings.webhook_key
         else None
     )
+    receiver = MeteredWebhooks(webhooks, metrics) if webhooks and metrics else webhooks
     return PublishingServices(
         schedules=PgSchedules(db, max_enabled_per_company=settings.schedules_per_company),
         webhooks=webhooks,
-        receiver=webhooks,
+        receiver=receiver,
         batches=PgBatches(
             db,
             limits=SheetLimits(
@@ -854,20 +1174,33 @@ def build_sessions(
     db: Database,
     platform: PgPlatform,
     fleet: Database | None = None,
-) -> tuple[RecordingSessions, LocalSessionLauncher]:
-    """Serviço das sessões de gravação com o lançador local (um processo por sessão).
+) -> tuple[RecordingSessions, LocalSessionLauncher | KubernetesSessionLauncher]:
+    """Serviço das sessões de gravação com o lançador local (um processo por sessão) ou,
+    com ``RAPA_SESSOES_EXECUTOR=kubernetes``, com um pod de uso único por sessão.
 
     ``fleet`` é o banco do papel do despachante, se este processo o tiver: com ele, as
     vagas contam as sessões e as validações de toda a plataforma, e a varredura encerra
     as sessões que nenhum processo segura (a API caiu).
     """
-    launcher = LocalSessionLauncher(
-        LocalSessionSettings(
-            chromium=settings.chromium,
-            browser_args=settings.browser_args,
-            profile_dir=settings.sessions_dir,
+    launcher: LocalSessionLauncher | KubernetesSessionLauncher
+    if settings.sessions_runner == "kubernetes":
+        launcher = KubernetesSessionLauncher(
+            KubernetesSessionSettings(
+                pod=settings.pod_settings(),
+                browser_args=settings.browser_args,
+                egress=settings.egress_policy(),
+            ),
+            api=KubeApi(KubeConfig.in_cluster()),
         )
-    )
+    else:
+        launcher = LocalSessionLauncher(
+            LocalSessionSettings(
+                chromium=settings.chromium,
+                browser_args=settings.browser_args,
+                profile_dir=settings.sessions_dir,
+                egress=settings.local_egress(),
+            )
+        )
     service = RecordingSessions(
         PgSessionStore(db, fleet=fleet),
         launcher,
@@ -901,7 +1234,7 @@ async def _sweep_sessions(sessions: RecordingSessions, stop: asyncio.Event) -> N
 
 async def _close_sessions(
     sessions: RecordingSessions,
-    launcher: LocalSessionLauncher,
+    launcher: LocalSessionLauncher | KubernetesSessionLauncher,
     stop: asyncio.Event,
     task: asyncio.Task[None],
 ) -> None:
@@ -910,9 +1243,55 @@ async def _close_sessions(
     with contextlib.suppress(Exception):
         await sessions.aclose()
     await launcher.aclose()
+    if isinstance(launcher, KubernetesSessionLauncher):
+        await launcher.api.aclose()
 
 
-def create_server_app(settings: ServerSettings) -> FastAPI:
+async def _stop_task(stop: asyncio.Event, task: asyncio.Task[None]) -> None:
+    stop.set()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def _start_pod_launcher(
+    stack: contextlib.AsyncExitStack, launcher: KubernetesLauncher, port: int
+) -> None:
+    """Abre o canal do despachante e a varredura dos órfãos; fecham depois do despachante."""
+    server = ChannelServer(launcher.channel, port=port)
+    stack.push_async_callback(launcher.api.aclose)
+    await server.start()
+    stack.push_async_callback(server.close)
+    stop = asyncio.Event()
+    sweeper = asyncio.create_task(launcher.run_sweeper(stop), name="pods-orfaos")
+    stack.push_async_callback(_stop_task, stop, sweeper)
+
+
+def build_readiness_checks(
+    db: Database,
+    dispatcher_db: Database | None,
+    supervisor: DispatcherSupervisor | None,
+    extra: Iterable[ReadinessCheck] = (),
+) -> list[ReadinessCheck]:
+    """As checagens de ``/saude/pronto``: o banco, o do despachante e o despachante.
+
+    ``extra`` são as do cofre e do armazenamento de objetos, quando configurados (as
+    ``readiness_checks()`` dos backends do OpenBao e do S3, que já têm a forma de
+    :class:`~rapa.control.health.ReadinessCheck`).
+    """
+    checks: list[ReadinessCheck] = [DatabaseCheck(db)]
+    if dispatcher_db is not None:
+        checks.append(DatabaseCheck(dispatcher_db, "banco_despachante"))
+    if supervisor is not None:
+        checks.append(DispatcherCheck(supervisor))
+    checks.extend(extra)
+    return checks
+
+
+async def _stop_watch(stop: asyncio.Event, task: asyncio.Task[None]) -> None:
+    stop.set()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+def create_server_app(settings: ServerSettings, *, tracing: Tracing | None = None) -> FastAPI:
     """Monta a aplicação: REST e MCP, interface (opcional) e despachante (opcional).
 
     O ``lifespan`` da aplicação roda uma vez só: para subir de novo, monte outra.
@@ -920,7 +1299,20 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
     execuções em andamento), depois o gateway MCP e a interface encerram, e só
     então o verificador de tokens e os bancos são fechados, mesmo se a subida
     falhar no meio.
+
+    As métricas (``app.state.metrics``) são montadas aqui, mas o servidor delas só
+    sobe em :func:`main`. Com ``OTEL_EXPORTER_OTLP_ENDPOINT`` (ou ``tracing``, nos
+    testes), os pedidos e as execuções ganham traços.
     """
+    version = _version()
+    metrics = Metrics(per_company=settings.metrics_per_company, version=version)
+    if tracing is None and settings.otel_endpoint:
+        tracing = activate_tracing(
+            endpoint=settings.otel_endpoint,
+            traces_endpoint=settings.otel_traces_endpoint,
+            service_name=settings.otel_service_name,
+            version=version,
+        )
     db = Database.from_url(settings.database_url)
     dispatcher_db = (
         Database.from_url(
@@ -941,10 +1333,11 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
         if settings.http and settings.sessions
         else (None, None)
     )
-    publishing = build_publishing(settings, db)
+    publishing = build_publishing(settings, db, metrics)
     repairs = build_repairs(settings, db)
     credentials = build_credentials(settings, db)
-    artifacts = build_artifacts(settings, db)
+    backends = Backends(settings.backends)
+    artifacts = build_artifacts(settings, db, backends)
     if verifier is not None:
         app = create_http_app(
             catalog=platform,
@@ -976,7 +1369,7 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
         async def health() -> dict[str, str]:
             return {"estado": "ok"}
 
-    dispatcher = build_dispatcher(settings, dispatcher_db) if dispatcher_db else None
+    dispatcher = build_dispatcher(settings, dispatcher_db, backends) if dispatcher_db else None
     if isinstance(dispatcher, Dispatcher) and dispatcher_db is not None:
         if dispatcher.scheduler is None:
             # As agendas vencidas viram execuções numa etapa do mesmo laço.
@@ -985,9 +1378,22 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
         if dispatcher.alerts is None:
             # Os avisos de vencimento do certificado A1 são outra etapa do mesmo laço.
             dispatcher.alerts = CredentialAlerts(dispatcher_db, warn_days=settings.a1_warn_days)
+        if isinstance(dispatcher.queue, PgRunQueue) and dispatcher.queue.observer is None:
+            # Cada execução concluída conta nas métricas (depois de gravada).
+            dispatcher.queue.observer = metrics
+        if tracing is not None and dispatcher.tracer is None:
+            dispatcher.tracer = tracing.run_spans()
     supervisor = DispatcherSupervisor(dispatcher) if dispatcher else None
     if supervisor is not None:
         app.add_middleware(_DispatcherHealth, supervisor=supervisor)
+    metrics.watch_dispatcher(supervisor)
+    metrics.watch_sessions(sessions)
+    # Antes da interface: o NiceGUI, montado em "/", pegaria o caminho.
+    # As do cofre e do S3 (as que estiverem configuradas) entram junto com as do banco.
+    readiness = Readiness(
+        build_readiness_checks(db, dispatcher_db, supervisor, backends.readiness_checks())
+    )
+    app.add_api_route(READY_PATH, readiness.endpoint, methods=["GET"], include_in_schema=False)
     app.state.dispatcher = dispatcher
     app.state.dispatcher_supervisor = supervisor
     app.state.sessions = sessions
@@ -995,6 +1401,13 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
     app.state.repairs = repairs
     app.state.credentials = credentials
     app.state.artifacts = artifacts
+    app.state.backends = backends
+    # As checagens de prontidão do cofre e do S3 (as que estiverem configuradas; também
+    # em /saude/pronto, acima).
+    app.state.readiness_checks = backends.readiness_checks()
+    app.state.metrics = metrics
+    app.state.readiness = readiness
+    app.state.tracing = tracing
     if settings.http and settings.ui:
         # Antes de envolver o lifespan: o NiceGUI (ui.run_with) envolve o que encontrar
         # com a subida e o encerramento dele, e esse conjunto fica dentro do nosso.
@@ -1010,6 +1423,10 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
             company,
             artifacts,
         )
+    # Por fora de tudo o que a aplicação já tem (inclusive os 413 e 503 das proteções).
+    instrument_http(app, metrics)
+    if tracing is not None:
+        tracing.instrument_app(app)
     inner = app.router.lifespan_context
     started = False
 
@@ -1029,12 +1446,35 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
         async with contextlib.AsyncExitStack() as stack:
             # Fechados por último e sempre, mesmo se a subida falhar no meio.
             stack.push_async_callback(db.dispose)
+            stack.push_async_callback(backends.aclose)
             if dispatcher_db is not None:
                 stack.push_async_callback(dispatcher_db.dispose)
             if isinstance(verifier, TokenVerifier):
                 stack.push_async_callback(verifier.aclose)
+            if tracing is not None:
+                # O que ficou na fila dos traços sai antes de o processo parar.
+                stack.push_async_callback(asyncio.to_thread, tracing.flush)
+            stack.push_async_callback(readiness.aclose)
             # A interface (se houver) e o gateway MCP: encerram antes de fechar os bancos.
             state = await stack.enter_async_context(inner(application))
+            pod_launcher = getattr(dispatcher, "launch", None)
+            if isinstance(pod_launcher, KubernetesLauncher):
+                # Antes do despachante: o canal fica aberto até as tentativas terminarem.
+                await _start_pod_launcher(stack, pod_launcher, settings.channel_port)
+            if dispatcher_db is not None and settings.metrics_port:
+                # A fila e os avisos do A1, lidos do banco do despachante a cada 30 s.
+                watch_stop = asyncio.Event()
+                watch = asyncio.create_task(
+                    watch_platform(
+                        metrics,
+                        dispatcher_db,
+                        watch_stop,
+                        warn_days=settings.a1_warn_days,
+                        clock=now_utc,
+                    ),
+                    name="metricas-da-fila",
+                )
+                stack.push_async_callback(_stop_watch, watch_stop, watch)
             if sessions is not None and session_launcher is not None:
                 # Os navegadores das sessões fecham antes dos bancos (a situação é gravada).
                 sweep_stop = asyncio.Event()
@@ -1044,6 +1484,12 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
                 stack.push_async_callback(
                     _close_sessions, sessions, session_launcher, sweep_stop, sweep
                 )
+                if isinstance(session_launcher, KubernetesSessionLauncher):
+                    pods_stop = asyncio.Event()
+                    pods = asyncio.create_task(
+                        session_launcher.run_sweeper(pods_stop), name="pods-de-sessao"
+                    )
+                    stack.push_async_callback(_stop_task, pods_stop, pods)
             if supervisor is not None:
                 stop = asyncio.Event()
                 stack.push_async_callback(
@@ -1056,6 +1502,21 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
     return app
 
 
+def _check_ports(settings: ServerSettings, port: int) -> None:
+    """As portas do processo não se cruzam: a do serviço (``--port``), a das métricas e,
+    num despachante com pods, a do canal (que abre o próprio servidor)."""
+    if settings.metrics_port and settings.metrics_port == port:
+        raise ValueError("RAPA_METRICAS_PORTA não pode ser a porta do serviço")
+    if settings.executor == "kubernetes" and settings.dispatcher_database_url:
+        if settings.channel_port == port:
+            raise ValueError(
+                "RAPA_CANAL_PORTA não pode ser a porta do serviço (--port): o canal dos pods "
+                "tem o servidor dele, e a saúde do despachante fica na porta do serviço"
+            )
+        if settings.metrics_port and settings.metrics_port == settings.channel_port:
+            raise ValueError("RAPA_METRICAS_PORTA não pode ser a porta do canal")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m rapa.server",
@@ -1064,19 +1525,67 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(argv)
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
     try:
         settings = ServerSettings.from_env()
+        _check_ports(settings, args.port)
     except ValueError as exc:
         print(f"rapa.server: configuração inválida: {exc}", file=sys.stderr)
         return 2
+    configure_logging(json_logs=settings.log_json)
     import uvicorn
 
-    app = create_server_app(settings)
-    with contextlib.suppress(KeyboardInterrupt):
-        uvicorn.run(app, host=args.host, port=args.port, log_level="info", access_log=False)
+    version = _version()
+    glitchtip: GlitchTip | None = None
+    tracing: Tracing | None = None
+    try:
+        # Primeiro o GlitchTip e o rastreio: o que ligar é o que foi pedido, ou nada sobe.
+        if settings.glitchtip_dsn:
+            glitchtip = configure_glitchtip(settings.glitchtip_dsn, release=f"rapa@{version}")
+        if settings.otel_endpoint:
+            tracing = activate_tracing(
+                endpoint=settings.otel_endpoint,
+                traces_endpoint=settings.otel_traces_endpoint,
+                service_name=settings.otel_service_name,
+                version=version,
+            )
+    except RuntimeError as exc:  # o extra observability não está instalado
+        print(f"rapa.server: {exc}", file=sys.stderr)
+        if glitchtip is not None:
+            glitchtip.close()
+        return 2
+    metrics_server: MetricsServer | None = None
+    try:
+        app = create_server_app(settings, tracing=tracing)
+        if settings.metrics_port:
+            # Antes do serviço: sem a porta das métricas, o processo não sobe. No mesmo
+            # endereço do serviço: com o padrão (127.0.0.1), nada fica aberto na rede.
+            try:
+                metrics_server = serve_metrics(
+                    app.state.metrics, settings.metrics_port, host=args.host
+                )
+            except OSError as exc:
+                logger.error(
+                    "não foi possível abrir a porta %d das métricas: %s",
+                    settings.metrics_port,
+                    type(exc).__name__,
+                )
+                return 2
+        with contextlib.suppress(KeyboardInterrupt):
+            uvicorn.run(
+                app,
+                host=args.host,
+                port=args.port,
+                log_level="info",
+                access_log=False,
+                log_config=uvicorn_log_config(json_logs=settings.log_json),
+            )
+    finally:
+        if metrics_server is not None:
+            metrics_server.stop()
+        if tracing is not None:
+            tracing.shutdown()
+        if glitchtip is not None:
+            glitchtip.close()
     return 0
 
 

@@ -1,0 +1,78 @@
+{{- if and .Values.app.enabled .Values.executions.admissionPolicy.enabled }}
+{{- $v := .Values -}}
+{{- $e := $v.executions -}}
+{{- $name := printf "%s-pods-de-uso-unico" $e.namespace -}}
+{{- $accounts := list "despachante" "web" -}}
+{{- $users := list -}}
+{{- range $accounts }}
+{{- $users = append $users (printf "'system:serviceaccount:%s:%s'" $.Release.Namespace (include "rapa.component" (dict "root" $ "component" .))) }}
+{{- end }}
+{{- $image := include "rapa.executorImage" . -}}
+{{- $run := $e.podLabels.run -}}
+{{- $session := $e.podLabels.session -}}
+# O que o token da web e o do despachante podem criar no namespace das execuções: só os
+# pods de uso único, como o lançador os monta (rapa.control.kube). A Pod Security
+# "restricted" do namespace não fixa a imagem, a conta, a RuntimeClass nem o comando; sem
+# esta política, quem tivesse um desses tokens criaria ali um pod no runc, com outra imagem
+# e com o rótulo que abre o canal e a internet.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "rapa.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ $e.namespace }}
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    # As contas do RaPA que criam pods ali (a Role rapa-pods-de-uso-unico).
+    - name: contas-do-rapa
+      expression: "request.userInfo.username in [{{ join ", " $users }}]"
+  variables:
+    - name: app
+      expression: "has(object.metadata.labels) && 'app.kubernetes.io/name' in object.metadata.labels ? object.metadata.labels['app.kubernetes.io/name'] : ''"
+  validations:
+    - expression: "variables.app in ['{{ $run }}', '{{ $session }}']"
+      message: "o pod precisa do rótulo app.kubernetes.io/name={{ $run }} (execução) ou {{ $session }} (sessão)"
+    - expression: "has(object.spec.serviceAccountName) && object.spec.serviceAccountName == '{{ include "rapa.executorServiceAccount" . }}'"
+      message: "o pod precisa da conta de serviço {{ include "rapa.executorServiceAccount" . }} (sem permissão nenhuma)"
+    - expression: "has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false"
+      message: "o pod não monta o token da conta de serviço (automountServiceAccountToken: false)"
+    {{- if $e.runtimeClass }}
+    - expression: "has(object.spec.runtimeClassName) && object.spec.runtimeClassName == '{{ $e.runtimeClass }}'"
+      message: "o pod precisa da RuntimeClass {{ $e.runtimeClass }} (o gVisor)"
+    {{- end }}
+    - expression: "object.spec.containers.all(c, c.image == '{{ $image }}')"
+      message: "o pod só roda a imagem do executor ({{ $image }})"
+    - expression: "(!has(object.spec.initContainers) || size(object.spec.initContainers) == 0) && (!has(object.spec.ephemeralContainers) || size(object.spec.ephemeralContainers) == 0)"
+      message: "o pod não tem contêineres de início nem efêmeros"
+    - expression: >-
+        object.spec.containers.all(c, !has(c.command) && has(c.args) && size(c.args) >= 3 &&
+        c.args[0] == 'python' && c.args[1] == '-m' &&
+        c.args[2] == (variables.app == '{{ $session }}' ? 'rapa.session.host' : 'rapa.runner.pod'))
+      message: "o pod só roda o agente da execução (python -m rapa.runner.pod) ou o host da sessão (python -m rapa.session.host), conforme o rótulo"
+    - expression: >-
+        object.spec.containers.all(c, !has(c.envFrom) && (!has(c.env) ||
+        c.env.all(v, v.name == 'PYTHONUNBUFFERED' || (!v.name.startsWith('PYTHON') && !v.name.startsWith('LD_')))))
+      message: "o pod não muda o Python nem o carregador (PYTHON* e LD_*) pelo ambiente"
+    - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.secret) || has(v.emptyDir))"
+      message: "o pod só monta volumes secret e emptyDir"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "rapa.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $name }}
+  validationActions: [Deny]
+{{- end }}
