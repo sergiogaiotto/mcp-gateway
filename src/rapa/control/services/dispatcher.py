@@ -367,12 +367,14 @@ class Dispatcher:
                 self._failed("reap", now, exc, backoff=True)
             else:
                 self._succeeded("reap", now)
-                if report.requeued or report.indeterminate or report.failed:
+                if report.requeued or report.indeterminate or report.failed or report.cancelled:
                     logger.warning(
-                        "concessões vencidas: %d de volta à fila, %d indeterminadas, %d falharam",
+                        "concessões vencidas: %d de volta à fila, %d indeterminadas, %d falharam, "
+                        "%d canceladas (empresa congelada)",
                         len(report.requeued),
                         len(report.indeterminate),
                         len(report.failed),
+                        len(report.cancelled),
                     )
         if self.scheduler is not None and (
             self._schedules_behind or self._due("schedules", now, self.schedule_interval)

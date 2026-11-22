@@ -25,15 +25,21 @@ __all__ = [
     "can_automate_anywhere",
     "can_create",
     "can_create_anywhere",
+    "can_manage_company",
+    "can_manage_roles",
+    "can_open_company",
     "can_publish",
     "can_record",
     "can_register_credential",
     "can_register_credential_anywhere",
     "can_revoke_credential",
     "can_run",
+    "can_see_usage",
     "can_validate",
     "creator_areas",
+    "has_any_role",
     "is_custodian",
+    "managed_areas",
     "publish_block_reason",
     "sees_expiry_alerts",
     "validate_block_reason",
@@ -186,3 +192,43 @@ def sees_expiry_alerts(principal: Principal) -> bool:
     for area_roles in principal.area_roles.values():
         roles |= area_roles
     return bool(roles & {Role.CREDENTIAL_CUSTODIAN, Role.AREA_ADMIN, Role.COMPANY_ADMIN})
+
+
+# -- a empresa ------------------------------------------------------------------------
+
+
+def has_any_role(principal: Principal) -> bool:
+    """Se a pessoa tem algum papel (quem acabou de entrar pela primeira vez não tem)."""
+    return bool(principal.company_roles) or any(principal.area_roles.values())
+
+
+def can_manage_company(principal: Principal) -> bool:
+    """Quem administra a empresa: usuários, papéis em qualquer lugar e áreas."""
+    return principal.has_role(Role.COMPANY_ADMIN)
+
+
+def managed_areas(principal: Principal) -> frozenset[UUID] | None:
+    """Áreas cujos papéis a pessoa administra; ``None`` quando são todas."""
+    if principal.has_role(Role.AREA_ADMIN):
+        return None
+    return frozenset(
+        area for area, roles in principal.area_roles.items() if Role.AREA_ADMIN in roles
+    )
+
+
+def can_manage_roles(principal: Principal) -> bool:
+    """Se a pessoa dá e tira papéis (na empresa toda ou nas áreas que administra)."""
+    managed = managed_areas(principal)
+    return can_manage_company(principal) or managed is None or bool(managed)
+
+
+def can_see_usage(principal: Principal) -> bool:
+    """Quem administra a empresa ou audita (na empresa ou numa área) vê o consumo."""
+    return principal.has_role(Role.AUDITOR) or any(
+        Role.AUDITOR in roles for roles in principal.area_roles.values()
+    )
+
+
+def can_open_company(principal: Principal) -> bool:
+    """Se a tela Empresa tem algo para a pessoa (papéis ou consumo)."""
+    return can_manage_roles(principal) or can_see_usage(principal)

@@ -7,11 +7,12 @@ mesma requisição devolve a mesma execução, e com outra requisição é confl
 :func:`enqueue_run` e :func:`enqueue_many` são o único caminho que inclui
 execuções: o REST, o MCP e a interface (por :class:`PgRunService`), as agendas,
 os webhooks e os lotes. Todos tomam a mesma trava da empresa, respeitam o limite
-da fila e auditam cada execução. Um robô com certificado digital A1 só entra na
-fila se o certificado pode ser usado agora (registrado na área, não revogado, não
-vencido e com a autorização do custodiante na impressão atual:
-:func:`rapa.control.services.a1.ensure_a1_ready`); senão,
-:class:`~rapa.core.contracts.CertificateBlocked`, com o que falta.
+da fila, recusam empresa congelada (:func:`ensure_company_active`) e auditam cada
+execução. Um robô com certificado digital A1 só entra na fila se o certificado pode
+ser usado agora (registrado na área, não revogado, não vencido e com a autorização do
+custodiante na impressão atual: :func:`rapa.control.services.a1.ensure_a1_ready`);
+senão, :class:`~rapa.core.contracts.CertificateBlocked`, com o que falta. A empresa
+congelada é conferida antes do certificado.
 """
 
 import hashlib
@@ -36,6 +37,8 @@ from rapa.control.services import audit
 from rapa.control.services._common import (
     PRIORITY_BY_TRIGGER,
     PgService,
+    ensure_company_active,
+    lock_company_status,
     now_utc,
     run_status,
     visible_areas,
@@ -157,7 +160,12 @@ async def lock_company_starts(session: AsyncSession, company_id: UUID) -> None:
     A conferência de idempotência (de uma chave, de uma ocorrência de agenda ou
     de uma entrega de webhook) e o limite da fila ficam corretos mesmo com
     pedidos simultâneos. Pode ser pedida mais de uma vez na mesma transação.
+
+    Antes, toma a trava da situação da empresa (compartilhada,
+    :func:`lock_company_status`): a ordem das travas é sempre a mesma, e congelar a
+    empresa espera os inícios em andamento.
     """
+    await lock_company_status(session, company_id)
     await session.execute(
         select(func.pg_advisory_xact_lock(_START_LOCK_CLASS, func.hashtext(str(company_id))))
     )
@@ -267,8 +275,12 @@ async def enqueue_run(
     ``scope`` e com a mesma requisição devolve a execução de antes (enquanto a
     chave vale); com outra requisição, é conflito. Cada origem usa o seu escopo,
     então uma chave do REST nunca alcança a de uma agenda ou de um webhook.
+
+    Empresa congelada: :class:`rapa.core.contracts.CompanyFrozen`, sem criar nada (nem
+    devolver a execução de antes da mesma chave).
     """
     await lock_company_starts(session, company_id)
+    await ensure_company_active(session, company_id)
     digest = request_hash(slug, inputs)
     existing = None
     if idempotency_key is not None:
@@ -381,6 +393,7 @@ async def enqueue_many(
     if not inputs:
         return []
     await lock_company_starts(session, company_id)
+    await ensure_company_active(session, company_id)
     await ensure_a1_ready(session, company_id=company_id, robot=robot, now=now_utc())
     await ensure_queue_room(session, company_id, len(inputs))
     run_ids = [new_id() for _ in inputs]

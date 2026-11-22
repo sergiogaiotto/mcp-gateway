@@ -39,6 +39,7 @@ __all__ = [
     "idempotency_keys",
     "memberships",
     "metadata",
+    "platform_events",
     "platform_settings",
     "recording_sessions",
     "recordings",
@@ -74,6 +75,12 @@ companies = Table(
     Column("id", Uuid, primary_key=True),
     Column("name", Text, nullable=False),
     _ts("created_at", nullable=False, server_default=True),
+    #: Situação (revisão 0007): ``active`` ou ``frozen`` (lê tudo, nada novo começa).
+    Column("status", Text, nullable=False, server_default="active"),
+    Column("status_reason", Text, nullable=True),
+    _ts("status_changed_at"),
+    #: Id ou apelido da organização no provedor de identidade (único).
+    Column("idp_organization", Text, nullable=True),
 )
 
 areas = Table(
@@ -446,6 +453,18 @@ credential_alerts = Table(
     Column("kind", Text, primary_key=True),
     _ts("not_after"),
     _ts("created_at", nullable=False, server_default=True),
+)
+
+#: Registros da plataforma sem empresa (revisão 0007): só o dono lê e escreve.
+platform_events = Table(
+    "platform_events",
+    metadata,
+    Column("id", BigInteger, primary_key=True),
+    _ts("at", nullable=False, server_default=True),
+    Column("action", Text, nullable=False),
+    Column("actor", Text, nullable=False),
+    Column("target", Text, nullable=False),
+    Column("data", JSONB, nullable=False),
 )
 
 #: Tabelas com dados de empresa (todas com isolamento por linha).

@@ -1,9 +1,18 @@
 """Cadastro de empresas, áreas, usuários, vínculos e credenciais.
 
 São operações de plataforma (entrada de empresa, convite pelo administrador),
-chamadas pela automação de cadastro e pelos testes, nunca com dados escolhidos
-por quem usa a API: por isso recebem a empresa explicitamente. Cada função roda
-numa transação fixada na empresa, então o isolamento por linha continua valendo.
+chamadas pela automação de cadastro, pelos comandos antigos de
+``python -m rapa.control.admin`` (``empresa NOME``, ``area`` e ``usuario``) e pelos
+testes, nunca com dados escolhidos por quem usa a API: por isso recebem a empresa
+explicitamente. Cada função roda numa transação fixada na empresa, então o
+isolamento por linha continua valendo.
+
+Toda mudança fica na auditoria da empresa, na mesma transação, com o ator
+``plataforma:<quem pediu>`` (``requested_by`` do construtor): ``empresa.criada``,
+``empresa.cota_alterada``, ``area.criada``, ``usuario.criado``,
+``usuario.papeis_alterados`` (o papel dado, como ``operator@empresa`` ou
+``creator@<área>``) e ``credencial.registrada`` (só a referência; o valor nunca passa
+por aqui).
 
 A capacidade da plataforma (``platform_settings``) só muda pelo dono das
 tabelas: nem a aplicação nem o despachante podem alterá-la.
@@ -30,16 +39,27 @@ from rapa.control.db.schema import (
     platform_settings,
     users,
 )
-from rapa.control.services._common import PgService
-from rapa.core.contracts import Role
+from rapa.control.db.session import Database
+from rapa.control.services import audit
+from rapa.control.services._common import PgService, platform_actor
+from rapa.core.contracts import NotFound, Role
 from rapa.core.ids import new_id
 from rapa.core.robot import CredentialKind, CredentialRef
 
 __all__ = ["PgProvisioning", "set_platform_capacity"]
 
 
+#: Quem pede, quando ninguém diz (a automação de cadastro e os testes).
+DEFAULT_REQUESTER = "provisionamento"
+
+
 class PgProvisioning(PgService):
-    """Cadastro básico de uma empresa (Fase 0)."""
+    """Cadastro básico de uma empresa (Fase 0), com auditoria de cada mudança."""
+
+    def __init__(self, db: Database, *, requested_by: str = DEFAULT_REQUESTER) -> None:
+        super().__init__(db)
+        #: O ator da auditoria: ``plataforma:<quem pediu>``.
+        self.actor = platform_actor(requested_by)
 
     async def create_company(
         self,
@@ -50,15 +70,29 @@ class PgProvisioning(PgService):
         max_queued: int = 1000,
     ) -> UUID:
         company_id = new_id()
+        factor = Decimal(str(max_borrow_factor))
         async with self.db.tenant_session(company_id) as session:
             await session.execute(insert(companies).values(id=company_id, name=name))
             await session.execute(
                 insert(company_quotas).values(
                     company_id=company_id,
                     guaranteed_slots=guaranteed_slots,
-                    max_borrow_factor=Decimal(str(max_borrow_factor)),
+                    max_borrow_factor=factor,
                     max_queued=max_queued,
                 )
+            )
+            await audit.append(
+                session,
+                company_id=company_id,
+                actor=self.actor,
+                action="empresa.criada",
+                target=f"empresa:{company_id}",
+                payload={
+                    "vagas": guaranteed_slots,
+                    "fila": max_queued,
+                    "emprestimo": str(factor),
+                    "areas": 0,
+                },
             )
         return company_id
 
@@ -70,15 +104,27 @@ class PgProvisioning(PgService):
         max_borrow_factor: Decimal | float,
         max_queued: int,
     ) -> None:
+        factor = Decimal(str(max_borrow_factor))
         async with self.db.tenant_session(company_id) as session:
-            await session.execute(
+            changed = await session.scalar(
                 update(company_quotas)
                 .where(company_quotas.c.company_id == company_id)
                 .values(
                     guaranteed_slots=guaranteed_slots,
-                    max_borrow_factor=Decimal(str(max_borrow_factor)),
+                    max_borrow_factor=factor,
                     max_queued=max_queued,
                 )
+                .returning(company_quotas.c.company_id)
+            )
+            if changed is None:
+                raise NotFound("empresa não encontrada")
+            await audit.append(
+                session,
+                company_id=company_id,
+                actor=self.actor,
+                action="empresa.cota_alterada",
+                target=f"empresa:{company_id}",
+                payload={"vagas": guaranteed_slots, "fila": max_queued, "emprestimo": str(factor)},
             )
 
     async def create_area(self, company_id: UUID, name: str) -> UUID:
@@ -86,6 +132,14 @@ class PgProvisioning(PgService):
         async with self.db.tenant_session(company_id) as session:
             await session.execute(
                 insert(areas).values(id=area_id, company_id=company_id, name=name)
+            )
+            await audit.append(
+                session,
+                company_id=company_id,
+                actor=self.actor,
+                action="area.criada",
+                target=f"area:{area_id}",
+                payload={"nome": name},
             )
         return area_id
 
@@ -96,6 +150,14 @@ class PgProvisioning(PgService):
                 insert(users).values(
                     id=user_id, company_id=company_id, subject=subject, display_name=display_name
                 )
+            )
+            await audit.append(
+                session,
+                company_id=company_id,
+                actor=self.actor,
+                action="usuario.criado",
+                target=f"usuario:{user_id}",
+                payload={"usuario": str(user_id)},
             )
         return user_id
 
@@ -113,6 +175,14 @@ class PgProvisioning(PgService):
                     user_id=user_id,
                     role=role.value,
                 )
+            )
+            await audit.append(
+                session,
+                company_id=company_id,
+                actor=self.actor,
+                action="usuario.papeis_alterados",
+                target=f"usuario:{user_id}",
+                payload={"adicionados": [f"{role.value}@{area_id or 'empresa'}"], "removidos": []},
             )
         return membership_id
 
@@ -132,6 +202,7 @@ class PgProvisioning(PgService):
         Um certificado A1 precisa da validade (``not_after``: o banco recusa sem ela).
         """
         credential_id = new_id()
+        kind = CredentialKind(ref.kind).value
         async with self.db.tenant_session(company_id) as session:
             await session.execute(
                 insert(credentials).values(
@@ -139,13 +210,21 @@ class PgProvisioning(PgService):
                     company_id=company_id,
                     area_id=area_id,
                     name=ref.name,
-                    kind=CredentialKind(ref.kind).value,
+                    kind=kind,
                     origin=ref.origin,
                     vault_path=vault_path,
                     custodian_user_id=custodian_user_id,
                     not_after=not_after,
                     fingerprint_sha256=fingerprint_sha256,
                 )
+            )
+            await audit.append(
+                session,
+                company_id=company_id,
+                actor=self.actor,
+                action="credencial.registrada",
+                target=f"credencial:{credential_id}",
+                payload={"nome": ref.name, "tipo": kind, "area": str(area_id)},
             )
         return credential_id
 

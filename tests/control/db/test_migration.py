@@ -6,8 +6,9 @@ import secrets
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
+import psycopg
 import pytest
 from alembic import command
 from psycopg import sql
@@ -111,6 +112,15 @@ def test_grants_skip_missing_roles_and_cli_reapplies(pg_database: PgDatabase) ->
         # E as da publicação (revisão 0004), as do conserto (revisão 0005) e as do A1 (0006).
         for table in (*_PUBLISHING_TABLES, *_REPAIR_TABLES, *_A1_TABLES):
             assert _app_can_read_runs(pg_database, name, table), table
+        # E as da operação por empresa (revisão 0007).
+        assert _company_schema(pg_database, name)["grants"] == (
+            True,
+            False,
+            True,
+            False,
+            False,
+            False,
+        )
 
 
 _PUBLISHING_TABLES = (
@@ -634,3 +644,170 @@ async def test_write_started_migrates_back_and_forth_and_is_filled_from_the_even
         assert report.requeued == [ids["leitura"]]
         assert sorted(report.failed) == sorted([ids["efeito"], ids["grava"]])
         assert report.indeterminate == [ids["irreversivel"]]
+
+
+# -- 0007: operação por empresa ---------------------------------------------------------
+
+_COMPANY_COLUMNS = ("idp_organization", "status", "status_changed_at", "status_reason")
+_COMPANY_FUNCTIONS = (
+    "rapa_company_active_guard",
+    "rapa_company_admin_guard",
+    "rapa_company_for_organization",
+    "rapa_platform_events_guard",
+    "rapa_purge_allowed",
+)
+#: Os gatilhos da empresa congelada (linhas novas) e do último company_admin ativo.
+_COMPANY_TRIGGERS = tuple(
+    sorted(
+        (
+            *(
+                f"{table}_company_active"
+                for table in (
+                    "runs",
+                    "robots",
+                    "robot_versions",
+                    "schedules",
+                    "webhooks",
+                    "batches",
+                    "recording_sessions",
+                    "repair_proposals",
+                )
+            ),
+            "memberships_keep_company_admin",
+            "users_keep_company_admin",
+        )
+    )
+)
+
+
+def _company_schema(pg: PgDatabase, database: str) -> dict[str, Any]:
+    with pg.server.connect(database) as conn:
+        columns = [
+            row[0]
+            for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' "
+                "AND table_name = 'companies' AND column_name = ANY(%s) ORDER BY column_name",
+                (list(_COMPANY_COLUMNS),),
+            ).fetchall()
+        ]
+        functions = [
+            row[0]
+            for row in conn.execute(
+                "SELECT proname FROM pg_proc WHERE proname = ANY(%s) ORDER BY proname",
+                (list(_COMPANY_FUNCTIONS),),
+            ).fetchall()
+        ]
+        policies = [
+            row[0]
+            for row in conn.execute(
+                "SELECT polname FROM pg_policy WHERE polrelid = 'companies'::regclass ORDER BY 1"
+            ).fetchall()
+        ]
+        triggers = [
+            row[0]
+            for row in conn.execute(
+                "SELECT tgname FROM pg_trigger WHERE tgname = ANY(%s) ORDER BY tgname",
+                (list(_COMPANY_TRIGGERS),),
+            ).fetchall()
+        ]
+        events = conn.execute("SELECT to_regclass('public.platform_events') IS NOT NULL").fetchone()
+        index = conn.execute(
+            "SELECT to_regclass('public.recording_sessions_company_created') IS NOT NULL"
+        ).fetchone()
+        dispatcher_id = conn.execute(
+            "SELECT has_column_privilege(%s, 'companies', 'id', 'SELECT')", (pg.roles.dispatcher,)
+        ).fetchone()
+        grants = (
+            conn.execute(
+                "SELECT has_function_privilege(%s, 'rapa_company_for_organization(text)', "
+                "'EXECUTE'), has_function_privilege(%s, 'rapa_company_for_organization(text)', "
+                "'EXECUTE'), has_column_privilege(%s, 'companies', 'status', 'SELECT'), "
+                "has_table_privilege(%s, 'companies', 'UPDATE'), "
+                "has_table_privilege(%s, 'platform_events', 'SELECT'), "
+                "has_table_privilege(%s, 'platform_events', 'SELECT')",
+                (
+                    pg.roles.app,
+                    pg.roles.dispatcher,
+                    pg.roles.dispatcher,
+                    pg.roles.app,
+                    pg.roles.app,
+                    pg.roles.dispatcher,
+                ),
+            ).fetchone()
+            if functions
+            else None
+        )
+    assert events is not None and index is not None and dispatcher_id is not None
+    return {
+        "columns": columns,
+        "functions": functions,
+        "policies": policies,
+        "triggers": triggers,
+        "platform_events": bool(events[0]),
+        "index": bool(index[0]),
+        "dispatcher_reads_company_id": bool(dispatcher_id[0]),
+        "grants": tuple(grants) if grants else None,
+    }
+
+
+def _owner_purges_audit(pg: PgDatabase, database: str, company: str) -> str | None:
+    """Tenta, como dono e com a marca, apagar a auditoria da empresa (e desfaz)."""
+    url = pg.server.url(database, pg.owner, pg.passwords[pg.owner])
+    with psycopg.connect(url) as conn:
+        try:
+            conn.execute("SELECT set_config('rapa.company_id', %s, true)", (company,))
+            conn.execute("SELECT set_config('rapa.purge_company', %s, true)", (company,))
+            conn.execute("DELETE FROM audit_log WHERE company_id = %s", (company,))
+        except psycopg.Error as exc:
+            return exc.sqlstate
+        finally:
+            conn.rollback()
+    return None
+
+
+def test_company_operation_migrates_back_and_forth(pg_database: PgDatabase) -> None:
+    with _scratch_database(pg_database) as name:
+        url = pg_database.server.url(
+            name, pg_database.owner, pg_database.passwords[pg_database.owner]
+        )
+        upgrade(url, roles=pg_database.roles)
+        head = _company_schema(pg_database, name)
+        assert head == {
+            "columns": list(_COMPANY_COLUMNS),
+            "functions": list(_COMPANY_FUNCTIONS),
+            "policies": ["organization_lookup", "tenant_isolation"],
+            "triggers": list(_COMPANY_TRIGGERS),
+            "platform_events": True,
+            "index": True,
+            "dispatcher_reads_company_id": True,
+            # A aplicação chama a função (o despachante, não); o despachante lê a situação; a
+            # aplicação nunca muda uma empresa; ninguém além do dono lê platform_events.
+            "grants": (True, False, True, False, False, False),
+        }
+        company = str(uuid4())
+        with psycopg.connect(url) as conn:
+            conn.execute("SELECT set_config('rapa.company_id', %s, false)", (company,))
+            conn.execute("INSERT INTO companies (id, name) VALUES (%s, 'Migração')", (company,))
+            conn.execute(
+                "INSERT INTO audit_log (company_id, actor, action, payload_digest) "
+                "VALUES (%s, 'teste', 'teste.acao', %s)",
+                (company, "0" * 64),
+            )
+            conn.commit()
+        # Na 0007, o dono com a marca apaga; de volta na 0005, a trava antiga recusa.
+        assert _owner_purges_audit(pg_database, name, company) is None
+        command.downgrade(alembic_config(url, pg_database.roles), "0005")
+        assert _company_schema(pg_database, name) == {
+            "columns": [],
+            "functions": [],
+            "policies": ["tenant_isolation"],
+            "triggers": [],
+            "platform_events": False,
+            "index": False,
+            "dispatcher_reads_company_id": False,
+            "grants": None,
+        }
+        assert _owner_purges_audit(pg_database, name, company) == "23514"
+        upgrade(url, roles=pg_database.roles)
+        assert _company_schema(pg_database, name) == head
+        assert _owner_purges_audit(pg_database, name, company) is None

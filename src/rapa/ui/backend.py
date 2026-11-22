@@ -30,12 +30,17 @@ from pydantic import TypeAdapter, ValidationError
 
 from rapa.core.contracts import (
     A1AuthorizationInfo,
+    AreaInfo,
     BatchFile,
     BatchFormat,
     BatchInfo,
     BatchPreview,
     BatchRow,
     BatchService,
+    CompanyAdminService,
+    CompanyFrozen,
+    CompanyInfo,
+    CompanyUser,
     Conflict,
     ContractError,
     CredentialInfo,
@@ -57,6 +62,7 @@ from rapa.core.contracts import (
     RobotInfo,
     RobotSummary,
     RobotVersionInfo,
+    RoleGrant,
     RunService,
     RunStatus,
     RunTrigger,
@@ -65,6 +71,7 @@ from rapa.core.contracts import (
     ScheduleOccurrence,
     ScheduleService,
     ScheduleSpec,
+    UsageReport,
     VersionApprovals,
     ViewerTicket,
     WebhookChanges,
@@ -80,6 +87,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "BATCHES_OFF",
+    "COMPANY_OFF",
     "CREDENTIALS_OFF",
     "REPAIRS_OFF",
     "SCHEDULES_OFF",
@@ -266,6 +274,26 @@ class Backend(Protocol):
 
     async def version_approvals(self, robot_id: UUID, version_no: int) -> VersionApprovals: ...
 
+    # -- a empresa: usuários e papéis, áreas e consumo -------------------------------
+
+    async def get_company(self) -> CompanyInfo: ...
+
+    async def list_company_users(self) -> list[CompanyUser]: ...
+
+    async def set_user_roles(self, user_id: UUID, roles: list[RoleGrant]) -> CompanyUser: ...
+
+    async def deactivate_user(self, user_id: UUID) -> CompanyUser: ...
+
+    async def reactivate_user(self, user_id: UUID) -> CompanyUser: ...
+
+    async def list_company_areas(self) -> list[AreaInfo]: ...
+
+    async def create_company_area(self, name: str) -> AreaInfo: ...
+
+    async def rename_company_area(self, area_id: UUID, name: str) -> AreaInfo: ...
+
+    async def company_usage(self, month: str | None = None) -> UsageReport: ...
+
 
 #: Mensagem quando este servidor não oferece a gravação de demonstrações.
 SESSIONS_OFF = "a gravação de demonstrações não está disponível neste servidor"
@@ -277,6 +305,8 @@ BATCHES_OFF = "os lotes por planilha não estão disponíveis neste servidor"
 REPAIRS_OFF = "o conserto assistido não está disponível neste servidor"
 #: Mensagem quando este servidor não oferece as credenciais (e as regras do A1).
 CREDENTIALS_OFF = "as credenciais não estão disponíveis neste servidor"
+#: Mensagem quando este servidor não oferece a administração da empresa.
+COMPANY_OFF = "a administração da empresa não está disponível neste servidor"
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +406,7 @@ class ContractsBackend:
         batches: BatchService | None = None,
         repairs: RepairService | None = None,
         credentials: CredentialService | None = None,
+        company: CompanyAdminService | None = None,
     ) -> None:
         self._catalog = catalog
         self._runs = runs
@@ -387,6 +418,7 @@ class ContractsBackend:
         self._batches = batches
         self._repairs = repairs
         self._credentials = credentials
+        self._company = company
 
     def __repr__(self) -> str:
         return f"ContractsBackend(subject={self._principal.subject!r})"
@@ -637,6 +669,40 @@ class ContractsBackend:
     async def version_approvals(self, robot_id: UUID, version_no: int) -> VersionApprovals:
         return await self._credential_service().approvals(self._principal, robot_id, version_no)
 
+    # -- a empresa ------------------------------------------------------------------------
+
+    def _company_service(self) -> CompanyAdminService:
+        if self._company is None:
+            raise BackendUnavailable(COMPANY_OFF)
+        return self._company
+
+    async def get_company(self) -> CompanyInfo:
+        return await self._company_service().get_company(self._principal)
+
+    async def list_company_users(self) -> list[CompanyUser]:
+        return await self._company_service().list_users(self._principal)
+
+    async def set_user_roles(self, user_id: UUID, roles: list[RoleGrant]) -> CompanyUser:
+        return await self._company_service().set_roles(self._principal, user_id, roles)
+
+    async def deactivate_user(self, user_id: UUID) -> CompanyUser:
+        return await self._company_service().deactivate_user(self._principal, user_id)
+
+    async def reactivate_user(self, user_id: UUID) -> CompanyUser:
+        return await self._company_service().reactivate_user(self._principal, user_id)
+
+    async def list_company_areas(self) -> list[AreaInfo]:
+        return await self._company_service().list_areas(self._principal)
+
+    async def create_company_area(self, name: str) -> AreaInfo:
+        return await self._company_service().create_area(self._principal, name)
+
+    async def rename_company_area(self, area_id: UUID, name: str) -> AreaInfo:
+        return await self._company_service().rename_area(self._principal, area_id, name)
+
+    async def company_usage(self, month: str | None = None) -> UsageReport:
+        return await self._company_service().usage(self._principal, month)
+
 
 class _Platform(RobotCatalog, RunService, RobotAdmin, Protocol):
     """Um objeto que segue os três contratos (como a plataforma em memória)."""
@@ -657,6 +723,7 @@ class ContractsBackendFactory:
         batches: BatchService | None = None,
         repairs: RepairService | None = None,
         credentials: CredentialService | None = None,
+        company: CompanyAdminService | None = None,
     ) -> None:
         self._catalog = catalog
         self._runs = runs
@@ -667,6 +734,7 @@ class ContractsBackendFactory:
         self._batches = batches
         self._repairs = repairs
         self._credentials = credentials
+        self._company = company
 
     @classmethod
     def from_platform(
@@ -679,6 +747,7 @@ class ContractsBackendFactory:
         batches: BatchService | None = None,
         repairs: RepairService | None = None,
         credentials: CredentialService | None = None,
+        company: CompanyAdminService | None = None,
     ) -> ContractsBackendFactory:
         return cls(
             platform,
@@ -690,6 +759,7 @@ class ContractsBackendFactory:
             batches=batches,
             repairs=repairs,
             credentials=credentials,
+            company=company,
         )
 
     def __call__(self, session: UiSession) -> ContractsBackend:
@@ -704,6 +774,7 @@ class ContractsBackendFactory:
             batches=self._batches,
             repairs=self._repairs,
             credentials=self._credentials,
+            company=self._company,
         )
 
 
@@ -739,6 +810,12 @@ _CREDENTIALS: TypeAdapter[list[CredentialInfo]] = TypeAdapter(list[CredentialInf
 _A1_AUTHORIZATION: TypeAdapter[A1AuthorizationInfo] = TypeAdapter(A1AuthorizationInfo)
 _A1_AUTHORIZATIONS: TypeAdapter[list[A1AuthorizationInfo]] = TypeAdapter(list[A1AuthorizationInfo])
 _APPROVALS: TypeAdapter[VersionApprovals] = TypeAdapter(VersionApprovals)
+_COMPANY: TypeAdapter[CompanyInfo] = TypeAdapter(CompanyInfo)
+_COMPANY_USER: TypeAdapter[CompanyUser] = TypeAdapter(CompanyUser)
+_COMPANY_USERS: TypeAdapter[list[CompanyUser]] = TypeAdapter(list[CompanyUser])
+_AREA: TypeAdapter[AreaInfo] = TypeAdapter(AreaInfo)
+_AREAS: TypeAdapter[list[AreaInfo]] = TypeAdapter(list[AreaInfo])
+_USAGE: TypeAdapter[UsageReport] = TypeAdapter(UsageReport)
 
 _MAX_MESSAGE = 500
 _MAX_DETAILS = 50
@@ -785,6 +862,8 @@ def _api_error(response: httpx2.Response) -> Exception:
             return NotFound(_clean(message, "não encontrado"))
         case 409:
             return Conflict(_clean(message, "a operação conflita com o estado atual"))
+        case 423:
+            return CompanyFrozen(_clean(message, "a empresa está congelada"))
         case 422:
             return InvalidInput(_clean(message, "dados inválidos"), [d for d in details if d])
         case 429:
@@ -1219,6 +1298,47 @@ class RestBackend:
     async def version_approvals(self, robot_id: UUID, version_no: int) -> VersionApprovals:
         data = await self._send("GET", f"/v1/robos/{robot_id}/versoes/{version_no}/aprovacoes")
         return self._parse(_APPROVALS, data)
+
+    # -- a empresa ------------------------------------------------------------------------
+
+    async def get_company(self) -> CompanyInfo:
+        return self._parse(_COMPANY, await self._send("GET", "/v1/empresa"))
+
+    async def list_company_users(self) -> list[CompanyUser]:
+        return self._parse(_COMPANY_USERS, await self._send("GET", "/v1/empresa/usuarios"))
+
+    async def set_user_roles(self, user_id: UUID, roles: list[RoleGrant]) -> CompanyUser:
+        body = {
+            "papeis": [
+                {"papel": g.role.value, "area_id": str(g.area_id) if g.area_id else None}
+                for g in roles
+            ]
+        }
+        data = await self._send("PUT", f"/v1/empresa/usuarios/{user_id}/papeis", json_body=body)
+        return self._parse(_COMPANY_USER, data)
+
+    async def deactivate_user(self, user_id: UUID) -> CompanyUser:
+        data = await self._send("POST", f"/v1/empresa/usuarios/{user_id}/desativar")
+        return self._parse(_COMPANY_USER, data)
+
+    async def reactivate_user(self, user_id: UUID) -> CompanyUser:
+        data = await self._send("POST", f"/v1/empresa/usuarios/{user_id}/reativar")
+        return self._parse(_COMPANY_USER, data)
+
+    async def list_company_areas(self) -> list[AreaInfo]:
+        return self._parse(_AREAS, await self._send("GET", "/v1/empresa/areas"))
+
+    async def create_company_area(self, name: str) -> AreaInfo:
+        data = await self._send("POST", "/v1/empresa/areas", json_body={"nome": name})
+        return self._parse(_AREA, data)
+
+    async def rename_company_area(self, area_id: UUID, name: str) -> AreaInfo:
+        data = await self._send("PATCH", f"/v1/empresa/areas/{area_id}", json_body={"nome": name})
+        return self._parse(_AREA, data)
+
+    async def company_usage(self, month: str | None = None) -> UsageReport:
+        params = {"mes": month} if month else None
+        return self._parse(_USAGE, await self._send("GET", "/v1/empresa/consumo", params=params))
 
     @staticmethod
     def _json(response: httpx2.Response) -> Any:

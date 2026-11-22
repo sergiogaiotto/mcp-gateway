@@ -62,6 +62,13 @@ lançar precisa (nunca ``vault_path``) e inclui os avisos de vencimento. O
 ``credentials`` (como na revisão 0001) saem em :func:`a1_revokes_sql`, que só age
 quando as tabelas da 0006 existem: assim cada revisão anterior continua com as
 permissões dela, e ``--somente-permissoes`` na 0006 não devolve o que ela tirou.
+
+A operação por empresa (revisão 0007) tem o bloco :func:`company_grants_sql`. A
+aplicação ganha só o ``EXECUTE`` de ``rapa_company_for_organization`` (achar a empresa
+da organização do token, antes de saber a empresa); ela continua sem ``UPDATE`` em
+``companies``, então nunca congela nem descongela uma empresa. O despachante lê só
+``companies.id`` e ``companies.status``, para não pegar execução de empresa congelada.
+``platform_events`` não tem permissão para nenhum dos dois: só o dono lê e escreve.
 """
 
 import os
@@ -76,6 +83,8 @@ __all__ = [
     "a1_restore_sql",
     "a1_revokes_sql",
     "all_grants_sql",
+    "company_grants_sql",
+    "company_revoke_sql",
     "grants_sql",
     "publishing_grants_sql",
     "repair_grants_sql",
@@ -217,6 +226,16 @@ REVOKE ALL ON credentials FROM {role};
 """
 
 _A1_TABLES = ("a1_authorizations", "version_approvals", "credential_alerts")
+_COMPANY_APP_GRANTS = """
+GRANT EXECUTE ON FUNCTION rapa_company_for_organization(text) TO {role};
+"""
+
+_COMPANY_DISPATCHER_GRANTS = """
+GRANT SELECT (id, status) ON companies TO {role};
+"""
+
+#: A tabela que a revisão 0007 cria (junto com a função e as colunas que os blocos usam).
+_COMPANY_TABLES = ("platform_events",)
 
 
 def _block(
@@ -307,6 +326,20 @@ def a1_restore_sql(roles: RoleNames) -> list[str]:
     ]
 
 
+def company_grants_sql(roles: RoleNames) -> list[str]:
+    """Permissões da operação por empresa (revisão 0007), se ela já foi aplicada."""
+    what = "da operação por empresa"
+    return [
+        _block(roles.app, _COMPANY_APP_GRANTS, tables=_COMPANY_TABLES, what=what),
+        _block(roles.dispatcher, _COMPANY_DISPATCHER_GRANTS, tables=_COMPANY_TABLES, what=what),
+    ]
+
+
+def company_revoke_sql(roles: RoleNames) -> list[str]:
+    """Tira o que :func:`company_grants_sql` deu e não some com as colunas (volta da 0007)."""
+    return [_block(roles.dispatcher, "REVOKE SELECT (id, status) ON companies FROM {role};")]
+
+
 def all_grants_sql(roles: RoleNames) -> list[str]:
     """Todas as permissões, das tabelas que existirem na revisão atual do banco."""
     return [
@@ -316,4 +349,5 @@ def all_grants_sql(roles: RoleNames) -> list[str]:
         *repair_grants_sql(roles),
         *a1_revokes_sql(roles),
         *a1_grants_sql(roles),
+        *company_grants_sql(roles),
     ]

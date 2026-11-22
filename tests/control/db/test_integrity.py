@@ -15,7 +15,14 @@ from rapa.control.services import PgPlatform, PgRunQueue, verify_chain
 from rapa.control.services import audit as audit_service
 from rapa.core.contracts import RunTrigger
 
-from .support import PROTOCOLO_INPUTS, make_tenant, protocolo, publish, reset_queue
+from .support import (
+    PROTOCOLO_INPUTS,
+    TENANT_AUDIT_ROWS,
+    make_tenant,
+    protocolo,
+    publish,
+    reset_queue,
+)
 
 pytestmark = pytest.mark.database
 
@@ -118,7 +125,7 @@ async def test_audit_chain_is_continuous_and_append_only(
             )
         ).all()
     assert report.ok, report.problems
-    assert report.rows == 3 + 3 + 10
+    assert report.rows == TENANT_AUDIT_ROWS + 3 + 3 + 10  # cadastro, publicação, inícios, os 10
     assert [r[0] for r in rows] == list(range(1, report.rows + 1))
     assert rows[0][1] == audit_service.GENESIS_HASH
     assert all(rows[i][1] == rows[i - 1][2] for i in range(1, len(rows)))
@@ -169,11 +176,20 @@ async def test_audit_rows_are_written_by_the_trigger(app_db: Database) -> None:
             ),
             {"c": tenant.company_id},
         )
-        row = (await session.execute(text("SELECT seq, prev_hash, row_hash FROM audit_log"))).one()
+        rows = (
+            await session.execute(
+                text("SELECT seq, prev_hash, row_hash, action FROM audit_log ORDER BY seq")
+            )
+        ).all()
         report = await verify_chain(session, tenant.company_id)
-    assert row[0] == 1
-    assert row[1] == audit_service.GENESIS_HASH
-    assert row[2] != "falso"
+    # A primeira linha da empresa (a do cadastro) começa a cadeia; a forçada vem logo depois
+    # da última, encadeada nela.
+    assert (rows[0][0], rows[0][1]) == (1, audit_service.GENESIS_HASH)
+    forced = rows[-1]
+    assert forced[3] == "teste.forca"
+    assert forced[0] == len(rows) == TENANT_AUDIT_ROWS + 1
+    assert forced[1] == rows[-2][2]
+    assert forced[2] != "falso"
     assert report.ok
 
 

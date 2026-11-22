@@ -43,6 +43,9 @@ entrega passa por :class:`WebhookGate`: um identificador que não existia há
 pouco é recusado (401) sem ir ao banco, um endereço de origem com recusas demais
 e o processo com leituras demais por segundo recebem 429.
 
+Empresa congelada: depois de conferida a assinatura, a entrega é recusada com 423
+(:class:`rapa.core.contracts.CompanyFrozen`) sem criar nada.
+
 A execução nasce com origem ``webhook`` (prioridade de agenda e webhook) em nome
 de ``webhook:<id>``. Nada é repetido sozinho: uma entrega recusada não cria
 nada, e uma execução que falha fica como falhou.
@@ -71,7 +74,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from rapa.control.db.schema import robots, runs, webhook_deliveries, webhooks
 from rapa.control.db.session import Database
 from rapa.control.services import audit
-from rapa.control.services._common import PgService, clean_title, now_utc
+from rapa.control.services._common import (
+    PgService,
+    clean_title,
+    ensure_company_active,
+    now_utc,
+)
 from rapa.control.services.inputs import validate_inputs
 from rapa.control.services.robots import published_robot
 from rapa.control.services.runs import enqueue_run, lock_company_starts
@@ -592,6 +600,7 @@ class PgWebhooks(PgService):
         webhook_id = new_id()
         salt = secrets.token_bytes(32)
         async with self.db.tenant_session(company_id) as session:
+            await ensure_company_active(session, company_id)
             robot = await self._robot(session, principal, robot_id)
             self._check_manage(principal, robot["area_id"])
             if await published_robot(session, company_id, robot_id) is None:
@@ -630,6 +639,7 @@ class PgWebhooks(PgService):
     ) -> WebhookInfo:
         company_id = principal.company_id
         async with self.db.tenant_session(company_id) as session:
+            await ensure_company_active(session, company_id)
             row = await self._webhook(session, principal, robot_id, webhook_id, lock=True)
             self._check_manage(principal, row["area_id"])
             values: dict[str, Any] = {"updated_by": principal.subject, "updated_at": func.now()}
@@ -663,6 +673,7 @@ class PgWebhooks(PgService):
         company_id = principal.company_id
         salt = secrets.token_bytes(32)
         async with self.db.tenant_session(company_id) as session:
+            await ensure_company_active(session, company_id)
             row = await self._webhook(session, principal, robot_id, webhook_id, lock=True)
             self._check_manage(principal, row["area_id"])
             version = int(row["key_version"]) + 1
@@ -804,6 +815,9 @@ class PgWebhooks(PgService):
         company_id: UUID = hook["company_id"]
         body_sha256 = hashlib.sha256(body).hexdigest()
         async with self.db.tenant_session(company_id) as session:
+            # A assinatura confere: quem chama tem a chave, e pode saber que a empresa
+            # está congelada (423, sem criar nada).
+            await ensure_company_active(session, company_id)
             # Sob a trava de inícios da empresa: duas entregas iguais não passam juntas.
             await lock_company_starts(session, company_id)
             # O webhook pode ter sido desligado, removido ou trocado de chave desde a leitura.

@@ -30,6 +30,7 @@ from rapa.core.robot import Effect, Manifest
 from rapa.ui import describe
 from rapa.ui.auth import BINDING_COOKIE, HOME_PATH, LOGIN_ERRORS, LoginError, safe_return_path
 from rapa.ui.backend import BackendError, BackendUnavailable, NotAuthenticated
+from rapa.ui.company import company_page
 from rapa.ui.context import UiContext, Viewer
 from rapa.ui.credentials import A1Context, a1_card, credentials_page, expiry_banner, load_a1
 from rapa.ui.forms import SchemaForm
@@ -42,6 +43,7 @@ from rapa.ui.labels import (
 from rapa.ui.layout import (
     effect_badge,
     error_box,
+    no_role_frame,
     notify_error,
     page_frame,
     run_action,
@@ -52,6 +54,7 @@ from rapa.ui.permissions import (
     can_create_anywhere,
     can_run,
     creator_areas,
+    has_any_role,
     publish_block_reason,
     validate_block_reason,
 )
@@ -95,6 +98,10 @@ async def _protected(ctx: UiContext, request: Request, active: str, body: _Body)
         return None
     if viewer is None:
         return ctx.login_redirect(request)
+    if not has_any_role(viewer.principal):
+        # O primeiro login cria a pessoa sem papel: ela só vê o pedido para ganhar um.
+        no_role_frame(viewer)
+        return None
     main = page_frame(viewer, active)
     with main:
         content = ui.column().classes("w-full gap-4")
@@ -197,6 +204,10 @@ def register_pages(ctx: UiContext) -> None:
     @ui.page("/lotes", title=f"Lotes · {name}", response_timeout=timeout)
     async def batches(request: Request) -> Response | None:
         return await _protected(ctx, request, "lotes", batches_page)
+
+    @ui.page("/empresa", title=f"Empresa · {name}", response_timeout=timeout)
+    async def company(request: Request, mes: str = "") -> Response | None:
+        return await _protected(ctx, request, "empresa", lambda v: company_page(v, mes))
 
     @ui.page("/lotes/{batch_id}", title=f"Lote · {name}", response_timeout=timeout)
     async def batch(request: Request, batch_id: str) -> Response | None:

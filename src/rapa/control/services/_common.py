@@ -4,11 +4,16 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import RowMapping
+from sqlalchemy import RowMapping, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from rapa.control.db.schema import companies
 from rapa.control.db.session import Database
 from rapa.core.contracts import (
+    CompanyFrozen,
+    CompanyStatus,
     InvalidInput,
+    NotFound,
     Principal,
     RobotSummary,
     RobotVersionInfo,
@@ -21,11 +26,16 @@ from rapa.core.contracts import (
 from rapa.core.robot import Manifest
 
 __all__ = [
+    "COMPANY_STATUS_LOCK_CLASS",
     "INTERACTIVE_PRIORITY",
+    "PLATFORM_ACTOR",
     "PRIORITY_BY_TRIGGER",
     "PgService",
     "clean_title",
+    "ensure_company_active",
+    "lock_company_status",
     "now_utc",
+    "platform_actor",
     "run_status",
     "summary",
     "version_info",
@@ -48,9 +58,24 @@ PRIORITY_BY_TRIGGER: dict[RunTrigger, int] = {
 }
 INTERACTIVE_PRIORITY = 0
 
+#: Classe da trava consultiva da situação da empresa (segundo argumento: a empresa).
+#: Toda escrita de uma empresa a toma compartilhada, primeiro na transação; congelar
+#: e apagar a empresa a tomam exclusiva, também primeiro. Assim quem congela espera as
+#: escritas em andamento terminarem, e as que chegam depois já veem a empresa congelada.
+COMPANY_STATUS_LOCK_CLASS = 7130
+
+#: Quem aparece na auditoria das operações da plataforma (seguido de quem pediu).
+PLATFORM_ACTOR = "plataforma"
+
 
 def now_utc() -> datetime:
     return datetime.now(UTC)
+
+
+def platform_actor(requested_by: str) -> str:
+    """O ator da auditoria de uma operação da plataforma: ``plataforma:<quem pediu>``."""
+    who = " ".join(requested_by.split()) or "desconhecido"
+    return f"{PLATFORM_ACTOR}:{who}"[:255]
 
 
 def clean_title(text: str) -> str:
@@ -59,6 +84,42 @@ def clean_title(text: str) -> str:
     if not cleaned:
         raise InvalidInput("título inválido", ["o título não pode ficar em branco"])
     return cleaned
+
+
+async def lock_company_status(session: AsyncSession, company_id: UUID) -> CompanyStatus | None:
+    """Trava a situação da empresa (compartilhada) até o fim da transação e a devolve.
+
+    ``None`` quando a empresa não existe (ou não é a da transação). Chame antes de
+    qualquer outra trava da transação: congelar e apagar uma empresa tomam esta mesma
+    trava, exclusiva, antes de tudo, e a ordem igual evita o impasse.
+    """
+    await session.execute(
+        select(
+            func.pg_advisory_xact_lock_shared(
+                COMPANY_STATUS_LOCK_CLASS, func.hashtext(str(company_id))
+            )
+        )
+    )
+    status = await session.scalar(select(companies.c.status).where(companies.c.id == company_id))
+    return None if status is None else CompanyStatus(status)
+
+
+async def ensure_company_active(session: AsyncSession, company_id: UUID) -> None:
+    """Recusa (:class:`CompanyFrozen`) qualquer coisa nova numa empresa congelada.
+
+    É a função única da regra "congelada: lê tudo, mas nada novo acontece", chamada no
+    começo de toda escrita: enfileirar execuções (``enqueue_run`` e ``enqueue_many``,
+    que cobrem REST, MCP, interface, agenda, webhook e lote), criar, validar e publicar
+    versões, criar e mudar agendas, webhooks e lotes, abrir sessão de gravação e pedir
+    conserto. Sem a empresa, ``NotFound`` (falha fechada). No banco, o gatilho
+    ``rapa_company_active_guard`` recusa a linha nova dessas tabelas mesmo de um caminho
+    que esqueça esta chamada (migração 0007).
+    """
+    status = await lock_company_status(session, company_id)
+    if status is None:
+        raise NotFound("empresa não encontrada")
+    if status is CompanyStatus.FROZEN:
+        raise CompanyFrozen()
 
 
 class PgService:

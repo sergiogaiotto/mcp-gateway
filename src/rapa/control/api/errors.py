@@ -18,6 +18,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from rapa.control.auth import AuthError
 from rapa.core.contracts import (
+    CompanyFrozen,
     Conflict,
     ContractError,
     Forbidden,
@@ -44,6 +45,8 @@ logger = logging.getLogger(__name__)
 _STATUS: tuple[tuple[type[ContractError], int], ...] = (
     (NotFound, 404),
     (Forbidden, 403),
+    # Antes de Conflict (de que é filha): a empresa congelada responde 423.
+    (CompanyFrozen, 423),
     (Conflict, 409),
     (InvalidInput, 422),
     (QuotaExceeded, 429),

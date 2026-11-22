@@ -21,7 +21,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from rapa.control.db import Database
 from rapa.control.db.schema import areas, platform_settings, recording_sessions, recordings, runs
 from rapa.control.services import audit
-from rapa.control.services._common import INTERACTIVE_PRIORITY, PgService
+from rapa.control.services._common import (
+    INTERACTIVE_PRIORITY,
+    PgService,
+    ensure_company_active,
+)
 from rapa.control.services.admission import Capacity
 from rapa.control.sessions.store import LIVE_STATUSES, SessionRecord, company_limit_error
 from rapa.core.contracts import Conflict, RecordingSessionStatus, RunState
@@ -129,6 +133,8 @@ class PgSessionStore(PgService):
     async def insert(self, record: SessionRecord, *, company_limit: int) -> None:
         company_id = record.company_id
         async with self.db.tenant_session(company_id) as session:
+            # Empresa congelada não abre sessão (antes de abrir o navegador).
+            await ensure_company_active(session, company_id)
             await session.execute(
                 text("SELECT pg_advisory_xact_lock(:key, hashtext(:company))"),
                 {"key": SESSION_LOCK_KEY, "company": str(company_id)},

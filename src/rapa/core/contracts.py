@@ -27,12 +27,15 @@ from rapa.core.robot import (
 __all__ = [
     "A1_APPROVALS",
     "AUTOMATION_ROLES",
+    "COMPANY_FROZEN_MESSAGE",
     "MAX_BATCHES_LISTED",
     "MAX_OCCURRENCES_LISTED",
     "MAX_RUNS_LISTED",
     "MAX_SESSIONS_LISTED",
     "A1AuthorizationInfo",
     "ApprovalInfo",
+    "AreaInfo",
+    "AreaUsage",
     "BatchColumn",
     "BatchFile",
     "BatchFormat",
@@ -43,6 +46,11 @@ __all__ = [
     "BatchService",
     "CertificateBlocked",
     "CheckProposal",
+    "CompanyAdminService",
+    "CompanyFrozen",
+    "CompanyInfo",
+    "CompanyStatus",
+    "CompanyUser",
     "Conflict",
     "ContractError",
     "CredentialInfo",
@@ -83,6 +91,7 @@ __all__ = [
     "RobotSummary",
     "RobotVersionInfo",
     "Role",
+    "RoleGrant",
     "RunMode",
     "RunService",
     "RunState",
@@ -100,6 +109,8 @@ __all__ = [
     "StepNameChoice",
     "StepNameProposal",
     "StepOverview",
+    "TriggerUsage",
+    "UsageReport",
     "VersionApprovals",
     "VersionStatus",
     "ViewerTicket",
@@ -373,6 +384,26 @@ class ServiceUnavailable(ContractError):
     """Um recurso da plataforma não está disponível agora (por exemplo, o navegador da gravação)."""
 
     code = "indisponivel"
+
+
+class CompanyFrozen(Conflict):
+    """A empresa está congelada: lê tudo, mas nada novo começa (HTTP 423).
+
+    É um :class:`Conflict`, então quem já trata conflitos (a interface, o MCP) mostra a
+    mensagem sem saber dela; a API responde 423 com o código ``empresa_congelada``.
+    """
+
+    code = "empresa_congelada"
+
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(message or COMPANY_FROZEN_MESSAGE)
+
+
+#: Mensagem de toda recusa por empresa congelada.
+COMPANY_FROZEN_MESSAGE = (
+    "a empresa está congelada: nada novo pode ser criado nem executado até a plataforma "
+    "descongelá-la"
+)
 
 
 class QuotaExceeded(ContractError):
@@ -1298,3 +1329,125 @@ class CredentialService(Protocol):
     async def approvals(
         self, principal: Principal, robot_id: UUID, version_no: int
     ) -> VersionApprovals: ...
+
+
+# ---------------------------------------------------------------------------
+# Operação por empresa: situação, usuários e papéis, áreas e consumo
+# ---------------------------------------------------------------------------
+
+
+class CompanyStatus(StrEnum):
+    """Situação de uma empresa na plataforma."""
+
+    ACTIVE = "active"
+    #: Congelada: lê tudo, mas nada novo começa (a saída da empresa começa por aqui).
+    FROZEN = "frozen"
+
+
+class CompanyInfo(_Model):
+    """A empresa de quem está chamando."""
+
+    company_id: UUID
+    name: str
+    status: CompanyStatus
+    #: Por que a plataforma congelou a empresa; só para quem administra ou audita.
+    status_reason: str | None = None
+    status_changed_at: datetime | None = None
+    created_at: datetime
+
+
+class AreaInfo(_Model):
+    area_id: UUID
+    name: str
+    created_at: datetime
+
+
+class RoleGrant(_Model):
+    """Um papel de um usuário: na empresa inteira (``area_id`` nulo) ou numa área."""
+
+    role: Role
+    area_id: UUID | None = None
+
+
+class CompanyUser(_Model):
+    """Um usuário da empresa com os papéis que quem pergunta pode ver."""
+
+    user_id: UUID
+    subject: str
+    display_name: str
+    active: bool
+    created_at: datetime
+    roles: list[RoleGrant] = Field(default_factory=list)
+
+
+class TriggerUsage(_Model):
+    """Consumo de uma área por uma origem (``trigger``) num mês."""
+
+    trigger: RunTrigger
+    runs: int
+    #: Execuções por situação (só as situações que aparecem).
+    runs_by_state: dict[RunState, int] = Field(default_factory=dict)
+    #: Minutos de navegador: do início ao fim de cada execução que começou.
+    browser_minutes: float = 0.0
+
+
+class AreaUsage(_Model):
+    area_id: UUID
+    area_name: str
+    runs: int = 0
+    browser_minutes: float = 0.0
+    by_trigger: list[TriggerUsage] = Field(default_factory=list)
+    #: Sessões de gravação abertas no mês e os minutos delas (do início ao fim).
+    sessions: int = 0
+    session_minutes: float = 0.0
+    batches: int = 0
+    batch_rows: int = 0
+
+
+class UsageReport(_Model):
+    """Consumo mensal da empresa, por área e por origem, no fuso ``America/Sao_Paulo``."""
+
+    company_id: UUID
+    #: O mês, ``AAAA-MM``.
+    month: str
+    timezone: str
+    period_start: datetime
+    period_end: datetime
+    areas: list[AreaUsage] = Field(default_factory=list)
+    runs: int = 0
+    browser_minutes: float = 0.0
+    sessions: int = 0
+    session_minutes: float = 0.0
+    batches: int = 0
+    batch_rows: int = 0
+
+
+class CompanyAdminService(Protocol):
+    """Administração da empresa por ela mesma: usuários e papéis, áreas e consumo.
+
+    Quem administra a empresa faz tudo; quem administra uma área só lista os usuários
+    e dá e tira os papéis da área dele (nunca ``company_admin`` nem
+    ``platform_admin``); o consumo é de quem administra a empresa e de quem audita.
+    ``platform_admin`` nunca é dado por aqui, e ninguém tira o último
+    ``company_admin`` ativo nem desativa a si mesmo.
+    """
+
+    async def get_company(self, principal: Principal) -> CompanyInfo: ...
+
+    async def list_users(self, principal: Principal) -> list[CompanyUser]: ...
+
+    async def set_roles(
+        self, principal: Principal, user_id: UUID, roles: list[RoleGrant]
+    ) -> CompanyUser: ...
+
+    async def deactivate_user(self, principal: Principal, user_id: UUID) -> CompanyUser: ...
+
+    async def reactivate_user(self, principal: Principal, user_id: UUID) -> CompanyUser: ...
+
+    async def list_areas(self, principal: Principal) -> list[AreaInfo]: ...
+
+    async def create_area(self, principal: Principal, name: str) -> AreaInfo: ...
+
+    async def rename_area(self, principal: Principal, area_id: UUID, name: str) -> AreaInfo: ...
+
+    async def usage(self, principal: Principal, month: str | None = None) -> UsageReport: ...

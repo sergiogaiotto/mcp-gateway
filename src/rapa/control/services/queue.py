@@ -18,6 +18,11 @@ Funções para o despachante, todas recebendo uma sessão sem empresa (papel
   certificado A1 de um robô ainda pode ser usado
   (:func:`rapa.control.services.a1.launch_block`).
 
+Empresa congelada (``companies.status = 'frozen'``): :func:`claim_next` não pega as
+execuções dela (nem conta a fila dela na admissão), e o recolhedor cancela, em vez de
+devolver à fila, a execução dela que perdeu o executor sem ter gravado nada (código
+``empresa_congelada``). As que estão rodando terminam normalmente.
+
 Escritas de uma tentativa antiga (``attempt`` diferente do atual, ou execução
 já devolvida à fila) são recusadas com :class:`StaleAttempt`.
 
@@ -79,6 +84,7 @@ from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rapa.control.db.schema import (
+    companies,
     company_quotas,
     platform_settings,
     recording_sessions,
@@ -93,6 +99,7 @@ from rapa.control.services._common import INTERACTIVE_PRIORITY, now_utc
 from rapa.control.services.a1 import launch_block
 from rapa.control.services.admission import Capacity, CompanyLoad, plan
 from rapa.core.contracts import (
+    CompanyStatus,
     Conflict,
     InvalidInput,
     NotFound,
@@ -105,6 +112,8 @@ from rapa.core.robot import Effect, Manifest
 from rapa.core.snapshot import MAX_SNAPSHOT_BYTES, SNAPSHOT_ERROR_CODES, PageSnapshot
 
 __all__ = [
+    "COMPANY_FROZEN_CODE",
+    "COMPANY_FROZEN_RUN_MESSAGE",
     "DEFAULT_LEASE",
     "DEFAULT_MAX_ATTEMPTS",
     "DEFAULT_MAX_DURATION",
@@ -119,6 +128,7 @@ __all__ = [
     "claim_next",
     "ensure_event_partitions",
     "finish",
+    "frozen_companies",
     "heartbeat",
     "ingest_events",
     "reap_expired",
@@ -155,6 +165,11 @@ _WROTE_BEFORE_STOPPING = (
 )
 #: Situações de uma sessão de gravação que ainda ocupa um navegador.
 _LIVE_SESSIONS = ("starting", "active")
+#: Código da execução cancelada porque a empresa foi congelada antes de ela começar.
+COMPANY_FROZEN_CODE = "empresa_congelada"
+COMPANY_FROZEN_RUN_MESSAGE = (
+    "A empresa foi congelada antes de a execução começar; ela foi cancelada sem rodar."
+)
 
 
 class StaleAttempt(Conflict):
@@ -215,6 +230,8 @@ class ReapReport:
     requeued: list[UUID] = field(default_factory=list)
     indeterminate: list[UUID] = field(default_factory=list)
     failed: list[UUID] = field(default_factory=list)
+    #: Não gravaram nada, mas a empresa está congelada: canceladas em vez de voltar à fila.
+    cancelled: list[UUID] = field(default_factory=list)
 
 
 def _utc(value: datetime) -> datetime:
@@ -248,10 +265,25 @@ async def _capacity(session: AsyncSession) -> Capacity | None:
     return Capacity(int(row[0]), Decimal(row[1]))
 
 
+async def frozen_companies(
+    session: AsyncSession, among: Collection[UUID] | None = None
+) -> set[UUID]:
+    """As empresas congeladas (entre ``among``, quando informado)."""
+    query = select(companies.c.id).where(companies.c.status == CompanyStatus.FROZEN.value)
+    if among is not None:
+        if not among:
+            return set()
+        query = query.where(companies.c.id.in_(list(among)))
+    return set((await session.scalars(query)).all())
+
+
 async def _loads(
-    session: AsyncSession,
+    session: AsyncSession, frozen: Collection[UUID] = ()
 ) -> tuple[dict[UUID, CompanyLoad], int, frozenset[UUID]]:
-    """Uso não interativo por empresa, interativos rodando e empresas com interativo na fila."""
+    """Uso não interativo por empresa, interativos rodando e empresas com interativo na fila.
+
+    A fila das empresas em ``frozen`` (congeladas) não conta: elas não recebem vaga.
+    """
     interactive = (runs.c.priority == INTERACTIVE_PRIORITY).label("interactive")
     queued = (runs.c.state == RunState.QUEUED.value).label("queued")
     rows = (
@@ -266,6 +298,8 @@ async def _loads(
     interactive_running = 0
     interactive_waiting: set[UUID] = set()
     for company_id, is_interactive, is_queued, count in rows:
+        if is_queued and company_id in frozen:
+            continue
         if is_interactive:
             if is_queued:
                 interactive_waiting.add(company_id)
@@ -326,7 +360,8 @@ async def claim_next(
     capacity = await _capacity(session)
     if capacity is None:
         return None
-    loads, interactive_running, interactive_waiting = await _loads(session)
+    frozen = await frozen_companies(session)
+    loads, interactive_running, interactive_waiting = await _loads(session, frozen)
     admission = plan(capacity, loads, interactive_running, interactive_waiting)
     conditions = []
     interactive = runs.c.priority == INTERACTIVE_PRIORITY
@@ -342,6 +377,10 @@ async def claim_next(
         )
     if not conditions:
         return None
+    where = [runs.c.state == RunState.QUEUED.value, or_(*conditions)]
+    if frozen:
+        # Empresa congelada: nada dela começa (a fila foi cancelada ao congelar).
+        where.append(runs.c.company_id.not_in(list(frozen)))
     # Na mesma prioridade, quem está dentro da garantia vem antes de quem pede emprestado.
     borrowing_last = (
         case(
@@ -359,7 +398,7 @@ async def claim_next(
     )
     candidates = (
         select(runs.c.id, runs.c.company_id, runs.c.version_id, runs.c.inputs, runs.c.mode)
-        .where(runs.c.state == RunState.QUEUED.value, or_(*conditions))
+        .where(*where)
         .order_by(runs.c.priority, borrowing_last, runs.c.queued_at, runs.c.id)
         .limit(1)
         .with_for_update(skip_locked=True)
@@ -885,6 +924,7 @@ async def reap_expired(
         .all()
     )
     report = ReapReport()
+    frozen = await frozen_companies(session, {row["company_id"] for row in expired})
     for row in expired:
         run_id: UUID = row["id"]
         if row["irreversible_started_at"] is not None:
@@ -926,6 +966,17 @@ async def reap_expired(
             }
             action = "execucao.falhou"
             report.failed.append(run_id)
+        elif row["company_id"] in frozen:
+            # Nada gravou, mas a empresa está congelada: não volta para a fila.
+            values = {
+                "state": RunState.CANCELLED.value,
+                "finished_at": now,
+                "lease_expires_at": None,
+                "error_code": COMPANY_FROZEN_CODE,
+                "error_message": COMPANY_FROZEN_RUN_MESSAGE,
+            }
+            action = "execucao.cancelada"
+            report.cancelled.append(run_id)
         else:
             values = {
                 "state": RunState.QUEUED.value,

@@ -39,6 +39,7 @@ from rapa.control.auth import (
     Authenticator,
     AuthError,
     BearerVerifier,
+    CachedOrganizationDirectory,
     DevTokenVerifier,
     JwtSettings,
     TokenVerifier,
@@ -57,7 +58,9 @@ from rapa.control.services import (
     Dispatcher,
     HubRepairAssistant,
     PgBatches,
+    PgCompanyAdmin,
     PgCredentials,
+    PgOrganizationDirectory,
     PgPlatform,
     PgPrincipalResolver,
     PgRepairs,
@@ -405,15 +408,18 @@ def _secret_source(settings: ServerSettings) -> SecretSource:
     return NoSecrets()
 
 
-def _verifier(settings: ServerSettings) -> BearerVerifier:
+def _verifier(settings: ServerSettings, db: Database) -> BearerVerifier:
     if settings.jwt_issuer and settings.jwt_audience and settings.jwks_url:
+        # A empresa da organização também vem do banco (companies.idp_organization), com
+        # cache curto: uma empresa nova entra sem reiniciar o serviço.
         return TokenVerifier(
             JwtSettings(
                 issuer=settings.jwt_issuer,
                 audience=settings.jwt_audience,
                 jwks_url=settings.jwks_url,
                 organization_aliases=settings.organization_aliases,
-            )
+            ),
+            organizations=CachedOrganizationDirectory(PgOrganizationDirectory(db)),
         )
     if settings.dev_tokens_file is None:  # pragma: no cover - barrado pela validação
         raise ValueError("sem verificação de tokens configurada")
@@ -429,6 +435,7 @@ def _mount_ui(
     publishing: PublishingServices | None = None,
     repairs: PgRepairs | None = None,
     credentials: PgCredentials | None = None,
+    company: PgCompanyAdmin | None = None,
 ) -> None:
     from rapa.ui.app import create_ui
     from rapa.ui.auth import DevLogin, DevProfile, OidcLogin, OidcSettings, UiAuth
@@ -473,6 +480,7 @@ def _mount_ui(
             batches=publishing.batches if publishing else None,
             repairs=repairs,
             credentials=credentials,
+            company=company,
         ),
         # A interface age direto nos serviços, então a sessão confere de novo no banco
         # (conta ativa e papéis), como a API faz a cada pedido.
@@ -843,7 +851,10 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
     )
     platform = PgPlatform(db)
     resolver = PgPrincipalResolver(db)
-    verifier = _verifier(settings) if settings.http else None
+    company = PgCompanyAdmin(db)
+    verifier = _verifier(settings, db) if settings.http else None
+    # O primeiro login cria o usuário (sem papéis) só com os tokens do Keycloak.
+    provisioner = resolver if isinstance(verifier, TokenVerifier) else None
     sessions, session_launcher = (
         build_sessions(settings, db, platform, dispatcher_db)
         if settings.http and settings.sessions
@@ -871,6 +882,8 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
             publishing=publishing,
             repairs=repairs,
             credentials=credentials,
+            company=company,
+            provisioner=provisioner,
         )
     else:
         app = FastAPI(title="RaPA (despachante)", docs_url=None, redoc_url=None, openapi_url=None)
@@ -904,11 +917,12 @@ def create_server_app(settings: ServerSettings) -> FastAPI:
             app,
             settings,
             platform,
-            Authenticator(verifier, resolver),  # type: ignore[arg-type]
+            Authenticator(verifier, resolver, provisioner=provisioner),  # type: ignore[arg-type]
             sessions,
             publishing,
             repairs,
             credentials,
+            company,
         )
     inner = app.router.lifespan_context
     started = False

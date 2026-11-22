@@ -1,6 +1,7 @@
 """Auxiliares dos testes da persistência: servidor, empresas, robôs e fila limpa."""
 
 import secrets
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -23,6 +24,18 @@ from rapa.fixtures.robots import baixar_notas, emitir_protocolo
 BASE = "http://portal-v1.rapa.test:8080"
 HOST = "portal-v1.rapa.test"
 PROTOCOLO_INPUTS = {"nome": "Maria", "cpf": "529.982.247-25", "uf": "SP"}
+
+#: As ações da auditoria do cadastro (``PgProvisioning``).
+PROVISIONING_ACTIONS = frozenset(
+    {"empresa.criada", "area.criada", "usuario.criado", "usuario.papeis_alterados"}
+)
+#: Linhas de auditoria que :func:`make_tenant` deixa: a empresa, 2 áreas, 6 pessoas e 8 papéis.
+TENANT_AUDIT_ROWS = 17
+
+
+def without_provisioning(actions: Sequence[str]) -> list[str]:
+    """As ações da auditoria sem as do cadastro da empresa (``PgProvisioning``)."""
+    return [action for action in actions if action not in PROVISIONING_ACTIONS]
 
 
 @dataclass(frozen=True)

@@ -14,7 +14,11 @@ plataforma em memória (:mod:`rapa.fixtures.memory`):
   a sugestão do modelo);
 - credenciais e as regras do certificado A1: :class:`PgCredentials` (registro,
   custodiante, autorizações por robô e aprovações) e :class:`CredentialAlerts` (os
-  avisos de vencimento, uma etapa do despachante).
+  avisos de vencimento, uma etapa do despachante);
+- operar por empresa: :class:`PgCompanyAdmin` (usuários, papéis, áreas e consumo, pela
+  própria empresa), :class:`PgOrganizationDirectory` (a empresa de uma organização do
+  provedor) e :mod:`~rapa.control.services.lifecycle` (entrada, congelar, exportar e
+  apagar, pela plataforma).
 """
 
 from typing import TYPE_CHECKING
@@ -22,6 +26,7 @@ from typing import TYPE_CHECKING
 from rapa.control.db.session import Database
 from rapa.control.services.audit import ChainReport, verify_chain
 from rapa.control.services.batches import PgBatches
+from rapa.control.services.company import PgCompanyAdmin
 from rapa.control.services.credentials import CredentialAlerts, PgCredentials
 from rapa.control.services.dispatcher import (
     Dispatcher,
@@ -30,7 +35,7 @@ from rapa.control.services.dispatcher import (
     WorkerNotStarted,
     failure_result,
 )
-from rapa.control.services.principals import PgPrincipalResolver
+from rapa.control.services.principals import PgOrganizationDirectory, PgPrincipalResolver
 from rapa.control.services.provisioning import PgProvisioning, set_platform_capacity
 from rapa.control.services.queue import (
     EventConflict,
@@ -46,6 +51,7 @@ from rapa.control.services.schedules import PgSchedules, Scheduler
 from rapa.control.services.webhooks import PgWebhooks, WebhookKeys
 from rapa.core.contracts import (
     BatchService,
+    CompanyAdminService,
     CredentialService,
     RepairService,
     RobotAdmin,
@@ -64,7 +70,9 @@ __all__ = [
     "HubRepairAssistant",
     "Launcher",
     "PgBatches",
+    "PgCompanyAdmin",
     "PgCredentials",
+    "PgOrganizationDirectory",
     "PgPlatform",
     "PgPrincipalResolver",
     "PgProvisioning",
@@ -114,3 +122,6 @@ if TYPE_CHECKING:
 
     def _credentials_conforms(db: Database) -> CredentialService:
         return PgCredentials(db)
+
+    def _company_conforms(db: Database) -> CompanyAdminService:
+        return PgCompanyAdmin(db)

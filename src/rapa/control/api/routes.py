@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, Header, Path, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from rapa.control.api.company import add_company_routes
 from rapa.control.api.credentials import add_credential_routes
 from rapa.control.api.errors import error_response
 from rapa.control.api.openapi_robots import build_robots_openapi
@@ -27,6 +28,7 @@ from rapa.control.sessions.service import RecordingSessions
 from rapa.control.validation import InputValidator, InvalidSchemaError
 from rapa.core.contracts import (
     MAX_RUNS_LISTED,
+    CompanyAdminService,
     CredentialService,
     InvalidInput,
     NotFound,
@@ -99,6 +101,8 @@ class ApiServices:
     repairs: RepairService | None = None
     #: Credenciais e as regras do certificado A1; sem elas, ``/v1/credenciais`` responde 503.
     credentials: CredentialService | None = None
+    #: A administração da empresa por ela mesma; sem ela, ``/v1/empresa`` responde 503.
+    company: CompanyAdminService | None = None
 
 
 def check_idempotency_key(key: str | None) -> str | None:
@@ -288,6 +292,9 @@ def create_api_router(services: ApiServices) -> APIRouter:
     # -- credenciais e o certificado A1 ----------------------------------------------
 
     add_credential_routes(router, services.credentials, current_principal)
+    # -- a empresa: usuários e papéis, áreas e consumo ------------------------------
+
+    add_company_routes(router, services.company, current_principal)
 
     # -- OpenAPI dos robôs --------------------------------------------------
 

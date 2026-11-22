@@ -62,7 +62,7 @@ from rapa.control.db.schema import (
 )
 from rapa.control.db.session import Database
 from rapa.control.services import audit
-from rapa.control.services._common import PgService
+from rapa.control.services._common import PgService, ensure_company_active
 from rapa.control.services.robots import insert_version
 from rapa.core.contracts import (
     Conflict,
@@ -538,6 +538,8 @@ class PgRepairs(PgService):
         self, principal: Principal, run_id: UUID, candidate_id: str
     ) -> RepairProposalInfo:
         async with self.db.tenant_session(principal.company_id) as session:
+            # Antes das travas das linhas: empresa congelada não pede conserto.
+            await ensure_company_active(session, principal.company_id)
             context = await self._context(session, principal, run_id, lock=True)
             run = context.run
             if not principal.has_role(Role.CREATOR, run["area_id"]):

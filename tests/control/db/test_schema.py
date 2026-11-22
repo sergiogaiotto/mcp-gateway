@@ -193,7 +193,8 @@ async def test_tables_without_company_are_known(superuser_engine: AsyncEngine) -
                 )
             ).all()
         )
-    assert tables == {"companies", "platform_settings", "alembic_version"}
+    # platform_events (revisão 0007): registros da plataforma, só o dono lê e escreve.
+    assert tables == {"companies", "platform_settings", "platform_events", "alembic_version"}
 
 
 async def test_partitions_are_only_reachable_through_parent(

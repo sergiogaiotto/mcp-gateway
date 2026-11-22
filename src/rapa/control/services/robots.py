@@ -32,6 +32,7 @@ from rapa.control.db.schema import areas, robot_versions, robots, version_approv
 from rapa.control.services import audit
 from rapa.control.services._common import (
     PgService,
+    ensure_company_active,
     now_utc,
     summary,
     version_info,
@@ -191,10 +192,11 @@ async def insert_version(
     O mesmo caminho para quem grava, para a revisão da gravação e para o conserto:
     só quem cria robôs na área cria versões, o portão de política roda e as violações
     ficam na versão (que então não pode ser validada), e a criação entra na auditoria.
-    Quem criou a versão nunca a publica.
+    Quem criou a versão nunca a publica. Empresa congelada não ganha versão nova.
     """
     if not principal.has_role(Role.CREATOR, area_id):
         raise Forbidden("só quem cria robôs nesta área pode criar versões")
+    await ensure_company_active(session, principal.company_id)
     violations = [v.message for v in policy.check(manifest)]
     fingerprint = manifest.fingerprint()
     company_id = principal.company_id
@@ -371,6 +373,7 @@ class PgRobotAdmin(PgService):
         self, principal: Principal, robot_id: UUID, version_no: int
     ) -> RobotVersionInfo:
         async with self.db.tenant_session(principal.company_id) as session:
+            await ensure_company_active(session, principal.company_id)
             robot = await self._robot(session, principal, robot_id, lock=True)
             if not (
                 principal.has_role(Role.CREATOR, robot["area_id"])
@@ -412,6 +415,7 @@ class PgRobotAdmin(PgService):
         """Registra a aprovação de quem chama; a última aprovação exigida publica."""
         company_id = principal.company_id
         async with self.db.tenant_session(company_id) as session:
+            await ensure_company_active(session, company_id)
             robot = await self._robot(session, principal, robot_id, lock=True)
             area_id: UUID = robot["area_id"]
             if not principal.has_role(Role.APPROVER, area_id):
