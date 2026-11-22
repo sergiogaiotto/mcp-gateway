@@ -451,14 +451,15 @@ executions.egress.extraInternalNetworks). Fixas no chart: nenhum valor as tira.
 {{- end -}}
 
 {{/*
-As equivalentes em IPv6: loopback, não especificado e compatível com IPv4 (::/96), IPv4
-mapeado, as redes internas de IPv4 dentro do prefixo NAT64 64:ff9b::/96 (o resto dele é a
+As equivalentes em IPv6: loopback, não especificado e compatível com IPv4 (::/96), as redes
+internas de IPv4 dentro do prefixo NAT64 64:ff9b::/96 (o resto dele é a
 internet de IPv4 pelo NAT64), o NAT64 de uso local, o 6to4, as locais únicas (fc00::/7, onde
-fica o metadata da AWS em IPv6), as link-local e o multicast.
+fica o metadata da AWS em IPv6), as link-local e o multicast. O IPv4 mapeado (::ffff:0:0/96)
+não entra: ele nunca sai como IPv6 (o kernel usa o IPv4, que as regras de IPv4 já cobrem), e
+a API do Kubernetes o lê como IPv4 e recusa a política ("must be a strict subset of cidr").
 */}}
 {{- define "rapa.internalIPv6" -}}
 - ::/96
-- ::ffff:0:0/96
 - 64:ff9b::/104
 - 64:ff9b::a00:0/104
 - 64:ff9b::6440:0/106

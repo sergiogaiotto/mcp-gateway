@@ -476,9 +476,13 @@ def test_robot_pods_reach_the_internet_minus_internal_networks(pods: str) -> Non
     # Cada rede interna de IPv4 também está fechada dentro do prefixo NAT64.
     for net in internet["0.0.0.0/0"]:
         assert _covered(_nat64(net), v6), net
-    for net in ("::1", "::ffff:10.0.0.1", "fd00:ec2::254", "fe80::1", "2002:a00:1::1"):
+    for net in ("::1", "fd00:ec2::254", "fe80::1", "2002:a00:1::1"):
         address = ipaddress.ip_address(net)
         assert any(address in block for block in v6), net
+    # O IPv4 mapeado (::ffff:10.0.0.1) nunca sai como IPv6: vale a regra de IPv4.
+    v4 = [ipaddress.ip_network(net) for net in internet["0.0.0.0/0"]]
+    mapped = ipaddress.ip_address("::ffff:10.0.0.1").ipv4_mapped  # type: ignore[union-attr]
+    assert any(mapped in block for block in v4)
     # E as do ambiente (o bloco IPv6 global da VPC).
     assert "2001:db8::/32" in internet["::/0"]
     # Toda exceção fica dentro da rede da regra (senão a NetworkPolicy é inválida).
@@ -487,6 +491,10 @@ def test_robot_pods_reach_the_internet_minus_internal_networks(pods: str) -> Non
         for item in excepts:
             child = ipaddress.ip_network(item)
             assert child.version == parent.version and child.subnet_of(parent), item  # type: ignore[arg-type]
+            # A API do Kubernetes (net.IPNet do Go) lê um IPv4 mapeado como IPv4 e recusa a
+            # política: "must be a strict subset of cidr".
+            if isinstance(child, ipaddress.IPv6Network):
+                assert child.network_address.ipv4_mapped is None, item
     # Fora a internet, só as redes internas permitidas e o proxy (na porta dele).
     others = [
         (peer["ipBlock"]["cidr"], rule.get("ports"))
