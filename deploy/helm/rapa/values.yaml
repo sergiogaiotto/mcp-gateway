@@ -27,6 +27,10 @@ images:
     repository: registro.exemplo.test/rapa/rapa-executor
     tag: ""
     digest: ""
+    # Os digests do executor da versão que está rodando, na atualização: a política de
+    # admissão também os aceita (o despachante e a web antigos lançam pods com eles até
+    # saírem). Tire-os quando a troca terminar.
+    previousDigests: []
   # Secrets de registro (kubernetes.io/dockerconfigjson) dos pods do chart; o primeiro
   # também vai para os pods de execução e de sessão (RAPA_K8S_PULL_SECRET), que precisam
   # dele no namespace das execuções.
@@ -232,8 +236,11 @@ executions:
     session: rapa-sessao
   egress:
     # RAPA_PROXY_SAIDA: proxy HTTP CONNECT corporativo (ex. http://proxy.interno:3128), e as
-    # redes e a porta dele para a NetworkPolicy. Um proxy com usuário e senha vem inteiro
-    # (a URL com eles) de um Secret: existingSecret e a chave key; a URL nunca leva senha.
+    # redes e a porta dele para a NetworkPolicy (a mesma porta da URL). Um proxy com usuário
+    # e senha vem inteiro de um Secret (existingSecret e a chave key), com a URL
+    # http://usuario:senha@host:porta (os caracteres reservados com %): a guarda manda os dois
+    # no Proxy-Authorization: Basic de cada CONNECT, e eles nunca vão numa linha de comando
+    # (o executor os recebe pelo canal, a sessão pelo Secret dela). url nunca leva senha.
     proxy:
       url: ""
       existingSecret: ""

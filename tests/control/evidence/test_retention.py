@@ -219,6 +219,9 @@ class _FlakyStore:
     async def staging_companies(self) -> list[UUID]:
         return await self.inner.staging_companies()
 
+    async def staged_attempts(self) -> list[tuple[UUID, UUID, int]]:
+        return await self.inner.staged_attempts()
+
     async def discard_staged_company(self, company_id: UUID) -> None:  # pragma: no cover
         await self.inner.discard_staged_company(company_id)
 
@@ -254,6 +257,9 @@ class _CountingStore:
 
     async def staging_companies(self) -> list[UUID]:
         return await self.inner.staging_companies()
+
+    async def staged_attempts(self) -> list[tuple[UUID, UUID, int]]:
+        return await self.inner.staged_attempts()
 
     async def discard_staged_company(self, company_id: UUID) -> None:  # pragma: no cover
         await self.inner.discard_staged_company(company_id)

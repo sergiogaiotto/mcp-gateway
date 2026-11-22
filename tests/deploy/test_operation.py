@@ -86,6 +86,32 @@ def test_argocd_waits_for_the_database_to_be_ready() -> None:
     assert "deploy/argocd/raiz.yaml" in operation and "argocd-cm-saude.yaml" in operation
 
 
+def _section(text: str, title: str) -> str:
+    start = text.index(title)
+    end = text.find("\n### ", start + len(title))
+    return text[start : end if end != -1 else len(text)]
+
+
+def test_database_restore_can_be_followed_on_argo_cd() -> None:
+    """A restauração de verdade (1.5) na instalação pelo Argo CD: a raiz (automated com
+    selfHeal) é dona das Applications filhas e desfaz em segundos o sync desligado nelas, e
+    a filha rapa desfaz o scale; e não há release do Helm (o Argo CD renderiza o chart), então
+    o banco e a aplicação se atualizam pelo sync, não pelo helm upgrade."""
+    raiz = yaml.safe_load((REPO / "deploy" / "argocd" / "raiz.yaml").read_text("utf-8"))
+    assert raiz["spec"]["syncPolicy"]["automated"]["selfHeal"] is True
+    text = (REPO / "docs" / "OPERACAO.md").read_text(encoding="utf-8")
+    restore = _section(text, "### 1.5 Backup e restauração do banco")
+    stop = restore.index("argocd app set rapa-raiz --sync-policy none")
+    assert stop < restore.index("argocd app set rapa --sync-policy none")
+    assert stop < restore.index("argocd app set rapa-banco --sync-policy none")
+    assert stop < restore.index("--replicas=0")
+    assert "argocd app sync rapa-banco" in restore and "argocd app sync rapa\n" in restore
+    # A raiz volta por último (ela devolve às filhas o syncPolicy do repositório).
+    assert restore.rindex("argocd app set rapa-raiz --sync-policy automated") > restore.index(
+        "argocd app sync rapa\n"
+    )
+
+
 def test_gitops_manifests_match_the_schemas() -> None:
     for name in ("raiz.yaml", "argocd-cm-saude.yaml"):
         text = (REPO / "deploy" / "argocd" / name).read_text(encoding="utf-8")
@@ -129,11 +155,6 @@ def test_tokens_carry_the_api_audience_and_one_organization() -> None:
     }
     assert mappers["oidc-audience-mapper"]["included.client.audience"] == "rapa-api"
     assert mappers["oidc-audience-mapper"]["access.token.claim"] == "true"
-    organization = mappers["oidc-organization-membership-mapper"]
-    assert organization["claim.name"] == "organization"
-    # Com o id: {"apelido": {"id": "<uuid>"}}, a forma que o RaPA liga à empresa pelo banco.
-    assert organization["addOrganizationId"] == "true"
-    assert organization["access.token.claim"] == "true"
     api = _client("rapa-api")
     assert not any(
         api[k]
@@ -146,10 +167,43 @@ def test_tokens_carry_the_api_audience_and_one_organization() -> None:
     )
 
 
+def test_tokens_carry_the_organization_from_the_organization_scope() -> None:
+    """O mapper de organização do Keycloak 26 (OrganizationMembershipMapper) só põe a claim
+    quando o escopo ``organization`` está no pedido (ou o login escolheu uma organização):
+    o cliente da interface leva o escopo entre os padrão, sem um segundo mapper no próprio
+    cliente (dois mappers da mesma claim correm: o Keycloak os aplica numa ordem qualquer)."""
+    client = _client("rapa-interface")
+    assert "organization" in client["defaultClientScopes"]
+    assert "organization" not in client["optionalClientScopes"]
+    assert not any(
+        m["protocolMapper"] == "oidc-organization-membership-mapper"
+        or m.get("config", {}).get("claim.name") == "organization"
+        for m in client["protocolMappers"]
+    )
+    # O realm não declara clientScopes: o Keycloak cria os padrão, o organization entre eles.
+    assert "clientScopes" not in realm()
+    # Com o id na claim ({"apelido": {"id": "<uuid>"}}), a forma que o RaPA liga pelo banco.
+    readme = (REPO / "deploy" / "keycloak" / "README.md").read_text(encoding="utf-8")
+    assert "Add organization id" in readme
+
+
 def test_keycloak_steps_point_to_the_company_cli() -> None:
     text = (REPO / "deploy" / "keycloak" / "README.md").read_text(encoding="utf-8")
     assert "python -m rapa.control.admin empresa criar" in text
     assert "--organizacao ID_DA_ORGANIZACAO" in text
+
+
+def test_install_requires_a_cni_that_enforces_network_policies() -> None:
+    """Todo o isolamento dos pods de execução e de sessão (o metadata, a API do Kubernetes, o
+    banco, os outros pods) vem das NetworkPolicies, e um CNI que não as aplica as ignora
+    calado: o Amazon VPC CNI do EKS só as aplica com enableNetworkPolicy. A ordem de
+    instalação pede isso antes do chart, e o teste de saída diz o que fazer quando abre."""
+    text = (REPO / "docs" / "OPERACAO.md").read_text(encoding="utf-8")
+    install = text[text.index("### 1.2 Ordem de instalação") : text.index("### 1.3 Atualização")]
+    nodes = install[: install.index("2. **Componentes externos**")]
+    assert "enableNetworkPolicy" in nodes and "NetworkPolicy" in nodes
+    check = text[text.index("### 1.9 Conferir a guarda de saída") : text.index("### 1.10")]
+    assert "ERRO: abriu" in check and "enableNetworkPolicy" in check
 
 
 def test_operation_manifests_match_the_schemas() -> None:

@@ -2,10 +2,12 @@
 volta, a retenção destrói a chave depois dos objetos, ``run_keys`` só aceita inclusões, e
 a saída da empresa exporta decifrado e apaga os objetos, os segredos e a chave transit."""
 
+import asyncio
 import io
 import json
 import tarfile
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -34,11 +36,24 @@ from rapa.control.services.lifecycle import (
     unfreeze_company,
 )
 from rapa.control.vault import OpenBaoClient, OpenBaoKeyDestroyer
-from rapa.core.contracts import InvalidInput, NotFound, ServiceUnavailable
+from rapa.core.contracts import (
+    InvalidInput,
+    NotFound,
+    RunnerJob,
+    RunTrigger,
+    ServiceUnavailable,
+)
 from rapa.core.ids import new_id
 from rapa.core.robot import CredentialKind, CredentialRef
 from tests.control.company.support import audit_actions, company_counts, freeze
-from tests.control.db.support import Tenant, make_tenant, protocolo, publish, reset_queue
+from tests.control.db.support import (
+    PROTOCOLO_INPUTS,
+    Tenant,
+    make_tenant,
+    protocolo,
+    publish,
+    reset_queue,
+)
 from tests.control.evidence.support import (
     FAILURE_FILES,
     PDF,
@@ -50,7 +65,7 @@ from tests.control.evidence.support import (
 from tests.control.vault.fakebao import API_ROLE, OPERATION_ROLE, ROLE, ROLES, FakeBao
 from tests.control.vault.support import bao_client
 
-from .s3support import BUCKET, Overridden, bucket_objects, fake_s3, s3_store
+from .s3support import BUCKET, Overridden, bucket_objects, fake_s3, s3_store, stage
 
 pytestmark = pytest.mark.database
 
@@ -316,15 +331,86 @@ async def test_retention_sweeps_the_staging_of_a_company_that_is_gone(
     """A saída da empresa rodou noutro pod: a retenção do despachante leva a passagem."""
     tenant = await world.tenant(app_db, "Passagem viva")
     root = world.store.staging_root
-    gone, run_id = new_id(), new_id()
-    for company in (gone, tenant.company_id):
-        folder = attempt_dir(root, company, run_id, 1)
-        folder.mkdir(parents=True)
-        (folder / "tela-001.png").write_bytes(PNG)
+    job = await _claim(world, tenant, dispatcher_db)
+    gone = new_id()
+    stage(root, gone, job.run_id, 1, "tela-001.png", PNG)
+    live = stage(root, tenant.company_id, job.run_id, job.attempt, "tela-001.png", PNG)
     report = await Retention(dispatcher_db, world.store, RetentionPolicy()).tick()
     assert report.staged_companies == 1
     assert not (root / str(gone)).exists()
-    assert (attempt_dir(root, tenant.company_id, run_id, 1) / "tela-001.png").exists()
+    assert live.exists()
+
+
+async def _claim(world: S3World, tenant: Tenant, dispatcher_db: Database) -> RunnerJob:
+    """Uma execução da empresa pega da fila (rodando, sem despachante que a acompanhe)."""
+    run = await world.evidence.platform.start(
+        tenant.operator, "emitir_protocolo", PROTOCOLO_INPUTS, RunTrigger.REST
+    )
+    job = await PgRunQueue(dispatcher_db).claim_next()
+    assert job is not None and job.run_id == run.run_id
+    return job
+
+
+async def test_a_stale_attempt_releases_its_staging_at_once(
+    world: S3World, app_db: Database, dispatcher_db: Database
+) -> None:
+    """A tentativa que fica antiga (o recolhedor de outra réplica a devolveu à fila) não
+    registra nada: o texto claro que ela deixou na passagem sai na hora, não fica para a
+    retenção (que pode rodar noutra réplica, longe deste disco)."""
+    tenant = await world.tenant(app_db, "Passagem antiga")
+    run = await world.evidence.platform.start(
+        tenant.operator, "emitir_protocolo", PROTOCOLO_INPUTS, RunTrigger.REST
+    )
+    root = world.store.staging_root
+    started, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def launch(job: RunnerJob) -> Mapping[str, Any]:
+        stage(root, job.company_id, job.run_id, job.attempt, "nota-001.pdf", PDF)
+        started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        raise AssertionError("a tentativa devia ter ficado antiga")  # pragma: no cover
+
+    dispatcher = Dispatcher(
+        PgRunQueue(dispatcher_db), launch, heartbeat_interval=0.02, artifacts=world.store
+    )
+    assert await dispatcher.run_once() == 1
+    await asyncio.wait_for(started.wait(), 5)
+    reaper = PgRunQueue(dispatcher_db)
+    report = await reaper.reap_expired(now=reaper.clock() + timedelta(minutes=5))
+    assert report.requeued == [run.run_id]
+    await asyncio.wait_for(cancelled.wait(), 5)
+    await dispatcher.drain()
+    assert not attempt_dir(root, tenant.company_id, run.run_id, 1).exists()
+
+
+async def test_each_replica_sweeps_the_staging_of_attempts_that_are_not_live(
+    world: S3World, app_db: Database, dispatcher_db: Database
+) -> None:
+    """Cada réplica do despachante tem a própria passagem (o emptyDir do pod), e a retenção
+    de uma execução pode rodar noutra réplica: a volta da retenção de cada uma apaga, no
+    próprio disco, a passagem de toda tentativa que não é mais a atual de uma execução
+    rodando (a de um despachante que caiu antes de registrar), e deixa a da viva."""
+    tenant = await world.tenant(app_db, "Passagem da outra réplica")
+    finished = await world.run(tenant)
+    job = await _claim(world, tenant, dispatcher_db)
+    replica = s3_store(world.s3, world.store.staging_root.parent / "outra-replica")
+    root = replica.staging_root
+    left = stage(root, tenant.company_id, finished, 1, "nota-001.pdf", PDF)
+    old = stage(root, tenant.company_id, job.run_id, job.attempt + 1, "nota-001.pdf", PDF)
+    live = stage(root, tenant.company_id, job.run_id, job.attempt, "tela-001.png", PNG)
+    # A execução viva debaixo de outra empresa (que existe): não é a tentativa viva.
+    stranger = await world.tenant(app_db, "Passagem de outra empresa")
+    other = stage(root, stranger.company_id, job.run_id, job.attempt, "tela-001.png", PNG)
+    report = await Retention(dispatcher_db, replica, RetentionPolicy()).tick()
+    assert not left.exists() and not left.parent.parent.exists()
+    assert not old.exists()
+    assert not other.exists()
+    assert live.exists()
+    assert report.staged_attempts == 3 and report.staged_companies == 0
 
 
 async def test_the_api_answers_503_when_the_key_vault_is_down(

@@ -14,6 +14,7 @@ from uuid import UUID
 
 import httpx2
 import pytest
+import yaml
 
 from rapa.control.channel import Channel
 from rapa.control.kube import PodSettings, channel_address, parse_node_selector, parse_tolerations
@@ -942,6 +943,31 @@ async def test_the_sweep_removes_objects_without_a_readable_attempt(tmp_path: Pa
     # tentativa viva e não pode ficar para sempre.
     assert await launcher.sweep() == 2
     assert sorted(name for _, _, name in fake.objects) == ["viva"]
+
+
+async def test_the_sweep_leaves_the_egress_test_pod_long_enough_to_run(tmp_path: Path) -> None:
+    """O pod de ``deploy/rede/teste-de-saida.yaml`` (OPERACAO 1.9) tem o rótulo de execução
+    e nenhuma tentativa: a varredura do despachante (a cada minuto, em cada réplica) não
+    pode apagá-lo no meio da conferência; só um que ficou para trás sai."""
+    manifest = yaml.safe_load(
+        (Path(__file__).parents[3] / "deploy" / "rede" / "teste-de-saida.yaml").read_text()
+    )
+    fake, channel = FakeKube(), Channel()
+    now = datetime.now(UTC)
+    for name, age in (("teste-de-saida", timedelta(seconds=20)), ("esquecido", timedelta(hours=1))):
+        pod = json.loads(json.dumps(manifest))
+        pod["metadata"]["name"] = name
+        pod["metadata"]["creationTimestamp"] = (now - age).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fake.add("pods", pod)
+    launcher = KubernetesLauncher(
+        RecordingIngestor(),
+        _settings(tmp_path),
+        api=fake.api(tmp_path),
+        channel=channel,
+        attempts=Registry(set()),
+    )
+    assert await launcher.sweep() == 1
+    assert sorted(name for _, _, name in fake.objects) == ["teste-de-saida"]
 
 
 def test_the_pod_ip_prefers_ipv4(monkeypatch: pytest.MonkeyPatch) -> None:

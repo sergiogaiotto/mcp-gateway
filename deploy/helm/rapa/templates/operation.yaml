@@ -57,6 +57,10 @@ template:
             value: /trabalho/arquivos
           - name: RAPA_PASTA_ARTEFATOS
             value: /trabalho/artefatos
+          # A exportação monta os artefatos decifrados e as tabelas numa pasta temporária
+          # (tempfile) antes do tar.gz: no disco da exportação, nunca no /tmp de 1 GiB.
+          - name: TMPDIR
+            value: /trabalho
         resources:
           {{- toYaml $o.resources | nindent 10 }}
         securityContext:

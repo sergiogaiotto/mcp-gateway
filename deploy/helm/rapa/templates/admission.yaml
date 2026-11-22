@@ -7,7 +7,12 @@
 {{- range $accounts }}
 {{- $users = append $users (printf "'system:serviceaccount:%s:%s'" $.Release.Namespace (include "rapa.component" (dict "root" $ "component" .))) }}
 {{- end }}
+{{- $dispatcher := printf "system:serviceaccount:%s:%s" .Release.Namespace (include "rapa.component" (dict "root" . "component" "despachante")) -}}
 {{- $image := include "rapa.executorImage" . -}}
+{{- $images := list (printf "'%s'" $image) -}}
+{{- range $v.images.executor.previousDigests }}
+{{- $images = append $images (printf "'%s@%s'" $v.images.executor.repository .) }}
+{{- end }}
 {{- $run := $e.podLabels.run -}}
 {{- $session := $e.podLabels.session -}}
 # O que o token da web e o do despachante podem criar no namespace das execuções: só os
@@ -39,9 +44,18 @@ spec:
   variables:
     - name: app
       expression: "has(object.metadata.labels) && 'app.kubernetes.io/name' in object.metadata.labels ? object.metadata.labels['app.kubernetes.io/name'] : ''"
+    # Cada conta, o seu rótulo: o despachante lança as execuções (o rótulo que abre o canal)
+    # e a web, as sessões. A web nunca cria um pod que alcance o canal.
+    - name: expected
+      expression: "request.userInfo.username == '{{ $dispatcher }}' ? '{{ $run }}' : '{{ $session }}'"
+    # A pasta do Secret do dono (rapa.control.launcher e rapa.control.sessions.launcher).
+    - name: secretDir
+      expression: "variables.app == '{{ $session }}' ? '/var/run/rapa/sessao' : '/var/run/rapa/canal'"
+    - name: secretVolumes
+      expression: "has(object.spec.volumes) ? object.spec.volumes.filter(v, has(v.secret)).map(v, v.name) : []"
   validations:
-    - expression: "variables.app in ['{{ $run }}', '{{ $session }}']"
-      message: "o pod precisa do rótulo app.kubernetes.io/name={{ $run }} (execução) ou {{ $session }} (sessão)"
+    - expression: "variables.app == variables.expected"
+      message: "o despachante só cria pods de execução (app.kubernetes.io/name={{ $run }}) e a web, só de sessão ({{ $session }})"
     - expression: "has(object.spec.serviceAccountName) && object.spec.serviceAccountName == '{{ include "rapa.executorServiceAccount" . }}'"
       message: "o pod precisa da conta de serviço {{ include "rapa.executorServiceAccount" . }} (sem permissão nenhuma)"
     - expression: "has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false"
@@ -50,21 +64,41 @@ spec:
     - expression: "has(object.spec.runtimeClassName) && object.spec.runtimeClassName == '{{ $e.runtimeClass }}'"
       message: "o pod precisa da RuntimeClass {{ $e.runtimeClass }} (o gVisor)"
     {{- end }}
-    - expression: "object.spec.containers.all(c, c.image == '{{ $image }}')"
-      message: "o pod só roda a imagem do executor ({{ $image }})"
+    # A do executor e, na atualização, a da versão anterior (images.executor.previousDigests):
+    # os pods que o despachante e a web antigos lançam até saírem.
+    - expression: "object.spec.containers.all(c, c.image in [{{ join ", " $images }}])"
+      message: "o pod só roda a imagem do executor ({{ $image }}{{ if $v.images.executor.previousDigests }} ou a anterior, de images.executor.previousDigests{{ end }})"
     - expression: "(!has(object.spec.initContainers) || size(object.spec.initContainers) == 0) && (!has(object.spec.ephemeralContainers) || size(object.spec.ephemeralContainers) == 0)"
       message: "o pod não tem contêineres de início nem efêmeros"
     - expression: >-
-        object.spec.containers.all(c, !has(c.command) && has(c.args) && size(c.args) >= 3 &&
-        c.args[0] == 'python' && c.args[1] == '-m' &&
-        c.args[2] == (variables.app == '{{ $session }}' ? 'rapa.session.host' : 'rapa.runner.pod'))
-      message: "o pod só roda o agente da execução (python -m rapa.runner.pod) ou o host da sessão (python -m rapa.session.host), conforme o rótulo"
+        object.spec.containers.all(c, !has(c.command) && has(c.args) && !has(c.workingDir) &&
+        c.args == (variables.app == '{{ $session }}' ?
+        ['python', '-m', 'rapa.session.host', '--config', '/var/run/rapa/sessao/config.json'] :
+        ['python', '-m', 'rapa.runner.pod']))
+      message: "o pod só roda o agente da execução (python -m rapa.runner.pod) ou o host da sessão (python -m rapa.session.host --config /var/run/rapa/sessao/config.json), conforme o rótulo"
+    # Nada roda no contêiner além do comando: nem ganchos nem sondas exec (a de prontidão da
+    # sessão é tcpSocket, sem host).
+    - expression: >-
+        object.spec.containers.all(c, !has(c.lifecycle) && !has(c.livenessProbe) && !has(c.startupProbe) &&
+        (!has(c.readinessProbe) || (has(c.readinessProbe.tcpSocket) && !has(c.readinessProbe.tcpSocket.host) &&
+        !has(c.readinessProbe.exec) && !has(c.readinessProbe.httpGet) && !has(c.readinessProbe.grpc))))
+      message: "o pod não tem ganchos (lifecycle) nem sondas além da de prontidão tcpSocket"
+    # Só as variáveis que o lançador põe (PATH, NODE_OPTIONS, RAPA_CHROMIUM_PATH,
+    # RAPA_ARGS_NAVEGADOR e as do carregador trocariam o que roda).
     - expression: >-
         object.spec.containers.all(c, !has(c.envFrom) && (!has(c.env) ||
-        c.env.all(v, v.name == 'PYTHONUNBUFFERED' || (!v.name.startsWith('PYTHON') && !v.name.startsWith('LD_')))))
-      message: "o pod não muda o Python nem o carregador (PYTHON* e LD_*) pelo ambiente"
+        c.env.all(v, v.name in ['PYTHONUNBUFFERED', 'TMPDIR'] && !has(v.valueFrom))))
+      message: "o pod só tem no ambiente PYTHONUNBUFFERED e TMPDIR"
     - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.secret) || has(v.emptyDir))"
       message: "o pod só monta volumes secret e emptyDir"
+    # O Secret do dono só na pasta dele e os emptyDir só em /tmp e /trabalho, sem subPath:
+    # nada cobre a imagem (o PATH, o pacote do RaPA, o Chromium).
+    - expression: >-
+        object.spec.containers.all(c, !has(c.volumeMounts) || c.volumeMounts.all(m,
+        !has(m.subPath) && !has(m.subPathExpr) &&
+        m.mountPath in [variables.secretDir, '/tmp', '/trabalho'] &&
+        (m.name in variables.secretVolumes) == (m.mountPath == variables.secretDir)))
+      message: "o pod só monta o Secret na pasta dele (/var/run/rapa/canal ou /var/run/rapa/sessao) e os emptyDir em /tmp e /trabalho, sem subPath"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

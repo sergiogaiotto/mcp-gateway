@@ -310,6 +310,78 @@ async def test_when_the_channel_drops_mid_run_everything_is_retried(tmp_path: Pa
     assert (attempt.artifacts_dir / "tela-001-emitir-depois.png").read_bytes() == b"PNG" * 100
 
 
+class _DropsFirstArtifact(httpx2.AsyncBaseTransport):
+    """TCP de verdade; a conexão do primeiro envio de artefato cai no meio do corpo."""
+
+    def __init__(self) -> None:
+        self.inner = httpx2.AsyncHTTPTransport()
+        self.dropped = False
+
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        if "/artefatos/" in request.url.path and not self.dropped:
+            self.dropped = True
+            stream = request.stream
+            assert isinstance(stream, httpx2.AsyncByteStream)
+            original: httpx2.AsyncByteStream = stream
+
+            class Dropping(httpx2.AsyncByteStream):
+                async def __aiter__(self) -> AsyncIterator[bytes]:
+                    async for chunk in original:
+                        yield chunk
+                        await asyncio.sleep(0.05)
+                        raise httpx2.WriteError("a conexão caiu")
+
+            request.stream = Dropping()
+        return await self.inner.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self.inner.aclose()
+
+
+async def test_an_artifact_retried_while_the_first_upload_is_still_open_is_not_lost(
+    tmp_path: Path,
+) -> None:
+    """A conexão do primeiro envio cai enquanto o disco do canal está lento: a nova
+    tentativa chega com o primeiro envio ainda aberto (que depois falha e apaga o arquivo).
+    O agente não pode dar o artefato por entregue nessa hora."""
+    from rapa.runner.pod import _deliver
+
+    channel = Channel()
+    job = _job()
+    attempt, ticket = channel.open(
+        job, work_dir=tmp_path / "canal", artifacts_dir=tmp_path / "a", secrets={}, options={}
+    )
+    attempt.ack_dir.mkdir(parents=True)
+    attempt.artifacts_dir.mkdir()
+    real_disk, slow = channel._disk, [True]
+
+    async def slow_disk(function: Any, *args: Any) -> Any:
+        if slow[0] and getattr(function, "__name__", "") == "write":
+            slow[0] = False  # a fila do disco segura a primeira gravação
+            await asyncio.sleep(1.0)
+        return await real_disk(function, *args)
+
+    channel._disk = slow_disk  # type: ignore[method-assign]
+    work = tmp_path / "pod"
+    (work / "artefatos").mkdir(parents=True)
+    downloaded = work / "artefatos" / "baixado-001.pdf"
+    downloaded.write_bytes(b"P" * 200_000)
+    artifact = {"name": downloaded.name, "path": str(downloaded)}
+    (work / "result.json").write_text(json.dumps({"state": "succeeded", "artifacts": [artifact]}))
+    async with ChannelServer(channel, host="127.0.0.1", port=0).running() as port:
+        address = f"http://127.0.0.1:{port}/canal/{job.run_id}/1"
+        transport = _DropsFirstArtifact()
+        async with ChannelClient(address, ticket, transport=transport) as client:
+            loop = asyncio.get_running_loop()
+            assert await _deliver(client, work, loop.time() + 15) == 0
+        assert transport.dropped and not slow[0]
+        channel.close(job.run_id, job.attempt)
+        assert await channel.drain(attempt)
+    # O resultado cita o artefato, e ele está no canal, inteiro.
+    assert attempt.result_received.is_set()
+    assert (attempt.artifacts_dir / downloaded.name).read_bytes() == b"P" * 200_000
+
+
 async def test_with_the_channel_down_nothing_is_confirmed_until_the_deadline(
     tmp_path: Path,
 ) -> None:
@@ -465,3 +537,57 @@ async def test_a_sigterm_after_the_attempt_does_not_kill_the_agent_on_its_way_ou
         os.kill(os.getpid(), signal.SIGTERM)  # ignorado
     finally:
         signal.signal(signal.SIGTERM, previous)
+
+
+async def test_a_slow_request_answered_with_408_is_sent_again(tmp_path: Path) -> None:
+    """O 408 do canal é o "pedido lento" (o disco dele demorou): o agente tenta de novo,
+    em vez de matar o robô no meio (eventos) ou perder um resultado pronto."""
+    from rapa.control import channel as channel_module
+    from rapa.control.channel import ChannelLimits
+    from rapa.runner.pod import _deliver
+
+    channel = Channel(ChannelLimits(idle_timeout_s=0.3))
+    job = _job()
+    attempt, ticket = channel.open(
+        job, work_dir=tmp_path / "canal", artifacts_dir=tmp_path / "a", secrets={}, options={}
+    )
+    attempt.ack_dir.mkdir(parents=True)
+    attempt.artifacts_dir.mkdir()
+    real_disk, slow = channel._disk, {channel_module._append, channel_module._write_atomic}
+
+    async def slow_once(function: Any, *args: Any) -> Any:
+        # A primeira gravação de cada tipo passa do tempo do pedido (a fila do disco).
+        if function in slow:
+            slow.discard(function)
+            await asyncio.sleep(0.6)
+        return await real_disk(function, *args)
+
+    channel._disk = slow_once  # type: ignore[method-assign]
+    transport = httpx2.ASGITransport(app=channel.app)
+    client = ChannelClient(f"http://canal/canal/{job.run_id}/1", ticket, transport=transport)
+    work = tmp_path / "pod"
+    (work / "ack").mkdir(parents=True)
+    (work / "artefatos").mkdir()
+    event = {
+        "run_id": str(job.run_id),
+        "attempt": 1,
+        "seq": 5,
+        "at": "2026-11-22T00:00:00Z",
+        "kind": "run_started",
+        "step_id": None,
+        "data": {},
+    }
+    (work / "events.jsonl").write_text(json.dumps(event) + "\n")
+    (work / "result.json").write_text(json.dumps({"state": "succeeded", "artifacts": []}))
+    loop = asyncio.get_running_loop()
+    async with client:
+        bridge = _Bridge(client, work, loop.time() + 10)
+        await bridge.pump()  # 408: fica pendente para a próxima vez, sem erro
+        await bridge.flush()
+        await bridge.close()
+        assert not bridge.pending and not bridge.over
+        assert await _deliver(client, work, loop.time() + 10) == 0
+    assert not slow  # as duas gravações lentas aconteceram (e receberam 408)
+    assert [e.seq for e in await _wait_events(attempt, 1)][-1] == 5
+    assert attempt.result_received.is_set()
+    assert json.loads(attempt.result_path.read_bytes())["state"] == "succeeded"

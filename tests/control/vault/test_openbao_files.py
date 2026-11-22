@@ -28,7 +28,7 @@ from rapa.control.vault import (
 )
 from rapa.core.ids import new_id
 
-from .acl import load_policy
+from .acl import ACL, load_policy, parse_policy
 from .fakebao import API_ROLE, OPERATION_ROLE, ROLE, WEB_ROLE, FakeBao
 from .support import bao_client
 from .tls import make_tls
@@ -36,6 +36,7 @@ from .tls import make_tls
 ROOT = Path(__file__).resolve().parents[3]
 FOLDER = ROOT / "deploy" / "openbao"
 SCRIPT = FOLDER / "preparar.sh"
+CUSTODIAN = FOLDER / "custodiante.sh"
 
 
 def _policy(name: str) -> dict[str, tuple[set[str], dict[str, list[Any]] | None]]:
@@ -313,24 +314,110 @@ def test_the_script_is_idempotent_and_follows_the_configured_mounts(tmp_path: Pa
             assert part in f"{call} ", (role, part)
     # Com o OpenBao no cluster, ele usa o CA e o token do próprio pod.
     assert "write auth/kubernetes/config kubernetes_host=https://kubernetes.default.svc" in calls
-    # Fora do cluster, o CA da API vem de KUBERNETES_CA_CERT.
+    # Fora do cluster, o CA da API vem de KUBERNETES_CA_CERT e o token da TokenReview de
+    # KUBERNETES_TOKEN_REVIEWER_JWT: sem ele, o OpenBao mandaria à API o token de quem entra
+    # (audiência openbao, que a API recusa). Sem o arquivo, o script para antes de mexer.
     ca = tmp_path / "ca.pem"
     ca.write_text("-----BEGIN CERTIFICATE-----\n")
-    done = _run_script(tmp_path, KUBERNETES_CA_CERT=str(ca))
+    reviewer = tmp_path / "revisor.jwt"
+    reviewer.write_text("jwt-de-teste")
+    empty = tmp_path / "vazio.jwt"
+    empty.write_text("")
+    before = len((state / "calls").read_text().splitlines())
+    for missing_reviewer in (
+        {},
+        {"KUBERNETES_TOKEN_REVIEWER_JWT": str(tmp_path / "nao.jwt")},
+        {"KUBERNETES_TOKEN_REVIEWER_JWT": str(empty)},
+    ):
+        refused = _run_script(tmp_path, KUBERNETES_CA_CERT=str(ca), **missing_reviewer)
+        assert refused.returncode == 1 and "KUBERNETES_TOKEN_REVIEWER_JWT" in refused.stderr
+    assert len((state / "calls").read_text().splitlines()) == before
+    done = _run_script(
+        tmp_path, KUBERNETES_CA_CERT=str(ca), KUBERNETES_TOKEN_REVIEWER_JWT=str(reviewer)
+    )
     assert done.returncode == 0, done.stderr
     last = (state / "calls").read_text().splitlines()
     assert any(
         call.startswith("write auth/kubernetes/config ")
         and f"kubernetes_ca_cert=@{ca}" in call
+        and f"token_reviewer_jwt=@{reviewer}" in call
         and "disable_local_ca_jwt=true" in call
         for call in last
     )
-    missing = _run_script(tmp_path, KUBERNETES_CA_CERT=str(tmp_path / "nao-existe.pem"))
+    missing = _run_script(
+        tmp_path,
+        KUBERNETES_CA_CERT=str(tmp_path / "nao-existe.pem"),
+        KUBERNETES_TOKEN_REVIEWER_JWT=str(reviewer),
+    )
     assert missing.returncode == 1 and "KUBERNETES_CA_CERT" in missing.stderr
     # Um nome fora da regra não chega ao OpenBao.
     refused = _run_script(tmp_path, RAPA_BAO_KV="../sys")
     assert refused.returncode == 1 and "montagem inválida" in refused.stderr
     assert _run_script(tmp_path, BAO_ADDR="").returncode != 0
+
+
+def _run_custodian(tmp_path: Path, *args: str, **env: str) -> subprocess.CompletedProcess[str]:
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    cli = bindir / "bao"
+    cli.write_text(_FAKE_CLI)
+    cli.chmod(0o755)
+    state = tmp_path / "estado"
+    state.mkdir(exist_ok=True)
+    return subprocess.run(  # noqa: S603
+        [str(CUSTODIAN), *args],
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": f"{bindir}:/usr/bin:/bin",
+            "BAO_ADDR": "https://openbao.cofre.test:8200",
+            "FAKE_BAO_STATE": str(state),
+            **env,
+        },
+        check=False,
+    )
+
+
+def test_the_custodian_of_a_company_only_writes_its_secrets(tmp_path: Path) -> None:
+    """Quem grava os segredos é o custodiante de cada empresa, direto no OpenBao (o token
+    raiz é revogado depois do preparo): uma política por empresa, só debaixo do prefixo
+    dela, que grava e lista, nunca lê o valor nem alcança outra empresa."""
+    subprocess.run(["bash", "-n", str(CUSTODIAN)], check=True)  # noqa: S603, S607
+    assert os.access(CUSTODIAN, os.X_OK)
+    assert "set -euo pipefail" in CUSTODIAN.read_text()
+    company, other = new_id(), new_id()
+    done = _run_custodian(tmp_path, str(company), RAPA_BAO_KV="cofre-rapa")
+    assert done.returncode == 0, done.stderr
+    text = (tmp_path / "estado" / f"policy-rapa-custodiante-{company}").read_text()
+    policy = parse_policy(text)
+    assert {path: rule.capabilities for path, rule in policy.items()} == {
+        f"cofre-rapa/data/empresas/{company}/*": {"create", "update"},
+        f"cofre-rapa/metadata/empresas/{company}/*": {"list"},
+        "sys/internal/ui/mounts/cofre-rapa": {"read"},
+    }
+    acl = ACL([policy])
+    mine = f"cofre-rapa/data/empresas/{company}/portal/acesso"
+    assert acl.allows(mine, "create") and acl.allows(mine, "update")
+    assert not acl.allows(mine, "read") and not acl.allows(mine, "delete")
+    assert acl.allows(f"cofre-rapa/metadata/empresas/{company}/", "list")
+    for path in (
+        f"cofre-rapa/data/empresas/{other}/portal/acesso",
+        f"cofre-rapa/data/empresas/{company}",
+        "cofre-rapa/data/empresas/x",
+        f"rapa/data/empresas/{company}/portal/acesso",
+    ):
+        assert not acl.allows(path, "create") and not acl.allows(path, "update"), path
+    assert not acl.allows("cofre-rapa/metadata/empresas/", "list")
+    # Só o id de uma empresa (o UUID, em minúsculas): nada que mude o caminho.
+    for bad in ("*", "../sys", f"{company}/*", str(company).upper(), ""):
+        refused = _run_custodian(tmp_path, bad)
+        assert refused.returncode != 0, bad
+    assert _run_custodian(tmp_path).returncode != 0
+    # A ordem de instalação cria os custodiantes antes de revogar o token raiz.
+    operation = (ROOT / "docs" / "OPERACAO.md").read_text(encoding="utf-8")
+    vault = operation[operation.index("### 1.6 Cofre") : operation.index("### 1.7")]
+    assert "deploy/openbao/custodiante.sh" in vault
+    assert vault.index("custodiante.sh") < vault.index("bao token revoke")
 
 
 # -- bao server -dev (só com o binário no PATH) ---------------------------------------
@@ -399,12 +486,15 @@ async def test_everything_against_bao_server_dev(bao_dev: tuple[str, str], tmp_p
     address, token = bao_dev
     # Fora de um pod, o OpenBao não tem o CA da API do Kubernetes montado: vem do script.
     ca, _, _ = make_tls(tmp_path)
+    reviewer = tmp_path / "revisor.jwt"
+    reviewer.write_text("jwt-de-teste")
     env = {
         **os.environ,
         "BAO_ADDR": address,
         "BAO_TOKEN": token,
         "KUBERNETES_HOST": "https://127.0.0.1:6443",
         "KUBERNETES_CA_CERT": str(ca),
+        "KUBERNETES_TOKEN_REVIEWER_JWT": str(reviewer),
     }
     for _ in range(2):  # idempotente de verdade
         await asyncio.to_thread(
@@ -412,6 +502,13 @@ async def test_everything_against_bao_server_dev(bao_dev: tuple[str, str], tmp_p
         )
     company, other = new_id(), new_id()
     headers = {"X-Vault-Token": token}
+    # Fora do cluster, a TokenReview usa o token informado (sem ele, o OpenBao mandaria o
+    # token de quem entra, com a audiência openbao, que a API recusa), e rodar de novo o
+    # mantém.
+    config = httpx2.get(f"{address}/v1/auth/kubernetes/config", headers=headers)
+    assert config.status_code == 200, config.text
+    assert config.json()["data"]["token_reviewer_jwt_set"] is True
+    assert config.json()["data"]["disable_local_ca_jwt"] is True
     for who in (company, other):
         for path in ("portal/acesso", "fiscal/a1"):
             response = httpx2.post(
@@ -444,3 +541,47 @@ async def test_everything_against_bao_server_dev(bao_dev: tuple[str, str], tmp_p
     finally:
         for client in clients:
             await client.aclose()
+
+
+async def test_the_custodian_policy_against_bao_server_dev(
+    bao_dev: tuple[str, str], tmp_path: Path
+) -> None:
+    """A política do custodiante de verdade: grava na própria empresa, nunca noutra."""
+    address, token = bao_dev
+    env = {**os.environ, "BAO_ADDR": address, "BAO_TOKEN": token}
+    reviewer = tmp_path / "revisor.jwt"
+    reviewer.write_text("jwt-de-teste")
+    await asyncio.to_thread(
+        subprocess.run,
+        [str(SCRIPT)],
+        env={
+            **env,
+            "KUBERNETES_HOST": "https://127.0.0.1:6443",
+            "KUBERNETES_CA_CERT": str(make_tls(tmp_path)[0]),
+            "KUBERNETES_TOKEN_REVIEWER_JWT": str(reviewer),
+        },
+        check=True,
+        capture_output=True,
+    )
+    company, other = new_id(), new_id()
+    await asyncio.to_thread(
+        subprocess.run, [str(CUSTODIAN), str(company)], env=env, check=True, capture_output=True
+    )
+    custodian = _role_token(address, token, f"rapa-custodiante-{company}")
+    headers = {"X-Vault-Token": custodian}
+    body = {"data": {"password": "senha-de-teste"}}
+    mine = httpx2.post(
+        f"{address}/v1/rapa/data/empresas/{company}/portal/acesso", headers=headers, json=body
+    )
+    assert mine.status_code == 200, mine.text
+    again = httpx2.post(
+        f"{address}/v1/rapa/data/empresas/{company}/portal/acesso", headers=headers, json=body
+    )
+    assert again.status_code == 200, again.text
+    for url in (
+        f"{address}/v1/rapa/data/empresas/{other}/portal/acesso",
+        f"{address}/v1/rapa/data/empresas/{company}",
+    ):
+        assert httpx2.post(url, headers=headers, json=body).status_code == 403, url
+    read = httpx2.get(f"{address}/v1/rapa/data/empresas/{company}/portal/acesso", headers=headers)
+    assert read.status_code == 403

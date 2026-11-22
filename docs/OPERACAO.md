@@ -17,7 +17,7 @@ O chart `deploy/helm/rapa` instala, no namespace `rapa` (o plano de controle):
 - O modelo do pod da operação (o `PodTemplate` `rapa-operacao`, com a conta de serviço e o papel do OpenBao da operação): nada roda sozinho; quem opera cria um pod dele para congelar, exportar e apagar uma empresa (1.10).
 - As NetworkPolicies, o RBAC, as contas de serviço, a `ValidatingAdmissionPolicy` dos pods de uso único e as `HTTPRoute`.
 
-No namespace `rapa-execucoes` (criado pelo chart com a Pod Security `restricted`) rodam os pods de uso único de cada execução (`app.kubernetes.io/name=rapa-executor`) e de cada sessão de gravação (`rapa-sessao`), com a imagem do executor e a RuntimeClass `gvisor`, sem token de conta de serviço e sem permissão nenhuma. O despachante e a web têm ali uma Role para criar, ler e apagar pods e Secrets, e o que elas criam passa pela `ValidatingAdmissionPolicy` `rapa-execucoes-pods-de-uso-unico`: só a imagem do executor (pelo digest), a conta `rapa-executor` sem token, a RuntimeClass `gvisor`, o rótulo e o comando de execução ou de sessão e volumes `secret` e `emptyDir`. Com o token de uma dessas contas, ninguém cria ali um pod no runc, com outra imagem ou com o rótulo que abre o canal. A Role lê os Secrets do namespace (o lançador lista os das tentativas): o `rapa-registro` dali só com permissão de baixar imagens.
+No namespace `rapa-execucoes` (criado pelo chart com a Pod Security `restricted`) rodam os pods de uso único de cada execução (`app.kubernetes.io/name=rapa-executor`) e de cada sessão de gravação (`rapa-sessao`), com a imagem do executor e a RuntimeClass `gvisor`, sem token de conta de serviço e sem permissão nenhuma. O despachante e a web têm ali uma Role para criar, ler e apagar pods e Secrets, e o que elas criam passa pela `ValidatingAdmissionPolicy` `rapa-execucoes-pods-de-uso-unico`: só a imagem do executor (pelo digest), a conta `rapa-executor` sem token, a RuntimeClass `gvisor`, o rótulo de cada conta (o despachante só cria pods de execução, e a web, só de sessão), o comando exato de execução ou de sessão, sem ganchos (`lifecycle`) nem sondas além da prontidão `tcpSocket` da sessão, só `PYTHONUNBUFFERED` e `TMPDIR` no ambiente e volumes `secret` e `emptyDir` montados só nas pastas do lançador (o Secret na dele, os `emptyDir` em `/tmp` e `/trabalho`, sem `subPath`). Com o token de uma dessas contas, ninguém cria ali um pod no runc, com outra imagem ou que rode outro código, e o da web não cria o pod com o rótulo que abre o canal. A Role lê os Secrets do namespace (o lançador lista os das tentativas): o `rapa-registro` dali só com permissão de baixar imagens.
 
 O banco (CloudNativePG) vem de outra release do mesmo chart (`rapa-banco`, com `values-banco.yaml`), instalada antes: o Job de migração roda antes de qualquer recurso da release da aplicação, então o banco não pode estar nela (o chart recusa).
 
@@ -32,8 +32,10 @@ Rede (NetworkPolicies, os dois namespaces negam tudo por padrão):
 ### 1.2 Ordem de instalação
 
 1. **Nós.** Dois grupos de nós autogerenciados no Outposts: o do plano de controle e o das execuções, com o gVisor (`runsc` como handler do containerd), o rótulo `rapa.dev/execucoes=sim` e o taint `rapa.dev/execucoes:NoSchedule`. Aplique `deploy/gvisor/runtimeclass.yaml` (a RuntimeClass `gvisor` já leva os pods para esses nós).
+
+   **O CNI precisa aplicar as NetworkPolicies.** Todo o isolamento de 1.1 vem delas (os pods de execução e de sessão longe do metadata, da API do Kubernetes, do banco, do despachante e dos outros pods; o plano de controle só para os destinos dele), e um CNI que não as aplica as aceita e ignora, calado. No EKS, o Amazon VPC CNI só as aplica com o complemento configurado com `enableNetworkPolicy: "true"` (o agente de políticas em cada nó, os do Outposts também; confira que a versão do complemento e dos nós o suporta); a outra saída é um CNI que as aplique (Calico, Cilium). Sem isso, não instale o chart: o teste de saída (1.9) mostra o problema.
 2. **Componentes externos**, cada um pelo chart dele: cert-manager, o operador CloudNativePG e o plugin Barman Cloud (`cnpg-system`), o OpenBao em HA com TLS (`cofre`; veja 1.6 para iniciar e desbloquear), o Keycloak (`identidade`; `deploy/keycloak/README.md`), o SeaweedFS com o S3 em TLS e os buckets `rapa-artefatos` e `rapa-backups` (`armazenamento`), o Envoy Gateway com o `Gateway` externo `rapa-externo`, o certificado TLS dele e um listener HTTPS que aceita rotas do namespace `rapa` (`allowedRoutes.namespaces`) (`envoy-gateway-system`; as redes dos pods do Envoy vão para `gateway.trustedNetworks`), o VictoriaMetrics (`monitoramento`), o GlitchTip e o Argo CD (`argocd`).
-3. **OpenBao**: `deploy/openbao/preparar.sh` monta o KV, o transit, o método kubernetes e os quatro papéis, um por conta de serviço e só para ela: `rapa-despachante` (lê os segredos e embrulha as chaves), `rapa-web` e `rapa-api` (só desembrulham) e `rapa-operacao` (o pod da operação: apaga os segredos e a chave de uma empresa). São os valores `vault.roles` do chart (`RAPA_BAO_PAPEL` de cada componente); a tabela está em `deploy/openbao/README.md`. O script roda de qualquer máquina com o CLI `bao` e o token de quem administra o cofre (no kind, do runner do CI, pelo port-forward); com o OpenBao fora de um pod do cluster, informe o CA da API em `KUBERNETES_CA_CERT`.
+3. **OpenBao**: `deploy/openbao/preparar.sh` monta o KV, o transit, o método kubernetes e os quatro papéis, um por conta de serviço e só para ela: `rapa-despachante` (lê os segredos e embrulha as chaves), `rapa-web` e `rapa-api` (só desembrulham) e `rapa-operacao` (o pod da operação: apaga os segredos e a chave de uma empresa). São os valores `vault.roles` do chart (`RAPA_BAO_PAPEL` de cada componente); a tabela está em `deploy/openbao/README.md`. O script roda de qualquer máquina com o CLI `bao` e o token de quem administra o cofre (no kind, do runner do CI, pelo port-forward); com o OpenBao fora de um pod do cluster, informe o CA da API em `KUBERNETES_CA_CERT` e, obrigatório junto, `KUBERNETES_TOKEN_REVIEWER_JWT` (o arquivo com o token de uma conta de serviço com `system:auth-delegator`, que o OpenBao usa na TokenReview; informe-o a cada execução, porque o script reescreve o config inteiro).
 4. **Segredos.** Crie os Secrets no namespace `rapa` antes do chart (o chart só leva os nomes; nenhum valor fica no Git nem nos valores). As senhas, sempre aleatórias e só com caracteres seguros numa URL (`openssl rand -hex 32`), de um arquivo 0600 e nunca na linha de comando:
 
    | Secret | Chaves | Para |
@@ -48,7 +50,7 @@ Rede (NetworkPolicies, os dois namespaces negam tudo por padrão):
    | `rapa-glitchtip` | `dsn` | `RAPA_GLITCHTIP_DSN` |
 | `RAPA_DOCS_API` | `0` | `1` serve a documentação da API REST em `/v1/docs` e `/v1/openapi.json` (1.13); no chart, `apiDocs` |
    | `rapa-registro` | `.dockerconfigjson` | o registro das imagens, nos dois namespaces (só com permissão de baixar: a Role da web e do despachante lê os Secrets do namespace das execuções) |
-   | `rapa-proxy` (opcional) | `url` | `RAPA_PROXY_SAIDA` com usuário e senha (`executions.egress.proxy.existingSecret`); a URL nunca vai nos valores |
+   | `rapa-proxy` (opcional) | `url` | `RAPA_PROXY_SAIDA` com usuário e senha (`http://usuario:senha@host:porta`, os caracteres reservados com `%`; `executions.egress.proxy.existingSecret`); a URL nunca vai nos valores |
 
    ```bash
    umask 077
@@ -82,7 +84,7 @@ Rede (NetworkPolicies, os dois namespaces negam tudo por padrão):
    kubectl apply -f deploy/argocd/raiz.yaml
    ```
 
-   Aplicadas soltas, sem a raiz, as duas Applications sincronizam ao mesmo tempo e a migração só conta com o retry da Application (5 tentativas, até cerca de 15 minutos). Depois da primeira instalação, cada filha sincroniza sozinha: numa troca do banco (1.5), pare o sync automático da aplicação até o Cluster novo ficar pronto.
+   Aplicadas soltas, sem a raiz, as duas Applications sincronizam ao mesmo tempo e a migração só conta com o retry da Application (5 tentativas, até cerca de 15 minutos). Depois da primeira instalação, cada filha sincroniza sozinha: numa troca do banco (1.5), pare o sync automático da raiz e das filhas até o Cluster novo ficar pronto (a raiz primeiro: ela desfaz a mudança nas filhas).
 7. **Primeira empresa**: a organização no Keycloak e o CLI (Parte 2), e o `deploy/rede/teste-de-saida.yaml` (1.9).
 
 Os valores de produção partem de `deploy/helm/rapa/values-producao-exemplo.yaml`. O chart recusa, antes de criar qualquer recurso:
@@ -97,9 +99,9 @@ Os valores de produção partem de `deploy/helm/rapa/values-producao-exemplo.yam
 
 ### 1.3 Atualização
 
-1. Construa e publique as imagens novas e troque os digests (`images.control.digest` e `images.executor.digest`) nos valores do ambiente. As duas imagens são sempre da mesma versão.
+1. Construa e publique as imagens novas e troque os digests (`images.control.digest` e `images.executor.digest`) nos valores do ambiente. As duas imagens são sempre da mesma versão. Ponha o digest do executor que está rodando em `images.executor.previousDigests`: a política de admissão passa a valer na hora da sincronização, e o despachante e a web antigos ainda lançam pods com o executor anterior até saírem (sem isso, as execuções que eles pegam na troca falham com `executor_nao_iniciou`, e as sessões não abrem). Quando a troca terminar (nenhum pod antigo de `rapa-despachante` nem de `rapa-web`), tire-o e sincronize de novo.
 2. Sincronize (o Argo CD) ou rode o `helm upgrade`. A migração roda antes de qualquer pod novo; um Job que falha segura a atualização e fica para conferir (`kubectl -n rapa logs job/rapa-migracao`).
-3. Os Deployments sobem um pod novo antes de tirar um velho. O despachante que sai espera as execuções em andamento (até 40 minutos: `dispatcher.terminationGracePeriodSeconds`); as execuções novas vão para o pod novo. Os pods de execução já lançados terminam com a imagem com que nasceram.
+3. Os Deployments sobem um pod novo antes de tirar um velho. O despachante que sai espera as execuções em andamento (até 40 minutos: `dispatcher.terminationGracePeriodSeconds`); até ser parado (o SIGTERM), o pod velho ainda pega execuções e as lança com o executor anterior (o de `images.executor.previousDigests`). Os pods de execução já lançados terminam com a imagem com que nasceram.
 4. As migrações valem para as duas versões durante a troca (só acrescentam). Voltar a versão do chart não volta o banco: se uma migração precisar ser desfeita, restaure (1.5).
 
 O operador do CloudNativePG, o plugin e os outros componentes têm atualizações próprias, uma de cada vez, com o banco conferido depois de cada uma.
@@ -159,8 +161,16 @@ kubectl -n rapa get cluster rapa-banco -o jsonpath='{.status.conditions}'
 
 **Restaurar de verdade** (perda do banco ou uma migração a desfazer). O Cluster novo vem da própria release do banco, com outro nome: assim ele ganha a NetworkPolicy dele (o namespace nega tudo, e a do Cluster antigo só escolhe os pods dele), e as NetworkPolicies da aplicação passam a apontar para ele pelo mesmo `database.cnpg.name`.
 
-1. Pare a aplicação: com o Argo CD, desligue o sync automático das Applications `rapa` e `rapa-banco`; depois `kubectl -n rapa scale deployment rapa-web rapa-api rapa-despachante --replicas=0`.
-2. Nos valores do ambiente (os mesmos das duas releases):
+1. Pare a aplicação. Com o Argo CD, desligue primeiro o sync automático da raiz, que é dona das duas Applications e, com o `selfHeal`, desfaz em segundos uma mudança nelas; depois o das duas filhas (o `selfHeal` da `rapa` desfaria o `scale`):
+
+   ```bash
+   argocd app set rapa-raiz --sync-policy none
+   argocd app set rapa --sync-policy none
+   argocd app set rapa-banco --sync-policy none
+   ```
+
+   Depois, com ou sem o Argo CD, `kubectl -n rapa scale deployment rapa-web rapa-api rapa-despachante --replicas=0`.
+2. Nos valores do ambiente (os mesmos das duas releases; com o Argo CD, no repositório de configuração que as duas Applications leem):
 
    ```yaml
    database:
@@ -184,16 +194,23 @@ kubectl -n rapa get cluster rapa-banco -o jsonpath='{.status.conditions}'
    kubectl -n rapa get cluster rapa-banco-2 -o jsonpath='{.status.managedRolesStatus.byStatus.reconciled}'
    ```
 
-   O Cluster antigo fica (o chart nunca o apaga), sem NetworkPolicy própria (isolado pelo nega-tudo) e sem o ObjectStore dele: confira o novo antes de apagar o antigo à mão (`kubectl -n rapa delete cluster rapa-banco`). O Cluster novo faz um backup de base logo que fica pronto; os backups do antigo ficam no bucket, na pasta dele (`rapa-banco`), sem retenção: apague-a quando não precisar mais deles.
-4. Atualize a release da aplicação (a migração confere a revisão; a web, a api, o despachante, a migração e a operação passam a sair para o `rapa-banco-2`) e, com o Argo CD, ligue de novo o sync automático das duas.
+   Com o Argo CD não há release do Helm (ele renderiza o chart e aplica): em vez do `helm upgrade`, faça o commit dos valores e rode `argocd app sync rapa-banco`, e espere do mesmo jeito.
+
+   O Cluster antigo fica (o chart nunca o apaga), sem NetworkPolicy própria (isolado pelo nega-tudo) e sem o ObjectStore dele (com o Argo CD, cujo prune do banco é desligado, os dois também ficam: apague-os junto com ele): confira o novo antes de apagar o antigo à mão (`kubectl -n rapa delete cluster rapa-banco`). O Cluster novo faz um backup de base logo que fica pronto; os backups do antigo ficam no bucket, na pasta dele (`rapa-banco`), sem retenção: apague-a quando não precisar mais deles.
+4. Atualize a release da aplicação (a migração confere a revisão; a web, a api, o despachante, a migração e a operação passam a sair para o `rapa-banco-2`): `helm upgrade rapa deploy/helm/rapa -n rapa -f valores-do-ambiente.yaml`, ou, com o Argo CD, a aplicação pelo sync e o sync automático de volta, a raiz por último (ela devolve às filhas o `syncPolicy` do repositório):
+
+   ```bash
+   argocd app sync rapa
+   argocd app set rapa-raiz --sync-policy automated --self-heal
+   ```
 5. Confira o que as execuções em andamento na hora da perda deixaram: as que tinham começado um passo que grava ficam para uma pessoa conferir o sistema de destino.
 
 ### 1.6 Cofre (OpenBao)
 
-- **Iniciar uma vez**, com 5 custodiantes e quórum de 3: `bao operator init -key-shares=5 -key-threshold=3 -pgp-keys=c1.asc,c2.asc,c3.asc,c4.asc,c5.asc`. Cada parte sai cifrada para a chave PGP de um custodiante; o token raiz é revogado assim que o `preparar.sh` termina (`bao token revoke`), e um novo só se gera com o quórum (`bao operator generate-root`).
+- **Iniciar uma vez**, com 5 custodiantes e quórum de 3: `bao operator init -key-shares=5 -key-threshold=3 -pgp-keys=c1.asc,c2.asc,c3.asc,c4.asc,c5.asc`. Cada parte sai cifrada para a chave PGP de um custodiante. Com o token raiz, e antes de revogá-lo: o `preparar.sh`; o método de entrada de quem administra o cofre (por exemplo, o OIDC do Keycloak), com uma política de administração (as políticas, os métodos de entrada e a montagem do transit, para a rotação abaixo); e o dos custodiantes das credenciais, com uma política por empresa (`deploy/openbao/custodiante.sh <uuid da empresa>`, ligada só à identidade do custodiante dela; `deploy/openbao/README.md`, "Custodiantes"). Só então o token raiz é revogado (`bao token revoke`): daí em diante, só essas identidades escrevem no cofre, e um token raiz novo só se gera com o quórum (`bao operator generate-root`).
 - **Desbloquear** (depois de reiniciar um pod do OpenBao ou do cluster): três custodiantes, cada um da própria máquina, rodam `bao operator unseal` com a parte dele, em cada pod do OpenBao (`kubectl -n cofre port-forward openbao-0 8200`). Enquanto estiver selado, veja 1.8.
 - **Rotação**: as partes dos custodiantes com `bao operator rekey` (quando um custodiante sai), a chave de cifra interna com `bao operator rotate`, e a chave transit de uma empresa com `bao write -f rapa-transit/keys/empresa-<uuid>/rotate` (as versões antigas continuam decifrando; o RaPA guarda a versão de cada chave embrulhada). Os tokens das contas de serviço são projetados e trocados sozinhos pelo Kubernetes.
-- Os segredos das credenciais ficam em `rapa/data/empresas/<empresa>/<caminho>`; quem os grava é o custodiante, direto no OpenBao. O RaPA só guarda a referência.
+- Os segredos das credenciais ficam em `rapa/data/empresas/<empresa>/<caminho>`; quem os grava é o custodiante, direto no OpenBao, com a política da empresa dele (`rapa-custodiante-<empresa>`, de `deploy/openbao/custodiante.sh`: grava e lista só ali, nunca lê o valor nem alcança outra empresa; nunca uma política de `empresas/*`). Cada empresa nova ganha a dela na entrada (Parte 2). O RaPA só guarda a referência.
 
 ### 1.7 Rotação de `RAPA_CHAVE_WEBHOOKS`
 
@@ -218,7 +235,7 @@ Troque também quando houver suspeita de vazamento.
   - `ImagePullBackOff`: o digest não existe no registro ou falta o `rapa-registro` no namespace das execuções;
   - `Unschedulable` (CPU, memória, cota): faltam nós de execução, ou o `ResourceQuota` do namespace chegou ao limite;
   - `forbidden` nos logs do despachante: o RBAC (a RoleBinding da conta `rapa-despachante`) ou a NetworkPolicy para a API do Kubernetes (`network.egress.kubernetesApi`);
-  - `denied request: ValidatingAdmissionPolicy 'rapa-execucoes-pods-de-uso-unico'` nos logs: o pod que o lançador montou não é o de uso único (a imagem não é a de `images.executor`, a RuntimeClass, a conta ou o comando); a mensagem diz qual regra;
+  - `denied request: ValidatingAdmissionPolicy 'rapa-execucoes-pods-de-uso-unico'` nos logs: o pod que o lançador montou não é o de uso único (a imagem não é a de `images.executor` nem uma de `images.executor.previousDigests`, a RuntimeClass, a conta ou o comando); a mensagem diz qual regra;
   - o pod sobe mas a execução não anda: a NetworkPolicy do canal (o despachante na porta 8081) ou o `RAPA_CANAL_ENDERECO`;
   - a execução falha com `segredo_indisponivel` sem nenhum pod: a credencial não está registrada na área do robô, o segredo ou um campo não está no KV (`rapa/data/empresas/<empresa>/<caminho>`), o certificado A1 não é um PFX em base64, ou o OpenBao não respondeu (a mensagem diz o que falta, só pelos nomes).
 - **Despachante que não sobe.** `rapa.server: configuração inválida: ...` no log, sem traceback e sem os valores: um `RAPA_CANAL_ENDERECO` sem `{ip}` (um Service), a porta do canal igual à da saúde ou à das métricas, a imagem do executor que falta, ou um valor do cofre e do S3 fora da regra (1.11).
@@ -233,7 +250,7 @@ kubectl -n rapa-execucoes logs -f teste-de-saida
 kubectl -n rapa-execucoes delete pod teste-de-saida
 ```
 
-Cada alvo interno (o metadata da nuvem em IPv4, em IPv6 e pelo NAT64, a API do Kubernetes, o banco, a web, uma rede privada também pelo NAT64) precisa sair como `ok: fechado`, e os externos como `ok: abriu` (sem internet direta, os externos só abrem pelo proxy). Some aos internos, em `ALVOS_DO_AMBIENTE`, os portais que não estão em `RAPA_REDES_INTERNAS_PERMITIDAS`; num cluster IPv6, também o endereço IPv6 de um pod do plano de controle (`kubectl -n rapa get pod -o wide`) e um da VPC, e em `ALVOS_EXTERNOS_IPV6` um destino da internet em IPv6. O pod de teste é criado por quem opera, não pelas contas do RaPA: a política de admissão dos pods de uso único não vale para ele. A guarda dentro do pod (a do navegador) se confere com um robô de teste cujo passo abre um domínio fora de `allowed_domains`: o passo falha com `dominio_nao_permitido`, também por WebSocket.
+Cada alvo interno (o metadata da nuvem em IPv4, em IPv6 e pelo NAT64, a API do Kubernetes, o banco, a web, uma rede privada também pelo NAT64) precisa sair como `ok: fechado`, e os externos como `ok: abriu` (sem internet direta, os externos só abrem pelo proxy). Um interno com `ERRO: abriu` (sobretudo o banco, a web ou a API do Kubernetes, que nenhuma regra do chart abre) é quase sempre o CNI que não aplica as NetworkPolicies (no EKS, o VPC CNI sem `enableNetworkPolicy`, 1.2 passo 1): nenhuma empresa usa o RaPA até o teste passar. Some aos internos, em `ALVOS_DO_AMBIENTE`, os portais que não estão em `RAPA_REDES_INTERNAS_PERMITIDAS`; num cluster IPv6, também o endereço IPv6 de um pod do plano de controle (`kubectl -n rapa get pod -o wide`) e um da VPC, e em `ALVOS_EXTERNOS_IPV6` um destino da internet em IPv6. O pod de teste é criado por quem opera, não pelas contas do RaPA: a política de admissão dos pods de uso único não vale para ele. Ele leva o rótulo dos pods de execução sem uma tentativa: a varredura de órfãos do despachante o apaga 15 minutos depois de criado (antes disso, ele fica para a conferência). A guarda dentro do pod (a do navegador) se confere com um robô de teste cujo passo abre um domínio fora de `allowed_domains`: o passo falha com `dominio_nao_permitido`, também por WebSocket.
 
 ### 1.10 O CLI no cluster
 
@@ -241,7 +258,7 @@ Os comandos da Parte 2 rodam num pod da operação, criado do `PodTemplate` `rap
 
 - a conta de serviço `rapa-operacao` (nenhuma permissão no Kubernetes, nenhum token montado) e o token projetado para o papel `rapa-operacao` do OpenBao (`vault.roles.operation`; a política `deploy/openbao/politicas/rapa-operacao.hcl`: apagar os metadados dos segredos da empresa e a chave transit dela, e decifrar os artefatos para a exportação), com `RAPA_COFRE` e `RAPA_CHAVES` do ambiente;
 - `RAPA_DATABASE_URL` (o papel `rapa_app`) e `RAPA_OWNER_DATABASE_URL` (o dono das tabelas, com a senha do Secret `rapa-banco-dono` pela expansão `$(VAR)`: ela nunca passa pela linha de comando);
-- o S3 dos artefatos e um disco próprio para a exportação (`/trabalho`, `operation.workSizeLimit`, 50Gi por padrão), longe dos pods que servem tráfego;
+- o S3 dos artefatos e um disco próprio para a exportação (`/trabalho`, `operation.workSizeLimit`, 50Gi por padrão), longe dos pods que servem tráfego: o `TMPDIR` aponta para ele, então a pasta de passagem da exportação (as tabelas e os artefatos decifrados, antes do `.tar.gz`) também fica ali, nunca no `/tmp` de 1 GiB; o disco precisa caber a passagem e o arquivo final juntos;
 - uma NetworkPolicy que só sai para o banco, o S3 e o OpenBao, e o prazo de 4 horas (`operation.activeDeadlineSeconds`).
 
 ```bash
@@ -279,7 +296,7 @@ As variáveis de `python -m rapa.server` que o deploy no Kubernetes acrescentou 
 | `RAPA_K8S_NODE_SELECTOR`, `RAPA_K8S_TOLERATIONS` | (nenhum) | onde os pods rodam, em JSON (`{"rótulo": "valor"}` e uma lista como a do Kubernetes) |
 | `RAPA_CANAL_PORTA` | `8081` | onde o despachante ouve o canal dos pods (só no modo `kubernetes`); nunca a porta do serviço nem a das métricas |
 | `RAPA_CANAL_ENDERECO` | `http://{ip}:<RAPA_CANAL_PORTA>` | o endereço que os pods usam para falar com o despachante; precisa de `{ip}`, que vira o IP do pod do despachante (um Service é recusado: cada réplica tem os bilhetes das tentativas dela) |
-| `RAPA_PROXY_SAIDA` | (nenhum) | o proxy HTTP CONNECT corporativo para a internet dos navegadores (`http://host:porta`, sem usuário e senha na URL; com senha, de um Secret) |
+| `RAPA_PROXY_SAIDA` | (nenhum) | o proxy HTTP CONNECT corporativo para a internet dos navegadores (`http://host:porta`; com senha, `http://usuario:senha@host:porta` de um Secret, mandados no `Proxy-Authorization: Basic`) |
 | `RAPA_REDES_INTERNAS_PERMITIDAS` | (nenhuma) | CIDRs, separados por vírgula, que os robôs e as sessões alcançam além da internet (os portais internos) |
 | `RAPA_COFRE` | `nenhum` (`dev` com `RAPA_DEV=1` e `RAPA_SEGREDOS_DEV`) | de onde vêm os segredos das credenciais: `nenhum`, `dev` (o arquivo de `RAPA_SEGREDOS_DEV`, só em desenvolvimento) ou `openbao` |
 | `RAPA_BAO_ENDERECO` | (obrigatório com o OpenBao) | o OpenBao (`https://` fora do desenvolvimento; o serviço ativo: o cliente não segue redirecionamento) |
@@ -351,7 +368,8 @@ O comando imprime o id da empresa. A organização fica ligada à empresa no ban
 
 O formato diz se `--organizacao` é o id ou o apelido: um valor no formato de UUID é sempre o id da organização (guardado em minúsculas, como o Keycloak o põe no token) e é comparado só com o id do token; qualquer outro valor é o apelido e é comparado só com o apelido. Prefira o id. Uma organização cujo apelido tem o formato de UUID só pode ser ligada pelo id.
 
-3. Quem entra pela primeira vez com um token dessa organização vira usuário sem papel nenhum e só vê o pedido para um administrador dar um papel. O administrador da empresa dá os papéis na tela **Empresa** (ou em `PUT /v1/empresa/usuarios/{id}/papeis`).
+3. No OpenBao, quem administra o cofre cria a política do custodiante da empresa (`deploy/openbao/custodiante.sh ID_DA_EMPRESA`) e a liga só à identidade dele (1.6): sem ela, ninguém grava os segredos das credenciais da empresa, e os robôs com credenciais falham com `segredo_indisponivel`.
+4. Quem entra pela primeira vez com um token dessa organização vira usuário sem papel nenhum e só vê o pedido para um administrador dar um papel. O administrador da empresa dá os papéis na tela **Empresa** (ou em `PUT /v1/empresa/usuarios/{id}/papeis`).
 
 ### 2. Consumo do mês
 
@@ -391,7 +409,7 @@ tar -xzf empresa.tar.gz && sha256sum tabelas/*.jsonl
 
 #### Apagar
 
-Só uma empresa congelada, sem execuções rodando nem sessões de gravação abertas, e com o nome exato:
+Só uma empresa congelada, sem execuções rodando nem sessões de gravação abertas (no prazo: uma sessão que a réplica da web que caiu deixou aberta no banco para de contar no prazo máximo dela, `RAPA_SESSAO_MAX_S`), e com o nome exato:
 
 ```bash
 uv run python -m rapa.control.admin empresa apagar ID_DA_EMPRESA --confirmar "Nome da empresa"

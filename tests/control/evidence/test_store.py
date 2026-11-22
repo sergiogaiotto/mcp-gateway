@@ -344,3 +344,26 @@ async def test_delete_run_keeps_a_legacy_download_name(tmp_path: Path) -> None:
         with pytest.raises(ValueError):
             await store.delete_run(COMPANY, RUN, keep=[(1, bad)])
     assert sorted(path.name for path in folder.iterdir()) == ["nota..fiscal.pdf"]
+
+
+async def test_company_listing_and_reading_include_a_legacy_download_name(
+    tmp_path: Path,
+) -> None:
+    """A saída da empresa leva também o download de antes da regra do ``..``.
+
+    ``nota..fiscal.pdf`` continua em ``runs.artifacts`` e na pasta (a retenção o deixa no
+    prazo das evidências): a exportação o lista e o lê pelo store, como fazia ao percorrer
+    a pasta da empresa. Registrar um nome assim continua recusado.
+    """
+    store = LocalArtifactStore(tmp_path / "artefatos")
+    _write(store, "tela-001.png")
+    legacy = _write(store, "nota..fiscal.pdf", b"%PDF legado")
+    listed = [(item.run_id, item.attempt, item.name) async for item in store.list_company(COMPANY)]
+    assert listed == [(RUN, 1, "nota..fiscal.pdf"), (RUN, 1, "tela-001.png")]
+    assert await _read(store, "nota..fiscal.pdf") == b"%PDF legado"
+    with pytest.raises(ValueError):
+        await store.put(COMPANY, RUN, 1, legacy.name, "download", legacy)
+    # Fora da regra de sempre (começa com ponto, tem barra): nem listado, nem lido.
+    for bad in ("..", ".nota..pdf", "../nota..fiscal.pdf"):
+        with pytest.raises(ArtifactMissing):
+            await store.open(COMPANY, RUN, 1, bad)

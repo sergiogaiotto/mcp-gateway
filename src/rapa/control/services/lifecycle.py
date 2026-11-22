@@ -29,7 +29,9 @@
     empresa ativa ou congelada, numa leitura consistente (``REPEATABLE READ``, só
     leitura).
   - :func:`purge_company` apaga uma empresa congelada (o nome confirmado), sem execuções
-    rodando nem sessões abertas, numa transação só que marca ``rapa.purge_company`` (as
+    rodando nem sessões abertas (dentro do prazo: uma sessão que ficou aberta no banco
+    depois de ``expires_at`` não tem mais navegador), numa transação só que marca
+    ``rapa.purge_company`` (as
     travas de "só inclusões" aceitam a exclusão só assim, e só do dono): apaga todas as
     linhas da empresa em todas as tabelas, das filhas para as mães, e por fim a linha de
     ``companies``; ainda dentro da transação, apaga os artefatos da empresa pelo store
@@ -1056,10 +1058,13 @@ async def purge_company(
         )
         if running:
             raise Conflict("a empresa ainda tem execuções rodando; espere elas terminarem")
+        # Só as que ainda estão no prazo: uma sessão que ficou aberta no banco depois dele
+        # (a réplica da web que a segurava caiu, e nenhuma outra a encerrou) não tem mais
+        # navegador (o pod sai no prazo máximo) e não conta em limite nenhum.
         live = await session.scalar(
             text(
                 "SELECT count(*) FROM recording_sessions WHERE company_id = :company "
-                "AND status IN ('starting', 'active')"
+                "AND status IN ('starting', 'active') AND expires_at > now()"
             ),
             {"company": company_id},
         )

@@ -298,8 +298,8 @@ class ServerSettings(BaseModel):
     #: Endereço do canal que os pods usam (``{ip}`` vira o IP deste pod).
     channel_address: str | None = None
     channel_port: int = Field(default=8081, ge=1, le=65535)
-    #: Proxy HTTP CONNECT de saída para a internet dos navegadores.
-    egress_proxy: str | None = Field(default=None, max_length=2000)
+    #: Proxy HTTP CONNECT de saída para a internet dos navegadores (pode ter usuário e senha).
+    egress_proxy: str | None = Field(default=None, max_length=2000, repr=False)
     #: Redes internas (CIDR) que os navegadores alcançam além da internet.
     internal_networks: tuple[str, ...] = ()
 
@@ -527,7 +527,8 @@ class ServerSettings(BaseModel):
         - a guarda da saída dos navegadores: ``RAPA_REDES_INTERNAS_PERMITIDAS`` (CIDRs
           separados por vírgula que os robôs e as sessões alcançam além da internet, para
           portais internos; padrão nenhuma) e ``RAPA_PROXY_SAIDA`` (proxy HTTP CONNECT
-          para a internet, ``http://host:porta``, sem usuário e senha). A guarda (só os
+          para a internet, ``http://host:porta`` ou, de um Secret,
+          ``http://usuario:senha@host:porta``, com ``Proxy-Authorization: Basic``). A guarda (só os
           domínios do robô, a rede interna fechada) vale sempre nos pods e, no lançador
           local, quando uma das duas está definida e sempre fora de ``RAPA_DEV``;
         - cofre, armazenamento e chaves (:mod:`rapa.control.backends`): ``RAPA_COFRE``

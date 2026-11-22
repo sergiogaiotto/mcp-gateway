@@ -18,7 +18,11 @@ delas) e ainda estão **a validar com o jurídico**:
   ``rapa_purge_run_keys`` da migração 0009. Destruir a chave é o que garante que o que
   sobrar dos objetos (num backup do S3, por exemplo) não abre mais;
 - a pasta de passagem do store de objetos: a de cada execução sai com os artefatos
-  dela (``delete_run``), e a de uma empresa que não existe mais sai inteira.
+  dela (``delete_run``), a de uma empresa que não existe mais sai inteira, e a de cada
+  tentativa que não é mais a atual de uma execução rodando sai em toda volta, no disco
+  de cada réplica (cada uma tem a própria passagem, e a retenção de uma execução pode
+  rodar noutra: sem isto, o texto claro de um despachante que caiu antes de registrar
+  ficaria nela depois de a chave da execução ser destruída).
 
 O prazo conta do fim da execução (``finished_at``) e, nos retratos, da gravação.
 
@@ -100,6 +104,8 @@ SUCCESS_AFTER_FAILURE = (
     "(RAPA_RETENCAO_SUCESSO_DIAS) não pode passar o das evidências "
     "(RAPA_RETENCAO_FALHAS_DIAS): elas sairiam com as evidências, antes do prazo dado"
 )
+#: Estados de uma execução rodando: só a tentativa atual dela ainda registra artefatos.
+_LIVE_STATES = (RunState.RUNNING.value, RunState.AWAITING_HUMAN.value)
 #: Estados cujas capturas (telas e vídeo) saem pelo prazo curto.
 _SHORT_STATES = (RunState.SUCCEEDED.value, RunState.CANCELLED.value)
 #: Estados cujos artefatos todos saem pelo prazo longo (o das evidências).
@@ -151,6 +157,8 @@ class RetentionReport:
     partitions: int = 0
     #: Empresas que não existem mais cuja pasta de passagem (no S3) foi apagada.
     staged_companies: int = 0
+    #: Tentativas que não são mais a atual de uma execução rodando cuja passagem saiu.
+    staged_attempts: int = 0
     #: A volta parou no limite de tempo (ou de lotes) com mais coisa para apagar.
     behind: bool = False
 
@@ -247,6 +255,7 @@ class Retention:
         report.partitions, more = await self._drop_event_partitions(give_up)
         report.behind = report.behind or more
         report.staged_companies = await self._sweep_staging()
+        report.staged_attempts = await self._sweep_staged_attempts()
         if report.partitions:
             logger.info(
                 "retenção: %d partição(ões) de eventos com mais de %d dias removida(s)",
@@ -282,6 +291,37 @@ class Retention:
         if gone:
             logger.info("retenção: a passagem de %d empresa(s) apagada(s) saiu", len(gone))
         return len(gone)
+
+    async def _sweep_staged_attempts(self) -> int:
+        """Apaga, neste disco, a passagem de tentativa que não é a atual de uma execução rodando.
+
+        Só a tentativa viva ainda registra artefatos (e solta a passagem no fim): o que
+        sobrou de uma tentativa que ficou antiga, de um despachante que caiu antes de
+        registrar ou de uma execução que já terminou nunca vai ser registrado. Cada réplica
+        tem a própria passagem (o ``emptyDir`` do pod) e a retenção de uma execução pode
+        rodar noutra, então cada volta confere a deste disco. A pasta só existe depois de a
+        tentativa ser pega da fila (gravada antes), e a tentativa atual só cresce: a que a
+        busca não vê rodando não volta a ser a atual.
+        """
+        staged = await self.store.staged_attempts()
+        if not staged:
+            return 0
+        ids = sorted({run_id for _, run_id, _ in staged})
+        live: set[tuple[UUID, UUID, int]] = set()
+        async with self.db.dispatcher_session() as session:
+            for start in range(0, len(ids), 500):
+                rows = await session.execute(
+                    select(runs.c.company_id, runs.c.id, runs.c.attempt).where(
+                        runs.c.id.in_(ids[start : start + 500]), runs.c.state.in_(_LIVE_STATES)
+                    )
+                )
+                live.update((row.company_id, row.id, row.attempt) for row in rows)
+        dead = [item for item in staged if item not in live]
+        for company_id, run_id, attempt in dead:
+            await self.store.release_attempt(company_id, run_id, attempt)
+        if dead:
+            logger.info("retenção: a passagem de %d tentativa(s) encerrada(s) saiu", len(dead))
+        return len(dead)
 
     async def _expire_artifacts(
         self,

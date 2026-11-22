@@ -38,7 +38,8 @@ sai inteira (o que o executor deixou sem informar, o que o store recusou e o que
 subiu de jeito nenhum): texto claro não fica esquecido no disco. ``delete_run`` (a
 retenção) e ``delete_company`` (a saída da empresa) também apagam a pasta de passagem
 da execução e da empresa, e a retenção apaga a de empresa que não existe mais
-(``staging_companies`` e ``discard_staged_company``). ``open``
+(``staging_companies`` e ``discard_staged_company``) e, no disco de cada réplica, a de
+tentativa que não é mais a atual de uma execução rodando (``staged_attempts``). ``open``
 lê em fluxo e decifra bloco a bloco: um bloco trocado, cortado, fora de ordem ou de
 outra execução para a leitura com :class:`ArtifactCorrupted`; sem a linha de
 ``run_keys`` (a chave destruída pela retenção), o artefato não existe mais
@@ -217,6 +218,13 @@ class ArtifactStore(Protocol):
         """As empresas com alguma coisa na pasta de passagem (no local, nenhuma)."""
         ...
 
+    async def staged_attempts(self) -> list[tuple[UUID, UUID, int]]:
+        """As tentativas com pasta de passagem neste disco, ``(empresa, execução, tentativa)``.
+
+        No local, nenhuma (a pasta da tentativa é o lugar final dos artefatos).
+        """
+        ...
+
     async def discard_staged_company(self, company_id: UUID) -> None:
         """Apaga a pasta de passagem da empresa (no local, nada: não há passagem)."""
         ...
@@ -258,6 +266,21 @@ def _kept_name(name: str) -> str:
 
     Aceita o nome de um artefato de antes da regra do ``..`` (um download de uma
     execução antiga fica no prazo curto como os outros).
+    """
+    if not isinstance(name, str) or not recorded_artifact_name(name):
+        raise ValueError("nome de artefato inválido")
+    return name
+
+
+def _stored_name(name: str) -> str:
+    """Um nome para ler (e listar) o que o store local já guarda.
+
+    Aceita o nome de antes da regra do ``..`` (o download de uma execução antiga, que
+    ainda está em ``runs.artifacts`` e na pasta): a saída da empresa o exporta. Nunca
+    tem barra nem começa com ponto (então nunca é ``.`` nem ``..``), e é aberto só dentro
+    da pasta da tentativa, sem seguir atalho. A API e a interface conferem o nome com
+    :func:`rapa.core.artifacts.valid_artifact_name` antes de chegar aqui; registrar
+    (``put``) continua só com ela.
     """
     if not isinstance(name, str) or not recorded_artifact_name(name):
         raise ValueError("nome de artefato inválido")
@@ -396,7 +419,7 @@ class LocalArtifactStore:
     def _open(self, company_id: UUID, run_id: UUID, attempt: int, name: str) -> _LocalReader:
         try:
             handle = _open_regular(
-                self.root, _parts(company_id, run_id, attempt), _checked_name(name)
+                self.root, _parts(company_id, run_id, attempt), _stored_name(name)
             )
         except OSError, ValueError:
             # Sem o arquivo, um atalho em qualquer parte do caminho (O_NOFOLLOW) ou um
@@ -510,6 +533,9 @@ class LocalArtifactStore:
     async def staging_companies(self) -> list[UUID]:
         return []
 
+    async def staged_attempts(self) -> list[tuple[UUID, UUID, int]]:
+        return []
+
     async def discard_staged_company(self, company_id: UUID) -> None:
         _company_part(company_id)
 
@@ -557,7 +583,7 @@ def _attempt_files(folder: int, run_name: str) -> Iterator[tuple[int, list[str]]
                 names = [
                     name
                     for name in sorted(os.listdir(attempt_fd))
-                    if valid_artifact_name(name)
+                    if recorded_artifact_name(name)
                     and stat.S_ISREG(os.lstat(name, dir_fd=attempt_fd).st_mode)
                 ]
             finally:
@@ -712,6 +738,20 @@ def _discard_empty(root: Path, parts: Sequence[str]) -> None:
         os.rmdir(parts[-1], dir_fd=directory)
     except OSError:
         return
+    finally:
+        os.close(directory)
+
+
+def _listing(root: Path, parts: Sequence[str]) -> list[str]:
+    """Os nomes em ``root/parts...`` (sem seguir atalho abaixo da raiz); nada se não abre."""
+    try:
+        directory = _open_dir(root, parts)
+    except OSError:
+        return []
+    try:
+        return os.listdir(directory)
+    except OSError:
+        return []
     finally:
         os.close(directory)
 
@@ -935,6 +975,24 @@ class S3ArtifactStore:
             except FileNotFoundError:
                 return []
             return sorted(found for name in names if (found := _canonical_uuid(name)) is not None)
+
+        return await asyncio.to_thread(run)
+
+    async def staged_attempts(self) -> list[tuple[UUID, UUID, int]]:
+        root = self.staging_root
+
+        def run() -> list[tuple[UUID, UUID, int]]:
+            found: list[tuple[UUID, UUID, int]] = []
+            for company_name in _listing(root, []):
+                if (company := _canonical_uuid(company_name)) is None:
+                    continue
+                for run_name in _listing(root, [company_name]):
+                    if (run_id := _canonical_uuid(run_name)) is None:
+                        continue
+                    for name in _listing(root, [company_name, run_name]):
+                        if (attempt := _attempt_number(name)) is not None:
+                            found.append((company, run_id, attempt))
+            return sorted(found)
 
         return await asyncio.to_thread(run)
 

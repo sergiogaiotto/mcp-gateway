@@ -358,6 +358,36 @@ async def test_export_never_follows_a_file_swapped_for_a_link(
     assert not any(b"de fora" in body for body in contents.values())
 
 
+async def test_export_keeps_a_download_named_before_the_dots_rule(
+    app_db: Database,
+    owner_engine: AsyncEngine,
+    superuser_engine: AsyncEngine,
+    tmp_path: Path,
+) -> None:
+    """Um download de antes da revisão 0008 (``nota..fiscal.pdf``, ainda no prazo das
+    evidências) sai na exportação, como saía ao percorrer a pasta da empresa: depois de
+    apagar, a exportação é a única cópia."""
+    world = await build_world(app_db, superuser_engine)
+    a = world.a
+    files, artifacts = _folders(tmp_path, a.company_id)
+    legacy = artifacts / str(a.company_id) / _RUN_FOLDER / "1" / "nota..fiscal.pdf"
+    legacy.write_bytes(b"%PDF-1.4 legado")
+    output = tmp_path / "empresa.tar.gz"
+    report = await export_company(
+        owner_engine, a.company_id, output, files_dir=files, artifacts_dir=artifacts
+    )
+    with tarfile.open(output, "r:gz") as tar:
+        manifest = json.loads(tar.extractfile("manifesto.json").read())  # type: ignore[union-attr]
+        member = tar.extractfile(f"artefatos/{_RUN_FOLDER}/1/nota..fiscal.pdf")
+        assert member is not None and member.read() == b"%PDF-1.4 legado"
+    assert report.files == 3 and manifest["artefatos_ilegiveis"] == 0
+    assert {entry["arquivo"] for entry in manifest["arquivos"]} == {
+        "arquivos/sub/nota.pdf",
+        _ARTIFACT,
+        f"artefatos/{_RUN_FOLDER}/1/nota..fiscal.pdf",
+    }
+
+
 def _is_dir(path: Path) -> bool:
     return path.is_dir()
 
@@ -533,6 +563,42 @@ async def test_purge_waits_for_open_sessions_and_runs_awaiting_a_person(
         id=session_id,
     )
     await purge()
+    assert set((await company_counts(superuser_engine, a.company_id)).values()) == {0}
+    assert destroyer.destroyed == [a.company_id]
+
+
+async def test_purge_is_not_held_by_a_session_past_its_deadline(
+    app_db: Database, owner_engine: AsyncEngine, superuser_engine: AsyncEngine
+) -> None:
+    """Uma sessão que ficou aberta no banco depois do prazo (a réplica da web que a segurava
+    caiu; no chart, a web não tem o papel do despachante, e a varredura não vê as sessões das
+    outras réplicas) não tem mais navegador: o pod dela sai no prazo máximo, e ela já não
+    conta em limite nenhum. Ela não segura a exclusão da empresa para sempre."""
+    world = await build_world(app_db, superuser_engine)
+    a = world.a
+    session_id = new_id()
+    async with superuser_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO recording_sessions (company_id, id, area_id, owner, start_url, "
+                "created_at, expires_at, seen_at) VALUES (:c, :id, :area, 'criadora', "
+                "'https://portal.exemplo.gov.br/', now() - interval '3 hours', "
+                "now() - interval '2 hours', now() - interval '2 hours')"
+            ),
+            {"c": a.company_id, "id": session_id, "area": a.area_id},
+        )
+        await conn.execute(
+            text(
+                "UPDATE recording_sessions SET status = 'active', started_at = created_at "
+                "WHERE id = :id"
+            ),
+            {"id": session_id},
+        )
+    await freeze(owner_engine, a.company_id)
+    destroyer = FakeDestroyer()
+    await purge_company(
+        owner_engine, a.company_id, confirm_name="Empresa A", key_destroyer=destroyer
+    )
     assert set((await company_counts(superuser_engine, a.company_id)).values()) == {0}
     assert destroyer.destroyed == [a.company_id]
 

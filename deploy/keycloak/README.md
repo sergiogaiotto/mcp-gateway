@@ -17,7 +17,9 @@ O que vem no realm:
 - `organizationsEnabled: true`: as Organizations do Keycloak 26.
 - `rapa-interface`: cliente OIDC **confidencial** da interface, só com o fluxo de código e PKCE `S256` (nada de fluxo implícito nem de senha direta). O retorno é `https://<endereço>/auth/oidc/retorno`.
 - `rapa-api`: só a **audiência** dos tokens da API (`RAPA_JWT_AUDIENCE=rapa-api`). O cliente da interface põe essa audiência no token de acesso (mapper `audiencia-da-api`): o mesmo token vale na interface e na REST.
-- Mapper `organizacao` (tipo *Organization Membership*): a claim `organization` com o apelido e o id da organização (`{"apelido": {"id": "<uuid>"}}`), que o RaPA confere (`rapa.control.auth`): exatamente uma organização por pessoa, ligada a uma empresa.
+- O escopo `organization` entre os escopos padrão do `rapa-interface`: a claim `organization`, que o RaPA confere (`rapa.control.auth`): exatamente uma organização por pessoa, ligada a uma empresa. O mapper de organização do Keycloak 26 só põe a claim quando o escopo `organization` está no pedido (ou quando o login escolheu uma organização); como escopo padrão, ele vai em todo pedido, sem o RaPA pedi-lo. O escopo e o mapper dele são os que o Keycloak cria na importação (o arquivo não declara `clientScopes`); o cliente não tem um mapper próprio da mesma claim (dois mappers da mesma claim correm, numa ordem qualquer).
+
+Depois de importar, ligue o id na claim: **Client scopes** → `organization` → **Mappers** → `organization` → **Add organization id** = On (e **Save**). Assim a claim vem com o apelido e o id (`{"apelido": {"id": "<uuid>"}}`), a forma que o RaPA liga à empresa pelo id da organização (`empresa criar --organizacao <id>`). Sem isso, a claim é só a lista dos apelidos (`["apelido"]`), e só uma empresa ligada pelo apelido aceita o login.
 
 ## 2. O segredo do cliente da interface
 
@@ -82,8 +84,8 @@ Prefira o id da organização (o apelido também é aceito, mas pode mudar). A l
 
 ## 4. Conferir
 
-Em **Client scopes** → **Evaluate**, escolha `rapa-interface` e uma pessoa da organização e veja o token de acesso gerado: precisa ter `aud` com `rapa-api` e a claim `organization` com o apelido e o id. Depois, na interface, a pessoa entra e vê a empresa dela; pela REST, `GET /v1/eu` com o token mostra a empresa e os papéis.
+Em **Clients** → `rapa-interface` → **Client scopes** → **Evaluate**, escolha uma pessoa da organização e veja o token de acesso gerado: precisa ter `aud` com `rapa-api`, `organization` no `scope` e a claim `organization` com o apelido e o id (sem a claim, o RaPA recusa o login com "o token não informa a empresa do usuário"). Depois, na interface, a pessoa entra e vê a empresa dela; pela REST, `GET /v1/eu` com o token mostra a empresa e os papéis.
 
 ## Outros clientes da API (agentes MCP)
 
-Um cliente que chama a REST ou o MCP com o próprio token (um agente, outro sistema) precisa dos mesmos dois mappers (`audiencia-da-api` e `organizacao`) e de pertencer a uma organização (ou à conta de serviço de uma). Nunca dê a ele o fluxo de senha direta.
+Um cliente que chama a REST ou o MCP com o próprio token (um agente, outro sistema) precisa do mesmo mapper `audiencia-da-api`, do escopo `organization` entre os escopos padrão dele (ou pedido no `scope` de cada token) e de pertencer a uma organização (ou à conta de serviço de uma). Nunca dê a ele o fluxo de senha direta.

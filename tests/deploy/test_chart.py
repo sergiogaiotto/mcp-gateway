@@ -1138,16 +1138,88 @@ def test_accounts_that_create_pods_only_create_single_use_pods(variant: str) -> 
     )
     rules = "\n".join(v["expression"] for v in spec["validations"])
     image = _env(variant, "despachante")["RAPA_K8S_IMAGEM_EXECUTOR"]
-    assert f"c.image == '{image}'" in rules
+    assert f"c.image in ['{image}']" in rules
     assert "object.spec.serviceAccountName == 'rapa-executor'" in rules
     assert "object.spec.automountServiceAccountToken == false" in rules
-    assert "variables.app in ['rapa-executor', 'rapa-sessao']" in rules
-    assert "'rapa.session.host' : 'rapa.runner.pod'" in rules
     assert "has(v.secret) || has(v.emptyDir)" in rules
-    assert "!has(c.command)" in rules and "PYTHON" in rules
+    assert "!has(c.command)" in rules
     gvisor = "object.spec.runtimeClassName == 'gvisor'"
     # No kind (sem gVisor), a RuntimeClass não é exigida; fora dele, sempre.
     assert (gvisor in rules) is (variant != "kind")
+
+
+@pytest.mark.parametrize("variant", APP_VARIANTS)
+def test_each_account_only_creates_its_own_pods_and_they_only_run_the_command(
+    variant: str,
+) -> None:
+    """A web não cria o pod de execução (o rótulo que abre o canal), e o pod que cada conta
+    cria não roda nada além do comando: nem gancho nem sonda exec, nem uma variável que troque
+    o que roda (PATH, NODE_OPTIONS, RAPA_CHROMIUM_PATH), nem um volume por cima da imagem."""
+    spec = _admission(rendered(variant))
+    variables = {v["name"]: v["expression"] for v in spec["variables"]}
+    assert variables["expected"] == (
+        "request.userInfo.username == 'system:serviceaccount:rapa:rapa-despachante' "
+        "? 'rapa-executor' : 'rapa-sessao'"
+    )
+    assert variables["secretDir"] == (
+        "variables.app == 'rapa-sessao' ? '/var/run/rapa/sessao' : '/var/run/rapa/canal'"
+    )
+    rules = [v["expression"] for v in spec["validations"]]
+    assert "variables.app == variables.expected" in rules
+    assert not any("variables.app in [" in rule for rule in rules)
+    text = " ".join(" ".join(rule.split()) for rule in rules)
+    # O comando exato de cada rótulo, sem pasta de trabalho.
+    assert (
+        "c.args == (variables.app == 'rapa-sessao' ? "
+        "['python', '-m', 'rapa.session.host', '--config', '/var/run/rapa/sessao/config.json'] : "
+        "['python', '-m', 'rapa.runner.pod'])"
+    ) in text
+    assert "!has(c.workingDir)" in text
+    # Nada de ganchos nem sondas que rodam comandos (ou que o kubelet faça para outro host).
+    for field in ("c.lifecycle", "c.livenessProbe", "c.startupProbe"):
+        assert f"!has({field})" in text
+    for field in ("exec", "httpGet", "grpc", "tcpSocket.host"):
+        assert f"!has(c.readinessProbe.{field})" in text
+    # Só as variáveis que o lançador põe, e nenhuma de um Secret.
+    assert "c.env.all(v, v.name in ['PYTHONUNBUFFERED', 'TMPDIR'] && !has(v.valueFrom))" in text
+    assert "!has(c.envFrom)" in text
+    # O Secret só na pasta dele, os emptyDir só em /tmp e /trabalho, sem subPath.
+    assert "!has(m.subPath) && !has(m.subPathExpr)" in text
+    assert "m.mountPath in [variables.secretDir, '/tmp', '/trabalho']" in text
+    assert "(m.name in variables.secretVolumes) == (m.mountPath == variables.secretDir)" in text
+
+
+def _admitted_images(render: Render) -> list[str]:
+    rules = "\n".join(v["expression"] for v in _admission(render)["validations"])
+    found = re.search(r"c\.image in \[([^\]]*)\]", rules)
+    assert found, rules
+    return re.findall(r"'([^']+)'", found[1])
+
+
+def test_an_upgrade_still_admits_the_executor_the_old_pods_launch() -> None:
+    """Na atualização, a política nova vale na hora, mas o despachante e a web antigos
+    continuam lançando pods com o executor anterior até saírem (o rollout sobe um pod novo
+    antes de tirar um velho): com images.executor.previousDigests, esses pods passam."""
+    old, new = "sha256:" + "2" * 64, "sha256:" + "3" * 64
+    before = template("values-producao-exemplo.yaml", sets={"images.executor.digest": old})
+    launched = _env_of(before, "despachante")["RAPA_K8S_IMAGEM_EXECUTOR"]
+    assert launched == _env_of(before, "web")["RAPA_K8S_IMAGEM_EXECUTOR"]
+    after = template(
+        "values-producao-exemplo.yaml",
+        sets={"images.executor.digest": new},
+        set_json={"images.executor.previousDigests": [old]},
+    )
+    current = _env_of(after, "despachante")["RAPA_K8S_IMAGEM_EXECUTOR"]
+    assert current.endswith(new)
+    assert _admitted_images(after) == [current, launched]
+    # Sem os digests anteriores, só o executor desta versão; um digest inválido é recusado.
+    assert _admitted_images(rendered("producao")) == [
+        _env("producao", "despachante")["RAPA_K8S_IMAGEM_EXECUTOR"]
+    ]
+    error = template_error(
+        "values-producao-exemplo.yaml", set_json={"images.executor.previousDigests": ["abc"]}
+    )
+    assert "digest inválido" in error
 
 
 def test_the_admission_policy_is_never_off_outside_dev() -> None:
@@ -1236,6 +1308,20 @@ def test_operation_pod_template_has_the_operation_identity() -> None:
     # Nenhum outro componente recebe o papel da operação.
     for component in COMPONENTS:
         assert _env("producao", component)["RAPA_BAO_PAPEL"] != "rapa-operacao"
+
+
+def test_operation_export_stages_on_its_own_disk() -> None:
+    """A exportação monta os arquivos decifrados numa pasta temporária (``tempfile``): ela
+    fica no disco da exportação (/trabalho, operation.workSizeLimit), nunca no /tmp de 1 GiB,
+    que despejaria o pod no meio de uma exportação grande."""
+    pod = rendered("producao").get("PodTemplate", "rapa-operacao")["template"]["spec"]
+    container = pod["containers"][0]
+    tmpdir = container_env(pod).get("TMPDIR")
+    mounts = {m["mountPath"]: m["name"] for m in container["volumeMounts"]}
+    assert tmpdir is not None, "sem TMPDIR, o tempfile usa o /tmp (TMPDIR da imagem)"
+    assert mounts.get(tmpdir) == "trabalho", (tmpdir, mounts)
+    volumes = {v["name"]: v for v in pod["volumes"]}
+    assert volumes["trabalho"]["emptyDir"]["sizeLimit"] == "50Gi"
 
 
 def test_operation_pod_only_reaches_the_database_s3_and_openbao() -> None:

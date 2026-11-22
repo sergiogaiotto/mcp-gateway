@@ -31,7 +31,8 @@ com o nome do destino; a guarda:
 3. conecta exatamente ao endereço que conferiu (uma troca de DNS no meio não muda o
    destino; um endereço literal vai na forma canônica, e um com zona, ``%...``, é
    recusado), ou, com o proxy de saída do operador (``RAPA_PROXY_SAIDA``, um proxy HTTP
-   CONNECT), manda o nome para ele, que resolve (só nomes e endereços conferidos: nada
+   CONNECT, com ``Proxy-Authorization: Basic`` quando a URL leva usuário e senha), manda
+   o nome para ele, que resolve (só nomes e endereços conferidos: nada
    se injeta na linha do ``CONNECT``): quando a guarda não resolve o nome
    (a internet só sai pelo proxy) ou ele resolve para a internet. Um nome que resolve
    para uma rede interna permitida vai direto, sem o proxy; um que resolve para outra
@@ -66,6 +67,7 @@ para o proxy, e o que ele alcança é a regra dele.
 """
 
 import asyncio
+import base64
 import contextlib
 import fnmatch
 import ipaddress
@@ -74,12 +76,13 @@ import logging
 import re
 import socket
 from collections.abc import Awaitable, Callable, Iterable, Sequence
-from dataclasses import dataclass
-from urllib.parse import urlsplit
+from dataclasses import dataclass, field
+from urllib.parse import quote, unquote, urlsplit
 
 __all__ = [
     "BROWSER_NETWORK_ARGS",
     "MAX_CONNECTIONS",
+    "PROXY_CREDENTIALS_ENV",
     "PROXY_SWITCHES",
     "WEBRTC_OFF_SCRIPT",
     "EgressGuard",
@@ -186,6 +189,11 @@ _NEVER_OPEN: tuple[Network, ...] = tuple(
 )
 #: Um nome que pode ir ao proxy de saída (nunca um espaço, um CR ou um LF no pedido).
 _NAME = re.compile(r"^[a-z0-9_](?:[a-z0-9_.-]{0,252})$")
+#: A variável de ambiente que leva ``usuário:senha`` do proxy de saída ao worker: a linha de
+#: comando de um processo é legível por qualquer outro da máquina ou do pod; o ambiente,
+#: só pelo mesmo usuário. O worker a tira do ambiente antes de abrir o navegador.
+PROXY_CREDENTIALS_ENV = "RAPA_PROXY_SAIDA_CREDENCIAIS"
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def without_proxy_switches(args: Iterable[str]) -> list[str]:
@@ -235,10 +243,18 @@ class UpstreamProxy:
 
     host: str
     port: int
+    #: ``usuário:senha`` do ``Proxy-Authorization: Basic``; nunca no ``repr`` nem em :attr:`url`.
+    credentials: str | None = field(default=None, repr=False)
 
     @classmethod
-    def parse(cls, url: str) -> UpstreamProxy:
-        """``http://proxy.interno:3128``: só ``http``, com a porta, sem usuário nem caminho."""
+    def parse(cls, url: str, credentials: str | None = None) -> UpstreamProxy:
+        """``http://proxy.interno:3128`` ou ``http://usuário:senha@proxy.interno:3128``.
+
+        Só ``http``, com a porta, sem caminho. Usuário e senha (com ``%`` nos caracteres
+        reservados da URL) vão no ``Proxy-Authorization: Basic`` de cada ``CONNECT``; vêm
+        da URL (o Secret do chart) ou de ``credentials`` (o worker, pelo ambiente). Nenhuma
+        mensagem de erro repete a URL.
+        """
         try:
             split = urlsplit(url.strip())
             port = split.port
@@ -246,19 +262,45 @@ class UpstreamProxy:
             raise ValueError("o proxy de saída precisa ser um endereço http://host:porta") from None
         if split.scheme != "http" or not split.hostname:
             raise ValueError("o proxy de saída precisa ser um endereço http://host:porta")
-        if split.username is not None or split.password is not None:
-            # Uma senha aqui iria para a linha de comando do executor e para os logs.
-            raise ValueError("o proxy de saída não pode ter usuário e senha no endereço")
         if port is None:
             raise ValueError("informe a porta do proxy de saída (ex. http://proxy.interno:3128)")
         if split.path not in ("", "/") or split.query or split.fragment:
             raise ValueError("o proxy de saída é só http://host:porta, sem caminho")
-        return cls(split.hostname, port)
+        if split.username is not None or split.password is not None:
+            if credentials is not None:
+                raise ValueError("o proxy de saída recebeu usuário e senha duas vezes")
+            credentials = f"{unquote(split.username or '')}:{unquote(split.password or '')}"
+        if credentials is not None:
+            user, separator, _ = credentials.partition(":")
+            if not user or not separator or _CONTROL_CHARS.search(credentials):
+                raise ValueError(
+                    "o usuário e a senha do proxy de saída precisam ser usuario:senha, sem "
+                    "caracteres de controle (escape os reservados da URL com %)"
+                )
+        return cls(split.hostname, port, credentials)
 
     @property
     def url(self) -> str:
+        """O endereço sem usuário e senha (o que pode ir para a linha de comando e os logs)."""
         host = f"[{self.host}]" if ":" in self.host else self.host
         return f"http://{host}:{self.port}"
+
+    @property
+    def url_with_credentials(self) -> str:
+        """:attr:`url` com usuário e senha: só para o que vai num Secret, no stdin do
+        hospedeiro da sessão ou no canal do despachante (como os segredos do robô)."""
+        if self.credentials is None:
+            return self.url
+        user, _, password = self.credentials.partition(":")
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"http://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{self.port}"
+
+    @property
+    def authorization(self) -> str | None:
+        """O valor do ``Proxy-Authorization`` (``Basic``), se o proxy pede usuário e senha."""
+        if self.credentials is None:
+            return None
+        return "Basic " + base64.b64encode(self.credentials.encode("utf-8")).decode("ascii")
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,10 +318,16 @@ class EgressPolicy:
     upstream_proxy: UpstreamProxy | None = None
 
     @classmethod
-    def parse(cls, networks: str | Iterable[str] = (), proxy: str | None = None) -> EgressPolicy:
+    def parse(
+        cls,
+        networks: str | Iterable[str] = (),
+        proxy: str | None = None,
+        *,
+        proxy_credentials: str | None = None,
+    ) -> EgressPolicy:
         return cls(
             allowed_networks=parse_networks(networks),
-            upstream_proxy=UpstreamProxy.parse(proxy) if proxy else None,
+            upstream_proxy=UpstreamProxy.parse(proxy, proxy_credentials) if proxy else None,
         )
 
     def reachable(self, address: str) -> bool:
@@ -299,11 +347,21 @@ class EgressPolicy:
         )
 
     def worker_args(self) -> list[str]:
-        """Os argumentos do worker que levam esta política (``--guarda-de-saida`` à parte)."""
+        """Os argumentos do worker que levam esta política (``--guarda-de-saida`` à parte).
+
+        O proxy vai sem usuário e senha: esses vão no ambiente (:meth:`worker_env`).
+        """
         args = [f"--rede-interna-permitida={network}" for network in self.allowed_networks]
         if self.upstream_proxy is not None:
             args.append(f"--proxy-saida={self.upstream_proxy.url}")
         return args
+
+    def worker_env(self) -> dict[str, str]:
+        """O ambiente do worker que leva usuário e senha do proxy (:data:`PROXY_CREDENTIALS_ENV`)."""
+        proxy = self.upstream_proxy
+        if proxy is None or proxy.credentials is None:
+            return {}
+        return {PROXY_CREDENTIALS_ENV: proxy.credentials}
 
 
 def _address(address: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -743,8 +801,12 @@ async def _connect_via_proxy(
     except OSError, TimeoutError:
         return _HOST_UNREACHABLE
     authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+    authorization = proxy.authorization
+    auth = f"Proxy-Authorization: {authorization}\r\n" if authorization else ""
     try:
-        writer.write(f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n".encode("ascii"))
+        writer.write(
+            f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n{auth}\r\n".encode("ascii")
+        )
         await writer.drain()
         head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), CONNECT_TIMEOUT_S)
     except (
@@ -761,7 +823,7 @@ async def _connect_via_proxy(
     if status == 200:
         return reader, writer
     writer.transport.abort()
-    # O proxy recusou pela regra dele (403, ou 407 sem autenticação): proibido.
+    # O proxy recusou pela regra dele (403, ou 407: sem usuário e senha, ou errados): proibido.
     return _NOT_ALLOWED if status in (403, 407) else _HOST_UNREACHABLE
 
 

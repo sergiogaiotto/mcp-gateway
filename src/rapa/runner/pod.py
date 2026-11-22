@@ -61,6 +61,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from rapa.core.contracts import RunnerJob
 from rapa.core.events import RunEvent
 from rapa.runner.ports import ack_path, valid_file_id, waits_for_ack
+from rapa.session.egress import PROXY_CREDENTIALS_ENV, UpstreamProxy
 
 __all__ = [
     "ChannelClient",
@@ -108,7 +109,8 @@ class PodOptions(BaseModel):
     internal_networks: tuple[str, ...] = Field(
         default=(), alias="redes_internas_permitidas", max_length=256
     )
-    egress_proxy: str | None = Field(default=None, alias="proxy_saida", max_length=2000)
+    #: A URL do proxy de saída, com usuário e senha quando há (nunca no ``repr``).
+    egress_proxy: str | None = Field(default=None, alias="proxy_saida", max_length=2000, repr=False)
     video: bool = Field(default=False, alias="video")
     ack_timeout_s: float = Field(default=30.0, gt=0, le=3600, alias="espera_ack_s")
     browser_args: tuple[str, ...] = Field(default=(), alias="argumentos_navegador", max_length=256)
@@ -117,6 +119,16 @@ class PodOptions(BaseModel):
     #: Os arquivos de entrada que o agente busca no canal antes de rodar o worker;
     #: ``None``: o despachante não tem pasta de arquivos (o worker fica sem, como no local).
     files: tuple[str, ...] | None = Field(default=None, alias="arquivos", max_length=256)
+
+    @field_validator("egress_proxy")
+    @classmethod
+    def _check_proxy(cls, value: str | None) -> str | None:
+        if value:
+            UpstreamProxy.parse(value)  # ValueError sem repetir a URL
+        return value or None
+
+    def upstream_proxy(self) -> UpstreamProxy | None:
+        return UpstreamProxy.parse(self.egress_proxy) if self.egress_proxy else None
 
     @field_validator("files")
     @classmethod
@@ -255,7 +267,9 @@ class ChannelClient:
         finally:
             await asyncio.to_thread(handle.close)
         if response.status_code in (201, 409):
-            return  # 409: já chegou numa tentativa anterior deste envio
+            # 409: já chegou inteiro numa tentativa anterior deste envio (um envio ainda em
+            # andamento no canal recebe 429, e o agente tenta de novo).
+            return
         _check(response, "um artefato")
 
     async def put_result(self, data: bytes) -> None:
@@ -270,9 +284,14 @@ class ChannelClient:
 
 
 def _transient(exc: BaseException) -> bool:
-    """Um erro que vale tentar de novo (rede, prazo ou 5xx do canal)."""
+    """Um erro que vale tentar de novo (rede, prazo, 5xx, 429 ou 408 do canal).
+
+    O 408 é o "pedido lento" do canal (o corpo ou o disco dele passou do tempo): o resultado
+    e o artefato não ficaram valendo, e repetir um lote de eventos é seguro (o despachante
+    grava pelo ``seq``).
+    """
     if isinstance(exc, httpx2.HTTPStatusError):
-        return exc.response.status_code >= 500 or exc.response.status_code == 429
+        return exc.response.status_code >= 500 or exc.response.status_code in (408, 429)
     return isinstance(exc, (httpx2.TransportError, OSError, TimeoutError))
 
 
@@ -536,8 +555,9 @@ def _downloader(client: ChannelClient, name: str, target: Path) -> Callable[[], 
     return download
 
 
-def _worker_env(work: Path) -> dict[str, str]:
-    """O ambiente do worker: só o que o Python, o Playwright e as fontes precisam."""
+def _worker_env(work: Path, options: PodOptions | None = None) -> dict[str, str]:
+    """O ambiente do worker: só o que o Python, o Playwright e as fontes precisam, mais
+    usuário e senha do proxy de saída (nunca na linha de comando)."""
     env = {
         key: value
         for key, value in os.environ.items()
@@ -545,6 +565,9 @@ def _worker_env(work: Path) -> dict[str, str]:
     }
     # Os temporários do Chromium (o perfil) vão para o disco do trabalho, não para o tmpfs.
     env["TMPDIR"] = str(work / "tmp")
+    proxy = options.upstream_proxy() if options is not None and options.egress_guard else None
+    if proxy is not None and proxy.credentials is not None:
+        env[PROXY_CREDENTIALS_ENV] = proxy.credentials
     return env
 
 
@@ -585,8 +608,9 @@ def _worker_command(
     if options.egress_guard:
         command.append("--guarda-de-saida")
         command += [f"--rede-interna-permitida={net}" for net in options.internal_networks]
-        if options.egress_proxy:
-            command.append(f"--proxy-saida={options.egress_proxy}")
+        proxy = options.upstream_proxy()
+        if proxy is not None:
+            command.append(f"--proxy-saida={proxy.url}")  # usuário e senha, no ambiente
     command += [f"--browser-arg={arg}" for arg in browser_args]
     return command
 
@@ -782,7 +806,7 @@ async def _run_attempt(
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
-            env=_worker_env(work),
+            env=_worker_env(work, options),
             cwd=work,
             start_new_session=True,
         )

@@ -16,7 +16,8 @@
 # soltas, sem a raiz, as duas Applications sincronizam ao mesmo tempo e a migração só
 # conta com o retry. Depois da primeira instalação, cada filha sincroniza sozinha (o banco
 # já existe); numa troca do banco (a restauração, docs/OPERACAO.md 1.5), pare o sync da
-# aplicação até o Cluster novo ficar pronto.
+# raiz e o das filhas (a raiz primeiro: com o selfHeal, ela desfaz a mudança nas filhas) até
+# o Cluster novo ficar pronto.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:

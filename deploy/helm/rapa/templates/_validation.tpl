@@ -71,7 +71,7 @@ só em kind e desenvolvimento.
 -}}
 {{- range $name := keys $urls | sortAlpha -}}
 {{- if regexMatch "^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]*@" (toString (index $urls $name)) -}}
-{{- fail (printf "%s não pode levar usuário e senha na URL (o valor vai em claro para o manifesto); para o proxy de saída, use executions.egress.proxy.existingSecret" $name) -}}
+{{- fail (printf "%s não pode levar usuário e senha na URL (o valor vai em claro para o manifesto); para o proxy de saída com usuário e senha, ponha a URL inteira num Secret e use executions.egress.proxy.existingSecret" $name) -}}
 {{- end -}}
 {{- end -}}
 
@@ -189,16 +189,17 @@ abrem. As redes internas a mais (que só fecham) precisam ser CIDRs, sem a inter
 {{- include "rapa.cidrCheck" (dict "text" . "what" "executions.egress.extraInternalNetworks" "minV4" 1 "minV6" 1 "forbidden" (list)) -}}
 {{- end -}}
 
-{{/* O proxy de saída (RAPA_PROXY_SAIDA): pela URL ou, com senha, por um Secret. */}}
+{{/* O proxy de saída (RAPA_PROXY_SAIDA): pela URL ou, com usuário e senha (o
+Proxy-Authorization: Basic da guarda), pela URL inteira num Secret. */}}
 {{- if and $e.proxy.url $e.proxy.existingSecret -}}
 {{- fail "executions.egress.proxy: informe url ou existingSecret, não os dois" -}}
 {{- end -}}
 {{- $proxy := or $e.proxy.url $e.proxy.existingSecret -}}
 {{- if and $proxy (not $e.proxy.cidrs) -}}
-{{- fail "executions.egress.proxy.url precisa de executions.egress.proxy.cidrs (a NetworkPolicy só conhece endereços)" -}}
+{{- fail "executions.egress.proxy (url ou existingSecret) precisa de executions.egress.proxy.cidrs (a NetworkPolicy só conhece endereços)" -}}
 {{- end -}}
 {{- if and (not $e.directInternet) (not $proxy) -}}
-{{- fail "sem executions.egress.directInternet, os robôs só saem pelo proxy: informe executions.egress.proxy.url" -}}
+{{- fail "sem executions.egress.directInternet, os robôs só saem pelo proxy: informe executions.egress.proxy.url (ou existingSecret)" -}}
 {{- end -}}
 
 {{/*
@@ -258,7 +259,7 @@ e a das métricas. A do host de sessão é fixa no código (o relay conecta nela
 {{- fail "images.requireDigest: informe images.control.digest e images.executor.digest (sha256:...)" -}}
 {{- end -}}
 {{- end -}}
-{{- range list $v.images.control.digest $v.images.executor.digest -}}
+{{- range concat (list $v.images.control.digest $v.images.executor.digest) ($v.images.executor.previousDigests | default list) -}}
 {{- if and . (not (regexMatch "^sha256:[0-9a-f]{64}$" .)) -}}
 {{- fail (printf "digest inválido: %q (use sha256:<64 hexadecimais>)" .) -}}
 {{- end -}}

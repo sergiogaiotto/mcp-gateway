@@ -692,7 +692,9 @@ class Dispatcher:
             except asyncio.CancelledError:
                 if not stale.is_set():
                     raise
-                # A tentativa ficou antiga: outra já assumiu, nada a gravar.
+                # A tentativa ficou antiga: outra já assumiu, nada a gravar. O que ela
+                # deixou na passagem nunca vai ser registrado: sai já, não na retenção.
+                await self._release_attempt(job)
                 return None
             except WorkerNotStarted as exc:
                 logger.error("o executor não foi iniciado: %s", _error_name(exc.__cause__ or exc))
@@ -728,14 +730,21 @@ class Dispatcher:
         try:
             return await self._store_artifacts(store, job, result)
         finally:
-            try:
-                await store.release_attempt(job.company_id, job.run_id, job.attempt)
-            except Exception as exc:
-                logger.error(
-                    "a passagem dos artefatos de %s não pôde ser limpa: %s",
-                    job.run_id,
-                    _error_name(exc),
-                )
+            await self._release_attempt(job)
+
+    async def _release_attempt(self, job: RunnerJob) -> None:
+        """Solta a tentativa no store (a passagem dela sai); um erro só vai para o log."""
+        store = self.artifacts
+        if store is None:
+            return
+        try:
+            await store.release_attempt(job.company_id, job.run_id, job.attempt)
+        except Exception as exc:
+            logger.error(
+                "a passagem dos artefatos de %s não pôde ser limpa: %s",
+                job.run_id,
+                _error_name(exc),
+            )
 
     async def _store_artifacts(
         self, store: ArtifactStore, job: RunnerJob, result: Mapping[str, Any]

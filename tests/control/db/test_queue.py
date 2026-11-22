@@ -1,15 +1,19 @@
 """Fila de execuções: admissão justa, reserva interativa, cerca e recolhedor."""
 
+import json
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
+import httpx2
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from rapa.control.channel import Channel
 from rapa.control.db import Database
 from rapa.control.launcher import LocalLauncherSettings, LocalProcessLauncher, _EventTail
 from rapa.control.services import (
@@ -1167,3 +1171,148 @@ async def test_resend_after_a_lost_commit_acknowledgement_is_acknowledged(
     state, irreversible_at, _ = await _run_row(dispatcher_db, rid)
     assert state == "running" and irreversible_at is not None
     assert [seq for _, seq, _ in await _stored(dispatcher_db, rid)] == [0, 1, 2]
+
+
+# ---------------------------------------------------------------------------
+# Eventos que um pod hostil manda pelo canal
+# ---------------------------------------------------------------------------
+
+
+async def _channel_attempt(
+    platform: PgPlatform, queue: PgRunQueue, app_db: Database, tmp_path: Path, name: str
+) -> tuple[RunnerJob, Path, httpx2.AsyncClient]:
+    tenant = await _tenant_with_robots(platform, app_db, name)
+    await platform.start(tenant.operator, "emitir_protocolo", PROTOCOLO_INPUTS, RunTrigger.REST)
+    job = await queue.claim_next()
+    assert job is not None
+    work = tmp_path / f"{job.run_id}-{job.attempt}"
+    (work / "ack").mkdir(parents=True)
+    (tmp_path / "artefatos").mkdir()
+    channel = Channel()
+    _, ticket = channel.open(
+        job, work_dir=work, artifacts_dir=tmp_path / "artefatos", secrets={}, options={}
+    )
+    http = httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=channel.app),
+        base_url="http://canal",
+        headers={"Authorization": f"Bearer {ticket}"},
+    )
+    return job, work, http
+
+
+def _raw(job: RunnerJob, number: int, changes: dict[str, Any] | None = None) -> bytes:
+    line: dict[str, Any] = _warning(job.run_id, job.attempt, number).model_dump(mode="json")
+    line.update(changes or {})
+    return json.dumps(line).encode() + b"\n"
+
+
+@pytest.mark.parametrize(
+    "poison",
+    [
+        {"seq": 2**31},  # cabe no modelo, não na coluna
+        {"data": {"texto": "a\u0000b"}},  # o JSONB não guarda o caractere nulo
+        {"at": "1999-01-01T00:00:00Z"},  # nenhuma partição do mês
+    ],
+    ids=["seq-fora-da-coluna", "nulo-nos-dados", "data-sem-particao"],
+)
+async def test_batch_the_database_refuses_is_left_out_instead_of_retried_forever(
+    app_db: Database,
+    dispatcher_db: Database,
+    superuser_engine: AsyncEngine,
+    tmp_path: Path,
+    poison: dict[str, Any],
+) -> None:
+    await reset_queue(superuser_engine, total_slots=5)
+    platform, queue = PgPlatform(app_db), PgRunQueue(dispatcher_db)
+    job, work, http = await _channel_attempt(platform, queue, app_db, tmp_path, "Pod hostil")
+    url = f"/canal/{job.run_id}/{job.attempt}/eventos"
+    launcher = _launcher(queue, tmp_path)
+    tail = _EventTail(work / "events.jsonl")
+    pending: list[dict[str, Any]] = []
+    async with http:
+        # O canal só confere o formato: o lote vai para o EVENTS.jsonl.
+        assert (await http.post(url, content=_raw(job, 1, poison))).status_code == 204
+        await launcher._forward(job, tail, work, pending)
+        # Repetir não muda nada: o lote fica de fora, sem confirmação nenhuma...
+        assert pending == [] and list((work / "ack").iterdir()) == []
+        assert await _stored(dispatcher_db, job.run_id) == []
+        # ...e o seguimento não fica preso nele: o que vem depois é gravado e confirmado.
+        assert (await http.post(url, content=_raw(job, 2))).status_code == 204
+        await launcher._forward(job, tail, work, pending)
+    assert pending == [] and (work / "ack" / "2.ack").exists()
+    assert [seq for _, seq, _ in await _stored(dispatcher_db, job.run_id)] == [2]
+
+
+async def test_a_burst_of_events_is_read_in_bounded_pieces_and_every_event_is_stored(
+    app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    await reset_queue(superuser_engine, total_slots=5)
+    platform, queue = PgPlatform(app_db), PgRunQueue(dispatcher_db)
+    job, work, http = await _channel_attempt(platform, queue, app_db, tmp_path, "Rajada")
+    url = f"/canal/{job.run_id}/{job.attempt}/eventos"
+    # Mais eventos entre duas leituras do que parâmetros que o driver manda numa consulta.
+    total = 70_000
+    lines = [
+        event(job.run_id, job.attempt, seq, RunEventKind.ARTIFACT).model_dump_json().encode()
+        for seq in range(total)
+    ]
+    async with http:
+        for start in range(0, total, 35_000):
+            body = b"\n".join(lines[start : start + 35_000]) + b"\n"
+            assert (await http.post(url, content=body)).status_code == 204
+    launcher = _launcher(queue, tmp_path)
+    tail = _EventTail(work / "events.jsonl")
+    pending: list[dict[str, Any]] = []
+    # Uma leitura por vez: o resto espera no disco, não na memória.
+    await launcher._forward(job, tail, work, pending)
+    assert pending == [] and tail.behind
+    first = len(await _stored(dispatcher_db, job.run_id))
+    assert 0 < first < total
+    # No fim, lê até o fim do arquivo e grava tudo.
+    await launcher._forward(job, tail, work, pending, final=True)
+    assert pending == [] and not tail.behind
+    assert len(await _stored(dispatcher_db, job.run_id)) == total
+
+
+class _DatabaseDown:
+    """O banco fora do ar: toda gravação falha como uma queda de conexão."""
+
+    def __init__(self) -> None:
+        self.sizes: list[int] = []
+
+    async def ingest_events(
+        self, run_id: UUID, attempt: int, events: list[dict[str, object]]
+    ) -> int:
+        self.sizes.append(len(events))
+        raise DBAPIError("INSERT", {}, ConnectionError("banco fora do ar"))
+
+
+async def test_events_waiting_for_the_database_do_not_grow_in_memory(
+    app_db: Database, dispatcher_db: Database, superuser_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    await reset_queue(superuser_engine, total_slots=5)
+    platform, queue = PgPlatform(app_db), PgRunQueue(dispatcher_db)
+    job, work, http = await _channel_attempt(platform, queue, app_db, tmp_path, "Banco fora")
+    url = f"/canal/{job.run_id}/{job.attempt}/eventos"
+    down = _DatabaseDown()
+    launcher = LocalProcessLauncher(
+        down,  # type: ignore[arg-type]
+        LocalLauncherSettings(work_dir=tmp_path / "trabalho", artifacts_dir=tmp_path / "artefatos"),
+    )
+    tail = _EventTail(work / "events.jsonl")
+    pending: list[dict[str, Any]] = []
+    seq = 0
+    async with http:
+        for _ in range(5):
+            body = b"".join(
+                event(job.run_id, job.attempt, s, RunEventKind.ARTIFACT).model_dump_json().encode()
+                + b"\n"
+                for s in range(seq, seq + 2000)
+            )
+            seq += 2000
+            assert (await http.post(url, content=body)).status_code == 204
+            await launcher._forward(job, tail, work, pending)
+    # Sempre o mesmo lote (a primeira leitura), por mais que o pod mande enquanto o banco
+    # não grava: o resto espera no disco.
+    assert down.sizes == [2000] * 5
+    assert len(pending) == 2000

@@ -163,7 +163,9 @@ class HostConfig(BaseModel):
     #: Token da sessão (pelo menos 32 caracteres); nunca vai para o log nem para o ``repr``.
     token: str = Field(min_length=32, max_length=512, repr=False)
     start_url: str = Field(min_length=1, max_length=2000)
-    listen_host: str = "127.0.0.1"
+    #: ``None``: todas as interfaces, em IPv4 e em IPv6 (o pod da sessão, cujo IP pode ser
+    #: IPv6); o lançador local usa ``127.0.0.1``.
+    listen_host: str | None = "127.0.0.1"
     listen_port: int = Field(default=0, ge=0, le=65535)
     chromium: str | None = None
     browser_args: tuple[str, ...] = ()
@@ -179,8 +181,9 @@ class HostConfig(BaseModel):
     egress_policy: bool = False
     #: Redes internas que o navegador alcança, com ``egress_policy`` (``10.20.0.0/16``).
     allowed_networks: tuple[str, ...] = Field(default=(), max_length=256)
-    #: Proxy HTTP CONNECT de saída, com ``egress_policy`` (``http://proxy.interno:3128``).
-    upstream_proxy: str | None = Field(default=None, max_length=2000)
+    #: Proxy HTTP CONNECT de saída, com ``egress_policy`` (``http://proxy.interno:3128``, ou
+    #: com usuário e senha); nunca no ``repr``.
+    upstream_proxy: str | None = Field(default=None, max_length=2000, repr=False)
 
     @field_validator("start_url")
     @classmethod

@@ -121,7 +121,8 @@ def test_the_kubernetes_names_are_read(tmp_path: Path) -> None:
             "precisa levar",
         ),
         ({"RAPA_REDES_INTERNAS_PERMITIDAS": "127.0.0.0/8"}, "RAPA_REDES_INTERNAS_PERMITIDAS"),
-        ({"RAPA_PROXY_SAIDA": "http://ana:Tr0ub4dor@proxy:3128"}, "usuário e senha"),
+        # O proxy com usuário e senha (de um Secret) vale; um erro nele não os repete.
+        ({"RAPA_PROXY_SAIDA": "http://ana:Tr0ub4dor@proxy"}, "informe a porta"),
     ],
 )
 def test_bad_pod_configuration_is_refused(

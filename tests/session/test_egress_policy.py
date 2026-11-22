@@ -124,7 +124,9 @@ def test_internal_networks_parse_from_the_environment_format() -> None:
     ("url", "message"),
     [
         ("https://proxy.interno:3128", "http://host:porta"),
-        ("http://usuario:Tr0ub4dor@proxy.interno:3128", "usuário e senha"),
+        # Com usuário e senha (ver test_egress_proxy_auth), os erros também não os repetem.
+        ("http://usuario:Tr0ub4dor@proxy.interno", "informe a porta"),
+        ("https://usuario:Tr0ub4dor@proxy.interno:3128", "http://host:porta"),
         ("http://proxy.interno", "informe a porta"),
         ("http://proxy.interno:3128/caminho", "sem caminho"),
         ("http://proxy.interno:porta", "http://host:porta"),

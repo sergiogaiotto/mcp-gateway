@@ -104,6 +104,7 @@ from typing import Any, Protocol, Self
 from uuid import UUID
 
 from pydantic import ValidationError
+from sqlalchemy.exc import DataError, IntegrityError
 
 from rapa.control.artifacts import attempt_dir
 from rapa.control.channel import Channel, ChannelAttempt
@@ -124,7 +125,7 @@ from rapa.control.kube import (
 from rapa.control.services.dispatcher import WorkerNotStarted, failure_result
 from rapa.control.services.queue import StaleAttempt
 from rapa.core.artifacts import valid_artifact_name
-from rapa.core.contracts import RunnerJob
+from rapa.core.contracts import InvalidInput, RunnerJob
 from rapa.core.events import RunEvent
 from rapa.core.robot import FieldType
 from rapa.runner.pod import PodOptions
@@ -163,6 +164,9 @@ _ENV_ALLOWED = frozenset({"PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR", "SYS
 _ENV_PREFIXES = ("PLAYWRIGHT_", "XDG_", "FONTCONFIG_")
 #: Tamanho máximo de uma linha de evento lida do worker.
 _MAX_EVENT_LINE = 1024 * 1024
+#: O que o seguimento lê do EVENTS.jsonl de uma vez (mais que uma linha inteira): o que
+#: o executor manda espera no disco, nunca na memória do despachante.
+_MAX_TAIL_READ = 2 * _MAX_EVENT_LINE
 #: Código da falha de um pod de execução que nunca subiu ou nunca buscou o trabalho.
 EXECUTOR_NOT_STARTED = "executor_nao_iniciou"
 #: Campos que uma fonte de segredos pode entregar: os do SECRETS.json e o certificado A1
@@ -171,6 +175,11 @@ SOURCE_SECRET_FIELDS = SECRET_FIELDS | {"pfx_base64"}
 #: Maior certificado A1 aceito (um PFX tem poucos KiB).
 _MAX_PFX_BYTES = 1024 * 1024
 _SECRETS_CODE = "segredo_indisponivel"
+#: Idade mínima de um pod ou Secret com o rótulo de execução e sem tentativa legível antes
+#: de a varredura apagá-lo. Nenhum lançador cria isso, mas quem opera cria: o pod de
+#: ``deploy/rede/teste-de-saida.yaml`` leva o rótulo (para ganhar a NetworkPolicy dos
+#: robôs) e precisa viver o bastante para rodar e ter o log lido.
+_UNLABELLED_GRACE_S = 15 * 60.0
 
 
 class SecretsUnavailable(Exception):
@@ -334,10 +343,13 @@ class LocalLauncherSettings:
 
 
 class _EventTail:
-    """Lê as linhas completas novas de EVENTS.jsonl."""
+    """Lê as linhas completas novas de EVENTS.jsonl, no máximo ``max_read`` bytes por vez."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, max_read: int = _MAX_TAIL_READ) -> None:
         self.path = path
+        self.max_read = max_read
+        #: A última leitura parou no limite: o arquivo ainda tem o que ler.
+        self.behind = False
         self._offset = 0
         self._partial = b""
 
@@ -345,9 +357,11 @@ class _EventTail:
         try:
             with self.path.open("rb") as handle:
                 handle.seek(self._offset)
-                chunk = handle.read()
+                chunk = handle.read(self.max_read)
         except FileNotFoundError:
+            self.behind = False
             return []
+        self.behind = len(chunk) >= self.max_read
         self._offset += len(chunk)
         data = self._partial + chunk
         lines = data.split(b"\n")
@@ -465,11 +479,23 @@ class _Follower:
         adia a entrega para a próxima leitura; no fim, tenta mais algumas vezes.
         Só o que foi gravado é confirmado: o worker não começa um passo que grava
         antes de o banco saber dele. Uma tentativa antiga (:class:`StaleAttempt`)
-        interrompe o lançamento.
+        interrompe o lançamento. Um lote que o banco recusa pelo conteúdo fica de fora,
+        sem confirmação (repetir não muda nada). Enquanto ``pending`` não é gravado,
+        nada mais é lido: a memória fica em uma leitura (:attr:`_EventTail.max_read`), e
+        o resto espera no disco. No fim (``final``), lê até o fim do arquivo.
         """
-        pending.extend(await asyncio.to_thread(tail.read_new))
-        if not pending:
-            return
+        while True:
+            if not pending:
+                pending.extend(await asyncio.to_thread(tail.read_new))
+            if pending and not await self._ingest(job, work, pending, final=final):
+                return
+            if not (final and tail.behind):
+                return
+
+    async def _ingest(
+        self, job: RunnerJob, work: Path, pending: list[dict[str, Any]], *, final: bool
+    ) -> bool:
+        """Grava ``pending`` e confirma; ``False`` se o banco não respondeu (fica para depois)."""
         tries = 4 if final else 1
         for attempt in range(1, tries + 1):
             try:
@@ -477,6 +503,19 @@ class _Follower:
                 break
             except StaleAttempt:
                 raise
+            except (InvalidInput, DataError, IntegrityError) as exc:
+                # Recusado pelo conteúdo (um número fora da coluna, um caractere que o
+                # banco não guarda, um evento malformado): repetir não muda nada. O lote
+                # fica de fora sem nenhuma confirmação (o passo que esperava uma não
+                # começa), em vez de ser repetido a cada leitura e crescer na memória.
+                logger.error(
+                    "%d evento(s) de %s recusados pelo banco: %s",
+                    len(pending),
+                    job.run_id,
+                    type(exc).__name__,
+                )
+                pending.clear()
+                return True
             except Exception as exc:
                 logger.warning(
                     "falha ao gravar eventos de %s (tentativa %d): %s",
@@ -485,7 +524,7 @@ class _Follower:
                     type(exc).__name__,
                 )
                 if attempt == tries:
-                    return
+                    return False
                 await asyncio.sleep(0.25 * attempt)
         delivered, pending[:] = list(pending), []
         for raw in delivered:
@@ -496,6 +535,7 @@ class _Follower:
             if waits_for_ack(event):
                 await asyncio.to_thread(_write_ack, work / "ack", event.seq)
                 self._acknowledged(job)
+        return True
 
     def _acknowledged(self, job: RunnerJob) -> None:
         """Uma confirmação acabou de ser escrita (o lançador de pods acorda o canal)."""
@@ -593,6 +633,12 @@ class LocalProcessLauncher(_Follower):
         command += [f"--browser-arg={arg}" for arg in settings.browser_args]
         return command
 
+    def _env(self) -> dict[str, str]:
+        """O ambiente do worker: o mínimo, mais usuário e senha do proxy de saída (nunca na
+        linha de comando, que qualquer processo da máquina lê)."""
+        egress = self.settings.egress
+        return {**_worker_env(), **(egress.worker_env() if egress is not None else {})}
+
     async def launch(self, job: RunnerJob) -> dict[str, Any]:
         """Roda a tentativa num worker e devolve o RESULT.json.
 
@@ -624,7 +670,7 @@ class LocalProcessLauncher(_Follower):
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
-                    env=_worker_env(),
+                    env=self._env(),
                     cwd=work,
                     start_new_session=True,
                 )
@@ -796,6 +842,20 @@ def _labelled_attempt(item: Mapping[str, Any]) -> tuple[str, tuple[UUID, int]] |
     return name, (run_id, attempt)
 
 
+def _age_s(item: Mapping[str, Any], now: datetime) -> float | None:
+    """A idade do objeto pelo ``creationTimestamp`` (``None`` se não der para ler)."""
+    raw = (item.get("metadata") or {}).get("creationTimestamp")
+    if not isinstance(raw, str):
+        return None
+    try:
+        created = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    return (now - created).total_seconds()
+
+
 def _read_pfx(path: str) -> bytes | None:
     try:
         with Path(path).open("rb") as handle:
@@ -886,7 +946,9 @@ class KubernetesLauncher(_Follower):
         return PodOptions(
             egress_guard=True,
             internal_networks=tuple(str(net) for net in settings.egress.allowed_networks),
-            egress_proxy=proxy.url if proxy is not None else None,
+            # Pelo canal, como os segredos do robô; o agente do pod os passa ao worker pelo
+            # ambiente, nunca pela linha de comando.
+            egress_proxy=proxy.url_with_credentials if proxy is not None else None,
             video=settings.video_on_failure,
             ack_timeout_s=settings.ack_timeout_s,
             browser_args=settings.browser_args,
@@ -1201,6 +1263,8 @@ class KubernetesLauncher(_Follower):
         selector = f"{LABEL_APP}={EXECUTOR_APP}"
         found: dict[str, tuple[UUID, int]] = {}
         unlabelled: set[str] = set()
+        young: set[str] = set()
+        now = datetime.now(UTC)
         for plural in ("pods", "secrets"):
             for item in await self.api.list(namespace, plural, label_selector=selector):
                 name = (item.get("metadata") or {}).get("name")
@@ -1210,14 +1274,19 @@ class KubernetesLauncher(_Follower):
                 if labelled is None:
                     # Rótulo de execução sem uma tentativa legível: nenhum lançador cria
                     # isso, então nunca é de uma tentativa viva (e não fica para sempre).
-                    unlabelled.add(name)
+                    # Um recente fica por enquanto (o pod de teste da saída, de quem opera).
+                    age = _age_s(item, now)
+                    if age is not None and age < _UNLABELLED_GRACE_S:
+                        young.add(name)
+                    else:
+                        unlabelled.add(name)
                 elif labelled[1] not in self._live:
                     found[labelled[0]] = labelled[1]
         if (not found and not unlabelled) or self.attempts is None:
             return 0
         live = await self.attempts.live_attempts(set(found.values())) if found else set()
         removed = 0
-        for name in sorted(unlabelled - set(found)):
+        for name in sorted(unlabelled - set(found) - young):
             await self._remove(name)
             removed += 1
         for name, key in found.items():

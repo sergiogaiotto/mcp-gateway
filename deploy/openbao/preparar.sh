@@ -29,6 +29,12 @@
 #                       (padrão: https://kubernetes.default.svc)
 #   KUBERNETES_CA_CERT  arquivo PEM do CA dessa API, só quando o OpenBao não roda num pod
 #                       do cluster (sem ele, o OpenBao usa o CA e o token montados no pod dele)
+#   KUBERNETES_TOKEN_REVIEWER_JWT
+#                       com KUBERNETES_CA_CERT, obrigatório: arquivo com o token de uma conta
+#                       de serviço com o papel system:auth-delegator, que o OpenBao usa na
+#                       TokenReview (o token projetado dos componentes tem a audiência do
+#                       OpenBao e não entra na API). O config é reescrito inteiro: informe-o
+#                       de novo a cada execução, ou o OpenBao fica sem ele
 set -euo pipefail
 
 : "${BAO_ADDR:?defina BAO_ADDR com o endereço do OpenBao}"
@@ -46,6 +52,7 @@ SA_API="${RAPA_SA_API:-rapa-api}"
 SA_OPERATION="${RAPA_SA_OPERACAO:-rapa-operacao}"
 K8S_HOST="${KUBERNETES_HOST:-https://kubernetes.default.svc}"
 K8S_CA="${KUBERNETES_CA_CERT:-}"
+K8S_REVIEWER="${KUBERNETES_TOKEN_REVIEWER_JWT:-}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Os nomes vão para caminhos do OpenBao: só letras, números, _ e - (e / nas montagens).
@@ -61,6 +68,17 @@ for value in "$NAMESPACE" "$AUDIENCE" "$SA_DISPATCHER" "$SA_WEB" "$SA_API" "$SA_
     exit 1
   }
 done
+
+# Fora do cluster, o token da TokenReview é obrigatório: sem ele, o OpenBao usaria o token
+# de quem entra, com a audiência do OpenBao, que a API do Kubernetes recusa (e as contas de
+# serviço do RaPA não têm o system:auth-delegator). Conferido antes de mexer no OpenBao.
+if [[ -n "$K8S_CA" ]]; then
+  [[ -f "$K8S_CA" ]] || { echo "preparar.sh: KUBERNETES_CA_CERT não é um arquivo" >&2; exit 1; }
+  [[ -n "$K8S_REVIEWER" && -f "$K8S_REVIEWER" && -s "$K8S_REVIEWER" ]] || {
+    echo "preparar.sh: com KUBERNETES_CA_CERT, KUBERNETES_TOKEN_REVIEWER_JWT (um arquivo não vazio) é obrigatório" >&2
+    exit 1
+  }
+fi
 
 mounted() {
   # $1: "secrets" ou "auth"; $2: a montagem. Confere pelo JSON da listagem.
@@ -83,11 +101,11 @@ if ! mounted auth "$AUTH"; then
 fi
 # Rodando no cluster, o OpenBao confere os tokens com a própria conta de serviço (que
 # precisa do papel system:auth-delegator) e o CA montado no pod dele. Fora do cluster, o CA
-# da API vem de KUBERNETES_CA_CERT.
+# da API vem de KUBERNETES_CA_CERT e o token da TokenReview de KUBERNETES_TOKEN_REVIEWER_JWT
+# (conferidos no começo).
 if [[ -n "$K8S_CA" ]]; then
-  [[ -f "$K8S_CA" ]] || { echo "preparar.sh: KUBERNETES_CA_CERT não é um arquivo" >&2; exit 1; }
   bao write "auth/$AUTH/config" kubernetes_host="$K8S_HOST" kubernetes_ca_cert="@$K8S_CA" \
-    disable_local_ca_jwt=true >/dev/null
+    token_reviewer_jwt="@$K8S_REVIEWER" disable_local_ca_jwt=true >/dev/null
 else
   bao write "auth/$AUTH/config" kubernetes_host="$K8S_HOST" >/dev/null
 fi

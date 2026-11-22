@@ -41,7 +41,7 @@
         "access.token.lifespan": "300",
         "use.refresh.tokens": "true"
       },
-      "defaultClientScopes": ["basic", "profile", "email", "web-origins", "acr"],
+      "defaultClientScopes": ["basic", "profile", "email", "web-origins", "acr", "organization"],
       "optionalClientScopes": [],
       "protocolMappers": [
         {
@@ -54,22 +54,6 @@
             "access.token.claim": "true",
             "id.token.claim": "false",
             "introspection.token.claim": "true"
-          }
-        },
-        {
-          "name": "organizacao",
-          "protocol": "openid-connect",
-          "protocolMapper": "oidc-organization-membership-mapper",
-          "consentRequired": false,
-          "config": {
-            "claim.name": "organization",
-            "addOrganizationId": "true",
-            "addOrganizationAttributes": "false",
-            "multivalued": "true",
-            "access.token.claim": "true",
-            "id.token.claim": "true",
-            "introspection.token.claim": "true",
-            "userinfo.token.claim": "false"
           }
         }
       ]

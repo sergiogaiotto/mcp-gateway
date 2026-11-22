@@ -202,7 +202,8 @@ class LocalSessionLauncher:
             proxy = settings.egress.upstream_proxy
             config["egress_policy"] = True
             config["allowed_networks"] = [str(net) for net in settings.egress.allowed_networks]
-            config["upstream_proxy"] = proxy.url if proxy is not None else None
+            # Pelo stdin do hospedeiro: usuário e senha do proxy, quando há, vão junto.
+            config["upstream_proxy"] = proxy.url_with_credentials if proxy is not None else None
         process: asyncio.subprocess.Process | None = None
         try:
             try:
@@ -490,7 +491,10 @@ class KubernetesSessionLauncher:
         return {
             "token": token,
             "start_url": job.start_url,
-            "listen_host": "0.0.0.0",  # noqa: S104 - o repasse chega pela rede do cluster
+            # Todas as interfaces, nas duas pilhas: o repasse chega pela rede do cluster no
+            # IP do pod, que é IPv6 num cluster IPv6 (com "0.0.0.0", só IPv4, a prontidão
+            # nunca passaria e o repasse seria recusado).
+            "listen_host": None,
             "listen_port": settings.port,
             "chromium": None,
             "browser_args": list(settings.browser_args),
@@ -501,7 +505,8 @@ class KubernetesSessionLauncher:
             "profile_parent": SESSION_WORK_DIR,
             "egress_policy": True,
             "allowed_networks": [str(net) for net in settings.egress.allowed_networks],
-            "upstream_proxy": proxy.url if proxy is not None else None,
+            # No Secret montado: usuário e senha do proxy, quando há, vão junto.
+            "upstream_proxy": proxy.url_with_credentials if proxy is not None else None,
         }
 
     def _labels(self, job: SessionJob) -> dict[str, str]:

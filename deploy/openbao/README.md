@@ -23,6 +23,8 @@ das chaves).
   exclusão (`allowed_parameters`: `deletion_allowed` = `"true"`); nunca cria, gira, corta
   ou exporta uma chave. Como o `+` não restringe o nome, a montagem do transit é só do
   RaPA (nenhuma outra chave nela).
+- `custodiante.sh <uuid da empresa>`: a política `rapa-custodiante-<uuid>` de quem grava os
+  segredos das credenciais de uma empresa (seção "Custodiantes").
 - `preparar.sh`: monta o KV v2 (`rapa`) e o transit (`rapa-transit`), liga o método
   kubernetes e escreve as três políticas e os quatro papéis (um por conta de serviço: o
   despachante, a interface, a API e a operação). Idempotente e sem segredo no arquivo: quem
@@ -40,7 +42,12 @@ O script roda de qualquer máquina com o CLI `bao` (no job kind do CI, do runner
 port-forward: a imagem do OpenBao não tem o bash). Com o OpenBao num pod do cluster, ele
 confere os tokens das contas de serviço com o CA e o token montados no pod dele; só com o
 OpenBao fora do cluster informe o CA da API do Kubernetes em `KUBERNETES_CA_CERT` (um
-arquivo PEM). As contas de serviço padrão (`RAPA_SA_DESPACHANTE`, `RAPA_SA_WEB`,
+arquivo PEM) e, obrigatório junto com ele, `KUBERNETES_TOKEN_REVIEWER_JWT`: um arquivo com o
+token de uma conta de serviço do cluster com o papel `system:auth-delegator` (só para a
+TokenReview; o token projetado dos componentes tem a audiência `openbao`, que a API do
+Kubernetes recusa como credencial, e as contas do RaPA não têm esse papel). O script
+reescreve o config do método inteiro: informe o arquivo a cada execução (sem ele, o script
+para antes de mexer), e troque-o antes de o token vencer. As contas de serviço padrão (`RAPA_SA_DESPACHANTE`, `RAPA_SA_WEB`,
 `RAPA_SA_API` e `RAPA_SA_OPERACAO`) são as do chart; troque só se trocar `nameBase` nele.
 
 Os segredos de uma empresa ficam em `rapa/data/empresas/<uuid da empresa>/<vault_path>`, com
@@ -52,6 +59,23 @@ sempre posto pelo RaPA. Exemplo, com um valor fictício:
 bao kv put -mount=rapa empresas/00000000-0000-4000-8000-000000000001/portal/acesso \
   username=usuario-de-exemplo password=@/caminho/da/senha-de-exemplo.txt
 ```
+
+## Custodiantes
+
+Quem grava os segredos de uma empresa é o custodiante dela, direto no OpenBao (o RaPA nunca
+recebe o valor). Cada empresa tem a própria política, só debaixo do prefixo dela:
+
+```bash
+./deploy/openbao/custodiante.sh 00000000-0000-4000-8000-000000000001
+```
+
+A política `rapa-custodiante-<uuid>` grava (`create`, `update`) em
+`rapa/data/empresas/<uuid>/*` e lista `rapa/metadata/empresas/<uuid>/*`; não lê o valor de um
+segredo, não apaga e não alcança outra empresa. Ligue-a só à identidade do custodiante daquela
+empresa no método de entrada do cofre (um grupo do OIDC do Keycloak, um usuário do
+`userpass`), criado com o token raiz antes de revogá-lo, ou depois por quem administra o cofre
+(docs/OPERACAO.md 1.6). Nunca dê a um custodiante uma política de `empresas/*`: ela deixaria o
+de uma empresa trocar os segredos de outra (e o despachante os entregaria às execuções dela).
 
 ## No cluster
 
@@ -70,6 +94,6 @@ web não entra como despachante, e o da API não entra como operação. A web e 
 OpenBao com `RAPA_CHAVES=openbao` (para desembrulhar); o cofre dos segredos
 (`RAPA_COFRE=openbao`) é só do despachante e da operação.
 
-A conta de serviço do próprio OpenBao precisa do papel `system:auth-delegator` para conferir
-os tokens. O endereço (`RAPA_BAO_ENDERECO`) é o do serviço ativo: o RaPA não segue
+A conta de serviço do próprio OpenBao (fora do cluster, a do `KUBERNETES_TOKEN_REVIEWER_JWT`)
+precisa do papel `system:auth-delegator` para conferir os tokens. O endereço (`RAPA_BAO_ENDERECO`) é o do serviço ativo: o RaPA não segue
 redirecionamentos.

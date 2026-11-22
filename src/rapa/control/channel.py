@@ -21,8 +21,9 @@ execução e tentativa (``/canal/<execução>/<tentativa>/...``):
   de o lançador gravar o anúncio no banco, como no lançador local;
 - ``PUT .../artefatos/<nome>``: o arquivo vai para a pasta de artefatos local da
   tentativa (a de :func:`rapa.control.artifacts.attempt_dir`), com as regras de nome do
-  executor, criado com ``O_EXCL`` (um nome repetido recebe 409) e com limite de
-  tamanho; daí o despachante o registra pelo store de sempre;
+  executor, criado com ``O_EXCL`` (um nome que já chegou inteiro recebe 409; um que
+  ainda está chegando por outro pedido, 429, porque esse envio ainda pode falhar) e com
+  limite de tamanho; daí o despachante o registra pelo store de sempre;
 - ``PUT .../resultado``: o RESULT.json, uma vez só, gravado na pasta de trabalho; o
   lançador o lê e valida como no lançador local (inválido vira ``resultado_invalido``).
 
@@ -177,6 +178,8 @@ class ChannelAttempt:
     artifacts: int = 0
     #: Bytes de artefatos gravados e reservados pelos envios em andamento.
     artifact_bytes: int = 0
+    #: Os nomes dos artefatos que algum pedido ainda está gravando.
+    _uploading: set[str] = field(default_factory=set, repr=False)
     event_bytes: int = 0
     _events_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _result_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -550,6 +553,10 @@ class Channel:
                 0o600,
             )
         except FileExistsError:
+            if name in attempt._uploading:
+                # Outro pedido ainda está gravando este nome e pode falhar (e apagar o
+                # arquivo): 409 aqui faria o agente dar por entregue o que pode sumir.
+                return _error(429, "artefato_em_andamento")
             return _error(409, "artefato_repetido")
         except OSError as exc:
             logger.error(
@@ -558,6 +565,7 @@ class Channel:
             return _error(500, "artefato_nao_gravado")
         # Contado já na reserva: dois envios ao mesmo tempo não passam do limite.
         attempt.artifacts += 1
+        attempt._uploading.add(name)
         digest = hashlib.sha256()
         size = 0
         kept = False
@@ -591,6 +599,7 @@ class Channel:
                 attempt.artifact_bytes -= size
                 with contextlib.suppress(OSError):
                     path.unlink()
+            attempt._uploading.discard(name)
         return JSONResponse(
             {"nome": name, "tamanho": size, "sha256": digest.hexdigest()}, status_code=201
         )

@@ -8,6 +8,7 @@ Os segredos que o chart só referencia (``valueFrom``) entram aqui com valores d
 o ``$(VAR)`` é expandido como o Kubernetes faz.
 """
 
+import ast
 import asyncio
 import json
 import re
@@ -193,35 +194,96 @@ async def _session_pod(settings: ServerSettings, tmp_path: Path) -> tuple[dict[s
     return created[0], endpoint.url
 
 
-def _admitted(policy: Mapping[str, Any], pod: Mapping[str, Any], app: str) -> None:
+async def test_the_proxy_password_from_the_secret_starts_and_stays_off_the_pods(
+    tmp_path: Path,
+) -> None:
+    """O proxy de saída com usuário e senha, como o chart o oferece (a URL inteira num Secret,
+    executions.egress.proxy.existingSecret): a web e o despachante sobem com ele, e a senha
+    não vai no manifesto de nenhum pod (o executor a recebe pelo canal; a sessão, no Secret
+    dela)."""
+    render = template(
+        "values-producao-exemplo.yaml",
+        sets={
+            "executions.egress.proxy.url": "",
+            "executions.egress.proxy.existingSecret": "rapa-proxy",
+        },
+    )
+    secret_url = "http://robos:S3nh%40-do-proxy@proxy.interno:3128"
+    settings: dict[str, ServerSettings] = {}
+    for component in ("web", "despachante"):
+        env, args = _env(render, f"rapa-{component}")
+        env["RAPA_PROXY_SAIDA"] = secret_url  # o valor do Secret rapa-proxy
+        settings[component] = ServerSettings.from_env(env)
+        _check_ports(settings[component], _port(args))
+        proxy = settings[component].egress_policy().upstream_proxy
+        assert proxy is not None and proxy.url == "http://proxy.interno:3128"
+        assert proxy.authorization is not None
+        assert "S3nh" not in repr(settings[component])
+    run = await _run_pod(settings["despachante"], tmp_path / "execucao")
+    session, _ = await _session_pod(settings["web"], tmp_path / "sessao")
+    for pod in (run, session):
+        assert "S3nh" not in json.dumps(pod)
+
+
+def _admitted(policy: Mapping[str, Any], pod: Mapping[str, Any], app: str, creator: str) -> None:
     """As regras da ValidatingAdmissionPolicy do chart, conferidas no pod de verdade.
 
-    O CEL da política é lido do render (a imagem, a conta e a RuntimeClass que ele fixa), e
-    cada regra é refeita aqui: um pod do lançador que o API server recusaria falha.
+    O CEL da política é lido do render (a imagem, a conta e a RuntimeClass que ele fixa, o
+    rótulo de cada conta, os argumentos, as variáveis e as pastas), e cada regra é refeita
+    aqui: um pod do lançador que o API server recusaria (criado por ``creator``) falha.
     """
-    rules = "\n".join(v["expression"] for v in policy["spec"]["validations"])
+    variables = {v["name"]: v["expression"] for v in policy["spec"]["variables"]}
+    rules = " ".join(" ".join(v["expression"].split()) for v in policy["spec"]["validations"])
     spec = pod["spec"]
     (container,) = spec["containers"]
     labels = pod["metadata"]["labels"]
     assert labels["app.kubernetes.io/name"] == app
-    assert f"'{app}'" in rules
+    # O rótulo é o da conta que cria o pod (o despachante, as execuções; a web, as sessões).
+    choice = r"(?:request\.userInfo\.username|variables\.app) == '([^']+)' \? '([^']+)' : '([^']+)'"
+    expected = re.fullmatch(choice, variables["expected"])
+    assert expected and (expected[2] if creator == expected[1] else expected[3]) == app
     account = re.search(r"serviceAccountName == '([^']+)'", rules)
     assert account and spec.get("serviceAccountName") == account[1]
     assert spec.get("automountServiceAccountToken") is False
     runtime = re.search(r"runtimeClassName == '([^']+)'", rules)
     assert spec.get("runtimeClassName") == (runtime[1] if runtime else None)
-    image = re.search(r"c\.image == '([^']+)'", rules)
+    # O lançador desta versão usa a primeira (as outras são as da versão anterior).
+    image = re.search(r"c\.image in \['([^']+)'", rules)
     assert image and container["image"] == image[1]
     assert not spec.get("initContainers") and not spec.get("ephemeralContainers")
-    assert "command" not in container
-    module = "rapa.session.host" if app == "rapa-sessao" else "rapa.runner.pod"
-    assert container["args"][:3] == ["python", "-m", module]
+    assert "command" not in container and "workingDir" not in container
+    args = re.search(
+        r"c\.args == \(variables\.app == '([^']+)' \? (\[[^\]]*\]) : (\[[^\]]*\])\)", rules
+    )
+    assert args
+    assert container["args"] == ast.literal_eval(args[2] if app == args[1] else args[3])
+    # Nenhum gancho nem sonda que rode um comando; a prontidão, só tcpSocket sem host.
+    for field in ("lifecycle", "livenessProbe", "startupProbe"):
+        assert field not in container
+    readiness = container.get("readinessProbe")
+    if readiness is not None:
+        assert {"exec", "httpGet", "grpc", "tcpSocket"} & set(readiness) == {"tcpSocket"}
+        assert "host" not in readiness["tcpSocket"]
     assert "envFrom" not in container
+    allowed = re.search(r"v\.name in (\[[^\]]*\])", rules)
+    assert allowed
     for variable in container.get("env", []):
-        name = variable["name"]
-        assert name == "PYTHONUNBUFFERED" or not name.startswith(("PYTHON", "LD_")), name
+        assert variable["name"] in ast.literal_eval(allowed[1]), variable["name"]
+        assert "valueFrom" not in variable
     for volume in spec["volumes"]:
         assert "secret" in volume or "emptyDir" in volume, volume
+    # O Secret só na pasta dele, os emptyDir só nas outras, sem subPath.
+    secret_dir = re.fullmatch(choice, variables["secretDir"])
+    assert secret_dir
+    directory = secret_dir[2] if app == secret_dir[1] else secret_dir[3]
+    others = re.search(r"m\.mountPath in \[variables\.secretDir, ([^\]]*)\]", rules)
+    assert others
+    paths = [directory, *ast.literal_eval(f"[{others[1]}]")]
+    secret_volumes = {v["name"] for v in spec["volumes"] if "secret" in v}
+    for mount in container["volumeMounts"]:
+        assert "subPath" not in mount and "subPathExpr" not in mount
+        assert mount["mountPath"] in paths, mount
+        assert (mount["name"] in secret_volumes) == (mount["mountPath"] == directory), mount
     # E a Pod Security "restricted" do namespace.
     security = container["securityContext"]
     assert security["allowPrivilegeEscalation"] is False
@@ -247,9 +309,13 @@ async def test_the_launchers_pods_are_what_the_chart_allows(variant: str, tmp_pa
     run = await _run_pod(ServerSettings.from_env(dispatcher), tmp_path / "execucao")
     session, url = await _session_pod(ServerSettings.from_env(web), tmp_path / "sessao")
     (admission,) = render.of_kind("ValidatingAdmissionPolicy")
+    accounts = {
+        values["run"]: "system:serviceaccount:rapa:rapa-despachante",
+        values["session"]: "system:serviceaccount:rapa:rapa-web",
+    }
     for pod, app in ((run, values["run"]), (session, values["session"])):
         assert pod["metadata"]["namespace"] == values["namespace"]
-        _admitted(admission, pod, app)
+        _admitted(admission, pod, app, accounts[app])
         # A conta dos pods existe no namespace das execuções, sem token.
         account = render.get(
             "ServiceAccount", pod["spec"]["serviceAccountName"], values["namespace"]

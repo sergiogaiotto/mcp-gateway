@@ -33,7 +33,9 @@ Uso::
   e recusa a própria máquina, o link-local, o metadata da nuvem e toda rede que não é
   da internet, menos as de ``--rede-interna-permitida``
   (``RAPA_REDES_INTERNAS_PERMITIDAS``). Com ``--proxy-saida`` (``RAPA_PROXY_SAIDA``,
-  um proxy HTTP CONNECT), a internet sai por ele. O ``route`` do interpretador
+  um proxy HTTP CONNECT), a internet sai por ele; usuário e senha dele, quando há, vêm
+  do ambiente (``RAPA_PROXY_SAIDA_CREDENCIAIS``, nunca da linha de comando), que o worker
+  esvazia antes de abrir o navegador. O ``route`` do interpretador
   continua: é ele que dá o erro ``dominio_nao_permitido`` claro no passo; a guarda
   cobre o que ele não vê (websockets, os saltos de um redirecionamento, um nome que
   resolve para a rede interna). O lançador sempre passa a guarda nos pods; no
@@ -92,6 +94,7 @@ from rapa.runner.video import (
 )
 from rapa.session.egress import (
     BROWSER_NETWORK_ARGS,
+    PROXY_CREDENTIALS_ENV,
     EgressGuard,
     EgressPolicy,
     without_proxy_switches,
@@ -543,6 +546,9 @@ async def _main_async(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # Usuário e senha do proxy de saída saem do ambiente antes de tudo: o Chromium herda
+    # o ambiente do driver do Playwright.
+    proxy_credentials = os.environ.pop(PROXY_CREDENTIALS_ENV, None) or None
     parser = build_parser()
     args = parser.parse_args(argv)
     if not args.ack_timeout > 0:
@@ -550,7 +556,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     egress: EgressPolicy | None = None
     if args.egress_guard:
         try:
-            egress = EgressPolicy.parse(args.internal_networks, args.egress_proxy)
+            egress = EgressPolicy.parse(
+                args.internal_networks, args.egress_proxy, proxy_credentials=proxy_credentials
+            )
         except ValueError as exc:
             parser.error(str(exc))
     elif args.internal_networks or args.egress_proxy:

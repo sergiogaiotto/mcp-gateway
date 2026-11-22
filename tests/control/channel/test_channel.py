@@ -385,6 +385,35 @@ async def test_an_upload_in_flight_stops_when_the_attempt_closes(tmp_path: Path)
     assert attempt.artifacts == 0 and attempt.artifact_bytes == 0
 
 
+async def test_a_name_still_arriving_is_not_answered_as_already_stored(tmp_path: Path) -> None:
+    """409 diz ao agente que o artefato já chegou inteiro; enquanto outro pedido ainda o
+    grava (e pode falhar, apagando o arquivo), a resposta é 429 e o agente tenta de novo."""
+    channel = Channel(ChannelLimits(idle_timeout_s=0.3))
+    job = _job()
+    attempt, ticket = _open(channel, tmp_path, job)
+    url = _url(job, "artefatos/baixado-001.pdf")
+    path = attempt.artifacts_dir / "baixado-001.pdf"
+
+    async def stalls() -> AsyncIterator[bytes]:
+        yield b"a" * 100
+        await asyncio.sleep(30)  # a conexão do primeiro envio morreu no meio
+        yield b"b" * 100
+
+    async with client(channel, ticket) as http:
+        first = asyncio.create_task(http.put(url, content=stalls()))
+        await _until(lambda: path.exists() and attempt.active == 1)
+        retry = await http.put(url, content=b"x" * 200)
+        assert retry.status_code == 429 and retry.json() == {"erro": "artefato_em_andamento"}
+        # O primeiro envio não termina: ele não deixa arquivo, e o próximo envio entra.
+        assert (await asyncio.wait_for(first, 5)).status_code == 408
+        assert not path.exists()
+        assert (await http.put(url, content=b"x" * 200)).status_code == 201
+        # Agora sim, o nome já chegou inteiro.
+        assert (await http.put(url, content=b"y" * 200)).status_code == 409
+    assert path.read_bytes() == b"x" * 200
+    assert attempt.artifacts == 1 and attempt.artifact_bytes == 200 and attempt.active == 0
+
+
 @pytest.mark.parametrize("route", ["artefatos/lento.bin", "eventos", "resultado"])
 async def test_a_body_that_stops_coming_gets_408(tmp_path: Path, route: str) -> None:
     channel = Channel(ChannelLimits(idle_timeout_s=0.3))

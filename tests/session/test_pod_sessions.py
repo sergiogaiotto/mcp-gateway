@@ -122,7 +122,8 @@ async def test_the_session_pod_and_the_handshake(tmp_path: Path) -> None:
     # A configuração vai no Secret montado, com o token, e o hospedeiro a aceita.
     config = json.loads(fake.secret_data(name)["config.json"])
     assert config["token"] == endpoint.token
-    assert config["listen_host"] == "0.0.0.0" and config["listen_port"] == 8765
+    # Todas as interfaces nas duas pilhas: num cluster IPv6 o IP do pod é IPv6.
+    assert config["listen_host"] is None and config["listen_port"] == 8765
     assert config["profile_parent"] == "/trabalho"
     assert config["egress_policy"] is True
     assert config["allowed_networks"] == ["10.20.0.0/16"]
@@ -294,6 +295,16 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _ipv6_loopback() -> bool:
+    """Se o sistema deixa ouvir em ``::1`` (sem IPv6, o teste só confere o IPv4)."""
+    try:
+        with socket.socket(socket.AF_INET6) as sock:
+            sock.bind(("::1", 0))
+    except OSError:
+        return False
+    return True
+
+
 @pytest.mark.browser
 async def test_the_host_reads_its_configuration_from_a_file(
     chromium_path: str, portal_v1: RunningPortal, tmp_path: Path
@@ -307,7 +318,8 @@ async def test_the_host_reads_its_configuration_from_a_file(
             {
                 "token": token,
                 "start_url": f"{portal_v1.base_url}/",
-                "listen_host": "127.0.0.1",
+                # Como no pod: todas as interfaces, nas duas pilhas.
+                "listen_host": None,
                 "listen_port": port,
                 "chromium": chromium_path,
                 "browser_args": [HOST_RESOLVER_ARG],
@@ -332,9 +344,10 @@ async def test_the_host_reads_its_configuration_from_a_file(
         assert process.stdout is not None
         line = await asyncio.wait_for(process.stdout.readline(), timeout=60)
         assert json.loads(line) == {"pronto": True, "porta": port}
-        # A prontidão do pod é a porta aceitando conexões.
-        _, writer = await asyncio.open_connection("127.0.0.1", port)
-        writer.close()
+        # A prontidão do pod é a porta aceitando conexões, no IP do pod em IPv4 ou IPv6.
+        for address in ("127.0.0.1", "::1") if _ipv6_loopback() else ("127.0.0.1",):
+            _, writer = await asyncio.open_connection(address, port)
+            writer.close()
         with pytest.raises(InvalidStatus) as caught:
             await connect(
                 f"ws://127.0.0.1:{port}/", additional_headers={"Authorization": "Bearer x"}
