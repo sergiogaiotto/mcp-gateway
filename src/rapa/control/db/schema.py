@@ -219,6 +219,11 @@ runs = Table(
     _ts("started_at"),
     _ts("finished_at"),
     _ts("created_at", nullable=False, server_default=True),
+    #: Quando a retenção apagou os arquivos dos artefatos (revisão 0008).
+    _ts("artifacts_expired_at"),
+    #: Quando a retenção apagou as telas e o vídeo de uma execução que deu certo; os
+    #: arquivos baixados ficam até ``artifacts_expired_at`` (revisão 0008).
+    _ts("captures_expired_at"),
 )
 
 idempotency_keys = Table(

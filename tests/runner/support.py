@@ -1,6 +1,8 @@
 """Auxiliares dos testes do executor."""
 
 import json
+import os
+import shutil
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
@@ -177,3 +179,56 @@ def load_jsonl(path: Path) -> list[RunEvent]:
         for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+
+
+def ffmpeg_browsers_path(base: Path) -> Path | None:
+    """Pasta para ``PLAYWRIGHT_BROWSERS_PATH`` com o ``ffmpeg`` que o vídeo do Playwright pede.
+
+    O Playwright procura ``<pasta>/ffmpeg-<revisão>/ffmpeg-linux``. Sem a revisão certa
+    instalada (no CI, o Chromium é o do Debian), a pasta aponta para outro ``ffmpeg``
+    da máquina: o do Playwright em outra revisão ou o do sistema, que também grava
+    VP8 (no CI, o ``ffmpeg`` do Debian). Sem nenhum, ``None`` (o teste do vídeo é
+    pulado, ou falha no CI: :func:`ffmpeg_or_skip`).
+    """
+    import playwright
+
+    manifest = Path(playwright.__file__).parent / "driver" / "package" / "browsers.json"
+    try:
+        browsers = json.loads(manifest.read_text(encoding="utf-8"))["browsers"]
+        revision = next(b["revision"] for b in browsers if b["name"] == "ffmpeg")
+    except OSError, ValueError, KeyError, StopIteration:
+        return None
+    # A revisão certa; senão o do sistema; por último, outra revisão do Playwright (uma
+    # antiga pode não gravar nada, e o teste do vídeo falharia sem motivo).
+    installed = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or "/nenhum")
+    candidates = [installed / f"ffmpeg-{revision}" / "ffmpeg-linux"]
+    if system := shutil.which("ffmpeg"):
+        candidates.append(Path(system))
+    candidates += sorted(installed.glob("ffmpeg-*/ffmpeg-linux"), reverse=True)
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            target = base / f"ffmpeg-{revision}"
+            target.mkdir(parents=True, exist_ok=True)
+            link = target / "ffmpeg-linux"
+            if not link.exists():
+                link.symlink_to(candidate)
+            return base
+    return None
+
+
+#: Com ``1`` (no CI, que instala o ``ffmpeg`` do Debian), os testes que filmam de verdade
+#: falham em vez de serem pulados quando não há ``ffmpeg``.
+VIDEO_REQUIRED_ENV = "RAPA_TEST_VIDEO_OBRIGATORIO"
+
+
+def ffmpeg_or_skip(base: Path) -> Path:
+    """:func:`ffmpeg_browsers_path`, ou pula o teste (falha, se ``VIDEO_REQUIRED_ENV=1``)."""
+    import pytest
+
+    browsers = ffmpeg_browsers_path(base)
+    if browsers is not None:
+        return browsers
+    message = "sem ffmpeg para o vídeo do Playwright"
+    if os.environ.get(VIDEO_REQUIRED_ENV) == "1":
+        pytest.fail(f"{message}, e {VIDEO_REQUIRED_ENV}=1 pede os testes do vídeo")
+    pytest.skip(message)

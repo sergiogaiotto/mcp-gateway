@@ -193,7 +193,15 @@ principais:
   recusado antes, e a mensagem diz o passo e o ramo;
 - eventos, mensagens, saídas e nomes de artefatos nunca contêm valores de
   credenciais; as chaves dos eventos e os valores que são constantes do
-  executor (efeito, estado, código de erro, id de passo) nunca são mascarados;
+  executor (efeito, estado, código de erro, id de passo) nunca são mascarados. A
+  saída que vem de um download é o nome do artefato (o identificador que a API da
+  execução usa), nunca o caminho no disco;
+- com o vídeo ligado (:mod:`rapa.runner.video`), o campo de cada credencial do cofre
+  é conferido antes e depois de digitar, e vigiado enquanto ela é digitada: se ele
+  não é ``<input type=password>`` antes ou depois, se o tipo dele muda no meio (um
+  "mostrar senha" ligado, por exemplo), ou se não deu para conferir,
+  :attr:`Interpreter.video_unsafe` fica verdadeiro e o vídeo não é guardado. A
+  conferência só lê o campo e nunca muda o resultado do passo;
 - quando um passo com alvo falha com ``elemento_nao_encontrado``,
   ``elemento_ambiguo`` ou ``localizador_alternativo_em_gravacao``, o executor tira,
   uma vez por execução (no passo mais interno), um retrato só de leitura dos
@@ -204,6 +212,7 @@ principais:
 """
 
 import asyncio
+import contextlib
 import math
 import os
 import re
@@ -288,6 +297,27 @@ MASK = "***"
 
 _TIMEOUT_GRACE_S = 2.0
 _SCREENSHOT_TIMEOUT_MS = 5_000
+#: Prazo, em segundos, para conferir se uma credencial foi para um campo de senha (só
+#: com o vídeo ligado; ver :meth:`Interpreter._check_video_field`).
+_VIDEO_FIELD_CHECK_S = 2.0
+#: Antes de digitar: o campo é de senha agora? E vigia o tipo dele até a conferência final.
+_WATCH_MASKED_FIELD_JS = """(e) => {
+    const watch = {ok: e.localName === 'input' && e.type === 'password', changed: false};
+    if (watch.ok) {
+        watch.observer = new MutationObserver(() => { watch.changed = true; });
+        watch.observer.observe(e, {attributes: true, attributeFilter: ['type']});
+    }
+    return watch;
+}"""
+#: Depois de digitar: era de senha antes, o tipo não mudou no meio e continua de senha.
+_STILL_MASKED_FIELD_JS = """(watch, e) => {
+    if (watch.observer) {
+        if (watch.observer.takeRecords().length > 0) watch.changed = true;
+        watch.observer.disconnect();
+    }
+    return watch.ok === true && watch.changed === false
+        && e.localName === 'input' && e.type === 'password';
+}"""
 _DETAIL_MAX = 300
 _MIN_MASKED_LENGTH = 4
 #: Campos de evento com hashes que o próprio executor calcula (nunca dados da página).
@@ -2013,7 +2043,12 @@ class Interpreter:
         postcondition_timeout_ms: int = 5_000,
         heal_after_ms: int = 1_000,
         poll_interval_ms: int = 100,
+        record_video: bool = False,
     ) -> None:
+        """``record_video`` diz que o contexto está sendo filmado (ver
+        :mod:`rapa.runner.video`): cada credencial do cofre digitada é conferida, e o
+        vídeo só pode ser guardado se todas foram para um campo de senha
+        (:attr:`video_unsafe`). A conferência só lê o campo; nada muda na execução."""
         if attempt < 1:
             raise ValueError("attempt começa em 1")
         if first_seq < 0:
@@ -2032,6 +2067,9 @@ class Interpreter:
         self._deadline_at = deadline
         self._cancel = cancel
         self._screenshot_every_step = screenshot_every_step
+        self._record_video = record_video
+        #: Uma credencial foi (ou pode ter sido) digitada fora de um campo de senha.
+        self._video_unsafe = False
         self._block_other_domains = block_other_domains
         self._redactor = _Redactor(redact_values)
         self._postcondition_timeout_s = postcondition_timeout_ms / 1000
@@ -2123,6 +2161,16 @@ class Interpreter:
     @property
     def irreversible_started(self) -> bool:
         return self._irreversible_step is not None
+
+    @property
+    def video_unsafe(self) -> bool:
+        """O vídeo desta execução pode mostrar uma credencial: não pode ser guardado.
+
+        Fica verdadeiro quando, com ``record_video``, uma credencial do cofre foi
+        digitada num campo que não é ``<input type=password>`` (ou não deu para
+        conferir o campo: na dúvida, o vídeo não é guardado).
+        """
+        return self._video_unsafe
 
     # ------------------------------------------------------------------
     # Execução
@@ -2753,12 +2801,9 @@ class Interpreter:
         número e escaparia dela. Se a máscara mudou algo, fica o texto mascarado.
         """
         if isinstance(raw, ArtifactRef):
-            # Só o hash, calculado pelo próprio executor, fica fora da máscara.
-            data = raw.model_dump(mode="json")
-            return {
-                key: item if key == "sha256" else self._redactor.value(item)
-                for key, item in data.items()
-            }
+            # O identificador do artefato (o nome, já saneado e mascarado): nunca o
+            # caminho no disco. O arquivo sai pela API da execução, com o hash na lista.
+            return self._redactor.value(raw.name)
         masked = self._redactor.value(raw)
         if masked != raw:
             return masked
@@ -3493,6 +3538,7 @@ class Interpreter:
         self._secret_locators.append(locator)
 
         async def act_secret() -> dict[str, Any]:
+            watch = await self._watch_video_field(handle, value.field)
             try:
                 if step.sequential:
                     await handle.fill("", timeout=ctx.remaining_ms())
@@ -3500,10 +3546,57 @@ class Interpreter:
                 else:
                     await handle.fill(secret, timeout=ctx.remaining_ms())
             finally:
+                await self._check_video_field(handle, watch)
                 await self._dispose(handle)
             return {"origem": "segredo", "tamanho": len(secret)}
 
         return act_secret
+
+    async def _watch_video_field(self, handle: ElementHandle, field: str) -> JSHandle | None:
+        """Com o vídeo ligado, confere o campo antes de digitar a credencial e passa a vigiá-lo.
+
+        O vídeo mostra a tela como ela é: um campo de senha aparece como pontos, mas o
+        usuário, o código TOTP ou uma senha num campo comum aparecem. Antes de digitar, o
+        campo precisa ser ``<input type=password>`` (um "mostrar senha" ligado deixa o
+        campo comum enquanto a senha é digitada, mesmo que a página o esconda de novo
+        depois), e o tipo dele fica vigiado até :meth:`_check_video_field`. Devolve a
+        vigia, ou ``None`` quando não há o que conferir (sem vídeo, ou o vídeo já não
+        pode ser guardado). Só lê o campo, com prazo curto, e nunca muda o passo.
+        """
+        if not self._record_video or self._video_unsafe:
+            return None
+        if field != "password":
+            self._video_unsafe = True
+            return None
+        try:
+            return await asyncio.wait_for(
+                handle.evaluate_handle(_WATCH_MASKED_FIELD_JS), timeout=_VIDEO_FIELD_CHECK_S
+            )
+        except Exception:  # documento que acabou, prazo, página que quebra a leitura
+            self._video_unsafe = True
+            return None
+
+    async def _check_video_field(self, handle: ElementHandle, watch: JSHandle | None) -> None:
+        """Com o vídeo ligado, confere de novo o campo depois de digitar a credencial.
+
+        O campo precisa ter sido de senha antes de digitar, continuar sendo depois (a
+        página pode ter trocado o tipo enquanto isso), e o tipo dele não pode ter mudado
+        no meio; senão, ou se a leitura falhar ou demorar, o vídeo não é guardado (falha
+        fechada). Só lê o campo, com prazo curto, e nunca muda o resultado do passo.
+        """
+        if watch is None:
+            return
+        try:
+            is_password = await asyncio.wait_for(
+                watch.evaluate(_STILL_MASKED_FIELD_JS, handle), timeout=_VIDEO_FIELD_CHECK_S
+            )
+        except Exception:  # documento que acabou, prazo, página que quebra a leitura
+            is_password = False
+        finally:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._dispose(watch), timeout=_VIDEO_FIELD_CHECK_S)
+        if is_password is not True:
+            self._video_unsafe = True
 
     async def _type(self, step: FillStep, ctx: _StepCtx, locator: PwLocator, text: str) -> None:
         """Digita ``text`` no campo, no lugar do que houver nele.

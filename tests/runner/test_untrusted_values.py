@@ -3038,8 +3038,11 @@ async def test_outputs_keys_and_artifact_names_are_masked(run_robot: RobotRunner
     recibo = result.outputs["recibo"]
     [ref] = [a for a in result.artifacts if a.kind == ArtifactKind.DOWNLOAD]
     assert ref.name == "recibo-_.txt"
-    assert recibo["name"] == ref.name
-    assert recibo["sha256"] == ref.sha256 == digest  # o hash do próprio executor fica intacto
+    # A saída é o identificador do artefato (o nome), nunca o caminho no disco.
+    assert recibo == ref.name
+    assert ref.path not in result.model_dump_json(include={"outputs"})
+    assert str(Path(ref.path).parent) not in json.dumps(result.outputs)
+    assert ref.sha256 == digest  # o hash do próprio executor fica intacto
     assert outcome.of(RunEventKind.ARTIFACT, "baixar")[0].data["sha256"] == digest
     started = outcome.of(RunEventKind.RUN_STARTED)[0]
     assert started.data["fingerprint"] == manifest.fingerprint()

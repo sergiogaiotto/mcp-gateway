@@ -18,12 +18,16 @@ plataforma em memória (:mod:`rapa.fixtures.memory`):
 - operar por empresa: :class:`PgCompanyAdmin` (usuários, papéis, áreas e consumo, pela
   própria empresa), :class:`PgOrganizationDirectory` (a empresa de uma organização do
   provedor) e :mod:`~rapa.control.services.lifecycle` (entrada, congelar, exportar e
-  apagar, pela plataforma).
+  apagar, pela plataforma);
+- evidências: :class:`PgArtifacts` (os artefatos de uma execução) e
+  :class:`Retention` (a retenção, uma etapa do laço do despachante).
 """
 
 from typing import TYPE_CHECKING
 
+from rapa.control.artifacts import LocalArtifactStore
 from rapa.control.db.session import Database
+from rapa.control.services.artifacts import PgArtifacts
 from rapa.control.services.audit import ChainReport, verify_chain
 from rapa.control.services.batches import PgBatches
 from rapa.control.services.company import PgCompanyAdmin
@@ -31,6 +35,7 @@ from rapa.control.services.credentials import CredentialAlerts, PgCredentials
 from rapa.control.services.dispatcher import (
     Dispatcher,
     Launcher,
+    RetentionTicker,
     Ticker,
     WorkerNotStarted,
     failure_result,
@@ -45,11 +50,13 @@ from rapa.control.services.queue import (
     StaleAttempt,
 )
 from rapa.control.services.repairs import HubRepairAssistant, PgRepairs
+from rapa.control.services.retention import Retention, RetentionPolicy, RetentionReport
 from rapa.control.services.robots import PgRobotAdmin, PgRobotCatalog
 from rapa.control.services.runs import PgRunService
 from rapa.control.services.schedules import PgSchedules, Scheduler
 from rapa.control.services.webhooks import PgWebhooks, WebhookKeys
 from rapa.core.contracts import (
+    ArtifactService,
     BatchService,
     CompanyAdminService,
     CredentialService,
@@ -69,6 +76,7 @@ __all__ = [
     "EventConflict",
     "HubRepairAssistant",
     "Launcher",
+    "PgArtifacts",
     "PgBatches",
     "PgCompanyAdmin",
     "PgCredentials",
@@ -84,6 +92,10 @@ __all__ = [
     "PgSchedules",
     "PgWebhooks",
     "ReapReport",
+    "Retention",
+    "RetentionPolicy",
+    "RetentionReport",
+    "RetentionTicker",
     "RunnerOutcome",
     "Scheduler",
     "StaleAttempt",
@@ -125,3 +137,7 @@ if TYPE_CHECKING:
 
     def _company_conforms(db: Database) -> CompanyAdminService:
         return PgCompanyAdmin(db)
+
+    def _evidence_conforms(db: Database) -> tuple[ArtifactService, RetentionTicker]:
+        store = LocalArtifactStore("artefatos")
+        return PgArtifacts(db, store), Retention(db, store)

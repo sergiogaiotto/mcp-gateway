@@ -35,6 +35,7 @@ from rapa.control.auth import (
 from rapa.control.mcp.server import McpGateway, McpSettings
 from rapa.control.validation import InputValidator
 from rapa.core.contracts import (
+    ArtifactService,
     CompanyAdminService,
     CredentialService,
     RepairService,
@@ -224,6 +225,7 @@ def create_http_app(
     credentials: CredentialService | None = None,
     company: CompanyAdminService | None = None,
     provisioner: UserProvisioner | None = None,
+    artifacts: ArtifactService | None = None,
 ) -> FastAPI:
     """Monta a aplicação FastAPI com REST, MCP, saúde e as proteções comuns.
 
@@ -232,7 +234,8 @@ def create_http_app(
     as agendas, os webhooks e os lotes por planilha (também fora do MCP),
     ``repairs``, o conserto assistido (``/v1/execucoes/{id}/conserto``),
     ``credentials``, as credenciais e as regras do certificado A1 (``/v1/credenciais``),
-    e ``company``, a administração da empresa (``/v1/empresa``). ``provisioner`` cria,
+    ``company``, a administração da empresa (``/v1/empresa``), e ``artifacts``, as
+    evidências das execuções (``/v1/execucoes/{id}/artefatos``). ``provisioner`` cria,
     no primeiro login, o usuário (sem papéis) de uma organização ligada a uma empresa.
     """
     settings = settings or HttpSettings()
@@ -296,6 +299,7 @@ def create_http_app(
         repairs=repairs,
         credentials=credentials,
         company=company,
+        artifacts=artifacts,
     )
     app.include_router(create_api_router(services))
     app.router.routes.append(Route("/mcp", endpoint=gateway, include_in_schema=False))

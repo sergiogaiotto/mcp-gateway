@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, Header, Path, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from rapa.control.api.artifacts import add_artifact_routes
 from rapa.control.api.company import add_company_routes
 from rapa.control.api.credentials import add_credential_routes
 from rapa.control.api.errors import error_response
@@ -28,6 +29,7 @@ from rapa.control.sessions.service import RecordingSessions
 from rapa.control.validation import InputValidator, InvalidSchemaError
 from rapa.core.contracts import (
     MAX_RUNS_LISTED,
+    ArtifactService,
     CompanyAdminService,
     CredentialService,
     InvalidInput,
@@ -103,6 +105,9 @@ class ApiServices:
     credentials: CredentialService | None = None
     #: A administração da empresa por ela mesma; sem ela, ``/v1/empresa`` responde 503.
     company: CompanyAdminService | None = None
+    #: As evidências (artefatos) das execuções; sem elas, ``/v1/execucoes/{id}/artefatos``
+    #: responde 503.
+    artifacts: ArtifactService | None = None
 
 
 def check_idempotency_key(key: str | None) -> str | None:
@@ -223,6 +228,10 @@ def create_api_router(services: ApiServices) -> APIRouter:
         if status is None:
             raise NotFound("execução não encontrada")
         return status
+
+    # -- evidências ----------------------------------------------------------------
+
+    add_artifact_routes(router, services.artifacts, current_principal)
 
     # -- consertar ----------------------------------------------------------------
 

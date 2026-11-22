@@ -10,7 +10,7 @@ protocolo :class:`Backend`, com duas implementações:
   acesso da sessão, guardado no servidor da interface.
 
 Os erros de negócio chegam como as exceções de :mod:`rapa.core.contracts`
-(``NotFound``, ``Forbidden``, ``Conflict``, ``InvalidInput``,
+(``NotFound``, ``Forbidden``, ``Conflict``, ``Gone``, ``InvalidInput``,
 ``QuotaExceeded``), com a mensagem em pt-BR; problemas de sessão e de rede
 viram :class:`NotAuthenticated` e :class:`BackendUnavailable`.
 """
@@ -28,9 +28,12 @@ from uuid import UUID
 import httpx2
 from pydantic import TypeAdapter, ValidationError
 
+from rapa.core.artifacts import valid_artifact_name
 from rapa.core.contracts import (
     A1AuthorizationInfo,
     AreaInfo,
+    ArtifactContent,
+    ArtifactService,
     BatchFile,
     BatchFormat,
     BatchInfo,
@@ -48,6 +51,7 @@ from rapa.core.contracts import (
     DraftChoices,
     Forbidden,
     GeneralizationProposals,
+    Gone,
     InvalidInput,
     NotFound,
     Principal,
@@ -63,6 +67,7 @@ from rapa.core.contracts import (
     RobotSummary,
     RobotVersionInfo,
     RoleGrant,
+    RunArtifact,
     RunService,
     RunStatus,
     RunTrigger,
@@ -86,6 +91,7 @@ if TYPE_CHECKING:
     from rapa.ui.auth import UiSession
 
 __all__ = [
+    "ARTIFACTS_OFF",
     "BATCHES_OFF",
     "COMPANY_OFF",
     "CREDENTIALS_OFF",
@@ -294,7 +300,15 @@ class Backend(Protocol):
 
     async def company_usage(self, month: str | None = None) -> UsageReport: ...
 
+    # -- evidências -------------------------------------------------------------------
 
+    async def list_artifacts(self, run_id: UUID) -> list[RunArtifact]: ...
+
+    async def open_artifact(self, run_id: UUID, name: str) -> ArtifactContent: ...
+
+
+#: Mensagem quando este servidor não oferece as evidências das execuções.
+ARTIFACTS_OFF = "as evidências das execuções não estão disponíveis neste servidor"
 #: Mensagem quando este servidor não oferece a gravação de demonstrações.
 SESSIONS_OFF = "a gravação de demonstrações não está disponível neste servidor"
 #: Mensagens quando este servidor não oferece agendas, webhooks ou lotes.
@@ -407,6 +421,7 @@ class ContractsBackend:
         repairs: RepairService | None = None,
         credentials: CredentialService | None = None,
         company: CompanyAdminService | None = None,
+        artifacts: ArtifactService | None = None,
     ) -> None:
         self._catalog = catalog
         self._runs = runs
@@ -419,6 +434,7 @@ class ContractsBackend:
         self._repairs = repairs
         self._credentials = credentials
         self._company = company
+        self._artifacts = artifacts
 
     def __repr__(self) -> str:
         return f"ContractsBackend(subject={self._principal.subject!r})"
@@ -703,6 +719,19 @@ class ContractsBackend:
     async def company_usage(self, month: str | None = None) -> UsageReport:
         return await self._company_service().usage(self._principal, month)
 
+    # -- evidências -------------------------------------------------------------------
+
+    def _artifact_service(self) -> ArtifactService:
+        if self._artifacts is None:
+            raise BackendUnavailable(ARTIFACTS_OFF)
+        return self._artifacts
+
+    async def list_artifacts(self, run_id: UUID) -> list[RunArtifact]:
+        return await self._artifact_service().list_artifacts(self._principal, run_id)
+
+    async def open_artifact(self, run_id: UUID, name: str) -> ArtifactContent:
+        return await self._artifact_service().open_artifact(self._principal, run_id, name)
+
 
 class _Platform(RobotCatalog, RunService, RobotAdmin, Protocol):
     """Um objeto que segue os três contratos (como a plataforma em memória)."""
@@ -724,6 +753,7 @@ class ContractsBackendFactory:
         repairs: RepairService | None = None,
         credentials: CredentialService | None = None,
         company: CompanyAdminService | None = None,
+        artifacts: ArtifactService | None = None,
     ) -> None:
         self._catalog = catalog
         self._runs = runs
@@ -735,6 +765,7 @@ class ContractsBackendFactory:
         self._repairs = repairs
         self._credentials = credentials
         self._company = company
+        self._artifacts = artifacts
 
     @classmethod
     def from_platform(
@@ -748,6 +779,7 @@ class ContractsBackendFactory:
         repairs: RepairService | None = None,
         credentials: CredentialService | None = None,
         company: CompanyAdminService | None = None,
+        artifacts: ArtifactService | None = None,
     ) -> ContractsBackendFactory:
         return cls(
             platform,
@@ -760,6 +792,7 @@ class ContractsBackendFactory:
             repairs=repairs,
             credentials=credentials,
             company=company,
+            artifacts=artifacts,
         )
 
     def __call__(self, session: UiSession) -> ContractsBackend:
@@ -775,6 +808,7 @@ class ContractsBackendFactory:
             repairs=self._repairs,
             credentials=self._credentials,
             company=self._company,
+            artifacts=self._artifacts,
         )
 
 
@@ -816,6 +850,9 @@ _COMPANY_USERS: TypeAdapter[list[CompanyUser]] = TypeAdapter(list[CompanyUser])
 _AREA: TypeAdapter[AreaInfo] = TypeAdapter(AreaInfo)
 _AREAS: TypeAdapter[list[AreaInfo]] = TypeAdapter(list[AreaInfo])
 _USAGE: TypeAdapter[UsageReport] = TypeAdapter(UsageReport)
+_ARTIFACTS: TypeAdapter[list[RunArtifact]] = TypeAdapter(list[RunArtifact])
+#: Tipos que a interface aceita mostrar na própria página (o resto vai como anexo).
+_INLINE_TYPES = frozenset({"image/png", "video/webm"})
 
 _MAX_MESSAGE = 500
 _MAX_DETAILS = 50
@@ -862,10 +899,12 @@ def _api_error(response: httpx2.Response) -> Exception:
             return NotFound(_clean(message, "não encontrado"))
         case 409:
             return Conflict(_clean(message, "a operação conflita com o estado atual"))
-        case 423:
-            return CompanyFrozen(_clean(message, "a empresa está congelada"))
+        case 410:
+            return Gone(_clean(message, "o recurso passou do prazo de retenção"))
         case 422:
             return InvalidInput(_clean(message, "dados inválidos"), [d for d in details if d])
+        case 423:
+            return CompanyFrozen(_clean(message, "a empresa está congelada"))
         case 429:
             return QuotaExceeded(
                 _clean(message, "limite de uso atingido; tente de novo mais tarde"),
@@ -1339,6 +1378,48 @@ class RestBackend:
     async def company_usage(self, month: str | None = None) -> UsageReport:
         params = {"mes": month} if month else None
         return self._parse(_USAGE, await self._send("GET", "/v1/empresa/consumo", params=params))
+
+    # -- evidências -------------------------------------------------------------------
+
+    async def list_artifacts(self, run_id: UUID) -> list[RunArtifact]:
+        data = await self._send("GET", f"/v1/execucoes/{run_id}/artefatos")
+        return self._parse(_ARTIFACTS, data)
+
+    async def open_artifact(self, run_id: UUID, name: str) -> ArtifactContent:
+        """Abre o arquivo pela API, em pedaços (a resposta fica aberta até ler tudo)."""
+        if not valid_artifact_name(name):
+            raise NotFound("arquivo não encontrado nesta execução")
+        request = self._client.build_request(
+            "GET",
+            f"/v1/execucoes/{run_id}/artefatos/{quote(name, safe='')}",
+            headers={"Authorization": f"Bearer {self._token}"},
+        )
+        try:
+            response = await self._client.send(request, stream=True)
+        except httpx2.TimeoutException:
+            raise BackendUnavailable(_UNAVAILABLE) from None
+        except httpx2.HTTPError as exc:
+            logger.warning("falha ao chamar a API do RaPA: %s", type(exc).__name__)
+            raise BackendUnavailable(_UNAVAILABLE) from None
+        if not response.is_success:
+            try:
+                await response.aread()
+            finally:
+                await response.aclose()
+            raise _api_error(response)
+        media_type = response.headers.get("content-type", "application/octet-stream")
+        media_type = media_type.split(";", 1)[0].strip().lower() or "application/octet-stream"
+        disposition = response.headers.get("content-disposition", "")
+        length = response.headers.get("content-length", "")
+        return ArtifactContent(
+            name=name,
+            media_type=media_type,
+            # Só abre na página o que a API mandou abrir e que é tela ou vídeo.
+            inline=disposition.startswith("inline") and media_type in _INLINE_TYPES,
+            size=int(length) if length.isdigit() else None,
+            chunks=response.aiter_bytes(),
+            close=response.aclose,
+        )
 
     @staticmethod
     def _json(response: httpx2.Response) -> Any:

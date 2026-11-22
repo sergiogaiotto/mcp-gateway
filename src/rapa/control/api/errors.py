@@ -22,6 +22,7 @@ from rapa.core.contracts import (
     Conflict,
     ContractError,
     Forbidden,
+    Gone,
     InvalidInput,
     NotFound,
     QuotaExceeded,
@@ -48,6 +49,7 @@ _STATUS: tuple[tuple[type[ContractError], int], ...] = (
     # Antes de Conflict (de que é filha): a empresa congelada responde 423.
     (CompanyFrozen, 423),
     (Conflict, 409),
+    (Gone, 410),
     (InvalidInput, 422),
     (QuotaExceeded, 429),
     (ServiceUnavailable, 503),

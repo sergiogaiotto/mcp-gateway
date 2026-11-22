@@ -69,6 +69,12 @@ da organização do token, antes de saber a empresa); ela continua sem ``UPDATE`
 ``companies``, então nunca congela nem descongela uma empresa. O despachante lê só
 ``companies.id`` e ``companies.status``, para não pegar execução de empresa congelada.
 ``platform_events`` não tem permissão para nenhum dos dois: só o dono lê e escreve.
+
+A retenção (revisão 0008) tem o bloco :func:`retention_grants_sql`: o despachante
+ganha só ``EXECUTE`` nas funções que apagam os retratos e as chaves de idempotência
+vencidos e removem as partições de eventos antigas (``SECURITY DEFINER``, donas: o
+dono das tabelas). Nenhum papel ganha ``DELETE`` nessas tabelas; as marcas de
+artefatos expirados são colunas de ``runs``, que o despachante já atualiza.
 """
 
 import os
@@ -88,6 +94,7 @@ __all__ = [
     "grants_sql",
     "publishing_grants_sql",
     "repair_grants_sql",
+    "retention_grants_sql",
     "session_grants_sql",
 ]
 
@@ -226,6 +233,7 @@ REVOKE ALL ON credentials FROM {role};
 """
 
 _A1_TABLES = ("a1_authorizations", "version_approvals", "credential_alerts")
+
 _COMPANY_APP_GRANTS = """
 GRANT EXECUTE ON FUNCTION rapa_company_for_organization(text) TO {role};
 """
@@ -237,17 +245,37 @@ GRANT SELECT (id, status) ON companies TO {role};
 #: A tabela que a revisão 0007 cria (junto com a função e as colunas que os blocos usam).
 _COMPANY_TABLES = ("platform_events",)
 
+_RETENTION_DISPATCHER_GRANTS = """
+GRANT EXECUTE ON FUNCTION rapa_purge_run_snapshots(integer, integer) TO {role};
+GRANT EXECUTE ON FUNCTION rapa_purge_idempotency_keys(integer) TO {role};
+GRANT EXECUTE ON FUNCTION rapa_drop_event_partitions(integer) TO {role};
+"""
+
+_RETENTION_FUNCTIONS = (
+    "rapa_purge_run_snapshots(integer, integer)",
+    "rapa_purge_idempotency_keys(integer)",
+    "rapa_drop_event_partitions(integer)",
+)
+
 
 def _block(
-    role: str, grants: str, *, tables: tuple[str, ...] = (), what: str = "das sessões"
+    role: str,
+    grants: str,
+    *,
+    tables: tuple[str, ...] = (),
+    functions: tuple[str, ...] = (),
+    what: str = "das sessões",
 ) -> str:
     body = grants.format(role=f'"{role}"').strip()
     condition = f"EXISTS (SELECT FROM pg_roles WHERE rolname = '{role}')"
     missing = "papel % não existe; permissões não concedidas"
     for table in tables:
         condition += f" AND to_regclass('public.{table}') IS NOT NULL"
-    if tables:
-        missing = f"papel % ou tabelas {what} ausentes; permissões não concedidas"
+    for function in functions:
+        condition += f" AND to_regprocedure('public.{function}') IS NOT NULL"
+    if tables or functions:
+        objects = "funções" if functions and not tables else "tabelas"
+        missing = f"papel % ou {objects} {what} ausentes; permissões não concedidas"
     return (
         "DO $grants$\nBEGIN\n"
         f"    IF {condition} THEN\n"
@@ -340,6 +368,18 @@ def company_revoke_sql(roles: RoleNames) -> list[str]:
     return [_block(roles.dispatcher, "REVOKE SELECT (id, status) ON companies FROM {role};")]
 
 
+def retention_grants_sql(roles: RoleNames) -> list[str]:
+    """Permissões das funções da retenção (revisão 0008), se elas existirem."""
+    return [
+        _block(
+            roles.dispatcher,
+            _RETENTION_DISPATCHER_GRANTS,
+            functions=_RETENTION_FUNCTIONS,
+            what="da retenção",
+        )
+    ]
+
+
 def all_grants_sql(roles: RoleNames) -> list[str]:
     """Todas as permissões, das tabelas que existirem na revisão atual do banco."""
     return [
@@ -350,4 +390,5 @@ def all_grants_sql(roles: RoleNames) -> list[str]:
         *a1_revokes_sql(roles),
         *a1_grants_sql(roles),
         *company_grants_sql(roles),
+        *retention_grants_sql(roles),
     ]

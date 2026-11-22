@@ -237,19 +237,31 @@ _MAX_NAME = 120
 
 
 def sanitize_filename(name: str, *, default: str = "arquivo") -> str:
-    """Nome de arquivo seguro: sem diretórios, sem acentos e só com ``[A-Za-z0-9._-]``."""
+    """Nome de arquivo seguro: sem diretórios, sem acentos e só com ``[A-Za-z0-9._-]``.
+
+    O nome é o identificador do artefato no plano de controle e na API, então segue a
+    regra de lá (:func:`rapa.core.artifacts.valid_artifact_name`): começa com letra ou
+    número e nunca tem ``..`` (pontos seguidos viram um só).
+    """
     normalized = unicodedata.normalize("NFKD", name)
     ascii_only = "".join(c for c in normalized if not unicodedata.combining(c))
     last = ascii_only.replace("\\", "/").rsplit("/", 1)[-1]
-    cleaned = _UNSAFE.sub("_", last).strip("._-")
-    cleaned = re.sub(r"_{2,}", "_", cleaned)
+    cleaned = _tidy(_UNSAFE.sub("_", last))
     if len(cleaned) > _MAX_NAME:
         stem, dot, ext = cleaned.rpartition(".")
         if dot and 0 < len(ext) <= 10:
             cleaned = f"{stem[: _MAX_NAME - len(ext) - 1]}.{ext}"
         else:
             cleaned = cleaned[:_MAX_NAME]
+        # O corte pode deixar um ponto no fim do começo do nome ("abc." + ".pdf").
+        cleaned = _tidy(cleaned)
     return cleaned or default
+
+
+def _tidy(name: str) -> str:
+    """Sem ``.``, ``_`` ou ``-`` nas pontas, e sem pontos nem sublinhados repetidos."""
+    name = re.sub(r"_{2,}", "_", re.sub(r"\.{2,}", ".", name))
+    return name.strip("._-")
 
 
 class DirectoryArtifactSink:

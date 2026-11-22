@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import json
 import secrets
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -811,3 +812,136 @@ def test_company_operation_migrates_back_and_forth(pg_database: PgDatabase) -> N
         upgrade(url, roles=pg_database.roles)
         assert _company_schema(pg_database, name) == head
         assert _owner_purges_audit(pg_database, name, company) is None
+
+
+# -- 0008: retenção --------------------------------------------------------------------
+
+
+def _retention_schema(pg: PgDatabase, database: str) -> dict[str, Any]:
+    with pg.server.connect(database) as conn:
+        column = conn.execute(
+            "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' "
+            "AND table_name = 'runs' "
+            "AND column_name IN ('artifacts_expired_at', 'captures_expired_at')"
+        ).fetchone()
+        functions = conn.execute(
+            "SELECT proname FROM pg_proc WHERE pronamespace = 'public'::regnamespace "
+            "AND proname IN ('rapa_purge_run_snapshots', 'rapa_purge_idempotency_keys', "
+            "'rapa_drop_event_partitions', 'rapa_runs_artifacts_guard', "
+            "'rapa_run_snapshots_append_only') ORDER BY proname"
+        ).fetchall()
+        definer = conn.execute(
+            "SELECT count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace "
+            "AND prosecdef AND proname IN ('rapa_purge_run_snapshots', "
+            "'rapa_purge_idempotency_keys', 'rapa_drop_event_partitions')"
+        ).fetchone()
+        policies = conn.execute(
+            "SELECT count(*) FROM pg_policy WHERE polname LIKE 'retention_sweep_%%'"
+        ).fetchone()
+        snapshot_guard = conn.execute(
+            "SELECT p.proname FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid "
+            "WHERE t.tgname = 'run_snapshots_append_only'"
+        ).fetchone()
+        execute = (
+            conn.execute(
+                "SELECT has_function_privilege(%s, 'rapa_purge_run_snapshots(integer, integer)', "
+                "'EXECUTE'), has_function_privilege(%s, 'rapa_purge_run_snapshots(integer, "
+                "integer)', 'EXECUTE'), has_table_privilege(%s, 'run_snapshots', 'DELETE')",
+                (pg.roles.dispatcher, pg.roles.app, pg.roles.dispatcher),
+            ).fetchone()
+            if functions
+            else None
+        )
+    assert column and definer and policies
+    return {
+        "columns": int(column[0]),
+        "functions": [row[0] for row in functions],
+        "definer": int(definer[0]),
+        "policies": int(policies[0]),
+        "snapshot_guard": snapshot_guard[0] if snapshot_guard else None,
+        "execute": tuple(execute) if execute else None,
+    }
+
+
+async def _legacy_run(pg: PgDatabase, database: str) -> UUID:
+    """Uma execução na fila, criada pelos serviços no banco ``database``."""
+    app = Database(
+        create_engine(
+            pg.server.url(database, pg.roles.app, pg.passwords[pg.roles.app]), poolclass=NullPool
+        )
+    )
+    try:
+        platform = PgPlatform(app)
+        tenant = await make_tenant(app, "Caminhos antigos")
+        await publish(platform, tenant, protocolo())
+        run = await platform.start(
+            tenant.operator, "emitir_protocolo", PROTOCOLO_INPUTS, RunTrigger.REST
+        )
+        return run.run_id
+    finally:
+        await app.dispose()
+
+
+async def test_retention_migrates_back_and_forth_and_takes_paths_out(
+    pg_database: PgDatabase,
+) -> None:
+    with _scratch_database(pg_database) as name:
+        url = pg_database.server.url(
+            name, pg_database.owner, pg_database.passwords[pg_database.owner]
+        )
+        upgrade(url, roles=pg_database.roles)
+        head = _retention_schema(pg_database, name)
+        assert head == {
+            "columns": 2,
+            "functions": [
+                "rapa_drop_event_partitions",
+                "rapa_purge_idempotency_keys",
+                "rapa_purge_run_snapshots",
+                "rapa_run_snapshots_append_only",
+                "rapa_runs_artifacts_guard",
+            ],
+            "definer": 3,
+            "policies": 4,
+            "snapshot_guard": "rapa_run_snapshots_append_only",
+            # Só o despachante executa as funções, e ninguém ganha DELETE nos retratos.
+            "execute": (True, False, False),
+        }
+        run_id = await _legacy_run(pg_database, name)
+
+        command.downgrade(alembic_config(url, pg_database.roles), "0005")
+        assert _retention_schema(pg_database, name) == {
+            "columns": 0,
+            "functions": [],
+            "definer": 0,
+            "policies": 0,
+            "snapshot_guard": "rapa_append_only",
+            "execute": None,
+        }
+        # Como as execuções ficavam antes: o caminho do disco nos artefatos e na saída.
+        artifact = {
+            "kind": "download",
+            "name": "nota.pdf",
+            "path": "/tmp/a/nota.pdf",
+            "size": 3,
+            "sha256": "c" * 64,
+        }
+        with pg_database.server.connect(name) as conn:
+            conn.execute(
+                "UPDATE runs SET state = 'succeeded', finished_at = now(), artifacts = %s, "
+                "outputs = %s WHERE id = %s",
+                (
+                    json.dumps([artifact, "estranho"]),
+                    json.dumps({"nota": artifact, "total": "3"}),
+                    run_id,
+                ),
+            )
+        upgrade(url, roles=pg_database.roles)
+        assert _retention_schema(pg_database, name) == head
+        with pg_database.server.connect(name) as conn:
+            row = conn.execute(
+                "SELECT artifacts, outputs FROM runs WHERE id = %s", (run_id,)
+            ).fetchone()
+        assert row is not None
+        stripped = {key: value for key, value in artifact.items() if key != "path"}
+        assert row[0] == [stripped, "estranho"]
+        assert row[1] == {"nota": "nota.pdf", "total": "3"}

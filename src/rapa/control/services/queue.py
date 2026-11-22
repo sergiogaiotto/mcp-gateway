@@ -11,7 +11,9 @@ Funções para o despachante, todas recebendo uma sessão sem empresa (papel
 - :func:`ingest_events` grava eventos do executor, idempotente por
   ``(run_id, seq)``;
 - :func:`finish` grava o resultado do executor (e, numa falha do alvo de um
-  passo, o retrato da página que o executor tirou, em ``run_snapshots``);
+  passo, o retrato da página que o executor tirou, em ``run_snapshots``); os
+  artefatos ficam em ``runs.artifacts`` sem o caminho do disco, com a tentativa e a
+  data (ver :mod:`rapa.control.artifacts`);
 - :func:`reap_expired` recolhe concessões vencidas: volta para a fila só o que
   não começou nenhum passo que grava (ver a regra abaixo);
 - :meth:`PgRunQueue.a1_block` confere, logo antes de lançar o executor, se o
@@ -83,6 +85,7 @@ from sqlalchemy import (
 from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from rapa.control.artifacts import ArtifactInfo
 from rapa.control.db.schema import (
     companies,
     company_quotas,
@@ -189,18 +192,6 @@ class EventConflict(StaleAttempt):
     """
 
     code = "evento_conflitante"
-
-
-class ArtifactInfo(BaseModel):
-    """Arquivo guardado pela execução (mesma forma do RESULT.json do executor)."""
-
-    model_config = ConfigDict(extra="ignore", frozen=True)
-
-    kind: str = Field(min_length=1, max_length=40)
-    name: str = Field(min_length=1, max_length=255)
-    path: str = Field(min_length=1, max_length=4000)
-    size: int = Field(ge=0)
-    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class RunnerOutcome(BaseModel):
@@ -779,6 +770,13 @@ def _snapshot_row(outcome: RunnerOutcome, state: RunState) -> dict[str, Any] | N
     }
 
 
+def _artifact_row(artifact: ArtifactInfo, attempt: int, now: datetime) -> dict[str, Any]:
+    """O artefato como fica em ``runs.artifacts``: sem caminho, com a tentativa e a data."""
+    return artifact.model_copy(
+        update={"attempt": artifact.attempt or attempt, "created_at": artifact.created_at or now}
+    ).model_dump(mode="json")
+
+
 def _final_state(reported: RunState, irreversible: bool) -> RunState:
     if reported is RunState.SUCCEEDED:
         return RunState.SUCCEEDED
@@ -845,7 +843,7 @@ async def finish(
         "error_message": error_message[:_MAX_ERROR_MESSAGE] if error_message else None,
         "failed_step_id": outcome.failed_step_id,
         "steps_done": func.greatest(runs.c.steps_done, outcome.steps_done),
-        "artifacts": [artifact.model_dump(mode="json") for artifact in outcome.artifacts],
+        "artifacts": [_artifact_row(artifact, attempt, now) for artifact in outcome.artifacts],
         "finished_at": now,
         "lease_expires_at": None,
     }

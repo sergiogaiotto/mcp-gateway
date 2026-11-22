@@ -33,6 +33,7 @@ from rapa.ui.backend import BackendError, BackendUnavailable, NotAuthenticated
 from rapa.ui.company import company_page
 from rapa.ui.context import UiContext, Viewer
 from rapa.ui.credentials import A1Context, a1_card, credentials_page, expiry_banner, load_a1
+from rapa.ui.evidence import evidence_card
 from rapa.ui.forms import SchemaForm
 from rapa.ui.labels import (
     ROBOT_STATUS_LABELS,
@@ -768,11 +769,21 @@ def _format_output(value: Any) -> str:
 
 
 class RunPanel:
-    """Estado de uma execução, atualizado periodicamente até terminar."""
+    """Estado de uma execução, atualizado periodicamente até terminar.
 
-    def __init__(self, viewer: Viewer, status: RunStatus) -> None:
+    ``on_finished`` é chamado uma vez quando a execução termina enquanto a página está
+    aberta (a tela da execução mostra as evidências nessa hora).
+    """
+
+    def __init__(
+        self,
+        viewer: Viewer,
+        status: RunStatus,
+        on_finished: Callable[[RunStatus], Awaitable[None]] | None = None,
+    ) -> None:
         self.viewer = viewer
         self.status = status
+        self.on_finished = on_finished
         self.container: ui.column | None = None
         self.notice: ui.label | None = None
         self.timer: ui.timer | None = None
@@ -855,6 +866,9 @@ class RunPanel:
             self._render()
         if status.state.finished:
             self._stop()
+            if self.on_finished is not None:
+                finished, self.on_finished = self.on_finished, None
+                await finished(status)
 
     def _stop(self) -> None:
         if self.timer is not None:
@@ -926,7 +940,20 @@ async def _run_detail(viewer: Viewer, run_id: str) -> None:
         _not_found("Execução não encontrada.")
         return
     ui.label("Execução").classes("text-h5")
-    RunPanel(viewer, status).build()
+    panel = RunPanel(viewer, status)
+    panel.build()
+    # As evidências (telas, vídeo da falha, arquivos) quando a execução termina.
+    evidence = ui.column().classes("w-full")
+
+    async def show_evidence(final: RunStatus) -> None:
+        evidence.clear()
+        with evidence:
+            await evidence_card(viewer, final)
+
+    if status.state.finished:
+        await show_evidence(status)
+    else:
+        panel.on_finished = show_evidence
     manifest = await _run_manifest(viewer, status) if can_repair_code(status) else None
     if can_repair(status, manifest):
         with ui.row().classes("items-center gap-2"):

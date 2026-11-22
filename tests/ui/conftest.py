@@ -32,6 +32,7 @@ from nicegui.testing import User
 from nicegui.testing.general import nicegui_reset_globals
 
 from rapa.core.contracts import (
+    ArtifactService,
     CredentialService,
     Principal,
     RecordingService,
@@ -100,6 +101,8 @@ class World:
     repairs: RepairService | None = None
     #: As credenciais e as regras do certificado A1 (a tela Credenciais).
     credentials: CredentialService | None = None
+    #: As evidências das execuções (telas, vídeo da falha e arquivos baixados).
+    artifacts: ArtifactService | None = None
 
     def auth(self) -> UiAuth:
         profiles = [
@@ -129,6 +132,7 @@ class World:
                 sessions=self.sessions,
                 repairs=self.repairs,
                 credentials=self.credentials,
+                artifacts=self.artifacts,
             ),
             auth=self.auth(),
             settings=self.settings(),

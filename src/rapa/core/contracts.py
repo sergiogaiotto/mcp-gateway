@@ -6,6 +6,7 @@ implementações em memória.
 """
 
 import builtins
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal, Protocol
@@ -36,6 +37,9 @@ __all__ = [
     "ApprovalInfo",
     "AreaInfo",
     "AreaUsage",
+    "ArtifactContent",
+    "ArtifactService",
+    "ArtifactStatus",
     "BatchColumn",
     "BatchFile",
     "BatchFormat",
@@ -61,6 +65,7 @@ __all__ = [
     "EffectProposal",
     "Forbidden",
     "GeneralizationProposals",
+    "Gone",
     "InvalidInput",
     "NotFound",
     "ParameterChoice",
@@ -92,6 +97,7 @@ __all__ = [
     "RobotVersionInfo",
     "Role",
     "RoleGrant",
+    "RunArtifact",
     "RunMode",
     "RunService",
     "RunState",
@@ -1451,3 +1457,95 @@ class CompanyAdminService(Protocol):
     async def rename_area(self, principal: Principal, area_id: UUID, name: str) -> AreaInfo: ...
 
     async def usage(self, principal: Principal, month: str | None = None) -> UsageReport: ...
+
+
+# ---------------------------------------------------------------------------
+# Evidências (os artefatos de uma execução)
+# ---------------------------------------------------------------------------
+
+
+class Gone(ContractError):
+    """O recurso existiu, mas o prazo de retenção acabou (HTTP 410)."""
+
+    code = "expirado"
+
+
+class ArtifactStatus(StrEnum):
+    """Se o arquivo de um artefato ainda pode ser lido."""
+
+    AVAILABLE = "disponivel"
+    #: O prazo de retenção acabou: o arquivo foi apagado e não é mais servido.
+    EXPIRED = "expirado"
+
+
+class RunArtifact(_Model):
+    """Um arquivo que a execução guardou: tela, arquivo baixado ou vídeo da falha.
+
+    ``name`` é o identificador do artefato na execução (o mesmo das saídas de um
+    download); o caminho no disco nunca aparece.
+    """
+
+    name: str
+    kind: str
+    size: int = Field(ge=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    media_type: str
+    created_at: datetime | None = None
+    status: ArtifactStatus = ArtifactStatus.AVAILABLE
+
+
+class ArtifactContent:
+    """Um artefato aberto para leitura, em pedaços (quem lê fecha com :meth:`aclose`)."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        media_type: str,
+        inline: bool,
+        chunks: AsyncIterator[bytes],
+        size: int | None = None,
+        close: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        self.name = name
+        self.media_type = media_type
+        self.inline = inline
+        self.size = size
+        self._chunks = chunks
+        self._close = close
+
+    def __repr__(self) -> str:
+        return f"ArtifactContent(name={self.name!r}, media_type={self.media_type!r})"
+
+    async def iterate(self) -> AsyncIterator[bytes]:
+        """Os bytes do arquivo; fecha a leitura no fim (também se quem lê desistir)."""
+        try:
+            async for chunk in self._chunks:
+                yield chunk
+        finally:
+            await self.aclose()
+
+    async def read(self) -> bytes:
+        """O arquivo inteiro (para arquivos pequenos, como uma tela)."""
+        return b"".join([chunk async for chunk in self.iterate()])
+
+    async def aclose(self) -> None:
+        close, self._close = self._close, None
+        if close is not None:
+            await close()
+
+
+class ArtifactService(Protocol):
+    """As evidências de uma execução: quem vê a execução vê os artefatos dela."""
+
+    async def list_artifacts(self, principal: Principal, run_id: UUID) -> list[RunArtifact]:
+        """Os artefatos da execução; :class:`NotFound` se ela não existe para o principal."""
+        ...
+
+    async def open_artifact(self, principal: Principal, run_id: UUID, name: str) -> ArtifactContent:
+        """Abre um artefato da lista da execução.
+
+        :class:`NotFound` para outra empresa ou área, nome inválido ou fora da lista;
+        :class:`Gone` quando o prazo de retenção acabou.
+        """
+        ...

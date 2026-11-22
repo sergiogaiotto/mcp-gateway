@@ -439,3 +439,24 @@ async def test_cancelled_or_stale_launch_kills_the_worker_promptly(
     # esperar a saída de erro dele fechar: nada de worker antigo gravando em paralelo.
     assert loop.time() - started < 5
     assert _gone(pid_file)
+
+
+def test_video_on_failure_goes_to_the_worker_and_into_the_end_budget(tmp_path: Path) -> None:
+    job = RunnerJob(
+        run_id=new_id(),
+        company_id=new_id(),
+        attempt=1,
+        manifest=emitir_protocolo("http://portal-v1.rapa.test:8080", "portal-v1.rapa.test"),
+        inputs=INPUTS,
+        deadline=datetime.now(UTC) + timedelta(minutes=2),
+    )
+    plain = LocalProcessLauncher(RecordingIngestor(), _settings(tmp_path, "/bin/chromium"))
+    filmed = LocalProcessLauncher(
+        RecordingIngestor(), _settings(tmp_path, "/bin/chromium", video_on_failure=True)
+    )
+    work, artifacts = filmed._paths(job)
+    assert "--video-dir" not in plain._command(job, work, artifacts, with_secrets=False)
+    command = filmed._command(job, work, artifacts, with_secrets=False)
+    # A pasta do vídeo fica dentro da pasta da tentativa, que some no fim.
+    assert command[command.index("--video-dir") + 1] == str(work / "video")
+    assert plain.grace_s == 15.0 and filmed.grace_s == 25.0
