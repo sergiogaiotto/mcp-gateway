@@ -1,0 +1,78 @@
+{{- if .Values.app.enabled }}
+{{- $v := .Values -}}
+{{- $env := include "rapa.dispatcherEnv" . -}}
+{{ include "rapa.deployment" (dict "root" . "component" "despachante" "values" $v.dispatcher "port" (int $v.executions.channel.port) "portName" "canal" "http" false "kubeApi" true "baoRole" $v.vault.roles.dispatcher "env" $env "volumes" (include "rapa.dispatcherVolumes" .) "mounts" (include "rapa.dispatcherMounts" .) "hpa" false) }}
+---
+{{ include "rapa.pdb" (dict "root" . "component" "despachante" "values" $v.dispatcher) }}
+---
+{{ include "rapa.serviceAccount" (dict "root" . "component" "despachante" "automount" true) }}
+{{- end }}
+
+{{/*
+O despachante: sem HTTP público (RAPA_HTTP=0). O processo ouve uma porta só, a do canal
+(RAPA_CANAL_PORTA): ali ficam o canal dos pods de execução e a saúde (/saude e
+/saude/pronto) que os probes usam. O endereço do canal que vai para cada pod é o IP desta
+réplica (os bilhetes ficam na memória dela).
+*/}}
+{{- define "rapa.dispatcherEnv" -}}
+{{- $v := .Values -}}
+- name: RAPA_HTTP
+  value: "0"
+- name: RAPA_UI
+  value: "0"
+- name: RAPA_SESSOES
+  value: "0"
+{{ include "rapa.databaseEnv" (dict "root" . "role" "dispatcher" "var" "RAPA_DISPATCHER_DATABASE_URL") }}
+- name: RAPA_COFRE
+  value: {{ $v.vault.mode | quote }}
+{{- if eq $v.vault.mode "dev" }}
+- name: RAPA_SEGREDOS_DEV
+  value: /var/run/rapa/dev/segredos/segredos.json
+{{- end }}
+- name: RAPA_EXECUTOR
+  value: kubernetes
+{{ include "rapa.podsEnv" (dict "root" .) }}
+- name: RAPA_POD_IP
+  valueFrom:
+    fieldRef:
+      fieldPath: status.podIP
+- name: RAPA_CANAL_PORTA
+  value: {{ $v.executions.channel.port | quote }}
+- name: RAPA_CANAL_ENDERECO
+  value: {{ include "rapa.channelAddress" . | quote }}
+- name: RAPA_CONCORRENCIA
+  value: {{ $v.dispatcher.concurrency | quote }}
+- name: RAPA_PASTA_TRABALHO
+  value: /trabalho/execucoes
+- name: RAPA_PASTA_ARTEFATOS
+  value: /trabalho/artefatos
+- name: RAPA_AGENDA_TOLERANCIA_S
+  value: {{ $v.publishing.scheduleCatchUpSeconds | quote }}
+- name: RAPA_AGENDA_INTERVALO_S
+  value: {{ $v.publishing.scheduleIntervalSeconds | quote }}
+{{- end -}}
+
+{{- define "rapa.dispatcherVolumes" -}}
+- name: trabalho
+  emptyDir:
+    sizeLimit: {{ .Values.dispatcher.workSizeLimit }}
+{{- if eq .Values.vault.mode "dev" }}
+- name: dev-segredos
+  secret:
+    secretName: {{ .Values.auth.dev.secretsSecret }}
+    defaultMode: 0440
+    items:
+      - key: segredos.json
+        path: segredos.json
+{{- end }}
+{{- end -}}
+
+{{- define "rapa.dispatcherMounts" -}}
+- name: trabalho
+  mountPath: /trabalho
+{{- if eq .Values.vault.mode "dev" }}
+- name: dev-segredos
+  mountPath: /var/run/rapa/dev/segredos
+  readOnly: true
+{{- end }}
+{{- end -}}

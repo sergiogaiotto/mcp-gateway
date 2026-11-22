@@ -1,0 +1,65 @@
+{{- if .Values.app.enabled }}
+{{- $v := .Values -}}
+{{- $sel := dict "root" . "component" "web" -}}
+{{- $env := include "rapa.webEnv" . -}}
+{{ include "rapa.deployment" (dict "root" . "component" "web" "values" $v.web "port" 8000 "portName" "http" "http" true "kubeApi" true "baoRole" $v.vault.roles.web "env" $env "volumes" (include "rapa.hubVolume" .) "mounts" (include "rapa.hubMount" .) "hpa" false) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rapa.component" $sel }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rapa.componentLabels" $sel | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "rapa.selectorLabels" $sel | nindent 4 }}
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+---
+{{ include "rapa.pdb" (dict "root" . "component" "web" "values" $v.web) }}
+---
+{{ include "rapa.serviceAccount" (dict "root" . "component" "web" "automount" true) }}
+{{- end }}
+
+{{/*
+A web: interface, REST, MCP e as sessões de gravação (em pods no namespace das execuções).
+Nunca lê o cofre (RAPA_COFRE=nenhum): o OpenBao só para as chaves dos artefatos.
+*/}}
+{{- define "rapa.webEnv" -}}
+{{- $v := .Values -}}
+- name: RAPA_HTTP
+  value: "1"
+- name: RAPA_UI
+  value: "1"
+- name: RAPA_SESSOES
+  value: "1"
+- name: RAPA_COFRE
+  value: nenhum
+- name: RAPA_SESSOES_EXECUTOR
+  value: kubernetes
+{{ include "rapa.podsEnv" (dict "root" .) }}
+- name: RAPA_SESSOES_POR_EMPRESA
+  value: {{ $v.web.sessions.perCompany | quote }}
+{{- if $v.web.sessions.max }}
+- name: RAPA_SESSOES_MAX
+  value: {{ $v.web.sessions.max | quote }}
+{{- end }}
+- name: RAPA_SESSAO_OCIOSA_S
+  value: {{ $v.web.sessions.idleSeconds | quote }}
+- name: RAPA_SESSAO_MAX_S
+  value: {{ $v.web.sessions.maxSeconds | quote }}
+{{- if $v.auth.oidc.clientId }}
+- name: RAPA_OIDC_CLIENT_ID
+  value: {{ $v.auth.oidc.clientId | quote }}
+- name: RAPA_OIDC_REDIRECT_URI
+  value: {{ required "auth.oidc.redirectUri é obrigatório com o login OIDC" $v.auth.oidc.redirectUri | quote }}
+{{- if $v.auth.oidc.existingSecret }}
+{{ include "rapa.secretEnv" (dict "name" "RAPA_OIDC_CLIENT_SECRET" "secret" $v.auth.oidc.existingSecret "key" $v.auth.oidc.secretKey) }}
+{{- end }}
+{{- end }}
+{{- end -}}

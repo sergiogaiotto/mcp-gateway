@@ -43,6 +43,7 @@ src/rapa/
   ui/         interface em NiceGUI (python -m rapa.ui para o modo de desenvolvimento)
   server.py   o serviço num processo só: REST, MCP, interface e despachante
   fixtures/   portais de teste e robôs de exemplo
+deploy/       imagens (docker), chart Helm, Argo CD, Keycloak, gVisor, rede, banco e o CI do kind
 tests/        testes automatizados (pytest)
 docs/         plano e documentação
 ```
@@ -129,6 +130,12 @@ Quem administra a empresa abre **Empresa** para dar e tirar papéis (por área o
 A tela de uma execução que terminou mostra as **Evidências**: as telas em miniatura (clique para ver grande), o vídeo da falha e os arquivos baixados, com tamanho e data. Pela API, `GET /v1/execucoes/{id}/artefatos` lista os artefatos e `GET /v1/execucoes/{id}/artefatos/{nome}` baixa um deles (a saída de um passo de download é esse nome). Quem vê a execução vê as evidências. O vídeo só é guardado quando a execução falha ou fica indeterminada, e só se o robô não digita credencial do cofre fora de um campo de senha; `RAPA_VIDEO_EM_FALHAS=0` desliga a gravação, que precisa do `ffmpeg` do Playwright no executor (`playwright install ffmpeg`; sem ele, as execuções rodam sem vídeo, e o servidor avisa no log ao subir). O despachante apaga o que venceu uma vez por hora: as telas e o vídeo de execuções que deram certo depois de `RAPA_RETENCAO_SUCESSO_DIAS` (7); as evidências (tudo de uma execução que falhou ou ficou indeterminada, e os arquivos baixados das que deram certo) e os retratos do conserto depois de `RAPA_RETENCAO_FALHAS_DIAS` (90); as chaves de idempotência vencidas; e os eventos depois de `RAPA_RETENCAO_EVENTOS_DIAS` (400). Esses prazos ainda estão a validar com o jurídico; o que foi apagado aparece como **expirado**. Nada de uma empresa congelada expira: as evidências dela ficam para a exportação da saída da empresa.
 
 Os arquivos de entrada (para robôs que enviam arquivos) ficam em `RAPA_PASTA_ARQUIVOS`, numa subpasta por empresa: `<RAPA_PASTA_ARQUIVOS>/<uuid da empresa>/<arquivo>`. Cada execução só enxerga a subpasta da própria empresa; arquivos soltos na raiz não valem. `/saude` responde 503 enquanto o despachante do processo estiver parado.
+
+## Instalar no Kubernetes
+
+Em produção, o RaPA roda no EKS do AWS Outposts (a única peça da AWS; o resto é código aberto no cluster), pelo chart `deploy/helm/rapa`: a interface (`rapa-web`), a REST e o MCP (`rapa-api`) e o despachante (`rapa-despachante`), com as execuções e as sessões de gravação em pods de uso único no gVisor, as NetworkPolicies que negam tudo por padrão e o banco no CloudNativePG numa release própria. As imagens saem de `deploy/docker/Dockerfile` (alvos `controle` e `executor`) e o Argo CD sincroniza as duas releases, o banco antes, pela Application raiz (`deploy/argocd/raiz.yaml`, com as checagens de saúde de `deploy/argocd/argocd-cm-saude.yaml`).
+
+A ordem de instalação, os segredos, o que cada valor faz, a atualização, o backup e a restauração, o cofre e os procedimentos de incidente estão em [docs/OPERACAO.md](docs/OPERACAO.md). O CI valida o chart (`helm lint`, `helm template` e `kubeconform`), constrói e roda as duas imagens e instala tudo num cluster kind (`values-kind.yaml`).
 
 ## Licença
 

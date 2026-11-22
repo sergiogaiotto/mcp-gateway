@@ -1,0 +1,22 @@
+{{- if .Values.app.enabled }}
+RaPA {{ .Chart.AppVersion }} instalado em {{ .Release.Namespace }} (execuções em {{ .Values.executions.namespace }}).
+
+- rapa-web: interface, REST, MCP e sessões ({{ .Values.web.replicas }} réplica(s)).
+- rapa-api: REST e MCP.
+- rapa-despachante: fila e pods de uso único; saúde e canal na porta {{ .Values.executions.channel.port }}.
+{{- if and .Values.network.policies.enabled (not .Values.network.egress.kubernetesApi.to) }}
+
+ATENÇÃO: network.egress.kubernetesApi.to está vazio. Com as NetworkPolicies ligadas, o
+despachante e a web não alcançam a API do Kubernetes e nenhum pod de execução ou de sessão
+sobe. Informe os endereços do plano de controle do cluster.
+{{- end }}
+{{- if .Values.auth.dev.enabled }}
+
+ATENÇÃO: modo de desenvolvimento (RAPA_DEV=1, tokens fixos). Só para kind e testes.
+{{- end }}
+
+Operação: docs/OPERACAO.md.
+{{- else if .Values.database.cnpg.enabled }}
+Banco {{ .Values.database.cnpg.name }} (CloudNativePG) em {{ .Release.Namespace }}.
+Confira com: kubectl -n {{ .Release.Namespace }} get cluster {{ .Values.database.cnpg.name }}
+{{- end }}

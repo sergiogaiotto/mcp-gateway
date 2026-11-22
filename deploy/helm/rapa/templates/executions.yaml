@@ -1,0 +1,71 @@
+{{- if .Values.app.enabled }}
+{{- $v := .Values -}}
+{{- $ns := $v.executions.namespace -}}
+{{- if eq $ns .Release.Namespace }}
+{{- fail "executions.namespace precisa ser outro namespace, separado do plano de controle" }}
+{{- end }}
+{{- if $v.executions.createNamespace }}
+# O namespace das execuções e das sessões, com a Pod Security "restricted" obrigatória.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns }}
+  labels:
+    {{- include "rapa.labels" . | nindent 4 }}
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+  annotations:
+    # Nunca apagado com a release (nem pelo Argo CD): os pods de uma execução em andamento
+    # ficam até o fim.
+    helm.sh/resource-policy: keep
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+---
+{{- end }}
+# A conta de serviço dos pods de execução e de sessão: nenhuma permissão e nenhum token.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "rapa.executorServiceAccount" . }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rapa.labels" . | nindent 4 }}
+    app.kubernetes.io/component: executor
+automountServiceAccountToken: false
+---
+# O que o despachante (execuções) e a web (sessões) fazem no namespace das execuções.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "rapa.name" . }}-pods-de-uso-unico
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rapa.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "secrets"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "rapa.name" . }}-pods-de-uso-unico
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rapa.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "rapa.name" . }}-pods-de-uso-unico
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "rapa.component" (dict "root" . "component" "despachante") }}
+    namespace: {{ .Release.Namespace }}
+  - kind: ServiceAccount
+    name: {{ include "rapa.component" (dict "root" . "component" "web") }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

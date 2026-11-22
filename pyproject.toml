@@ -80,6 +80,8 @@ dev = [
     "mypy>=2.4",
     # S3 falso dos testes do store de objetos.
     "moto[s3]>=5.1",
+    # Os testes do deploy leem os manifestos do helm template e o workflow do CI.
+    "pyyaml>=6.0.3",
 ]
 
 [build-system]

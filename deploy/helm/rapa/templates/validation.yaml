@@ -1,0 +1,2 @@
+{{- /* Não gera nenhum recurso: só confere os valores (templates/_validation.tpl). */ -}}
+{{- include "rapa.validate" . -}}

@@ -1,0 +1,140 @@
+{{- if and .Values.app.enabled .Values.gateway.enabled }}
+{{- $v := .Values -}}
+{{- if not $v.gateway.hostnames }}
+{{- fail "gateway.enabled precisa de gateway.hostnames" }}
+{{- end }}
+{{- if not $v.publicUrl }}
+{{- fail "gateway.enabled precisa de publicUrl (RAPA_PUBLIC_URL)" }}
+{{- end }}
+{{- $web := include "rapa.component" (dict "root" . "component" "web") -}}
+{{- $api := include "rapa.component" (dict "root" . "component" "api") -}}
+{{- $timeout := $v.gateway.requestTimeout -}}
+# A interface e as sessões de gravação (com a visão ao vivo por WebSocket) vão para a web. O
+# TLS fica no Gateway externo (parentRefs). Sem prazo só os websockets: o da interface
+# (/_nicegui_ws, o socket.io do NiceGUI) e o da visão ao vivo de uma sessão; as páginas, os
+# envios e o resto de /v1/sessoes têm o prazo dos pedidos comuns. O Envoy Gateway confere o
+# caminho exato, depois a expressão regular e por fim o prefixo mais longo.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $web }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rapa.componentLabels" (dict "root" . "component" "web") | nindent 4 }}
+spec:
+  parentRefs:
+    {{- toYaml $v.gateway.parentRefs | nindent 4 }}
+  hostnames:
+    {{- toYaml $v.gateway.hostnames | nindent 4 }}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /_nicegui_ws
+        - path:
+            type: RegularExpression
+            value: ^/v1/sessoes/[^/]+/ao-vivo$
+      backendRefs:
+        - name: {{ $web }}
+          port: 8000
+      timeouts:
+        request: 0s
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1/sessoes
+      backendRefs:
+        - name: {{ $web }}
+          port: 8000
+      timeouts:
+        request: {{ $timeout }}
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: {{ $web }}
+          port: 8000
+      timeouts:
+        request: {{ $timeout }}
+---
+# A REST (/v1, inclusive os webhooks em /v1/webhooks), o MCP (/mcp) e os metadados do recurso
+# protegido do MCP (RFC 9728) vão para a api. Sem prazo só o /mcp (respostas em fluxo).
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $api }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rapa.componentLabels" (dict "root" . "component" "api") | nindent 4 }}
+spec:
+  parentRefs:
+    {{- toYaml $v.gateway.parentRefs | nindent 4 }}
+  hostnames:
+    {{- toYaml $v.gateway.hostnames | nindent 4 }}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1/webhooks
+      backendRefs:
+        - name: {{ $api }}
+          port: 8000
+      timeouts:
+        request: {{ $timeout }}
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1
+      backendRefs:
+        - name: {{ $api }}
+          port: 8000
+      timeouts:
+        request: {{ $timeout }}
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /.well-known/oauth-protected-resource
+      backendRefs:
+        - name: {{ $api }}
+          port: 8000
+      timeouts:
+        request: {{ $timeout }}
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /mcp
+      backendRefs:
+        - name: {{ $api }}
+          port: 8000
+      timeouts:
+        request: 0s
+{{- if gt (int $v.web.replicas) 1 }}
+---
+# Mais de uma réplica da web: cada navegador fica sempre na mesma (a interface e as sessões
+# ficam na memória do processo), por um cookie do Envoy.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: {{ $web }}-afinidade
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rapa.componentLabels" (dict "root" . "component" "web") | nindent 4 }}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: {{ $web }}
+  loadBalancer:
+    type: ConsistentHash
+    consistentHash:
+      type: Cookie
+      cookie:
+        name: {{ $v.gateway.webAffinityCookie }}
+        ttl: 12h
+        attributes:
+          SameSite: Lax
+          Secure: ""
+          HttpOnly: ""
+{{- end }}
+{{- end }}

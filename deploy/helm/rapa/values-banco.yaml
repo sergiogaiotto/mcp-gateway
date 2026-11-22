@@ -1,0 +1,12 @@
+# A release só do banco (CloudNativePG), instalada antes da release da aplicação e com os
+# mesmos valores do ambiente:
+#
+#   helm install rapa-banco deploy/helm/rapa -n rapa -f <valores do ambiente> -f values-banco.yaml
+#
+# O Job de migração da release da aplicação roda antes de qualquer recurso dela; por isso o
+# banco nunca fica na mesma release.
+app:
+  enabled: false
+database:
+  cnpg:
+    enabled: true

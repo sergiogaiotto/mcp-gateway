@@ -1,0 +1,328 @@
+{{- if .Values.database.cnpg.enabled }}
+{{- $v := .Values -}}
+{{- $db := $v.database -}}
+{{- $cnpg := $db.cnpg -}}
+{{- $ns := .Release.Namespace -}}
+{{- $pooler := printf "%s-pooler-rw" $cnpg.name -}}
+{{- $recovery := $cnpg.recovery -}}
+{{- if and $v.network.policies.enabled (not $v.network.egress.kubernetesApi.to) }}
+{{- fail "as instâncias do CloudNativePG falam com a API do Kubernetes: informe network.egress.kubernetesApi.to (ou, só no desenvolvimento, desligue network.policies.enabled)" }}
+{{- end }}
+# O banco do RaPA no CloudNativePG. Os três papéis (rapa.control.db.roles): o dono das tabelas
+# é o dono do banco (bootstrap); a aplicação sem BYPASSRLS e o despachante com BYPASSRLS são
+# managed.roles, com as senhas dos Secrets kubernetes.io/basic-auth que o operador criou. Na
+# restauração (database.cnpg.recovery), o banco nasce dos backups da origem, com o mesmo dono.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ $cnpg.name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rapa.componentLabels" (dict "root" . "component" "banco") | nindent 4 }}
+  annotations:
+    # O banco nunca é apagado pela release nem pelo Argo CD (nem apagando a Application).
+    helm.sh/resource-policy: keep
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+spec:
+  instances: {{ $cnpg.instances }}
+  {{- with $cnpg.imageName }}
+  imageName: {{ . }}
+  {{- end }}
+  primaryUpdateStrategy: unsupervised
+  enableSuperuserAccess: false
+  enablePDB: true
+  bootstrap:
+    {{- if $recovery.enabled }}
+    recovery:
+      source: origem
+      database: {{ $db.name }}
+      # O dono que está nos backups (sem ele, o operador cria e confere outro papel).
+      owner: {{ $db.roles.owner.name }}
+      secret:
+        name: {{ $db.roles.owner.existingSecret }}
+      {{- with $recovery.targetTime }}
+      recoveryTarget:
+        targetTime: {{ . | quote }}
+      {{- end }}
+    {{- else }}
+    initdb:
+      database: {{ $db.name }}
+      owner: {{ $db.roles.owner.name }}
+      secret:
+        name: {{ $db.roles.owner.existingSecret }}
+      dataChecksums: true
+      encoding: UTF8
+    {{- end }}
+  {{- if $recovery.enabled }}
+  # A origem da restauração: os backups do Cluster de origem (só leitura).
+  externalClusters:
+    - name: origem
+      plugin:
+        name: barman-cloud.cloudnative-pg.io
+        parameters:
+          barmanObjectName: {{ $cnpg.name }}-origem
+          serverName: {{ $recovery.source }}
+  {{- end }}
+  managed:
+    roles:
+      - name: {{ $db.roles.app.name }}
+        ensure: present
+        comment: RaPA, aplicação (API, MCP e interface), sujeita ao isolamento por linha
+        login: true
+        superuser: false
+        bypassrls: false
+        createdb: false
+        createrole: false
+        replication: false
+        inherit: true
+        passwordSecret:
+          name: {{ $db.roles.app.existingSecret }}
+      - name: {{ $db.roles.dispatcher.name }}
+        ensure: present
+        comment: RaPA, despachante da fila (atende todas as empresas)
+        login: true
+        superuser: false
+        bypassrls: true
+        createdb: false
+        createrole: false
+        replication: false
+        inherit: true
+        passwordSecret:
+          name: {{ $db.roles.dispatcher.existingSecret }}
+  postgresql:
+    parameters:
+      {{- toYaml $cnpg.parameters | nindent 6 }}
+    # Nenhuma conexão por TCP sem TLS: as regras fixas do operador (a replicação e o Pooler,
+    # por certificado) vêm antes e já são hostssl; esta vem antes da regra padrão (host).
+    pg_hba:
+      - hostnossl all all all reject
+  storage:
+    size: {{ $cnpg.storage.size }}
+    {{- with $cnpg.storage.storageClass }}
+    storageClass: {{ . }}
+    {{- end }}
+  walStorage:
+    size: {{ $cnpg.walStorage.size }}
+    {{- with $cnpg.walStorage.storageClass }}
+    storageClass: {{ . }}
+    {{- end }}
+  resources:
+    {{- toYaml $cnpg.resources | nindent 4 }}
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+    podAntiAffinityType: preferred
+  {{- if $cnpg.pooler.enabled }}
+  # O Pooler serve com o certificado do banco: o nome dele entra no certificado.
+  certificates:
+    serverAltDNSNames:
+      - {{ $pooler }}
+      - {{ printf "%s.%s" $pooler $ns }}
+      - {{ printf "%s.%s.svc" $pooler $ns }}
+      - {{ printf "%s.%s.svc.%s" $pooler $ns $v.clusterDomain }}
+  {{- end }}
+  {{- if $cnpg.backup.enabled }}
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: {{ $cnpg.name }}-backup
+  {{- end }}
+{{- range $store := list "backup" "origem" }}
+{{- if or (and (eq $store "backup") $cnpg.backup.enabled) (and (eq $store "origem") $recovery.enabled) }}
+---
+# {{ ternary "Onde ficam os backups (base e WAL contínuo): o S3 do SeaweedFS, com retenção." "De onde vem a restauração: o mesmo caminho, lido pelo Cluster novo (só leitura)." (eq $store "backup") }}
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: {{ $cnpg.name }}-{{ $store }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rapa.componentLabels" (dict "root" $ "component" "banco") | nindent 4 }}
+spec:
+  {{- if eq $store "backup" }}
+  retentionPolicy: {{ $cnpg.backup.retentionPolicy | quote }}
+  {{- end }}
+  configuration:
+    destinationPath: {{ $cnpg.backup.destinationPath | quote }}
+    endpointURL: {{ $cnpg.backup.endpointURL | quote }}
+    {{- if $cnpg.backup.caSecret.name }}
+    endpointCA:
+      name: {{ $cnpg.backup.caSecret.name }}
+      key: {{ $cnpg.backup.caSecret.key }}
+    {{- end }}
+    s3Credentials:
+      accessKeyId:
+        name: {{ $cnpg.backup.existingSecret }}
+        key: {{ $cnpg.backup.accessKeyKey }}
+      secretAccessKey:
+        name: {{ $cnpg.backup.existingSecret }}
+        key: {{ $cnpg.backup.secretKeyKey }}
+    wal:
+      compression: gzip
+    data:
+      compression: gzip
+{{- end }}
+{{- end }}
+{{- if $cnpg.backup.enabled }}
+---
+# Backup de base diário (o WAL é contínuo).
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: {{ $cnpg.name }}-diario
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rapa.componentLabels" (dict "root" . "component" "banco") | nindent 4 }}
+spec:
+  schedule: {{ $cnpg.backup.schedule | quote }}
+  immediate: true
+  backupOwnerReference: self
+  cluster:
+    name: {{ $cnpg.name }}
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
+{{- end }}
+{{- if $cnpg.pooler.enabled }}
+---
+# PgBouncer em modo sessão: o RaPA fixa a empresa com set_config(..., true) em cada
+# transação e usa transações explícitas; o modo sessão mantém tudo como num banco direto.
+apiVersion: postgresql.cnpg.io/v1
+kind: Pooler
+metadata:
+  name: {{ $pooler }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rapa.componentLabels" (dict "root" . "component" "banco") | nindent 4 }}
+spec:
+  cluster:
+    name: {{ $cnpg.name }}
+  instances: {{ $cnpg.pooler.instances }}
+  type: rw
+  pgbouncer:
+    poolMode: session
+    parameters:
+      max_client_conn: {{ $cnpg.pooler.maxClientConn | quote }}
+      default_pool_size: {{ $cnpg.pooler.defaultPoolSize | quote }}
+{{- end }}
+{{- if $cnpg.monitoring.enabled }}
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: {{ $cnpg.name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rapa.componentLabels" (dict "root" . "component" "banco") | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      cnpg.io/cluster: {{ $cnpg.name }}
+      cnpg.io/podRole: instance
+  podMetricsEndpoints:
+    - port: metrics
+{{- end }}
+{{- if $v.network.policies.enabled }}
+---
+# As instâncias do banco: recebem só dos clientes (os pods do RaPA), umas das outras, do
+# operador e do coletor de métricas; saem para o DNS, umas para as outras, o operador, a API
+# do Kubernetes e o S3 dos backups (e o da origem, numa restauração).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $cnpg.name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rapa.componentLabels" (dict "root" . "component" "banco") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: {{ $cnpg.name }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        {{- toYaml $cnpg.networkPolicies.clients | nindent 8 }}
+        {{- if $cnpg.pooler.enabled }}
+        - podSelector:
+            matchLabels:
+              cnpg.io/poolerName: {{ $pooler }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 5432
+    - from:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: {{ $cnpg.name }}
+    - from:
+        {{- toYaml $cnpg.networkPolicies.operator | nindent 8 }}
+    {{- if $v.network.metricsCollector }}
+    - from:
+        {{- toYaml $v.network.metricsCollector | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: 9187
+    {{- end }}
+  egress:
+    {{- include "rapa.dnsEgress" . | nindent 4 }}
+    - to:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: {{ $cnpg.name }}
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 8000
+    - to:
+        {{- toYaml $cnpg.networkPolicies.operator | nindent 8 }}
+    {{- include "rapa.egressDestinations" (dict "root" . "names" (list "kubernetesApi")) | nindent 4 }}
+    {{- if or $cnpg.backup.enabled $recovery.enabled }}
+    - to:
+        {{- toYaml $cnpg.networkPolicies.s3 | nindent 8 }}
+      ports:
+        {{- include "rapa.tcpPorts" $cnpg.networkPolicies.s3Ports | nindent 8 }}
+    {{- end }}
+{{- if $cnpg.pooler.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $pooler }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rapa.componentLabels" (dict "root" . "component" "banco") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/poolerName: {{ $pooler }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        {{- toYaml $cnpg.networkPolicies.clients | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: 5432
+    - from:
+        {{- toYaml $cnpg.networkPolicies.operator | nindent 8 }}
+    {{- if $v.network.metricsCollector }}
+    - from:
+        {{- toYaml $v.network.metricsCollector | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: 9127
+    {{- end }}
+  egress:
+    {{- include "rapa.dnsEgress" . | nindent 4 }}
+    - to:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: {{ $cnpg.name }}
+      ports:
+        - protocol: TCP
+          port: 5432
+    {{- include "rapa.egressDestinations" (dict "root" . "names" (list "kubernetesApi")) | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- end }}
