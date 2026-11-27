@@ -497,9 +497,12 @@ async def test_everything_against_bao_server_dev(bao_dev: tuple[str, str], tmp_p
         "KUBERNETES_TOKEN_REVIEWER_JWT": str(reviewer),
     }
     for _ in range(2):  # idempotente de verdade
-        await asyncio.to_thread(
-            subprocess.run, [str(SCRIPT)], env=env, check=True, capture_output=True
+        done = await asyncio.to_thread(
+            subprocess.run, [str(SCRIPT)], env=env, check=False, capture_output=True, text=True
         )
+        # A saída do script e do bao vai na falha (só nomes de caminhos e de papéis; o token
+        # de teste não aparece nela).
+        assert done.returncode == 0, (done.returncode, done.stdout[-3000:], done.stderr[-3000:])
     company, other = new_id(), new_id()
     headers = {"X-Vault-Token": token}
     # Fora do cluster, a TokenReview usa o token informado (sem ele, o OpenBao mandaria o
