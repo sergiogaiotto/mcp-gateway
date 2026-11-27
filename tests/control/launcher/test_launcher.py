@@ -298,8 +298,11 @@ def test_worker_environment_leaves_control_plane_variables_out(
     monkeypatch.setenv("RAPA_DATABASE_URL", "postgresql://rapa:senha@banco/rapa")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "chave")
     monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/pw-browsers")
+    # O Playwright tiraria o loopback do proxy da guarda: o Chromium abriria a máquina direto.
+    monkeypatch.setenv("PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK", "1")
     env = _worker_env()
     assert "RAPA_DATABASE_URL" not in env and "AWS_SECRET_ACCESS_KEY" not in env
+    assert "PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK" not in env
     assert env["PLAYWRIGHT_BROWSERS_PATH"] == "/opt/pw-browsers"
 
 

@@ -1,0 +1,77 @@
+{{- if and .Values.app.enabled .Values.operation.enabled }}
+{{- $v := .Values -}}
+{{- $o := $v.operation -}}
+{{- $sel := dict "root" . "component" "operacao" -}}
+{{- $ctx := dict "root" . "component" "operacao" "baoRole" $v.vault.roles.operation "http" false -}}
+# A conta de serviço da operação (python -m rapa.control.admin): nenhuma permissão no
+# Kubernetes e nenhum token montado; o token projetado, com a audiência do OpenBao, só serve
+# para o papel rapa-operacao (deploy/openbao: apagar os segredos e a chave de uma empresa e
+# decifrar os artefatos para a exportação).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "rapa.component" $sel }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rapa.componentLabels" $sel | nindent 4 }}
+automountServiceAccountToken: false
+---
+# O pod da operação, guardado como modelo: nada roda sozinho. Quem opera cria um pod dele
+# para congelar, exportar e apagar uma empresa (docs/OPERACAO.md, "O CLI no cluster"), com a
+# URL do dono das tabelas, o OpenBao com o papel da operação, o S3 e as chaves, e um disco
+# próprio para a exportação (operation.workSizeLimit), longe dos pods que servem tráfego. O
+# pod não leva o rótulo app.kubernetes.io/instance: o Argo CD (com o rastreio por rótulo)
+# não o toma como recurso da Application nem o apaga no meio do trabalho.
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: {{ include "rapa.component" $sel }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rapa.componentLabels" $sel | nindent 4 }}
+template:
+  metadata:
+    labels:
+      {{- include "rapa.operationLabels" . | nindent 6 }}
+  spec:
+    serviceAccountName: {{ include "rapa.component" $sel }}
+    automountServiceAccountToken: false
+    enableServiceLinks: false
+    restartPolicy: Never
+    activeDeadlineSeconds: {{ $o.activeDeadlineSeconds }}
+    terminationGracePeriodSeconds: 30
+    securityContext:
+      {{- include "rapa.podSecurityContext" . | nindent 6 }}
+    {{- include "rapa.imagePullSecrets" . | nindent 4 }}
+    containers:
+      - name: operacao
+        image: {{ include "rapa.controlImage" . | quote }}
+        imagePullPolicy: {{ $v.images.control.pullPolicy }}
+        args: ["sleep", "infinity"]
+        env:
+          {{- include "rapa.commonEnv" $ctx | nindent 10 }}
+          {{- include "rapa.databaseEnv" (dict "root" . "role" "owner" "var" "RAPA_OWNER_DATABASE_URL") | nindent 10 }}
+          - name: RAPA_COFRE
+            value: {{ $v.vault.mode | quote }}
+          - name: RAPA_PASTA_ARQUIVOS
+            value: /trabalho/arquivos
+          - name: RAPA_PASTA_ARTEFATOS
+            value: /trabalho/artefatos
+          # A exportação monta os artefatos decifrados e as tabelas numa pasta temporária
+          # (tempfile) antes do tar.gz: no disco da exportação, nunca no /tmp de 1 GiB.
+          - name: TMPDIR
+            value: /trabalho
+        resources:
+          {{- toYaml $o.resources | nindent 10 }}
+        securityContext:
+          {{- include "rapa.containerSecurityContext" . | nindent 10 }}
+        volumeMounts:
+          {{- include "rapa.commonMounts" $ctx | nindent 10 }}
+          - name: trabalho
+            mountPath: /trabalho
+    volumes:
+      {{- include "rapa.commonVolumes" $ctx | nindent 6 }}
+      - name: trabalho
+        emptyDir:
+          sizeLimit: {{ $o.workSizeLimit }}
+{{- end }}

@@ -370,8 +370,9 @@ class DevLogin:
             if profile.key in self.profiles:
                 raise ValueError(f"perfil repetido: {profile.key!r}")
             self.profiles[profile.key] = profile
-        if not self.profiles:
-            raise ValueError("o login de desenvolvimento precisa de ao menos um perfil")
+        # Sem perfis (os tokens ainda não têm usuário ativo no banco, como logo depois de
+        # instalar), a interface sobe e a tela de entrada diz o que falta, em vez de o
+        # serviço não subir.
 
     def get(self, key: str | None) -> DevProfile | None:
         return self.profiles.get(key) if key else None

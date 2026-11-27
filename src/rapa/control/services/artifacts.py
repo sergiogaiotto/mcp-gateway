@@ -13,7 +13,11 @@ curto de uma execução que deu certo, em que os arquivos baixados ficam).
 A lista vem de ``runs.artifacts`` (só a forma registrada pelo despachante: nome,
 tipo, tamanho, SHA-256, tentativa e data; nunca o caminho). O arquivo vem do
 :class:`rapa.control.artifacts.ArtifactStore`, pela empresa, a execução e a
-tentativa da lista: nada que venha do pedido escolhe a pasta.
+tentativa da lista: nada que venha do pedido escolhe a pasta. No store de objetos, um
+artefato cuja chave não abre agora (o cofre fora do ar) ou que o S3 não entrega agora
+(fora do ar, recusando) responde 503; sem a chave (a retenção a destruiu), o arquivo
+não está mais guardado (404); um objeto danificado (o cabeçalho trocado, cortado) não
+pode ser lido (404, com um erro no log para quem opera).
 """
 
 import logging
@@ -22,7 +26,13 @@ from uuid import UUID
 from pydantic import ValidationError
 from sqlalchemy import RowMapping, select
 
-from rapa.control.artifacts import ArtifactInfo, ArtifactMissing, ArtifactStore
+from rapa.control.artifacts import (
+    ArtifactCorrupted,
+    ArtifactInfo,
+    ArtifactMissing,
+    ArtifactStore,
+    ArtifactUnavailable,
+)
 from rapa.control.db.schema import runs
 from rapa.control.db.session import Database
 from rapa.control.services._common import PgService, visible_areas
@@ -34,6 +44,7 @@ from rapa.core.contracts import (
     NotFound,
     Principal,
     RunArtifact,
+    ServiceUnavailable,
 )
 
 __all__ = ["PgArtifacts"]
@@ -125,6 +136,15 @@ class PgArtifacts(PgService):
             )
         except ArtifactMissing:
             raise NotFound("o arquivo desta execução não está mais guardado") from None
+        except ArtifactCorrupted:
+            logger.error("um artefato da execução %s está danificado no armazenamento", run_id)
+            raise NotFound(
+                "o arquivo desta execução está danificado no armazenamento e não pode ser lido"
+            ) from None
+        except ArtifactUnavailable:
+            raise ServiceUnavailable(
+                "o arquivo desta execução não pôde ser aberto agora; tente de novo"
+            ) from None
         media_type, inline = media_type_for(info.kind, info.name)
         return ArtifactContent(
             name=info.name,

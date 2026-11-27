@@ -1,0 +1,127 @@
+# Valores do teste em kind (o job "kind" do CI, deploy/kind/): sem gVisor, com tokens de
+# desenvolvimento, o portal de teste, o OpenBao em modo dev (http) e um SeaweedFS de um nó.
+# Nunca use em produção: o chart recusa o modo de desenvolvimento junto com o gateway.
+
+images:
+  control:
+    repository: rapa-controle
+    tag: ci
+    pullPolicy: Never
+  executor:
+    repository: rapa-executor
+    tag: ci
+
+auth:
+  dev:
+    enabled: true
+    tokensSecret: rapa-dev-tokens
+  cookieSecure: false
+  rateLimitPerSecond: "0"
+
+database:
+  host: rapa-banco-rw
+  sslMode: verify-full
+  caSecret:
+    name: rapa-banco-ca
+    key: ca.crt
+  cnpg:
+    instances: 1
+    storage:
+      size: 1Gi
+    walStorage:
+      size: 1Gi
+    parameters:
+      max_connections: "100"
+      shared_buffers: 128MB
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 1Gi
+    # Sem o plugin Barman Cloud (que pede o cert-manager) no kind.
+    backup:
+      enabled: false
+
+migration:
+  # As permissões de novo depois de instalar (os papéis do CloudNativePG podem chegar depois
+  # da migração).
+  grantsJob:
+    enabled: true
+
+executions:
+  # Sem gVisor no kind.
+  runtimeClass: ""
+  cpu: 500m
+  memory: 1Gi
+  egress:
+    # A rede dos Services do kind (deploy/kind/cluster.yaml): o portal de teste
+    # (portal.rapa.test) é um Service.
+    allowedInternalNetworks:
+      - 10.96.0.0/16
+    # E o pod do portal, no namespace rapa-teste (extraRules só vale no desenvolvimento).
+    extraRules:
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: rapa-teste
+        ports:
+          - protocol: TCP
+            port: 8080
+
+network:
+  metricsCollector: []
+  egress:
+    keycloak:
+      to: []
+    # O plano de controle do kind (o script troca pelo endereço do nó, /32).
+    kubernetesApi:
+      to:
+        - ipBlock:
+            cidr: 172.18.0.0/16
+      ports: [6443, 443]
+
+vault:
+  mode: openbao
+  address: http://openbao.cofre.svc:8200
+  caSecret:
+    name: ""
+
+storage:
+  mode: s3
+  s3:
+    endpoint: http://seaweedfs-s3.armazenamento.svc:8333
+    bucket: rapa-artefatos
+    existingSecret: rapa-s3
+
+keys:
+  mode: openbao
+
+web:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      memory: 1536Mi
+
+api:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+
+dispatcher:
+  replicas: 1
+  concurrency: 2
+  terminationGracePeriodSeconds: 60
+  workSizeLimit: 2Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi

@@ -1,0 +1,23 @@
+# A RuntimeClass gvisor dos pods de uso único (execuções e sessões). O gVisor (runsc) é
+# instalado nos nós de execução pelo provisionamento dos nós autogerenciados do Outposts (o
+# containerd com o handler "runsc"); o chart só usa o nome (RAPA_K8S_RUNTIME_CLASS).
+#
+# O scheduling leva todo pod com esta RuntimeClass para os nós de execução (rótulo e taint
+# rapa.dev/execucoes), mesmo sem RAPA_K8S_NODE_SELECTOR e RAPA_K8S_TOLERATIONS. O overhead
+# soma o custo do próprio gVisor ao pedido de cada pod (para a cota e o agendamento).
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc
+overhead:
+  podFixed:
+    cpu: 100m
+    memory: 128Mi
+scheduling:
+  nodeSelector:
+    rapa.dev/execucoes: "sim"
+  tolerations:
+    - key: rapa.dev/execucoes
+      operator: Exists
+      effect: NoSchedule

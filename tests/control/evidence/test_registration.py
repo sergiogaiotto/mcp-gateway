@@ -69,7 +69,12 @@ async def test_names_the_runner_makes_are_names_the_store_accepts(
 
 
 class _BrokenStore:
+    def __init__(self) -> None:
+        self.puts = 0
+        self.released: list[tuple[UUID, UUID, int]] = []
+
     async def put(self, *args: Any) -> Any:
+        self.puts += 1
         raise RuntimeError("armazenamento fora do ar")
 
     async def open(self, *args: Any) -> Any:  # pragma: no cover - não é usado aqui
@@ -80,14 +85,32 @@ class _BrokenStore:
     ) -> None:  # pragma: no cover
         raise AssertionError
 
+    async def release_attempt(self, company_id: UUID, run_id: UUID, attempt: int) -> None:
+        self.released.append((company_id, run_id, attempt))
+
 
 async def test_a_store_that_fails_never_stops_the_result(
     world: EvidenceWorld, app_db: Database, superuser_engine: AsyncEngine
 ) -> None:
+    """O store fora do ar: tenta de novo algumas vezes e, sem jeito, a execução diz que
+    perdeu os artefatos (nada some calado), e o resultado é gravado do mesmo jeito."""
     tenant = await make_tenant(app_db, "Store fora")
     await publish(world.platform, tenant, protocolo())
-    world.dispatcher.artifacts = _BrokenStore()
+    broken = _BrokenStore()
+    world.dispatcher.artifacts = broken  # type: ignore[assignment]
     run_id = await world.run(tenant, state="succeeded")
     status = await world.platform.get(tenant.operator, run_id)
     assert status is not None and status.state is RunState.SUCCEEDED
-    assert (await run_row(superuser_engine, run_id))["artifacts"] == []
+    row = await run_row(superuser_engine, run_id)
+    assert row["artifacts"] == []
+    assert row["error_code"] == "artefatos_nao_guardados"
+    assert row["error_message"].startswith("3 artefato(s) desta execução não puderam ser")
+    # Cada um, a primeira vez e mais três; e a tentativa foi solta no fim.
+    assert broken.puts == 3 * 4
+    assert broken.released == [(tenant.company_id, run_id, 1)]
+    # Numa falha, o código dela fica (é o motivo); a mensagem diz o que se perdeu.
+    failed = await world.run(tenant, state="failed")
+    row = await run_row(superuser_engine, failed)
+    assert row["error_code"] == "elemento_nao_encontrado"
+    assert row["error_message"].startswith("3 artefato(s) desta execução não puderam ser")
+    assert row["error_message"].endswith("Não encontrei o elemento 'botão Entrar'.")

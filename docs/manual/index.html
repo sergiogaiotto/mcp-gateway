@@ -1,0 +1,1822 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="Manual de instalação, configuração e testes do RaPA: desenvolvimento local, EKS no AWS Outposts, configuração, uso tela a tela, testes e operação.">
+<title>Manual do RaPA</title>
+<script>document.documentElement.classList.add("js");</script>
+<style>
+:root {
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Liberation Sans", Arial, sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", "Cascadia Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --bg: #f7f8f9;
+  --surface: #ffffff;
+  --text: #1c232b;
+  --muted: #56616d;
+  --border: #d9dee4;
+  --accent: #1d5f8f;
+  --accent-text: #174d75;
+  --accent-weak: #e6f0f7;
+  --code-bg: #f1f4f6;
+  --code-border: #dfe4e9;
+  --inline-code-bg: #eef1f4;
+  --sidebar-bg: #eef1f4;
+  --sidebar-active: #dbe7f1;
+  --nota-bg: #eaf2fa;
+  --nota-border: #2f6fb0;
+  --atencao-bg: #fdf3e1;
+  --atencao-border: #b26b00;
+  --perigo-bg: #fcebea;
+  --perigo-border: #b8322a;
+  --th-bg: #eef1f4;
+  --shadow: 0 1px 2px rgba(20, 30, 40, .06);
+  --d-ns-fill: #f3f6f8;
+  --d-ns-stroke: #9aa7b4;
+  --d-box-fill: #ffffff;
+  --d-box-stroke: #8593a1;
+  --d-key-fill: #e3eef7;
+  --d-key-stroke: #2c6a9a;
+  --d-guard-fill: #fbefd9;
+  --d-guard-stroke: #b07a1c;
+  --d-line: #4c5864;
+  --d-text: #1c232b;
+  --d-muted: #4f5b67;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14181d;
+    --surface: #1b2027;
+    --text: #e3e7ec;
+    --muted: #a3adb8;
+    --border: #323a44;
+    --accent: #6fb0e6;
+    --accent-text: #8cc2ee;
+    --accent-weak: #1e3142;
+    --code-bg: #10141a;
+    --code-border: #2b333d;
+    --inline-code-bg: #262d36;
+    --sidebar-bg: #181d23;
+    --sidebar-active: #233648;
+    --nota-bg: #172736;
+    --nota-border: #5a9bd8;
+    --atencao-bg: #2e2413;
+    --atencao-border: #d99a2b;
+    --perigo-bg: #33191a;
+    --perigo-border: #e0605a;
+    --th-bg: #222932;
+    --shadow: none;
+    --d-ns-fill: #1d232b;
+    --d-ns-stroke: #5b6775;
+    --d-box-fill: #232a33;
+    --d-box-stroke: #6c7987;
+    --d-key-fill: #1e3346;
+    --d-key-stroke: #5b9bd1;
+    --d-guard-fill: #3a2d15;
+    --d-guard-stroke: #c9902b;
+    --d-line: #a6b1bd;
+    --d-text: #e3e7ec;
+    --d-muted: #b3bdc8;
+  }
+}
+*, *::before, *::after { box-sizing: border-box; }
+html { scroll-padding-top: 16px; -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.65;
+}
+a { color: var(--accent-text); text-underline-offset: 2px; }
+a:hover { text-decoration-thickness: 2px; }
+.pular {
+  position: absolute; left: 8px; top: -48px; z-index: 50;
+  background: var(--surface); color: var(--text); padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px;
+}
+.pular:focus { top: 8px; }
+
+/* Barra do topo (só em telas estreitas) e sumário lateral */
+.topo { display: none; }
+.sumario {
+  position: fixed; top: 0; left: 0; bottom: 0; width: 300px;
+  overflow-y: auto; background: var(--sidebar-bg); border-right: 1px solid var(--border);
+  padding: 20px 14px 40px 18px; font-size: 14px; line-height: 1.45; z-index: 30;
+}
+.sumario .marca { display: block; font-weight: 700; font-size: 18px; color: var(--text); text-decoration: none; margin: 0 0 2px; }
+.sumario .marca-sub { color: var(--muted); font-size: 12.5px; margin: 0 0 16px; }
+.sumario ol { list-style: none; margin: 0; padding: 0; }
+.sumario > nav > ol > li { margin: 0 0 6px; }
+.sumario ol ol { margin: 2px 0 6px 10px; padding-left: 8px; border-left: 1px solid var(--border); }
+.sumario a { display: block; color: var(--text); text-decoration: none; padding: 3px 8px; border-radius: 5px; }
+.sumario ol ol a { color: var(--muted); padding: 2px 8px; }
+.sumario a:hover { background: var(--sidebar-active); color: var(--text); }
+.sumario a.ativo { background: var(--sidebar-active); color: var(--accent-text); font-weight: 600; }
+.sumario > nav > ol > li > a { font-weight: 600; }
+
+main { margin-left: 300px; }
+.conteudo { max-width: 900px; margin: 0 auto; padding: 36px 44px 80px; }
+
+h1, h2, h3, h4 { line-height: 1.25; color: var(--text); }
+h1 { font-size: 2.1rem; margin: 0 0 6px; letter-spacing: -.01em; }
+h2 { font-size: 1.6rem; margin: 64px 0 14px; padding-bottom: 8px; border-bottom: 2px solid var(--border); }
+h3 { font-size: 1.22rem; margin: 40px 0 10px; }
+h4 { font-size: 1.02rem; margin: 26px 0 8px; }
+p, ul, ol, dl { margin: 0 0 14px; }
+li { margin: 3px 0; }
+li > ul, li > ol { margin: 4px 0; }
+.subtitulo { color: var(--muted); font-size: 1.08rem; margin: 0 0 22px; }
+.capa { padding: 6px 0 8px; }
+.capa .meta { color: var(--muted); font-size: 14px; }
+hr { border: 0; border-top: 1px solid var(--border); margin: 32px 0; }
+strong { font-weight: 650; }
+
+code, kbd, samp { font-family: var(--font-mono); font-size: .88em; }
+:not(pre) > code {
+  background: var(--inline-code-bg); padding: .08em .35em; border-radius: 4px;
+  overflow-wrap: break-word;
+}
+pre {
+  margin: 0 0 18px; padding: 14px 16px;
+  background: var(--code-bg); border: 1px solid var(--code-border); border-radius: 8px;
+  overflow-x: auto; line-height: 1.5; font-size: 13.5px; tab-size: 4;
+}
+pre code { font-size: inherit; background: none; padding: 0; white-space: pre; }
+.bloco-codigo { position: relative; margin: 0 0 18px; }
+.bloco-codigo > pre { margin: 0; padding-top: 36px; }
+.copiar {
+  position: absolute; top: 7px; right: 8px;
+  font: 12px/1 var(--font-sans); color: var(--text); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 5px; padding: 6px 9px; cursor: pointer; opacity: .85;
+}
+.copiar:hover, .copiar:focus-visible { opacity: 1; border-color: var(--accent); }
+.copiar.ok { color: var(--accent-text); border-color: var(--accent); }
+
+.tabela { overflow-x: auto; margin: 0 0 20px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 14px; line-height: 1.5; }
+th, td { text-align: left; vertical-align: top; padding: 8px 11px; border-bottom: 1px solid var(--border); }
+th { background: var(--th-bg); font-weight: 650; white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+td code { font-size: .86em; }
+td.grupo { background: var(--accent-weak); font-weight: 650; color: var(--accent-text); }
+.col-var { min-width: 14em; }
+
+.aviso { margin: 0 0 18px; padding: 12px 16px 12px 16px; border-left: 4px solid; border-radius: 0 8px 8px 0; }
+.aviso > :last-child { margin-bottom: 0; }
+.aviso .rotulo { display: block; font-weight: 700; font-size: 12.5px; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 3px; }
+.nota { background: var(--nota-bg); border-color: var(--nota-border); }
+.nota .rotulo { color: var(--nota-border); }
+.atencao { background: var(--atencao-bg); border-color: var(--atencao-border); }
+.atencao .rotulo { color: var(--atencao-border); }
+.perigo { background: var(--perigo-bg); border-color: var(--perigo-border); }
+.perigo .rotulo { color: var(--perigo-border); }
+
+figure { margin: 8px 0 26px; }
+figure a.imagem { display: block; text-align: center; }
+figure img {
+  display: block; margin: 0 auto; width: 100%; height: auto;
+  border: 1px solid var(--border); border-radius: 6px; background: #fff; box-shadow: var(--shadow);
+}
+figure img.alta { width: auto; max-width: 100%; max-height: 1100px; }
+figure img.faixa { width: auto; max-width: 100%; }
+figcaption { color: var(--muted); font-size: 13.5px; margin-top: 8px; line-height: 1.5; }
+figcaption b { color: var(--text); }
+
+.diagrama { overflow-x: auto; margin: 6px 0 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); padding: 10px; }
+.diagrama svg { display: block; width: 100%; min-width: 760px; height: auto; font-family: var(--font-sans); }
+.d-ns { fill: var(--d-ns-fill); stroke: var(--d-ns-stroke); stroke-width: 1.2; stroke-dasharray: 6 4; }
+.d-box { fill: var(--d-box-fill); stroke: var(--d-box-stroke); stroke-width: 1.2; }
+.d-key { fill: var(--d-key-fill); stroke: var(--d-key-stroke); stroke-width: 1.5; }
+.d-ext { fill: var(--d-box-fill); stroke: var(--d-box-stroke); stroke-width: 1.2; stroke-dasharray: 5 4; }
+.d-guard { fill: var(--d-guard-fill); stroke: var(--d-guard-stroke); stroke-width: 1.2; }
+.d-line { fill: none; stroke: var(--d-line); stroke-width: 1.4; }
+.d-dash { stroke-dasharray: 5 4; }
+.d-head { fill: var(--d-line); }
+.d-t { fill: var(--d-text); font-size: 13.5px; font-weight: 650; }
+.d-s { fill: var(--d-muted); font-size: 12px; }
+.d-l { fill: var(--d-muted); font-size: 12px; font-style: italic; }
+@media (min-width: 1360px) {
+  .diagrama { width: min(1060px, calc(100vw - 380px)); margin-left: 50%; transform: translateX(-50%); }
+}
+.d-ns-t { fill: var(--d-muted); font-size: 12px; font-weight: 650; letter-spacing: .02em; }
+
+.ciclo { list-style: none; padding: 0; margin: 4px 0 18px; display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; counter-reset: passo; }
+.ciclo li { margin: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px 10px 44px; position: relative; counter-increment: passo; font-size: 14.5px; }
+.ciclo li::before { content: counter(passo); position: absolute; left: 12px; top: 10px; width: 22px; height: 22px; border-radius: 50%; background: var(--accent); color: var(--surface); font-weight: 700; font-size: 12.5px; line-height: 22px; text-align: center; }
+.ciclo li > b:first-child { display: block; }
+
+.lista-passos > li { margin-bottom: 10px; }
+dl.glossario dt { font-weight: 650; margin-top: 12px; }
+dl.glossario dd { margin: 2px 0 0 0; }
+.parte-rotulo { display: block; font-size: 12.5px; font-weight: 700; color: var(--muted); letter-spacing: .08em; text-transform: uppercase; margin-bottom: 2px; }
+.check { list-style: none; padding-left: 0; }
+.check > li { padding-left: 28px; position: relative; margin-bottom: 14px; }
+.check > li::before { content: ""; position: absolute; left: 2px; top: .35em; width: 14px; height: 14px; border: 2px solid var(--accent); border-radius: 3px; }
+.rodape { color: var(--muted); font-size: 13.5px; border-top: 1px solid var(--border); margin-top: 56px; padding-top: 16px; }
+
+@media (max-width: 960px) {
+  .topo {
+    display: flex; align-items: center; gap: 12px; position: sticky; top: 0; z-index: 40;
+    background: var(--sidebar-bg); border-bottom: 1px solid var(--border); padding: 8px 16px;
+  }
+  .topo .titulo { font-weight: 700; }
+  .topo button {
+    font: 600 14px/1 var(--font-sans); color: var(--text); background: var(--surface);
+    border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; cursor: pointer;
+  }
+  main { margin-left: 0; }
+  .conteudo { padding: 20px 16px 64px; }
+  h1 { font-size: 1.7rem; }
+  h2 { font-size: 1.35rem; margin-top: 48px; }
+  h3 { font-size: 1.12rem; }
+  html.js .sumario {
+    top: 53px; width: min(340px, 88vw); transform: translateX(-105%);
+    transition: transform .18s ease; box-shadow: 0 8px 24px rgba(0, 0, 0, .25);
+  }
+  html.js.sumario-aberto .sumario { transform: none; }
+  html:not(.js) .sumario { position: static; width: auto; border-right: 0; border-bottom: 1px solid var(--border); }
+  html:not(.js) .topo button { display: none; }
+  html { scroll-padding-top: 64px; }
+  figure img.alta { max-height: none; width: 100%; }
+  .tabela table { min-width: 600px; }
+}
+@media (prefers-reduced-motion: reduce) { html.js .sumario { transition: none; } }
+
+@media print {
+  @page { margin: 16mm 14mm; }
+  html, body { background: #fff; color: #000; font-size: 10.5pt; }
+  :root { --text: #000; --muted: #333; --border: #bbb; --code-bg: #f5f5f5; --inline-code-bg: #f0f0f0; --surface: #fff; --th-bg: #eee; }
+  .sumario, .topo, .pular, .copiar { display: none !important; }
+  main { margin: 0; }
+  .conteudo { max-width: none; padding: 0; }
+  section.parte { break-before: page; }
+  h2 { margin-top: 0; }
+  h2, h3, h4 { break-after: avoid; }
+  pre, .bloco-codigo > pre { white-space: pre-wrap; padding: 10px 12px; overflow: visible; break-inside: avoid; }
+  pre code { white-space: pre-wrap; overflow-wrap: anywhere; }
+  figure, .aviso, .tabela, tr, .diagrama { break-inside: avoid; }
+  .tabela { overflow: visible; border: 0; }
+  table { font-size: 8.5pt; }
+  figure img, figure img.alta { width: auto; max-width: 100%; max-height: 22cm; box-shadow: none; }
+  .diagrama { width: auto; margin-left: 0; transform: none; }
+  .diagrama svg { min-width: 0; }
+  a { color: #000; text-decoration: none; }
+}
+</style>
+</head>
+<body>
+<a class="pular" href="#conteudo">Pular para o conteúdo</a>
+
+<div class="topo">
+  <button type="button" id="abrir-sumario" aria-controls="sumario" aria-expanded="false">Sumário</button>
+  <span class="titulo">Manual do RaPA</span>
+</div>
+
+<aside class="sumario" id="sumario">
+  <a class="marca" href="#inicio">RaPA</a>
+  <p class="marca-sub">Manual de instalação, configuração e testes</p>
+  <nav aria-label="Sumário">
+  <ol>
+    <li><a href="#visao-geral">1. Visão geral</a>
+      <ol>
+        <li><a href="#o-que-faz">1.1 O que o RaPA faz</a></li>
+        <li><a href="#governanca">1.2 Regras de governança</a></li>
+        <li><a href="#arquitetura">1.3 Arquitetura</a></li>
+        <li><a href="#licencas">1.4 Componentes e licenças</a></li>
+      </ol>
+    </li>
+    <li><a href="#requisitos">2. Requisitos</a>
+      <ol>
+        <li><a href="#req-local">2.1 Desenvolvimento local</a></li>
+        <li><a href="#req-cluster">2.2 O cluster</a></li>
+        <li><a href="#req-externos">2.3 Componentes externos</a></li>
+        <li><a href="#req-rede">2.4 Registro, DNS e TLS</a></li>
+      </ol>
+    </li>
+    <li><a href="#local">3. Instalação local</a>
+      <ol>
+        <li><a href="#local-deps">3.1 Dependências</a></li>
+        <li><a href="#local-banco">3.2 Banco e papéis</a></li>
+        <li><a href="#local-migracoes">3.3 Migrações</a></li>
+        <li><a href="#local-cadastro">3.4 Empresa, áreas e pessoas</a></li>
+        <li><a href="#local-tokens">3.5 Tokens e segredos</a></li>
+        <li><a href="#local-subir">3.6 Subir o serviço</a></li>
+        <li><a href="#local-interface">3.7 Abrir a interface</a></li>
+        <li><a href="#local-portais">3.8 Portais de teste</a></li>
+      </ol>
+    </li>
+    <li><a href="#eks">4. Instalação no EKS do Outposts</a>
+      <ol>
+        <li><a href="#eks-ordem">4.1 A ordem</a></li>
+        <li><a href="#eks-imagens">4.2 Imagens com digest</a></li>
+        <li><a href="#eks-nos">4.3 Nós, gVisor e CNI</a></li>
+        <li><a href="#eks-externos">4.4 Componentes externos e Keycloak</a></li>
+        <li><a href="#eks-openbao">4.5 OpenBao</a></li>
+        <li><a href="#eks-segredos">4.6 Namespace e Secrets</a></li>
+        <li><a href="#eks-banco">4.7 A release do banco</a></li>
+        <li><a href="#eks-valores">4.8 Valores do ambiente</a></li>
+        <li><a href="#eks-app">4.9 A release da aplicação</a></li>
+        <li><a href="#eks-empresa">4.10 A primeira empresa</a></li>
+        <li><a href="#eks-verificar">4.11 Verificação</a></li>
+        <li><a href="#eks-atualizar">4.12 Atualizações</a></li>
+        <li><a href="#eks-backup">4.13 Backup e restauração</a></li>
+        <li><a href="#eks-desinstalar">4.14 Desinstalar</a></li>
+      </ol>
+    </li>
+    <li><a href="#configuracao">5. Configuração</a>
+      <ol>
+        <li><a href="#cfg-variaveis">5.1 Variáveis do serviço</a></li>
+        <li><a href="#cfg-valores">5.2 Valores do chart</a></li>
+        <li><a href="#cfg-pessoas">5.3 Empresas, áreas e papéis</a></li>
+        <li><a href="#cfg-a1">5.4 Credenciais e A1</a></li>
+        <li><a href="#cfg-capacidade">5.5 Cotas e capacidade</a></li>
+        <li><a href="#cfg-retencao">5.6 Retenção</a></li>
+        <li><a href="#cfg-docs-api">5.7 Documentação da API</a></li>
+        <li><a href="#cfg-observabilidade">5.8 Observabilidade e saúde</a></li>
+        <li><a href="#cfg-saida">5.9 Saída dos navegadores</a></li>
+      </ol>
+    </li>
+    <li><a href="#uso">6. Uso, tela a tela</a>
+      <ol>
+        <li><a href="#uso-entrar">6.1 Entrar</a></li>
+        <li><a href="#uso-catalogo">6.2 Catálogo e Executar</a></li>
+        <li><a href="#uso-execucoes">6.3 Execuções e evidências</a></li>
+        <li><a href="#uso-gravar">6.4 Gravar e revisar</a></li>
+        <li><a href="#uso-robos">6.5 Robôs, versões e aprovações</a></li>
+        <li><a href="#uso-conserto">6.6 Consertar um passo</a></li>
+        <li><a href="#uso-agendas">6.7 Agendas</a></li>
+        <li><a href="#uso-webhooks">6.8 Webhooks</a></li>
+        <li><a href="#uso-lotes">6.9 Lotes</a></li>
+        <li><a href="#uso-credenciais">6.10 Credenciais e A1</a></li>
+        <li><a href="#uso-empresa">6.11 Empresa e consumo</a></li>
+        <li><a href="#uso-rest">6.12 API REST</a></li>
+        <li><a href="#uso-mcp">6.13 MCP</a></li>
+      </ol>
+    </li>
+    <li><a href="#testes">7. Testes</a>
+      <ol>
+        <li><a href="#testes-suite">7.1 A suíte</a></li>
+        <li><a href="#testes-chart">7.2 O chart</a></li>
+        <li><a href="#testes-ci">7.3 O CI</a></li>
+        <li><a href="#testes-capturas">7.4 Regenerar as capturas</a></li>
+        <li><a href="#testes-aceite">7.5 Aceite no Outposts</a></li>
+      </ol>
+    </li>
+    <li><a href="#operacao">8. Operação e incidentes</a>
+      <ol>
+        <li><a href="#op-runbook">8.1 Runbook resumido</a></li>
+        <li><a href="#op-residuos">8.2 Resíduos conhecidos</a></li>
+      </ol>
+    </li>
+    <li><a href="#apendices">Apêndices</a>
+      <ol>
+        <li><a href="#glossario">A. Glossário</a></li>
+        <li><a href="#onde-esta">B. Onde está cada coisa</a></li>
+      </ol>
+    </li>
+  </ol>
+  </nav>
+</aside>
+
+<main id="conteudo">
+<div class="conteudo">
+
+<header class="capa" id="inicio">
+  <h1>Manual do RaPA</h1>
+  <p class="subtitulo">Instalação, configuração e testes: do desenvolvimento local ao EKS no AWS Outposts</p>
+  <p class="meta">RaPA 0.1.0 · chart <code>rapa</code> 0.1.0 · Python 3.14 · licença Apache-2.0</p>
+</header>
+
+<p>Este manual é para o time da plataforma (quem instala e opera), para quem desenvolve e para quem testa o RaPA. Ele junta, numa leitura só, o que está no código e nos documentos do repositório. Quando houver dúvida, vale o código; as regras completas de cada parte estão em <a href="../CONTRIBUINDO.md"><code>docs/CONTRIBUINDO.md</code></a> e o roteiro detalhado da plataforma em <a href="../OPERACAO.md"><code>docs/OPERACAO.md</code></a>, que este manual cita pela numeração dele (por exemplo, OPERACAO 1.5).</p>
+
+<div class="aviso nota">
+  <span class="rotulo">Convenções</span>
+  <p>Textos em MAIÚSCULAS nos comandos, como <code>ID_DA_EMPRESA</code>, <code>SENHA</code> ou <code>ID_DO_FISCAL</code>, são para trocar pelo valor do seu ambiente. Os endereços <code>*.exemplo.test</code> são os dos exemplos do repositório. As pessoas e a "Empresa Demonstração" das telas são inventadas pelo roteiro das capturas (<code>docs/manual/capturar.py</code>). Nenhum valor de segredo aparece aqui: as senhas e chaves são sempre geradas no seu ambiente.</p>
+  <p>Os avisos aparecem em três níveis: <b>nota</b> (contexto útil), <b>atenção</b> (algo que costuma dar errado) e <b>perigo</b> (perda de dados ou de isolamento).</p>
+</div>
+
+<!-- =========================================================================== -->
+<section class="parte" id="visao-geral" aria-labelledby="t-visao-geral">
+<h2 id="t-visao-geral"><span class="parte-rotulo">Parte 1</span>1. Visão geral</h2>
+
+<h3 id="o-que-faz">1.1 O que o RaPA faz</h3>
+<p>O RaPA cria robôs de automação web (RPA) sob demanda para pessoas de negócio, sem que ninguém precise ler código. A pessoa demonstra a tarefa uma vez num navegador na nuvem; o RaPA transforma a gravação num robô determinístico (uma lista fechada de passos, cada um com o efeito declarado: leitura, gravação ou irreversível) e o publica como ferramenta MCP e como endpoint REST. O ciclo completo:</p>
+<ol class="ciclo">
+  <li><b>Gravar</b>Quem cria robôs abre <b>Gravar</b>, informa a área e o endereço inicial e faz a tarefa num Chromium da nuvem que vê ao vivo.</li>
+  <li><b>Revisar</b>O RaPA propõe entradas, nomes dos passos e repetições (pelas regras e, com o hub, pelo modelo). Nada entra sem a pessoa aceitar; o resultado é um rascunho.</li>
+  <li><b>Publicar</b>Outra pessoa, com o papel de aprovação, valida e publica. Um robô com certificado A1 pede duas aprovações.</li>
+  <li><b>Executar</b>Pela interface, pela REST, pelo MCP, por agenda (cron), por webhook assinado ou por lote de planilha. Cada tentativa roda num pod de uso único no gVisor, sem LLM.</li>
+  <li><b>Evidências</b>As telas, os arquivos baixados e, numa falha, o vídeo ficam com a execução, cifrados no S3 e apagados pela retenção.</li>
+  <li><b>Consertar</b>Quando o elemento de um passo some, a pessoa escolhe o elemento novo entre os candidatos do retrato da página; vira a próxima versão em rascunho, publicada por outra pessoa.</li>
+</ol>
+<div class="aviso nota">
+  <span class="rotulo">Nota</span>
+  <p>O modelo de linguagem (um modelo aberto num hub interno) só ajuda a criar e a consertar robôs, e sempre como proponente: o código decide. As execuções normais nunca usam LLM. Se o hub cair, só as propostas do modelo somem; os robôs publicados continuam rodando.</p>
+</div>
+
+<h3 id="governanca">1.2 Regras de governança</h3>
+<ul>
+  <li><b>A empresa é fronteira obrigatória.</b> Toda tabela com dados de empresa tem <code>company_id</code> e isolamento por linha no PostgreSQL. A empresa vem sempre do token (a organização do Keycloak), nunca de algo que a pessoa escolhe.</li>
+  <li><b>Ninguém aprova a própria versão.</b> Quem cria uma versão (também a do conserto ou a da revisão de uma gravação) nunca a publica; o banco recusa a aprovação de quem criou.</li>
+  <li><b>Certificado A1 com custodiante e duas aprovações.</b> O RaPA guarda só a referência ao cofre. O custodiante (papel <code>credential_custodian</code>) autoriza cada par robô e portal; a versão precisa de duas aprovações de pessoas diferentes, nenhuma delas o custodiante, e nunca de uma versão que o custodiante criou; o conserto assistido fica desligado; o vencimento gera avisos. Um certificado vencido, revogado ou sem a autorização não deixa o robô rodar por nenhuma origem (<code>certificado_a1_bloqueado</code>).</li>
+  <li><b>Nada que gravou é repetido sozinho.</b> Um passo que grava só começa depois que o plano de controle registra o aviso; a partir daí a execução nunca volta para a fila. Depois de um passo irreversível, uma falha vira <b>indeterminada</b>, e uma pessoa confere o sistema de destino.</li>
+  <li><b>Segredos nunca aparecem</b> em eventos, logs, prompts, telas ou resultados; o executor digita o valor do cofre na hora.</li>
+  <li><b>Empresa congelada.</b> A plataforma congela uma empresa pela linha de comando: ela lê tudo, mas nada novo começa (a API responde 423, <code>empresa_congelada</code>), a fila é cancelada, a retenção para e os avisos do A1 param. É o primeiro passo da saída: congelar, exportar, entregar, apagar.</li>
+  <li><b>Retenção.</b> Telas e vídeo de execuções que deram certo: 7 dias; evidências e retratos das falhas: 90 dias; partições de eventos: 400 dias. Os prazos ainda estão <b>a validar com o jurídico</b> (<a href="#cfg-retencao">5.6</a>).</li>
+  <li><b>Só código aberto.</b> Toda dependência tem licença aprovada pela OSI; nada com GPL ou AGPL é importado no processo. A única peça da AWS é o EKS no Outposts.</li>
+</ul>
+
+<h3 id="arquitetura">1.3 Arquitetura</h3>
+<p>No cluster, o chart <code>deploy/helm/rapa</code> instala dois namespaces: <code>rapa</code> (o plano de controle) e <code>rapa-execucoes</code> (os pods de uso único). O banco vem de outra release do mesmo chart (<code>rapa-banco</code>). Os componentes externos são instalados pelos próprios charts deles e só configurados pelo RaPA.</p>
+<div class="diagrama">
+<svg viewBox="0 0 1000 800" role="img" aria-labelledby="diag-titulo diag-desc" xmlns="http://www.w3.org/2000/svg">
+  <title id="diag-titulo">Arquitetura do RaPA no EKS do AWS Outposts</title>
+  <desc id="diag-desc">O Envoy Gateway leva o tráfego à rapa-web e à rapa-api no namespace rapa; o despachante cria pods de uso único no namespace rapa-execucoes, no gVisor, que falam só com o canal dele; os pods de sessão recebem a visão ao vivo da rapa-web; a saída dos navegadores passa pela guarda e, opcionalmente, pelo proxy corporativo; o plano de controle usa o PostgreSQL do CloudNativePG, o OpenBao, o S3 do SeaweedFS, o Keycloak, a API do Kubernetes, a observabilidade e o hub do modelo.</desc>
+  <defs>
+    <marker id="seta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" class="d-head"/>
+    </marker>
+  </defs>
+
+  <!-- Entrada -->
+  <rect x="20" y="16" width="250" height="56" rx="8" class="d-ext"/>
+  <text x="145" y="39" text-anchor="middle" class="d-t">Pessoas, agentes MCP</text>
+  <text x="145" y="58" text-anchor="middle" class="d-s">e outros sistemas (REST, webhooks)</text>
+  <line x1="270" y1="44" x2="326" y2="44" class="d-line" marker-end="url(#seta)"/>
+  <rect x="330" y="16" width="330" height="56" rx="8" class="d-box"/>
+  <text x="495" y="39" text-anchor="middle" class="d-t">Envoy Gateway · rapa-externo (TLS)</text>
+  <text x="495" y="58" text-anchor="middle" class="d-s">HTTPRoute para a rapa-web e a rapa-api</text>
+
+  <!-- namespace rapa -->
+  <rect x="20" y="100" width="640" height="310" rx="10" class="d-ns"/>
+  <text x="650" y="119" text-anchor="end" class="d-ns-t">namespace rapa · plano de controle</text>
+  <path d="M380,72 V86 H135 V131" class="d-line" marker-end="url(#seta)"/>
+  <line x1="420" y1="72" x2="420" y2="131" class="d-line" marker-end="url(#seta)"/>
+
+  <rect x="40" y="135" width="190" height="92" rx="8" class="d-key"/>
+  <text x="135" y="157" text-anchor="middle" class="d-t">rapa-web</text>
+  <text x="135" y="176" text-anchor="middle" class="d-s">interface, REST e MCP</text>
+  <text x="135" y="194" text-anchor="middle" class="d-s">sessões de gravação</text>
+  <text x="135" y="212" text-anchor="middle" class="d-s">1 réplica (afinidade)</text>
+
+  <rect x="245" y="135" width="190" height="92" rx="8" class="d-key"/>
+  <text x="340" y="157" text-anchor="middle" class="d-t">rapa-api</text>
+  <text x="340" y="176" text-anchor="middle" class="d-s">REST /v1 e MCP /mcp</text>
+  <text x="340" y="194" text-anchor="middle" class="d-s">webhooks /v1/webhooks</text>
+  <text x="340" y="212" text-anchor="middle" class="d-s">2 réplicas, HPA opcional</text>
+
+  <rect x="450" y="135" width="190" height="92" rx="8" class="d-key"/>
+  <text x="545" y="157" text-anchor="middle" class="d-t">rapa-despachante</text>
+  <text x="545" y="176" text-anchor="middle" class="d-s">fila, agendas, retenção</text>
+  <text x="545" y="194" text-anchor="middle" class="d-s">saúde :8080 · canal :8081</text>
+  <text x="545" y="212" text-anchor="middle" class="d-s">2 réplicas</text>
+
+  <line x1="135" y1="227" x2="135" y2="249" class="d-line" marker-end="url(#seta)"/>
+  <line x1="340" y1="227" x2="340" y2="249" class="d-line" marker-end="url(#seta)"/>
+  <line x1="545" y1="227" x2="545" y2="249" class="d-line" marker-end="url(#seta)"/>
+  <rect x="40" y="252" width="600" height="62" rx="8" class="d-box"/>
+  <text x="340" y="276" text-anchor="middle" class="d-t">Cluster rapa-banco · CloudNativePG (release rapa-banco)</text>
+  <text x="340" y="297" text-anchor="middle" class="d-s">PostgreSQL, 3 instâncias e Pooler · papéis rapa_owner, rapa_app e rapa_dispatcher</text>
+
+  <rect x="40" y="334" width="190" height="58" rx="8" class="d-key"/>
+  <text x="135" y="357" text-anchor="middle" class="d-t">Job rapa-migracao</text>
+  <text x="135" y="377" text-anchor="middle" class="d-s">hook pre-install, pre-upgrade</text>
+  <rect x="245" y="334" width="190" height="58" rx="8" class="d-key"/>
+  <text x="340" y="357" text-anchor="middle" class="d-t">PodTemplate rapa-operacao</text>
+  <text x="340" y="377" text-anchor="middle" class="d-s">pod da operação (CLI)</text>
+  <rect x="450" y="334" width="190" height="58" rx="8" class="d-box"/>
+  <text x="545" y="357" text-anchor="middle" class="d-t">NetworkPolicies</text>
+  <text x="545" y="377" text-anchor="middle" class="d-s">nega-tudo + admissão</text>
+
+  <!-- namespace rapa-execucoes -->
+  <rect x="20" y="450" width="640" height="170" rx="10" class="d-ns"/>
+  <text x="36" y="469" class="d-ns-t">namespace rapa-execucoes · Pod Security restricted · nós com gVisor</text>
+
+  <rect x="40" y="485" width="290" height="112" rx="8" class="d-key"/>
+  <text x="185" y="507" text-anchor="middle" class="d-t">Pod de sessão · rapa-sessao</text>
+  <text x="185" y="526" text-anchor="middle" class="d-s">um por gravação · RuntimeClass gvisor</text>
+  <text x="185" y="544" text-anchor="middle" class="d-s">python -m rapa.session.host + Chromium</text>
+  <rect x="60" y="556" width="250" height="30" rx="6" class="d-guard"/>
+  <text x="185" y="575" text-anchor="middle" class="d-s">guarda de saída (SOCKS5)</text>
+
+  <rect x="350" y="485" width="290" height="112" rx="8" class="d-key"/>
+  <text x="495" y="507" text-anchor="middle" class="d-t">Pod de execução · rapa-executor</text>
+  <text x="495" y="526" text-anchor="middle" class="d-s">um por tentativa · RuntimeClass gvisor</text>
+  <text x="495" y="544" text-anchor="middle" class="d-s">python -m rapa.runner.pod + Chromium</text>
+  <rect x="370" y="556" width="250" height="30" rx="6" class="d-guard"/>
+  <text x="495" y="575" text-anchor="middle" class="d-s">guarda de saída (SOCKS5)</text>
+
+  <!-- relay da sessão e canal -->
+  <path d="M40,190 H30 V530 H37" class="d-line" marker-end="url(#seta)"/>
+  <path d="M640,530 H650 V190 H643" class="d-line" marker-end="url(#seta)"/>
+  <text x="36" y="436" class="d-l">WebSocket :8765 (visão ao vivo)</text>
+  <text x="644" y="436" text-anchor="end" class="d-l">canal :8081 (bilhete por tentativa)</text>
+
+  <!-- saída -->
+  <path d="M185,586 V636 H495 V586" class="d-line"/>
+  <line x1="340" y1="636" x2="340" y2="653" class="d-line" marker-end="url(#seta)"/>
+  <rect x="200" y="656" width="280" height="46" rx="8" class="d-ext"/>
+  <text x="340" y="676" text-anchor="middle" class="d-t">Proxy de saída corporativo</text>
+  <text x="340" y="693" text-anchor="middle" class="d-s">opcional; sem ele, a saída é direta</text>
+  <line x1="340" y1="702" x2="340" y2="723" class="d-line" marker-end="url(#seta)"/>
+  <rect x="140" y="726" width="400" height="56" rx="8" class="d-ext"/>
+  <text x="340" y="748" text-anchor="middle" class="d-t">Internet e portais: só os domínios do robô</text>
+  <text x="340" y="767" text-anchor="middle" class="d-s">+ as redes internas permitidas (portais da intranet)</text>
+
+  <!-- serviços da plataforma -->
+  <rect x="700" y="16" width="280" height="60" rx="8" class="d-box"/>
+  <text x="840" y="37" text-anchor="middle" class="d-t">Argo CD · argocd</text>
+  <text x="840" y="54" text-anchor="middle" class="d-s">rapa-raiz cria rapa-banco (onda -1)</text>
+  <text x="840" y="69" text-anchor="middle" class="d-s">e depois rapa (onda 0)</text>
+  <line x1="700" y1="70" x2="664" y2="98" class="d-line d-dash" marker-end="url(#seta)"/>
+
+  <line x1="660" y1="180" x2="680" y2="180" class="d-line"/>
+  <line x1="680" y1="130" x2="680" y2="628" class="d-line"/>
+
+  <rect x="700" y="100" width="280" height="60" rx="8" class="d-box"/>
+  <text x="840" y="121" text-anchor="middle" class="d-t">Keycloak 26 · identidade</text>
+  <text x="840" y="138" text-anchor="middle" class="d-s">uma Organization por empresa</text>
+  <text x="840" y="153" text-anchor="middle" class="d-s">login da web e tokens (JWKS)</text>
+  <line x1="680" y1="130" x2="697" y2="130" class="d-line" marker-end="url(#seta)"/>
+
+  <rect x="700" y="172" width="280" height="60" rx="8" class="d-box"/>
+  <text x="840" y="193" text-anchor="middle" class="d-t">OpenBao (HA, TLS) · cofre</text>
+  <text x="840" y="210" text-anchor="middle" class="d-s">KV rapa: segredos (despachante)</text>
+  <text x="840" y="225" text-anchor="middle" class="d-s">transit rapa-transit: chave por empresa</text>
+  <line x1="680" y1="202" x2="697" y2="202" class="d-line" marker-end="url(#seta)"/>
+
+  <rect x="700" y="244" width="280" height="60" rx="8" class="d-box"/>
+  <text x="840" y="265" text-anchor="middle" class="d-t">SeaweedFS (S3) · armazenamento</text>
+  <text x="840" y="282" text-anchor="middle" class="d-s">rapa-artefatos: evidências cifradas</text>
+  <text x="840" y="297" text-anchor="middle" class="d-s">rapa-backups: WAL e backups do banco</text>
+  <line x1="680" y1="274" x2="697" y2="274" class="d-line" marker-end="url(#seta)"/>
+
+  <rect x="700" y="316" width="280" height="60" rx="8" class="d-box"/>
+  <text x="840" y="337" text-anchor="middle" class="d-t">API do Kubernetes</text>
+  <text x="840" y="354" text-anchor="middle" class="d-s">despachante e web criam pods e Secrets</text>
+  <text x="840" y="369" text-anchor="middle" class="d-s">em rapa-execucoes (Role e admissão)</text>
+  <line x1="680" y1="346" x2="697" y2="346" class="d-line" marker-end="url(#seta)"/>
+
+  <rect x="700" y="388" width="280" height="60" rx="8" class="d-box"/>
+  <text x="840" y="409" text-anchor="middle" class="d-t">CloudNativePG · cnpg-system</text>
+  <text x="840" y="426" text-anchor="middle" class="d-s">operador e plugin Barman Cloud</text>
+  <text x="840" y="441" text-anchor="middle" class="d-s">(com o cert-manager)</text>
+  <line x1="680" y1="418" x2="697" y2="418" class="d-line"/>
+
+  <rect x="700" y="460" width="280" height="60" rx="8" class="d-box"/>
+  <text x="840" y="481" text-anchor="middle" class="d-t">Observabilidade · monitoramento</text>
+  <text x="840" y="498" text-anchor="middle" class="d-s">VictoriaMetrics lê as métricas (:9100)</text>
+  <text x="840" y="513" text-anchor="middle" class="d-s">coletor OTLP e GlitchTip opcionais</text>
+  <line x1="680" y1="490" x2="697" y2="490" class="d-line"/>
+
+  <rect x="700" y="598" width="280" height="60" rx="8" class="d-ext"/>
+  <text x="840" y="619" text-anchor="middle" class="d-t">Hub do modelo (fora do cluster)</text>
+  <text x="840" y="636" text-anchor="middle" class="d-s">propostas da revisão e do conserto</text>
+  <text x="840" y="651" text-anchor="middle" class="d-s">nunca usado nas execuções</text>
+  <line x1="680" y1="628" x2="697" y2="628" class="d-line" marker-end="url(#seta)"/>
+
+  <!-- legenda -->
+  <rect x="700" y="690" width="22" height="14" rx="3" class="d-key"/>
+  <text x="730" y="702" class="d-s">peças do chart deploy/helm/rapa</text>
+  <rect x="700" y="715" width="22" height="14" rx="3" class="d-box"/>
+  <text x="730" y="727" class="d-s">no cluster EKS do AWS Outposts</text>
+  <rect x="700" y="740" width="22" height="14" rx="3" class="d-ext"/>
+  <text x="730" y="752" class="d-s">fora do cluster</text>
+  <rect x="700" y="765" width="22" height="14" rx="3" class="d-guard"/>
+  <text x="730" y="777" class="d-s">guarda de saída dentro do pod</text>
+</svg>
+</div>
+<p>Como o tráfego e os dados andam:</p>
+<ul>
+  <li><b>Entrada.</b> O Envoy Gateway termina o TLS no <code>Gateway</code> <code>rapa-externo</code>. As <code>HTTPRoute</code> mandam a interface (<code>/</code>), o websocket do NiceGUI (<code>/_nicegui_ws</code>) e as sessões de gravação (<code>/v1/sessoes</code>, com a visão ao vivo em <code>/v1/sessoes/{id}/ao-vivo</code>) para a <code>rapa-web</code>; a REST (<code>/v1</code>, inclusive <code>/v1/webhooks</code>), o MCP (<code>/mcp</code>) e <code>/.well-known/oauth-protected-resource</code> para a <code>rapa-api</code>.</li>
+  <li><b>Plano de controle.</b> A <code>rapa-web</code> serve a interface, a REST, o MCP e as sessões; a <code>rapa-api</code> serve só a REST e o MCP (<code>RAPA_UI=0</code>, <code>RAPA_SESSOES=0</code>); o <code>rapa-despachante</code> (<code>RAPA_HTTP=0</code>) tem a fila, as agendas, os avisos do A1 e a retenção, e cria os pods de uso único.</li>
+  <li><b>Pods de uso único.</b> Cada tentativa de execução vira um pod <code>rapa-executor</code> e cada gravação um pod <code>rapa-sessao</code>, com a imagem do executor, a RuntimeClass <code>gvisor</code>, sem token de conta de serviço e sem permissão nenhuma. O pod de execução nunca fala com o banco nem com o cofre: só com o canal da réplica do despachante que o lançou (<code>http://{ip}:8081</code>, com um bilhete por tentativa). A web conecta no WebSocket do pod de sessão (porta 8765). A <code>ValidatingAdmissionPolicy</code> <code>rapa-execucoes-pods-de-uso-unico</code> só aceita ali o pod exato que o lançador monta.</li>
+  <li><b>Saída dos navegadores.</b> Dentro de cada pod, o Chromium sai por uma guarda SOCKS5 que só deixa os domínios do robô, recusa a própria máquina, o metadata da nuvem e toda rede interna (menos as permitidas) e, se houver, usa o proxy corporativo. A NetworkPolicy fecha o mesmo por fora.</li>
+  <li><b>Dados.</b> O PostgreSQL (CloudNativePG) guarda tudo, com isolamento por linha; os segredos das credenciais ficam no KV do OpenBao, debaixo da pasta da empresa; os artefatos vão para o S3 cifrados com uma chave por execução, embrulhada pela chave transit da empresa.</li>
+</ul>
+
+<h3 id="licencas">1.4 Componentes e licenças</h3>
+<p>Tudo é código aberto com licença aprovada pela OSI, menos o EKS no AWS Outposts, que é o serviço gerenciado da AWS onde o cluster roda (a única peça da AWS).</p>
+<div class="tabela"><table>
+<thead><tr><th>Peça</th><th>Para quê</th><th>Licença</th></tr></thead>
+<tbody>
+<tr><td class="grupo" colspan="3">Plataforma (cada uma pelo próprio chart)</td></tr>
+<tr><td>EKS no AWS Outposts</td><td>o cluster Kubernetes, com nós autogerenciados no rack</td><td>serviço da AWS (não é código aberto)</td></tr>
+<tr><td>gVisor (<code>runsc</code>)</td><td>o kernel isolado dos pods de uso único</td><td>Apache-2.0</td></tr>
+<tr><td>PostgreSQL</td><td>o banco do plano de controle</td><td>PostgreSQL License</td></tr>
+<tr><td>CloudNativePG e plugin Barman Cloud</td><td>o Cluster, o Pooler, o WAL contínuo e os backups</td><td>Apache-2.0</td></tr>
+<tr><td>PgBouncer</td><td>o Pooler do CloudNativePG</td><td>ISC</td></tr>
+<tr><td>cert-manager</td><td>pedido pelo plugin Barman Cloud</td><td>Apache-2.0</td></tr>
+<tr><td>OpenBao</td><td>o cofre (KV v2 e transit)</td><td>MPL-2.0</td></tr>
+<tr><td>Keycloak 26</td><td>identidade, com as Organizations</td><td>Apache-2.0</td></tr>
+<tr><td>SeaweedFS</td><td>o S3 dos artefatos e dos backups</td><td>Apache-2.0</td></tr>
+<tr><td>Envoy Gateway</td><td>a entrada HTTP com o TLS</td><td>Apache-2.0</td></tr>
+<tr><td>VictoriaMetrics</td><td>as métricas</td><td>Apache-2.0</td></tr>
+<tr><td>GlitchTip</td><td>as exceções não tratadas (opcional)</td><td>MIT</td></tr>
+<tr><td>Argo CD e Helm</td><td>o deploy</td><td>Apache-2.0</td></tr>
+<tr><td>Chromium do Debian 13</td><td>o navegador das execuções e das sessões</td><td>BSD-3-Clause (e as licenças livres dos componentes)</td></tr>
+<tr><td class="grupo" colspan="3">Bibliotecas no processo do RaPA (as versões estão no <code>uv.lock</code>)</td></tr>
+<tr><td>Python 3.14</td><td>a linguagem</td><td>PSF-2.0</td></tr>
+<tr><td>FastAPI, pydantic, SQLAlchemy, Alembic, PyJWT, <code>mcp</code>, NiceGUI, openpyxl, jsonschema-rs, sentry-sdk</td><td>API, modelos, banco, migrações, tokens, MCP, interface, planilhas, esquemas, GlitchTip</td><td>MIT</td></tr>
+<tr><td>uvicorn, Authlib, websockets, httpx2</td><td>servidor HTTP, OIDC, websockets e cliente HTTP</td><td>BSD-3-Clause</td></tr>
+<tr><td>psycopg 3</td><td>o driver do PostgreSQL</td><td>LGPL-3.0</td></tr>
+<tr><td>Playwright, boto3, OpenTelemetry, python-multipart, tzdata</td><td>navegador, S3, traços, envio de arquivos, fusos</td><td>Apache-2.0</td></tr>
+<tr><td>cryptography; prometheus-client; defusedxml</td><td>cifra dos artefatos; métricas; XML seguro</td><td>Apache-2.0 ou BSD-3-Clause; Apache-2.0 e BSD-2-Clause; PSF</td></tr>
+</tbody></table></div>
+<p>O próprio RaPA é Apache-2.0 (<code>LICENSE</code>). O Swagger UI da documentação da API vem com as licenças dele em <code>src/rapa/control/static/swagger-ui/</code>.</p>
+</section>
+
+<!-- =========================================================================== -->
+<section class="parte" id="requisitos" aria-labelledby="t-requisitos">
+<h2 id="t-requisitos"><span class="parte-rotulo">Parte 2</span>2. Requisitos</h2>
+
+<h3 id="req-local">2.1 Desenvolvimento local</h3>
+<ul>
+  <li><b>Python 3.14</b> e <b>uv</b> (as imagens fixam o uv 0.11.32). O projeto declara os extras <code>runner</code>, <code>llm</code>, <code>control</code>, <code>observability</code>, <code>ui</code> e <code>fixtures</code> em <code>pyproject.toml</code>; para desenvolver, instale todos.</li>
+  <li><b>PostgreSQL</b> (o CI usa o 18) com um superusuário para criar os papéis. Os testes de banco usam <code>RAPA_TEST_DATABASE_URL</code> ou sobem um PostgreSQL temporário com os binários locais (<code>initdb</code>, <code>pg_ctl</code>).</li>
+  <li><b>Chromium completo</b> (não o <code>chrome-headless-shell</code>, que ignora a política do WebRTC), em <code>RAPA_CHROMIUM_PATH</code>, <code>/usr/bin/chromium</code> ou <code>/opt/pw-browsers/chromium</code>. Em produção, o executor usa o Chromium do Debian 13.</li>
+  <li><b>ffmpeg do Playwright</b> para o vídeo das falhas (<code>playwright install ffmpeg</code>); sem ele, as execuções rodam sem vídeo e o servidor avisa no log ao subir.</li>
+  <li>Opcionais, para partes específicas: <code>helm</code> e <code>kubeconform</code> (testes do chart; o CI usa o Helm v3.19.0 e o kubeconform v0.7.0), o binário <code>bao</code> do OpenBao (<code>deploy/ci/instalar-bao.sh</code>, só Linux x86_64), Docker com buildx (as imagens) e kind (o ponta a ponta em Kubernetes).</li>
+</ul>
+
+<h3 id="req-cluster">2.2 O cluster (EKS no AWS Outposts)</h3>
+<ul>
+  <li><b>Kubernetes 1.30 ou mais novo</b> (o <code>kubeVersion</code> do chart), com a <code>ValidatingAdmissionPolicy</code> (<code>admissionregistration.k8s.io/v1</code>).</li>
+  <li><b>Dois grupos de nós autogerenciados</b> no rack: o do plano de controle e o das execuções. Os de execução têm o gVisor (<code>runsc</code> como handler do containerd), o rótulo <code>rapa.dev/execucoes=sim</code> e o taint <code>rapa.dev/execucoes:NoSchedule</code>.</li>
+  <li><b>A RuntimeClass <code>gvisor</code></b> de <code>deploy/gvisor/runtimeclass.yaml</code>, que já leva os pods para esses nós e soma o custo do gVisor (100m de CPU e 128Mi) a cada pod.</li>
+  <li><b>Um CNI que aplica as NetworkPolicies.</b> No EKS, o Amazon VPC CNI só as aplica com o complemento configurado com <code>enableNetworkPolicy: "true"</code> (o agente de políticas em cada nó, também nos do Outposts); a outra saída é um CNI que as aplique (Calico, Cilium).</li>
+  <li><b>Uma StorageClass</b> para os discos do banco (o exemplo de produção usa <code>gp2</code>, 100Gi de dados e 40Gi de WAL por instância) e para o SeaweedFS.</li>
+  <li><b>Capacidade.</b> Os números do <a href="../PLANO-RaPA.md"><code>docs/PLANO-RaPA.md</code></a> são estimativas até as medições da Fase 1. Cada pod de uso único pede 1 CPU e 2Gi por padrão (<code>executions.cpu</code>, <code>executions.memory</code>) mais o custo do gVisor.</li>
+  <li><b>IPv6</b>: num cluster IPv6, o bloco IPv6 global da VPC em <code>executions.egress.extraInternalNetworks</code> é obrigatório (o chart recusa sem ele).</li>
+</ul>
+
+<h3 id="req-externos">2.3 Componentes externos</h3>
+<p>Cada um é instalado pelo próprio chart dele, no namespace indicado (os nomes são os padrões dos valores do RaPA; com outros, ajuste <code>network.egress.*</code> e os endereços).</p>
+<div class="tabela"><table>
+<thead><tr><th>Componente</th><th>Namespace</th><th>O que o RaPA espera</th><th>Precisa?</th></tr></thead>
+<tbody>
+<tr><td>cert-manager</td><td>(o dele)</td><td>o que o plugin Barman Cloud pede</td><td>sim</td></tr>
+<tr><td>Operador CloudNativePG e plugin Barman Cloud</td><td><code>cnpg-system</code></td><td>os CRDs <code>Cluster</code>, <code>Pooler</code>, <code>ScheduledBackup</code> e <code>ObjectStore</code></td><td>sim</td></tr>
+<tr><td>OpenBao em HA com TLS</td><td><code>cofre</code></td><td>o serviço ativo em <code>https://openbao.cofre.svc:8200</code>; preparado por <code>deploy/openbao/preparar.sh</code></td><td>sim</td></tr>
+<tr><td>Keycloak 26</td><td><code>identidade</code></td><td>o realm de <code>deploy/keycloak/realm-rapa.json</code> e uma Organization por empresa</td><td>sim</td></tr>
+<tr><td>SeaweedFS com o S3 em TLS</td><td><code>armazenamento</code></td><td><code>https://seaweedfs-s3.armazenamento.svc:8333</code> e os buckets <code>rapa-artefatos</code> e <code>rapa-backups</code></td><td>sim</td></tr>
+<tr><td>Envoy Gateway</td><td><code>envoy-gateway-system</code></td><td>o <code>Gateway</code> <code>rapa-externo</code>, o certificado TLS dele e um listener HTTPS (<code>sectionName: https</code>) que aceita rotas do namespace <code>rapa</code></td><td>sim</td></tr>
+<tr><td>VictoriaMetrics</td><td><code>monitoramento</code></td><td>o CRD <code>VMPodScrape</code> (com <code>observability.vmPodScrape.enabled</code>)</td><td>recomendado</td></tr>
+<tr><td>Coletor OTLP e GlitchTip</td><td><code>monitoramento</code></td><td><code>observability.otlpEndpoint</code> e o Secret do DSN</td><td>opcional</td></tr>
+<tr><td>Argo CD</td><td><code>argocd</code></td><td>as checagens de saúde de <code>deploy/argocd/argocd-cm-saude.yaml</code></td><td>recomendado (ou <code>helm</code>)</td></tr>
+<tr><td>Hub do modelo</td><td>fora do cluster</td><td>uma API compatível com a da OpenAI e a matriz da sonda</td><td>opcional</td></tr>
+<tr><td>Proxy de saída corporativo</td><td>fora do cluster</td><td>um proxy HTTP CONNECT</td><td>opcional</td></tr>
+</tbody></table></div>
+
+<h3 id="req-rede">2.4 Registro, DNS e TLS</h3>
+<ul>
+  <li><b>Registro de imagens.</b> As duas imagens (<code>rapa-controle</code> e <code>rapa-executor</code>) vão para o registro da empresa e são referenciadas pelo digest. O Secret <code>rapa-registro</code> (tipo <code>.dockerconfigjson</code>) fica nos dois namespaces e só com permissão de baixar imagens: a Role da web e do despachante lê os Secrets do namespace das execuções.</li>
+  <li><b>DNS.</b> O endereço público (<code>publicUrl</code>, por exemplo <code>https://rapa.exemplo.test</code>) aponta para o Envoy. O emissor do Keycloak tem um nome público que, dentro do cluster, precisa chegar direto ao Service do Keycloak (uma reescrita no CoreDNS; <code>deploy/keycloak/README.md</code>, "O emissor dentro do cluster"), senão a NetworkPolicy recusa o login.</li>
+  <li><b>TLS.</b> O Envoy termina o TLS público. Fora do desenvolvimento, o chart exige <code>https://</code> para o OpenBao, o S3, o Keycloak, o hub do modelo, o <code>publicUrl</code> e o S3 dos backups, e o banco com o TLS conferido (<code>verify-full</code> ou <code>verify-ca</code>, com o CA do CloudNativePG em <code>rapa-banco-ca</code>). Os CAs do OpenBao e do S3 vão nos Secrets <code>rapa-openbao-ca</code> e <code>rapa-s3-ca</code>.</li>
+</ul>
+</section>
+
+<!-- =========================================================================== -->
+<section class="parte" id="local" aria-labelledby="t-local">
+<h2 id="t-local"><span class="parte-rotulo">Parte 3</span>3. Instalação local (desenvolvimento)</h2>
+<p>Este roteiro sobe o RaPA inteiro num processo só (<code>python -m rapa.server</code>: interface, REST, MCP e despachante), sobre um PostgreSQL local, no modo de desenvolvimento: tokens fixos, login sem senha e segredos num arquivo. Em produção, os tokens vêm do Keycloak e os segredos do OpenBao.</p>
+
+<h3 id="local-deps">3.1 Dependências</h3>
+<pre><code>uv sync --all-extras</code></pre>
+<p>Num Debian (é o que o CI faz, como root), o Chromium e o ffmpeg do sistema:</p>
+<pre><code>apt-get install -y --no-install-recommends chromium ffmpeg</code></pre>
+<p>Ou o ffmpeg que o Playwright procura, pelo próprio Playwright:</p>
+<pre><code>uv run playwright install ffmpeg</code></pre>
+
+<h3 id="local-banco">3.2 Banco e papéis</h3>
+<p>Crie os três papéis e o banco como superusuário do PostgreSQL: <code>rapa_owner</code> é o dono das tabelas, <code>rapa_app</code> serve a aplicação (sujeito ao isolamento por empresa) e <code>rapa_dispatcher</code> serve o despachante (enxerga todas as empresas, só no que precisa).</p>
+<pre><code>CREATE ROLE rapa_owner LOGIN PASSWORD 'SENHA';
+CREATE ROLE rapa_app LOGIN PASSWORD 'SENHA' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
+CREATE ROLE rapa_dispatcher LOGIN PASSWORD 'SENHA' NOSUPERUSER BYPASSRLS NOCREATEDB NOCREATEROLE;
+CREATE DATABASE rapa OWNER rapa_owner;</code></pre>
+<div class="aviso atencao">
+  <span class="rotulo">Atenção</span>
+  <p>Use senhas diferentes e só com caracteres seguros numa URL (por exemplo, <code>openssl rand -hex 32</code>): elas entram nas URLs do banco.</p>
+</div>
+
+<h3 id="local-migracoes">3.3 Migrações</h3>
+<p>As tabelas são criadas pelo dono (Alembic, revisões 0001 a 0009 em <code>src/rapa/control/migrations/versions/</code>). A URL pode ir em <code>--url</code> ou em <code>RAPA_DATABASE_URL</code>; pelo ambiente, a senha não fica no histórico do shell nem na lista de processos:</p>
+<pre><code>RAPA_DATABASE_URL=postgresql://rapa_owner:SENHA@localhost/rapa uv run python -m rapa.control.db.migrate</code></pre>
+<div class="tabela"><table>
+<thead><tr><th>Opção de <code>python -m rapa.control.db.migrate</code></th><th>O que faz</th></tr></thead>
+<tbody>
+<tr><td><code>--url</code></td><td>o banco, com o dono das tabelas (padrão: <code>RAPA_DATABASE_URL</code>)</td></tr>
+<tr><td><code>--revisao</code></td><td>a revisão de destino (padrão: <code>head</code>)</td></tr>
+<tr><td><code>--papel-app</code>, <code>--papel-despachante</code></td><td>os nomes dos papéis, se não forem <code>rapa_app</code> e <code>rapa_dispatcher</code> (também <code>RAPA_DB_APP_ROLE</code> e <code>RAPA_DB_DISPATCHER_ROLE</code>)</td></tr>
+<tr><td><code>--somente-permissoes</code></td><td>só reaplica as permissões (por exemplo, depois de criar um papel que faltava: a migração só concede aos papéis que existem)</td></tr>
+</tbody></table></div>
+
+<h3 id="local-cadastro">3.4 Empresa, áreas e pessoas</h3>
+<p>O cadastro é pela linha de comando <code>python -m rapa.control.admin</code>, com o papel da aplicação. Cada comando imprime o identificador criado; anote-os. Os exemplos usam a "Empresa Demonstração" das capturas.</p>
+<pre><code>export RAPA_DATABASE_URL=postgresql://rapa_app:SENHA@localhost/rapa
+uv run python -m rapa.control.admin empresa criar "Empresa Demonstração" --organizacao empresa-demonstracao --admin ana.lima@demonstracao.example --nome-admin "Ana Lima" --vagas 2</code></pre>
+<pre><code>uv run python -m rapa.control.admin area ID_DA_EMPRESA "Fiscal"
+uv run python -m rapa.control.admin area ID_DA_EMPRESA "Financeiro"</code></pre>
+<pre><code>uv run python -m rapa.control.admin usuario ID_DA_EMPRESA bruno.reis@demonstracao.example --nome "Bruno Reis" --papel creator:ID_DO_FISCAL --papel creator:ID_DO_FINANCEIRO
+uv run python -m rapa.control.admin usuario ID_DA_EMPRESA carla.souza@demonstracao.example --nome "Carla Souza" --papel approver:ID_DO_FISCAL --papel approver:ID_DO_FINANCEIRO
+uv run python -m rapa.control.admin usuario ID_DA_EMPRESA eduarda.martins@demonstracao.example --nome "Eduarda Martins" --papel operator</code></pre>
+<p>Um papel sem área (<code>--papel operator</code>) vale na empresa inteira; <code>papel:ID_DA_AREA</code> vale só naquela área. Os papéis estão em <a href="#cfg-pessoas">5.3</a>. Sem o Keycloak, o valor de <code>--organizacao</code> é só o apelido guardado no banco; com o Keycloak, é o id da Organization (<a href="#eks-empresa">4.10</a>).</p>
+<div class="aviso nota">
+  <span class="rotulo">Nota</span>
+  <p>Um robô criado por uma pessoa precisa ser publicado por outra, com o papel de aprovação. Por isso o cadastro mínimo para experimentar tem pelo menos quem cria (<code>creator</code>), quem aprova (<code>approver</code>) e quem executa (<code>operator</code>).</p>
+</div>
+
+<h3 id="local-tokens">3.5 Tokens e segredos de desenvolvimento</h3>
+<p><code>tokens.json</code> tem um token de desenvolvimento por pessoa (o sujeito é o mesmo do cadastro):</p>
+<pre><code>{
+  "token-ana": {"sujeito": "ana.lima@demonstracao.example", "empresa": "ID_DA_EMPRESA"},
+  "token-bruno": {"sujeito": "bruno.reis@demonstracao.example", "empresa": "ID_DA_EMPRESA"},
+  "token-carla": {"sujeito": "carla.souza@demonstracao.example", "empresa": "ID_DA_EMPRESA"},
+  "token-eduarda": {"sujeito": "eduarda.martins@demonstracao.example", "empresa": "ID_DA_EMPRESA"}
+}</code></pre>
+<p><code>segredos.json</code> tem, por empresa, os segredos de cada credencial que os robôs declaram (os campos aceitos são <code>username</code>, <code>password</code>, <code>totp_secret</code>, <code>pfx_base64</code> e <code>pfx_password</code>):</p>
+<pre><code>{
+  "ID_DA_EMPRESA": {
+    "portal": {"username": "USUARIO_DO_PORTAL", "password": "SENHA_DO_PORTAL"},
+    "portal_otp": {"totp_secret": "SEGREDO_TOTP_DO_PORTAL"}
+  }
+}</code></pre>
+<pre><code>chmod 600 tokens.json segredos.json</code></pre>
+<div class="aviso perigo">
+  <span class="rotulo">Perigo</span>
+  <p>Os tokens de desenvolvimento entram sem senha. <code>RAPA_DEV=1</code> só existe para desenvolvimento e testes: o chart recusa o modo de desenvolvimento atrás do gateway público, e o servidor recusa tokens e segredos em arquivo sem ele.</p>
+</div>
+
+<h3 id="local-subir">3.6 Subir o serviço</h3>
+<pre><code>export RAPA_DATABASE_URL=postgresql://rapa_app:SENHA@localhost/rapa
+export RAPA_DISPATCHER_DATABASE_URL=postgresql://rapa_dispatcher:SENHA@localhost/rapa
+export RAPA_DEV=1
+export RAPA_COOKIE_SEGURO=0
+export RAPA_TOKENS_DEV=tokens.json
+export RAPA_SEGREDOS_DEV=segredos.json
+export RAPA_CHAVE_WEBHOOKS=CHAVE_DOS_WEBHOOKS
+export RAPA_DOCS_API=1
+uv run python -m rapa.server --port 8000</code></pre>
+<ul>
+  <li><code>RAPA_DISPATCHER_DATABASE_URL</code> liga o despachante no mesmo processo: sem ele, nada sai da fila.</li>
+  <li><code>RAPA_CHAVE_WEBHOOKS</code> é um texto aleatório de pelo menos 32 caracteres, gerado uma vez (por exemplo, <code>openssl rand -hex 32</code>) e guardado: trocá-lo invalida as chaves de todos os webhooks. Sem ele, os webhooks respondem 503.</li>
+  <li><code>RAPA_DOCS_API=1</code> liga a documentação da API em <code>/v1/docs</code> (opcional).</li>
+  <li>O servidor ouve em <code>127.0.0.1:8000</code> (<code>--host</code> e <code>--port</code>) e abre as métricas na porta 9100 do mesmo endereço; com a 9100 ocupada, ele não sobe: use <code>RAPA_METRICAS_PORTA=0</code> (desliga) ou outra porta.</li>
+  <li>Uma configuração fora da regra para o processo com <code>rapa.server: configuração inválida: ...</code>, sem traceback e sem repetir o valor.</li>
+</ul>
+<p>Para conferir:</p>
+<pre><code>curl -s http://127.0.0.1:8000/saude
+curl -s http://127.0.0.1:8000/saude/pronto</code></pre>
+<p><code>/saude</code> responde 200 com o estado e a versão enquanto o despachante do processo está de pé (Figura 1) e 503 quando ele para; <code>/saude/pronto</code> responde <code>{"estado": "pronto"}</code>, ou 503 com os nomes do que falhou.</p>
+<figure id="fig-saude">
+  <a class="imagem" href="img/22-saude.png"><img class="faixa" src="img/22-saude.png" width="1440" height="200" loading="lazy" alt="Resposta JSON de GET /saude com estado ok e a versão 0.1.0"></a>
+  <figcaption><b>Figura 1.</b> GET /saude: 200 com a versão enquanto o despachante do processo está de pé (503 quando ele para).</figcaption>
+</figure>
+
+<h3 id="local-interface">3.7 Abrir a interface</h3>
+<p>Abra <code>http://127.0.0.1:8000</code>. No modo de desenvolvimento, a tela de entrada mostra um perfil por pessoa do arquivo de tokens (Figura 2); em produção, o login é pelo Keycloak. Entre como quem executa robôs para ver o catálogo (Figura 3). A REST fica em <code>/v1</code> e o MCP em <code>/mcp</code>, com <code>Authorization: Bearer token-eduarda</code>; o uso de cada tela está na <a href="#uso">Parte 6</a>.</p>
+<figure id="fig-entrar">
+  <a class="imagem" href="img/01-entrar.png"><img src="img/01-entrar.png" width="2880" height="1800" loading="lazy" alt="Tela Entrar no RaPA com a lista de perfis de desenvolvimento e um botão Entrar para cada pessoa"></a>
+  <figcaption><b>Figura 2.</b> Tela de entrada no modo de desenvolvimento: um perfil por pessoa do arquivo de tokens (em produção, o login é pelo Keycloak). Endereço: <code>/entrar</code>.</figcaption>
+</figure>
+<figure id="fig-catalogo">
+  <a class="imagem" href="img/02-catalogo.png"><img src="img/02-catalogo.png" width="2880" height="2160" loading="lazy" alt="Catálogo de robôs com quatro robôs publicados, cada um com o efeito, a versão e os botões Executar e Ver passos"></a>
+  <figcaption><b>Figura 3.</b> Catálogo: os robôs publicados que a pessoa pode usar, com o efeito, a versão e os botões Executar e Ver passos (Eduarda Martins, operação na empresa inteira). Endereço: <code>/catalogo</code>.</figcaption>
+</figure>
+
+<h3 id="local-portais">3.8 Portais de teste e o modo só-interface</h3>
+<p>O repositório traz um portal de teste em pt-BR (<code>src/rapa/fixtures/portal.py</code>: login com senha e código TOTP, tabela paginada com downloads, formulário com CPF e um passo irreversível "Emitir") e robôs de exemplo (<code>src/rapa/fixtures/robots.py</code>: <code>emitir_protocolo</code> e <code>baixar_notas</code>). Para experimentar uma gravação contra ele:</p>
+<ol class="lista-passos">
+  <li>Suba o portal (como o CI faz):
+<pre><code>uv run python -m uvicorn --factory rapa.fixtures.portal:create_app --host 127.0.0.1 --port 8080</code></pre></li>
+  <li>Faça o Chromium do RaPA resolver <code>*.rapa.test</code> para a sua máquina, antes de subir o serviço (3.6):
+<pre><code>export RAPA_ARGS_NAVEGADOR="'--host-resolver-rules=MAP *.rapa.test 127.0.0.1'"</code></pre>
+  É configuração do operador: a guarda de saída aceita esses nomes mapeados, mesmo no loopback. Só o Chromium do RaPA os resolve; o seu navegador, não.</li>
+  <li>Em <b>Gravar</b>, use o endereço inicial <code>http://portal-v1.rapa.test:8080/login</code>. O usuário, a senha e o segredo TOTP do portal são as constantes <code>DEFAULT_USER</code>, <code>DEFAULT_PASSWORD</code> e <code>DEFAULT_TOTP_SECRET</code> de <code>src/rapa/fixtures/portal.py</code>; para um robô rodar, ponha-os em <code>segredos.json</code> com os nomes de credencial que a tela do robô mostra em <b>Credenciais do cofre</b>. O compilador tira o nome do primeiro rótulo do endereço (numa gravação em <code>portal-v1.rapa.test</code>, <code>portal_v1</code> e <code>portal_v1_otp</code>); os robôs de exemplo usam <code>portal</code> e <code>portal_otp</code>.</li>
+</ol>
+<p>Para só olhar a interface, sem banco nem executor, há o modo de desenvolvimento em memória (<code>src/rapa/ui/dev.py</code>: duas empresas fictícias com duas áreas cada, os robôs de exemplo publicados e um perfil por papel; as execuções ficam na fila):</p>
+<pre><code>uv run python -m rapa.ui --port 8090</code></pre>
+<p>Para ver o mundo de demonstração inteiro das capturas (banco temporário, portais, empresa, robôs, execuções, agendas, webhooks, lote, A1 e gravação), rode o roteiro das capturas (<a href="#testes-capturas">7.4</a>).</p>
+</section>
+
+<!-- =========================================================================== -->
+<section class="parte" id="eks" aria-labelledby="t-eks">
+<h2 id="t-eks"><span class="parte-rotulo">Parte 4</span>4. Instalação no EKS do AWS Outposts</h2>
+<p>Este roteiro segue a ordem de OPERACAO 1.2. Os valores de produção partem de <code>deploy/helm/rapa/values-producao-exemplo.yaml</code>, copiado para o repositório de configuração do ambiente (nos comandos, <code>valores-do-ambiente.yaml</code>).</p>
+
+<h3 id="eks-ordem">4.1 A ordem</h3>
+<ol>
+  <li><a href="#eks-imagens">Imagens</a>: construir, publicar e anotar os digests.</li>
+  <li><a href="#eks-nos">Nós</a>: os dois grupos, o gVisor, a RuntimeClass e o CNI que aplica as NetworkPolicies.</li>
+  <li><a href="#eks-externos">Componentes externos</a>, cada um pelo chart dele, com o realm do Keycloak.</li>
+  <li><a href="#eks-openbao">OpenBao</a>: iniciar, desbloquear e <code>preparar.sh</code>.</li>
+  <li><a href="#eks-segredos">Namespace e Secrets</a>.</li>
+  <li><a href="#eks-banco">Banco</a>: a release <code>rapa-banco</code> e a espera pelo Cluster pronto.</li>
+  <li><a href="#eks-app">Aplicação</a>: a release <code>rapa</code> (a migração roda antes, como hook), pelo <code>helm</code> ou pelo Argo CD.</li>
+  <li><a href="#eks-empresa">Primeira empresa</a>: a organização no Keycloak, o CLI no pod da operação e a política do custodiante.</li>
+  <li><a href="#eks-verificar">Verificação</a>: a prontidão, o teste de saída e uma primeira execução.</li>
+</ol>
+
+<h3 id="eks-imagens">4.2 Imagens com digest</h3>
+<p>As duas imagens saem do mesmo Dockerfile, construídas da raiz do repositório, sobre o Python do Debian 13: <code>controle</code> (o plano de controle, a migração e o CLI, com todos os extras) e <code>executor</code> (os pods de execução e de sessão, só com o extra <code>runner</code>). As duas têm o Chromium do Debian, as fontes e o ffmpeg, rodam como o usuário 10001 com o disco só de leitura, e nenhum segredo entra numa camada.</p>
+<pre><code>docker buildx build -f deploy/docker/Dockerfile --target controle -t registro.exemplo.test/rapa/rapa-controle:0.1.0 .
+docker buildx build -f deploy/docker/Dockerfile --target executor -t registro.exemplo.test/rapa/rapa-executor:0.1.0 .</code></pre>
+<p>Argumentos de construção: <code>PYTHON_IMAGE</code> (fixe a base pelo digest em produção: <code>--build-arg PYTHON_IMAGE=python:3.14-slim-trixie@sha256:...</code>), <code>UV_VERSION</code> (0.11.32), <code>VERSAO</code>, <code>REVISAO</code> e <code>FONTE</code> (os rótulos OCI). Publique as duas no registro da empresa e anote o digest <code>sha256:</code> de cada uma; nos valores do ambiente:</p>
+<pre><code>images:
+  control:
+    repository: registro.exemplo.test/rapa/rapa-controle
+    digest: sha256:DIGEST_DA_IMAGEM_DE_CONTROLE
+  executor:
+    repository: registro.exemplo.test/rapa/rapa-executor
+    digest: sha256:DIGEST_DA_IMAGEM_DO_EXECUTOR
+  pullSecrets:
+    - rapa-registro
+  requireDigest: true</code></pre>
+<div class="aviso atencao">
+  <span class="rotulo">Atenção</span>
+  <p>As duas imagens são sempre da mesma versão. A política de admissão só aceita no namespace das execuções a imagem do executor pelo digest (e os de <code>images.executor.previousDigests</code> durante uma atualização). Com <code>images.requireDigest: true</code>, o chart recusa renderizar sem os dois digests. O repositório não traz um comando de envio ao registro: use a ferramenta do registro de vocês.</p>
+</div>
+
+<h3 id="eks-nos">4.3 Nós, gVisor e CNI</h3>
+<p>Provisione os dois grupos de nós autogerenciados (2.2) e aplique a RuntimeClass:</p>
+<pre><code>kubectl apply -f deploy/gvisor/runtimeclass.yaml</code></pre>
+<div class="aviso perigo">
+  <span class="rotulo">Perigo</span>
+  <p>Todo o isolamento dos pods de execução e de sessão (longe do metadata, da API do Kubernetes, do banco, do despachante e dos outros pods) vem das NetworkPolicies. Um CNI que não as aplica as aceita e ignora, calado. Sem o VPC CNI com <code>enableNetworkPolicy: "true"</code> (ou um CNI que as aplique), não instale o chart: o teste de saída (<a href="#eks-verificar">4.11</a>) mostra o problema, e nenhuma empresa usa o RaPA até ele passar.</p>
+</div>
+
+<h3 id="eks-externos">4.4 Componentes externos e Keycloak</h3>
+<p>Instale, cada um pelo chart dele: cert-manager; o operador CloudNativePG e o plugin Barman Cloud (<code>cnpg-system</code>); o OpenBao em HA com TLS (<code>cofre</code>); o Keycloak (<code>identidade</code>); o SeaweedFS com o S3 em TLS e os buckets <code>rapa-artefatos</code> e <code>rapa-backups</code> (<code>armazenamento</code>); o Envoy Gateway com o <code>Gateway</code> externo <code>rapa-externo</code>, o certificado TLS dele e um listener HTTPS que aceita rotas do namespace <code>rapa</code> (<code>allowedRoutes.namespaces</code>), anotando as redes dos pods do Envoy para <code>gateway.trustedNetworks</code>; o VictoriaMetrics (<code>monitoramento</code>), o GlitchTip e o Argo CD (<code>argocd</code>).</p>
+<h4>O realm do Keycloak</h4>
+<ol class="lista-passos">
+  <li>Em <code>deploy/keycloak/realm-rapa.json</code>, troque <code>rapa.exemplo.test</code> pelo endereço público do RaPA (o mesmo de <code>publicUrl</code>) nos <code>redirectUris</code>, <code>webOrigins</code> e <code>post.logout.redirect.uris</code>, e importe: pela tela de administração (<b>Create realm</b> → <b>Resource file</b>), por um <code>KeycloakRealmImport</code> do operador ou por <code>kc.sh import --file realm-rapa.json</code>. O realm traz <code>organizationsEnabled: true</code>, o cliente confidencial <code>rapa-interface</code> (código com PKCE <code>S256</code>, retorno em <code>/auth/oidc/retorno</code>) e a audiência <code>rapa-api</code>.</li>
+  <li>Ligue o id da organização na claim: <b>Client scopes</b> → <code>organization</code> → <b>Mappers</b> → <code>organization</code> → <b>Add organization id</b> = On. Assim o RaPA liga a empresa pelo id da organização.</li>
+  <li>Copie o segredo do cliente (<b>Clients</b> → <code>rapa-interface</code> → <b>Credentials</b>) para o Secret <code>rapa-oidc</code>, sem passar pela linha de comando:
+<pre><code>umask 077
+read -rs segredo &amp;&amp; printf '%s' "$segredo" &gt; /tmp/segredo-oidc &amp;&amp; unset segredo   # cole e Enter
+kubectl -n rapa create secret generic rapa-oidc --from-file=client-secret=/tmp/segredo-oidc
+shred -u /tmp/segredo-oidc</code></pre>
+  (o namespace <code>rapa</code> é criado em <a href="#eks-segredos">4.6</a>).</li>
+  <li>Faça o nome público do emissor chegar ao Service do Keycloak dentro do cluster, no CoreDNS (<code>kube-system/coredns</code>, bloco <code>.:53</code>; no EKS, pela configuração do complemento), e reinicie o CoreDNS:
+<pre><code>rewrite name exact sso.exemplo.test keycloak.identidade.svc.cluster.local</code></pre>
+  O certificado do Keycloak precisa ter o nome público, e a porta do Service, a do endereço público (443) ou a do emissor.</li>
+</ol>
+
+<h3 id="eks-openbao">4.5 OpenBao</h3>
+<ol class="lista-passos">
+  <li><b>Iniciar uma vez</b>, com 5 custodiantes e quórum de 3; cada parte sai cifrada para a chave PGP de um custodiante:
+<pre><code>bao operator init -key-shares=5 -key-threshold=3 -pgp-keys=c1.asc,c2.asc,c3.asc,c4.asc,c5.asc</code></pre></li>
+  <li><b>Desbloquear</b> (também depois de reiniciar um pod do OpenBao ou o cluster): três custodiantes, cada um da própria máquina, rodam <code>bao operator unseal</code> com a parte dele, em cada pod do OpenBao, por um port-forward:
+<pre><code>kubectl -n cofre port-forward openbao-0 8200</code></pre></li>
+  <li><b>Preparar para o RaPA</b>, com o token de quem administra o cofre, de qualquer máquina com o CLI <code>bao</code>. O script é idempotente e não tem segredo: monta o KV v2 (<code>rapa</code>) e o transit (<code>rapa-transit</code>), liga o método kubernetes e escreve as três políticas e os quatro papéis.
+<pre><code>export BAO_ADDR=https://openbao.cofre.svc:8200 BAO_CACERT=/caminho/do/ca.pem
+bao login -method=oidc
+RAPA_NAMESPACE=rapa ./deploy/openbao/preparar.sh</code></pre>
+  Com o OpenBao fora de um pod do cluster, informe o CA da API em <code>KUBERNETES_CA_CERT</code> e, obrigatório junto, <code>KUBERNETES_TOKEN_REVIEWER_JWT</code> (o arquivo com o token de uma conta de serviço com <code>system:auth-delegator</code>), a cada execução: o script reescreve o config inteiro.</li>
+  <li>Ainda com o token raiz: o método de entrada de quem administra o cofre (por exemplo, o OIDC do Keycloak) com uma política de administração, e o dos custodiantes das credenciais (a política de cada empresa vem de <code>deploy/openbao/custodiante.sh</code>, em <a href="#eks-empresa">4.10</a>). Só então revogue o token raiz (<code>bao token revoke</code>); um novo só se gera com o quórum (<code>bao operator generate-root</code>).</li>
+</ol>
+<div class="tabela"><table>
+<thead><tr><th>Componente</th><th>Conta de serviço</th><th><code>RAPA_BAO_PAPEL</code> (<code>vault.roles</code>)</th><th>Política</th><th>Pode</th></tr></thead>
+<tbody>
+<tr><td>despachante</td><td><code>rapa-despachante</code></td><td><code>rapa-despachante</code></td><td><code>rapa-despachante</code></td><td>ler <code>rapa/data/empresas/*</code>, embrulhar e desembrulhar com <code>empresa-*</code></td></tr>
+<tr><td>interface</td><td><code>rapa-web</code></td><td><code>rapa-web</code></td><td><code>rapa-api</code></td><td>só desembrulhar (servir artefatos)</td></tr>
+<tr><td>API</td><td><code>rapa-api</code></td><td><code>rapa-api</code></td><td><code>rapa-api</code></td><td>só desembrulhar</td></tr>
+<tr><td>operação</td><td><code>rapa-operacao</code></td><td><code>rapa-operacao</code></td><td><code>rapa-operacao</code></td><td>desembrulhar (exportar), apagar os segredos e a chave transit de uma empresa</td></tr>
+</tbody></table></div>
+<p>As variáveis opcionais do <code>preparar.sh</code>: <code>RAPA_BAO_KV</code>, <code>RAPA_BAO_TRANSIT</code>, <code>RAPA_BAO_AUTH</code>, <code>RAPA_NAMESPACE</code> (padrão <code>rapa</code>), <code>RAPA_BAO_AUDIENCIA</code> (<code>openbao</code>), <code>RAPA_BAO_TTL</code> (<code>1h</code>), <code>RAPA_SA_DESPACHANTE</code>, <code>RAPA_SA_WEB</code>, <code>RAPA_SA_API</code>, <code>RAPA_SA_OPERACAO</code> e <code>KUBERNETES_HOST</code> (<code>https://kubernetes.default.svc</code>). Os detalhes estão em <code>deploy/openbao/README.md</code>.</p>
+
+<h3 id="eks-segredos">4.6 Namespace e Secrets</h3>
+<p>Crie o namespace e os Secrets antes do chart: o chart só leva os nomes, e nenhum valor fica no Git nem nos valores. As senhas são sempre aleatórias, só com caracteres seguros numa URL, de um arquivo 0600 e nunca na linha de comando.</p>
+<pre><code>kubectl create namespace rapa --dry-run=client -o yaml | kubectl apply -f -</code></pre>
+<div class="tabela"><table>
+<thead><tr><th>Secret (namespace <code>rapa</code>)</th><th>Chaves</th><th>Para</th></tr></thead>
+<tbody>
+<tr><td><code>rapa-banco-dono</code>, <code>rapa-banco-app</code>, <code>rapa-banco-despachante</code></td><td><code>username</code>, <code>password</code> (tipo <code>kubernetes.io/basic-auth</code>)</td><td>os papéis <code>rapa_owner</code>, <code>rapa_app</code> e <code>rapa_dispatcher</code> (o CloudNativePG cria os papéis com essas senhas)</td></tr>
+<tr><td><code>rapa-banco-backup-s3</code></td><td><code>ACCESS_KEY_ID</code>, <code>ACCESS_SECRET_KEY</code></td><td>o bucket dos backups</td></tr>
+<tr><td><code>rapa-s3</code></td><td><code>AWS_ACCESS_KEY_ID</code>, <code>AWS_SECRET_ACCESS_KEY</code></td><td>o bucket dos artefatos</td></tr>
+<tr><td><code>rapa-openbao-ca</code>, <code>rapa-s3-ca</code></td><td><code>ca.crt</code></td><td>os CAs do OpenBao e do S3</td></tr>
+<tr><td><code>rapa-oidc</code></td><td><code>client-secret</code></td><td>o cliente <code>rapa-interface</code> do Keycloak</td></tr>
+<tr><td><code>rapa-webhooks</code></td><td><code>chave</code></td><td><code>RAPA_CHAVE_WEBHOOKS</code> (32 caracteres ou mais)</td></tr>
+<tr><td><code>rapa-hub</code></td><td><code>api-key</code></td><td><code>RAPA_LLM_API_KEY</code></td></tr>
+<tr><td><code>rapa-glitchtip</code></td><td><code>dsn</code></td><td><code>RAPA_GLITCHTIP_DSN</code></td></tr>
+<tr><td><code>rapa-registro</code></td><td><code>.dockerconfigjson</code></td><td>o registro das imagens, nos dois namespaces, só com permissão de baixar</td></tr>
+<tr><td><code>rapa-proxy</code> (opcional)</td><td><code>url</code></td><td><code>RAPA_PROXY_SAIDA</code> com usuário e senha (<code>http://usuario:senha@host:porta</code>, os caracteres reservados com <code>%</code>); a URL nunca vai nos valores</td></tr>
+</tbody></table></div>
+<p>O padrão para uma senha do banco (repita para <code>rapa-banco-dono</code> com <code>rapa_owner</code> e <code>rapa-banco-despachante</code> com <code>rapa_dispatcher</code>):</p>
+<pre><code>umask 077
+openssl rand -hex 32 | tr -d '\n' &gt; /tmp/senha    # sem a quebra de linha no fim
+kubectl -n rapa create secret generic rapa-banco-app --type=kubernetes.io/basic-auth \
+  --from-literal=username=rapa_app --from-file=password=/tmp/senha
+shred -u /tmp/senha</code></pre>
+<p>A chave dos webhooks:</p>
+<pre><code>umask 077; openssl rand -base64 48 | tr -d '\n' &gt; /tmp/chave
+kubectl -n rapa create secret generic rapa-webhooks --from-file=chave=/tmp/chave
+shred -u /tmp/chave</code></pre>
+<p>Os outros seguem o mesmo jeito, uma chave por arquivo (<code>--from-file=CHAVE=arquivo</code>). O <code>rapa-registro</code> precisa estar também no namespace <code>rapa-execucoes</code>, que o chart cria na instalação da aplicação (<code>executions.createNamespace: true</code>): crie-o lá logo depois do passo 7, antes da primeira execução ou sessão. Para criar o namespace antes, com o rótulo <code>pod-security.kubernetes.io/enforce=restricted</code>, use <code>executions.createNamespace: false</code>.</p>
+
+<h3 id="eks-banco">4.7 A release do banco</h3>
+<p>O banco vem de uma release própria do mesmo chart, instalada antes: o Job de migração roda antes de qualquer recurso da release da aplicação, então o banco nunca fica nela (o chart recusa).</p>
+<pre><code>helm upgrade --install rapa-banco deploy/helm/rapa -n rapa -f valores-do-ambiente.yaml -f deploy/helm/rapa/values-banco.yaml
+kubectl -n rapa wait cluster/rapa-banco --for=condition=Ready --timeout=20m
+kubectl -n rapa get cluster rapa-banco -o jsonpath='{.status.managedRolesStatus.byStatus.reconciled}'</code></pre>
+<p>Espere <code>rapa_app</code> e <code>rapa_dispatcher</code> entre os papéis reconciliados: a migração só concede permissões aos papéis que existem (se eles chegarem depois, o Job de permissões, <code>migration.grantsJob.enabled</code>, concede de novo depois de instalar). A release cria o <code>Cluster</code> <code>rapa-banco</code> (3 instâncias, TLS), o <code>ObjectStore</code> <code>rapa-banco-backup</code>, o <code>ScheduledBackup</code> <code>rapa-banco-diario</code> (03:00 UTC, retenção de 30 dias), o <code>Pooler</code> se ligado, o monitor e as NetworkPolicies do banco.</p>
+
+<h3 id="eks-valores">4.8 Valores do ambiente</h3>
+<p>Do <code>values-producao-exemplo.yaml</code>, troque pelo menos:</p>
+<ul>
+  <li><code>images.*</code> (4.2) e <code>publicUrl</code>;</li>
+  <li><code>auth.jwt.issuer</code>, <code>auth.jwt.audience</code> (<code>rapa-api</code>), <code>auth.jwt.jwksUrl</code> e <code>auth.oidc.*</code> (<code>clientId: rapa-interface</code>, <code>redirectUri</code> terminando em <code>/auth/oidc/retorno</code>, <code>existingSecret: rapa-oidc</code>);</li>
+  <li><code>database.host</code> (<code>rapa-banco-pooler-rw</code> com o Pooler, ou <code>rapa-banco-rw</code>) e <code>database.cnpg.storage.storageClass</code>;</li>
+  <li><code>executions.nodeSelector</code> e <code>executions.tolerations</code> (os nós de execução), <code>executions.egress.proxy</code>, <code>executions.egress.allowedInternalNetworks</code> e <code>executions.egress.extraInternalNetworks</code> (<a href="#cfg-saida">5.9</a>);</li>
+  <li><code>network.egress.kubernetesApi.to</code> (os endereços do plano de controle do EKS; os do Endpoints <code>kubernetes</code> do namespace <code>default</code>), <code>network.egress.modelHub.to</code> e <code>network.egress.observability.to</code>;</li>
+  <li><code>gateway.enabled: true</code>, <code>gateway.hostnames</code> e <code>gateway.trustedNetworks</code> (a sub-rede dos pods do Envoy);</li>
+  <li><code>vault.*</code>, <code>storage.s3.*</code> e <code>keys.mode: openbao</code>; <code>observability.*</code>; <code>modelHub.*</code> (com a matriz da sonda em <code>capabilities</code>); <code>publishing.webhookKey.existingSecret: rapa-webhooks</code>.</li>
+</ul>
+<p>O chart recusa, antes de criar qualquer recurso (as regras estão em <code>deploy/helm/rapa/templates/_validation.tpl</code>):</p>
+<ul>
+  <li>o modo de desenvolvimento junto com o gateway público;</li>
+  <li>fora do desenvolvimento: as NetworkPolicies ou a política de admissão desligadas, <code>executions.egress.extraRules</code>, a RuntimeClass vazia, o banco sem TLS conferido e o OpenBao, o S3, o Keycloak, o hub, o <code>publicUrl</code> ou o S3 dos backups sem <code>https://</code>;</li>
+  <li>o gateway sem <code>gateway.trustedNetworks</code>, ou com uma rede fora das redes privadas dos pods (10/8, 172.16/12, 192.168/16, 100.64/10) ou, em IPv6, mais larga que /48;</li>
+  <li>uma rede interna permitida ou do proxy que não é um CIDR canônico, mais larga que /16 (IPv4) ou /48 (IPv6), ou que toca o loopback, o link-local, o metadata da nuvem, o 6to4 ou o multicast;</li>
+  <li>um cluster IPv6 sem o bloco da VPC em <code>executions.egress.extraInternalNetworks</code>; uma URL dos valores com usuário e senha;</li>
+  <li><code>storage.mode=local</code>, o proxy sem as redes dele, o banco na release da aplicação, a restauração no mesmo nome do Cluster de origem e, com <code>images.requireDigest</code>, as imagens sem digest.</li>
+</ul>
+<div class="aviso atencao">
+  <span class="rotulo">Atenção</span>
+  <p>O chart não confere todas as regras cruzadas da partida: sem <code>auth.jwt</code> com o gateway desligado, <code>auth.oidc.clientId</code> sem <code>auth.jwt.issuer</code>, <code>web.sessions.idleSeconds</code> acima de <code>maxSeconds</code> ou <code>evidence.retentionSuccessDays</code> acima de <code>retentionFailureDays</code>, o render passa e a web e a api não sobem (<code>configuração inválida</code> no log, com o que corrigir). Com as NetworkPolicies e sem <code>network.egress.kubernetesApi.to</code>, o chart só avisa nas NOTES (que o Argo CD não mostra): nenhuma execução nem sessão abre.</p>
+</div>
+
+<h3 id="eks-app">4.9 A release da aplicação</h3>
+<h4>Com o Helm</h4>
+<pre><code>helm upgrade --install rapa deploy/helm/rapa -n rapa -f valores-do-ambiente.yaml</code></pre>
+<h4>Com o Argo CD</h4>
+<p>As duas releases são as duas Applications de <code>deploy/argocd/application.yaml</code> (troque o <code>repoURL</code> e os arquivos de valores), filhas da Application raiz <code>deploy/argocd/raiz.yaml</code>. A raiz cria a do banco (onda -1, com o prune desligado), espera ela ficar saudável e só então cria a da aplicação (onda 0). Para a raiz esperar, o <code>argocd-cm</code> precisa das checagens de saúde de <code>argoproj.io/Application</code> e do Cluster do CloudNativePG:</p>
+<pre><code>kubectl -n argocd patch configmap argocd-cm --type merge --patch-file deploy/argocd/argocd-cm-saude.yaml
+kubectl apply -f deploy/argocd/raiz.yaml</code></pre>
+<div class="aviso atencao">
+  <span class="rotulo">Atenção</span>
+  <p>Aplicadas soltas, sem a raiz, as duas Applications sincronizam ao mesmo tempo e a migração só conta com o retry da Application (5 tentativas, até cerca de 15 minutos).</p>
+</div>
+<h4>A migração</h4>
+<p>O Job <code>rapa-migracao</code> roda <code>python -m rapa.control.db.migrate</code> como o dono das tabelas, num hook <code>pre-install,pre-upgrade</code> (no Argo CD, PreSync), antes de qualquer pod novo. Um Job que falha segura a instalação e fica para conferir:</p>
+<pre><code>kubectl -n rapa logs job/rapa-migracao</code></pre>
+<p>Com <code>migration.grantsJob.enabled</code>, o Job <code>rapa-permissoes</code> (<code>--somente-permissoes</code>) roda depois de instalar e de cada atualização. Ao fim, o chart deixa no namespace <code>rapa</code> os Deployments <code>rapa-web</code>, <code>rapa-api</code> e <code>rapa-despachante</code>, o <code>PodTemplate</code> <code>rapa-operacao</code>, as NetworkPolicies, o RBAC e, com o gateway ligado, as <code>HTTPRoute</code>; no <code>rapa-execucoes</code>, a conta <code>rapa-executor</code>, a Role dos pods de uso único e as NetworkPolicies deles; e a <code>ValidatingAdmissionPolicy</code> <code>rapa-execucoes-pods-de-uso-unico</code>.</p>
+
+<h3 id="eks-empresa">4.10 A primeira empresa</h3>
+<ol class="lista-passos">
+  <li><b>Keycloak.</b> Em <b>Organizations</b> → <b>Create organization</b>: o nome, o apelido e o domínio dos e-mails; copie o <b>id</b> da organização. Em <b>Members</b>, adicione as pessoas (uma pessoa pertence a uma organização só). Copie o <code>sub</code> (o <b>ID</b> em <b>Users</b>) de quem vai administrar a empresa.</li>
+  <li><b>O pod da operação.</b> Os comandos de empresa rodam num pod criado do <code>PodTemplate</code> <code>rapa-operacao</code> (nada roda sozinho), nunca nos pods que servem tráfego: ele tem a conta e o papel do OpenBao da operação, a URL do dono das tabelas e um disco próprio para a exportação.
+<pre><code>kubectl -n rapa get podtemplate rapa-operacao -o json \
+  | jq '{apiVersion: "v1", kind: "Pod", metadata: (.template.metadata + {name: "rapa-operacao"}), spec: .template.spec}' \
+  | kubectl -n rapa create -f -
+kubectl -n rapa wait pod/rapa-operacao --for=condition=Ready --timeout=5m
+op() { kubectl -n rapa exec rapa-operacao -- python -m rapa.control.admin "$@"; }</code></pre></li>
+  <li><b>A empresa</b>, já ligada à organização, com o administrador e as primeiras áreas, numa transação só (o comando imprime o id da empresa):
+<pre><code>op empresa criar "Empresa Demonstração" --organizacao ID_DA_ORGANIZACAO --admin SUB_DO_ADMIN --nome-admin "Ana Lima" --area "Fiscal" --area "Financeiro" --vagas 2 --fila 1000 --emprestimo 2.0 --por "$USER"</code></pre>
+  A organização fica ligada no banco (<code>companies.idp_organization</code>) e o serviço passa a aceitar os tokens dela em até 60 segundos, sem reiniciar. Um valor no formato de UUID é sempre o id da organização; qualquer outro é o apelido. Prefira o id.</li>
+  <li><b>O custodiante no cofre.</b> Quem administra o OpenBao cria a política do custodiante da empresa e a liga só à identidade dele (um grupo do OIDC, um usuário do <code>userpass</code>): sem ela, ninguém grava os segredos das credenciais da empresa, e os robôs com credenciais falham com <code>segredo_indisponivel</code>.
+<pre><code>./deploy/openbao/custodiante.sh ID_DA_EMPRESA</code></pre>
+  A política <code>rapa-custodiante-&lt;uuid&gt;</code> grava e lista só em <code>rapa/data/empresas/&lt;uuid&gt;/</code>; nunca lê um valor, nunca apaga e nunca alcança outra empresa.</li>
+  <li><b>Papéis.</b> Quem entra pela primeira vez com um token da organização vira usuário sem papel e só vê o pedido para um administrador dar um papel. O administrador da empresa dá os papéis na tela <b>Empresa</b> (<a href="#uso-empresa">6.11</a>).</li>
+  <li>Apague o pod da operação no fim: <code>kubectl -n rapa delete pod rapa-operacao</code>.</li>
+</ol>
+
+<h3 id="eks-verificar">4.11 Verificação</h3>
+<p>A lista completa, com os comandos e o resultado esperado, está no <a href="#testes-aceite">aceite de 7.5</a>. O mínimo antes de liberar para uma empresa:</p>
+<ul>
+  <li><code>/saude/pronto</code> da web, da api e do despachante responde <code>{"estado": "pronto"}</code> (o banco, o despachante, o OpenBao e o S3 conferidos);</li>
+  <li>o pod <code>deploy/rede/teste-de-saida.yaml</code> termina com todos os internos <code>ok: fechado</code> e os externos <code>ok: abriu</code>;</li>
+  <li>um robô publicado roda pela REST num pod de uso único até <code>succeeded</code>, e os artefatos dele saem pela API e estão no bucket só cifrados.</li>
+</ul>
+
+<h3 id="eks-atualizar">4.12 Atualizações</h3>
+<ol class="lista-passos">
+  <li>Construa e publique as imagens novas e troque os digests (<code>images.control.digest</code> e <code>images.executor.digest</code>). Ponha o digest do executor que está rodando em <code>images.executor.previousDigests</code>: a política de admissão passa a valer na hora da sincronização, e o despachante e a web antigos ainda lançam pods com o executor anterior até saírem.
+<pre><code>images:
+  executor:
+    digest: sha256:DIGEST_NOVO_DO_EXECUTOR
+    previousDigests:
+      - sha256:DIGEST_DO_EXECUTOR_QUE_ESTA_RODANDO</code></pre>
+  Sem isso, as execuções que eles pegam na troca falham com <code>executor_nao_iniciou</code>, e as sessões não abrem. Quando não houver mais pod antigo de <code>rapa-despachante</code> nem de <code>rapa-web</code>, tire o digest antigo e sincronize de novo.</li>
+  <li>Sincronize (Argo CD) ou rode o <code>helm upgrade</code>. A migração roda antes de qualquer pod novo; um Job que falha segura a atualização (<code>kubectl -n rapa logs job/rapa-migracao</code>).</li>
+  <li>Os Deployments sobem um pod novo antes de tirar um velho. O despachante que sai espera as execuções em andamento (até 40 minutos: <code>dispatcher.terminationGracePeriodSeconds</code>); os pods de execução já lançados terminam com a imagem com que nasceram.</li>
+  <li>As migrações só acrescentam e valem para as duas versões durante a troca. Voltar a versão do chart não volta o banco: para desfazer uma migração, restaure (4.13).</li>
+</ol>
+<p>O operador do CloudNativePG, o plugin e os outros componentes têm atualizações próprias, uma de cada vez, com o banco conferido depois de cada uma. Durante um OpenBao selado, não atualize o chart: os pods novos não ficam prontos e a troca para.</p>
+
+<h3 id="eks-backup">4.13 Backup e restauração</h3>
+<p>O Cluster arquiva o WAL continuamente pelo plugin Barman Cloud no bucket <code>rapa-backups</code> (o <code>ObjectStore</code> <code>rapa-banco-backup</code>), com um backup de base diário (<code>ScheduledBackup</code> <code>rapa-banco-diario</code>, 03:00 UTC) e retenção de 30 dias (<code>database.cnpg.backup.retentionPolicy</code>). Para conferir:</p>
+<pre><code>kubectl -n rapa get backups.postgresql.cnpg.io
+kubectl -n rapa get cluster rapa-banco -o jsonpath='{.status.conditions}'</code></pre>
+<h4>Teste de restauração semanal</h4>
+<p><code>deploy/banco/testar-restauracao.sh</code> sobe um Cluster novo a partir dos backups num namespace à parte (<code>rapa-restauracao</code>), confere que o banco abre (a revisão da migração e as contagens) e apaga tudo; o banco de produção não é tocado. Agende toda semana numa máquina da operação com o <code>kubectl</code> do cluster (o cron está no topo do script) e registre o resultado: a última linha diz o que foi conferido e quanto tempo levou; uma saída diferente de 0 é uma restauração que falhou. Variáveis: <code>ORIGEM_NS</code>, <code>NS</code>, <code>CLUSTER</code>, <code>BANCO</code>, <code>DONO</code>, <code>TAMANHO</code>, <code>ALVO_HORA</code> e <code>MANTER=1</code>.</p>
+<h4>Restaurar de verdade</h4>
+<p>O Cluster novo vem da própria release do banco, com outro nome (o chart recusa o mesmo nome da origem).</p>
+<ol class="lista-passos">
+  <li>Pare a aplicação. Com o Argo CD, desligue primeiro o sync automático da raiz (com o <code>selfHeal</code>, ela desfaz em segundos uma mudança nas filhas) e depois o das duas filhas:
+<pre><code>argocd app set rapa-raiz --sync-policy none
+argocd app set rapa --sync-policy none
+argocd app set rapa-banco --sync-policy none</code></pre>
+  Depois, com ou sem o Argo CD:
+<pre><code>kubectl -n rapa scale deployment rapa-web rapa-api rapa-despachante --replicas=0</code></pre></li>
+  <li>Nos valores do ambiente (os mesmos das duas releases):
+<pre><code>database:
+  host: rapa-banco-2-pooler-rw      # ou rapa-banco-2-rw, sem o Pooler
+  caSecret:
+    name: rapa-banco-2-ca
+  cnpg:
+    name: rapa-banco-2
+    recovery:
+      enabled: true
+      source: rapa-banco             # o Cluster de origem (o nome do servidor nos backups)
+      targetTime: ""                 # ou um instante, RFC 3339 ("2026-11-20T03:00:00Z")</code></pre></li>
+  <li>Atualize a release do banco e espere o Cluster novo e os papéis:
+<pre><code>helm upgrade rapa-banco deploy/helm/rapa -n rapa -f valores-do-ambiente.yaml -f deploy/helm/rapa/values-banco.yaml
+kubectl -n rapa wait cluster/rapa-banco-2 --for=condition=Ready --timeout=60m
+kubectl -n rapa get cluster rapa-banco-2 -o jsonpath='{.status.managedRolesStatus.byStatus.reconciled}'</code></pre>
+  Com o Argo CD, em vez do <code>helm upgrade</code>: o commit dos valores e <code>argocd app sync rapa-banco</code>, e a mesma espera.</li>
+  <li>Atualize a aplicação (a migração confere a revisão; tudo passa a sair para o <code>rapa-banco-2</code>): <code>helm upgrade rapa deploy/helm/rapa -n rapa -f valores-do-ambiente.yaml</code>, ou, com o Argo CD:
+<pre><code>argocd app sync rapa
+argocd app set rapa-raiz --sync-policy automated --self-heal</code></pre></li>
+  <li>Confira o que as execuções em andamento na hora da perda deixaram: as que tinham começado um passo que grava ficam para uma pessoa conferir o sistema de destino.</li>
+  <li>No cron do teste semanal, passe o nome novo: <code>CLUSTER=rapa-banco-2 deploy/banco/testar-restauracao.sh</code>.</li>
+</ol>
+<div class="aviso atencao">
+  <span class="rotulo">Atenção</span>
+  <p>O Cluster antigo fica (o chart nunca o apaga), sem NetworkPolicy própria e sem o ObjectStore dele (com o Argo CD, os dois ficam). Confira o novo antes de apagar o antigo à mão (<code>kubectl -n rapa delete cluster rapa-banco</code>). Os backups do antigo ficam no bucket, na pasta dele, sem retenção.</p>
+</div>
+
+<h3 id="eks-desinstalar">4.14 Desinstalar</h3>
+<ul>
+  <li><b>Espere as execuções e as sessões acabarem</b> (ou apague os pods de <code>rapa-execucoes</code>) antes de <code>helm uninstall</code> ou de apagar a Application: a desinstalação tira as NetworkPolicies, a política de admissão e a Role do namespace das execuções, que fica com os pods até o <code>activeDeadlineSeconds</code> deles.</li>
+  <li>O <code>Cluster</code> do banco e o namespace <code>rapa-execucoes</code> têm <code>helm.sh/resource-policy: keep</code> e <code>Prune=false,Delete=false</code> no Argo CD: nunca saem com a release. Apague-os à mão, só quando tiver certeza, e lembre que os backups no bucket <code>rapa-backups</code> e os artefatos em <code>rapa-artefatos</code> ficam.</li>
+  <li>As empresas saem antes pelo roteiro da Parte 2 de OPERACAO (congelar, exportar, apagar), que destrói os segredos e a chave transit de cada uma.</li>
+</ul>
+</section>
+
+<!-- =========================================================================== -->
+<section class="parte" id="configuracao" aria-labelledby="t-configuracao">
+<h2 id="t-configuracao"><span class="parte-rotulo">Parte 5</span>5. Configuração</h2>
+
+<h3 id="cfg-variaveis">5.1 Variáveis do serviço</h3>
+<p>Todas as variáveis de <code>python -m rapa.server</code> são lidas por <code>ServerSettings.from_env</code> (<code>src/rapa/server.py</code>) e pelo <code>BackendSettings</code> (<code>src/rapa/control/backends.py</code>) e conferidas na partida: um valor fora da regra para o processo. As de 1 ou 0 também aceitam <code>true</code>, <code>sim</code>, <code>on</code> e os contrários. No cluster, o chart as preenche a partir dos valores (<a href="#cfg-valores">5.2</a>).</p>
+<div class="tabela"><table>
+<thead><tr><th class="col-var">Variável</th><th>Padrão</th><th>O que faz</th></tr></thead>
+<tbody>
+<tr><td class="grupo" colspan="3">Banco e processo</td></tr>
+<tr><td><code>RAPA_DATABASE_URL</code></td><td>(obrigatória)</td><td>o banco com o papel da aplicação (<code>rapa_app</code>); na migração e no CLI, a do papel que cada comando pede</td></tr>
+<tr><td><code>RAPA_DISPATCHER_DATABASE_URL</code></td><td>(nenhuma)</td><td>o banco com o papel do despachante; sem ela, o processo não despacha</td></tr>
+<tr><td><code>RAPA_OWNER_DATABASE_URL</code></td><td>(nenhuma)</td><td>só o CLI: o dono das tabelas, para congelar, descongelar, exportar e apagar (ou <code>--url-dono</code>)</td></tr>
+<tr><td><code>RAPA_HTTP</code>, <code>RAPA_UI</code></td><td><code>1</code>, <code>1</code></td><td><code>RAPA_HTTP=0</code>: só o despachante (com a saúde na porta do serviço); <code>RAPA_UI=0</code>: sem a interface</td></tr>
+<tr><td><code>RAPA_CONCORRENCIA</code></td><td><code>4</code></td><td>execuções ao mesmo tempo neste processo (1 a 256)</td></tr>
+<tr><td><code>RAPA_PASTA_TRABALHO</code>, <code>RAPA_PASTA_ARTEFATOS</code></td><td><code>rapa-trabalho</code> e <code>rapa-artefatos</code> na pasta temporária</td><td>a pasta de trabalho das tentativas e a dos artefatos (com o S3, só a de passagem)</td></tr>
+<tr><td><code>RAPA_PASTA_ARQUIVOS</code></td><td>(nenhuma)</td><td>os arquivos de entrada, numa subpasta por empresa (<code>&lt;pasta&gt;/&lt;uuid da empresa&gt;/&lt;arquivo&gt;</code>); não montada no cluster</td></tr>
+<tr><td><code>RAPA_CHROMIUM_PATH</code>, <code>RAPA_ARGS_NAVEGADOR</code></td><td>(opcionais)</td><td>o Chromium completo e os argumentos dele (separados por espaço, com aspas se preciso); na imagem do executor, <code>/usr/bin/chromium</code> e <code>--no-sandbox</code></td></tr>
+<tr><td class="grupo" colspan="3">Identidade e acesso</td></tr>
+<tr><td><code>RAPA_PUBLIC_URL</code></td><td>(nenhum)</td><td>o endereço público: OpenAPI dos robôs, metadados do MCP e a origem aceita na visão ao vivo</td></tr>
+<tr><td><code>RAPA_DEV</code>, <code>RAPA_TOKENS_DEV</code>, <code>RAPA_SEGREDOS_DEV</code></td><td><code>0</code></td><td>modo de desenvolvimento: tokens fixos (<code>{"token": {"sujeito": ..., "empresa": ...}}</code>) e segredos em arquivo (<code>{"uuid da empresa": {"credencial": {...}}}</code>)</td></tr>
+<tr><td><code>RAPA_JWT_ISSUER</code>, <code>RAPA_JWT_AUDIENCE</code>, <code>RAPA_JWKS_URL</code></td><td>(nenhum)</td><td>os tokens do Keycloak (os três juntos; obrigatórios com HTTP fora do desenvolvimento)</td></tr>
+<tr><td><code>RAPA_ORGANIZATION_ALIASES</code></td><td><code>{}</code></td><td>mapa estático <code>{"apelido": "uuid da empresa"}</code>; prefira ligar pelo CLI (<code>empresa criar --organizacao</code>)</td></tr>
+<tr><td><code>RAPA_OIDC_CLIENT_ID</code>, <code>RAPA_OIDC_CLIENT_SECRET</code>, <code>RAPA_OIDC_REDIRECT_URI</code></td><td>(nenhum)</td><td>o login da interface pelo Keycloak (pede <code>RAPA_JWT_ISSUER</code>)</td></tr>
+<tr><td><code>RAPA_COOKIE_SEGURO</code></td><td><code>1</code></td><td>o cookie da interface só em HTTPS (<code>0</code> só em desenvolvimento por HTTP)</td></tr>
+<tr><td><code>RAPA_MCP_ORIGENS</code>, <code>RAPA_ORIGENS_AO_VIVO</code></td><td>(nenhuma)</td><td>origens aceitas no MCP e no websocket da visão ao vivo (além da de <code>RAPA_PUBLIC_URL</code>), separadas por vírgula</td></tr>
+<tr><td><code>RAPA_LIMITE_POR_SEGUNDO</code></td><td><code>20</code></td><td>o limite de pedidos por segundo de cada empresa, na memória de cada processo (<code>0</code> desliga)</td></tr>
+<tr><td><code>RAPA_DOCS_API</code></td><td><code>0</code></td><td><code>1</code>: <code>/v1/docs</code> e <code>/v1/openapi.json</code> (<a href="#cfg-docs-api">5.7</a>)</td></tr>
+<tr><td><code>FORWARDED_ALLOW_IPS</code></td><td>(do uvicorn)</td><td>as redes do proxy em que o uvicorn confia para o endereço do cliente; no chart, <code>gateway.trustedNetworks</code>; nunca <code>*</code></td></tr>
+<tr><td class="grupo" colspan="3">Sessões de gravação</td></tr>
+<tr><td><code>RAPA_SESSOES</code></td><td><code>1</code></td><td>sessões de gravação neste processo</td></tr>
+<tr><td><code>RAPA_SESSOES_POR_EMPRESA</code></td><td><code>2</code></td><td>abertas ao mesmo tempo por empresa (nunca mais que metade de <code>RAPA_SESSOES_MAX</code>)</td></tr>
+<tr><td><code>RAPA_SESSOES_MAX</code></td><td>a reserva interativa</td><td>vagas da plataforma para gravações, contando as validações rodando (padrão: 10% das vagas)</td></tr>
+<tr><td><code>RAPA_SESSAO_OCIOSA_S</code>, <code>RAPA_SESSAO_MAX_S</code></td><td><code>600</code>, <code>3600</code></td><td>segundos sem entrada até encerrar e prazo máximo de uma sessão</td></tr>
+<tr><td><code>RAPA_PASTA_SESSOES</code></td><td>(opcional)</td><td>onde ficam os perfis temporários dos navegadores das sessões (apagados no fim)</td></tr>
+<tr><td class="grupo" colspan="3">Hub do modelo (criar e consertar)</td></tr>
+<tr><td><code>RAPA_LLM_BASE_URL</code>, <code>RAPA_LLM_MODEL</code>, <code>RAPA_LLM_API_KEY</code></td><td>(nenhum)</td><td>o hub (endereço e modelo juntos) e a chave</td></tr>
+<tr><td><code>RAPA_LLM_CAPACIDADES</code></td><td>(nenhum)</td><td>a matriz da sonda, gravada por <code>python -m rapa.llm.probe --out</code> (obrigatória com o hub)</td></tr>
+<tr><td class="grupo" colspan="3">Publicar: agendas, webhooks e lotes</td></tr>
+<tr><td><code>RAPA_CHAVE_WEBHOOKS</code></td><td>(nenhuma: webhooks em 503)</td><td>a chave do servidor (32 caracteres ou mais) de que se deriva a de cada webhook</td></tr>
+<tr><td><code>RAPA_AGENDA_TOLERANCIA_S</code></td><td><code>600</code></td><td>até quantos segundos depois do horário uma ocorrência ainda roda (depois, fica registrada como perdida)</td></tr>
+<tr><td><code>RAPA_AGENDA_INTERVALO_S</code></td><td><code>5</code></td><td>de quantos em quantos segundos o despachante procura agendas vencidas</td></tr>
+<tr><td><code>RAPA_AGENDAS_POR_EMPRESA</code></td><td><code>200</code></td><td>agendas ligadas, no máximo, por empresa</td></tr>
+<tr><td><code>RAPA_WEBHOOKS_POR_SEGUNDO</code></td><td><code>200</code></td><td>leituras de webhook por segundo no processo, antes de conferir a assinatura (acima, 429)</td></tr>
+<tr><td><code>RAPA_LOTE_MAX_LINHAS</code>, <code>RAPA_LOTE_MAX_BYTES</code></td><td><code>1000</code>, 5 MiB</td><td>linhas e tamanho máximos da planilha de um lote</td></tr>
+<tr><td class="grupo" colspan="3">Conserto, certificado A1 e evidências</td></tr>
+<tr><td><code>RAPA_CONSERTO_CANDIDATOS</code></td><td><code>8</code></td><td>quantos candidatos o conserto mostra (1 a 20)</td></tr>
+<tr><td><code>RAPA_A1_AVISO_DIAS</code></td><td><code>30</code></td><td>quantos dias antes do vencimento de um A1 o aviso começa</td></tr>
+<tr><td><code>RAPA_VIDEO_EM_FALHAS</code></td><td><code>1</code></td><td>filma cada execução e guarda o vídeo só quando ela falha ou fica indeterminada</td></tr>
+<tr><td><code>RAPA_RETENCAO_SUCESSO_DIAS</code>, <code>RAPA_RETENCAO_FALHAS_DIAS</code>, <code>RAPA_RETENCAO_EVENTOS_DIAS</code></td><td><code>7</code>, <code>90</code>, <code>400</code></td><td>os prazos de retenção (<a href="#cfg-retencao">5.6</a>)</td></tr>
+<tr><td class="grupo" colspan="3">Execuções e sessões em pods</td></tr>
+<tr><td><code>RAPA_EXECUTOR</code>, <code>RAPA_SESSOES_EXECUTOR</code></td><td><code>local</code>, o de <code>RAPA_EXECUTOR</code></td><td><code>kubernetes</code>: cada tentativa (e cada sessão) num pod de uso único; sempre assim no cluster</td></tr>
+<tr><td><code>RAPA_K8S_NAMESPACE_EXECUCOES</code></td><td><code>rapa-execucoes</code></td><td>o namespace dos pods de uso único</td></tr>
+<tr><td><code>RAPA_K8S_IMAGEM_EXECUTOR</code></td><td>(obrigatória no modo <code>kubernetes</code>)</td><td>a imagem do executor</td></tr>
+<tr><td><code>RAPA_K8S_RUNTIME_CLASS</code></td><td><code>gvisor</code></td><td>a RuntimeClass dos pods; vazia, nenhuma (só kind e desenvolvimento)</td></tr>
+<tr><td><code>RAPA_K8S_CPU</code>, <code>RAPA_K8S_MEMORIA</code></td><td><code>1</code>, <code>2Gi</code></td><td>os limites (iguais aos pedidos) de cada pod</td></tr>
+<tr><td><code>RAPA_K8S_SA_EXECUTOR</code>, <code>RAPA_K8S_PULL_SECRET</code></td><td>(a conta <code>default</code>), (nenhum)</td><td>a conta dos pods (sem permissão e sem token; no chart, <code>rapa-executor</code>) e o Secret do registro</td></tr>
+<tr><td><code>RAPA_K8S_NODE_SELECTOR</code>, <code>RAPA_K8S_TOLERATIONS</code></td><td>(nenhum)</td><td>onde os pods rodam, em JSON</td></tr>
+<tr><td><code>RAPA_CANAL_PORTA</code></td><td><code>8081</code></td><td>onde o despachante ouve o canal dos pods; nunca a porta do serviço nem a das métricas</td></tr>
+<tr><td><code>RAPA_CANAL_ENDERECO</code></td><td><code>http://{ip}:&lt;porta&gt;</code></td><td>o endereço que os pods usam; precisa de <code>{ip}</code> (o IP da réplica); um Service é recusado na partida</td></tr>
+<tr><td class="grupo" colspan="3">Saída dos navegadores</td></tr>
+<tr><td><code>RAPA_PROXY_SAIDA</code></td><td>(nenhum)</td><td>o proxy HTTP CONNECT para a internet (<code>http://host:porta</code>; com senha, de um Secret)</td></tr>
+<tr><td><code>RAPA_REDES_INTERNAS_PERMITIDAS</code></td><td>(nenhuma)</td><td>CIDRs, separados por vírgula, que os robôs e as sessões alcançam além da internet</td></tr>
+<tr><td class="grupo" colspan="3">Cofre, armazenamento e chaves</td></tr>
+<tr><td><code>RAPA_COFRE</code></td><td><code>nenhum</code> (<code>dev</code> com <code>RAPA_DEV=1</code> e <code>RAPA_SEGREDOS_DEV</code>)</td><td>de onde vêm os segredos: <code>nenhum</code>, <code>dev</code> ou <code>openbao</code></td></tr>
+<tr><td><code>RAPA_BAO_ENDERECO</code>, <code>RAPA_BAO_CA</code></td><td>(obrigatório com o OpenBao), (os CAs do sistema)</td><td>o serviço ativo do OpenBao (<code>https://</code> fora do desenvolvimento) e o CA do TLS</td></tr>
+<tr><td><code>RAPA_BAO_KV</code>, <code>RAPA_BAO_TRANSIT</code></td><td><code>rapa</code>, <code>rapa-transit</code></td><td>as montagens do KV v2 e do transit</td></tr>
+<tr><td><code>RAPA_BAO_AUTH</code>, <code>RAPA_BAO_PAPEL</code></td><td><code>kubernetes</code>, (obrigatório)</td><td>o método de entrada e o papel do componente</td></tr>
+<tr><td><code>RAPA_BAO_TOKEN_SA</code></td><td><code>/var/run/secrets/rapa/bao/token</code></td><td>o token projetado da conta de serviço, com a audiência do OpenBao</td></tr>
+<tr><td><code>RAPA_BAO_TOKEN_ARQUIVO</code></td><td>(nenhum)</td><td>um token do OpenBao num arquivo: só em desenvolvimento</td></tr>
+<tr><td><code>RAPA_ARMAZENAMENTO</code></td><td><code>local</code></td><td><code>local</code> (a pasta dos artefatos) ou <code>s3</code> (cifrados); no cluster, sempre <code>s3</code></td></tr>
+<tr><td><code>RAPA_S3_ENDERECO</code>, <code>RAPA_S3_BUCKET</code></td><td>(obrigatórios com <code>s3</code>)</td><td>o S3 (<code>https://</code> fora do desenvolvimento) e o bucket</td></tr>
+<tr><td><code>RAPA_S3_REGIAO</code>, <code>RAPA_S3_CA</code>, <code>RAPA_S3_ESTILO_CAMINHO</code></td><td><code>us-east-1</code>, (os do sistema), <code>1</code></td><td>a região da assinatura, o CA e o bucket no caminho (o SeaweedFS)</td></tr>
+<tr><td><code>AWS_ACCESS_KEY_ID</code>, <code>AWS_SECRET_ACCESS_KEY</code></td><td>(obrigatórias com <code>s3</code>)</td><td>as credenciais do S3, de um Secret; o cliente nunca procura outras</td></tr>
+<tr><td><code>RAPA_CHAVES</code></td><td><code>openbao</code> com o cofre no OpenBao; senão <code>local</code></td><td>a chave de cada empresa que embrulha a de cada execução</td></tr>
+<tr><td><code>RAPA_CHAVE_ARTEFATOS</code></td><td>(sorteada por processo)</td><td>a chave mestra das chaves locais (32 caracteres ou mais): só desenvolvimento e testes</td></tr>
+<tr><td class="grupo" colspan="3">Observabilidade</td></tr>
+<tr><td><code>RAPA_METRICAS_PORTA</code></td><td><code>9100</code></td><td>a porta do <code>GET /metrics</code>, no mesmo endereço do serviço; <code>0</code> desliga</td></tr>
+<tr><td><code>RAPA_METRICAS_POR_EMPRESA</code></td><td><code>0</code></td><td><code>1</code> põe o rótulo <code>empresa</code> nas execuções concluídas, na fila e nos avisos do A1</td></tr>
+<tr><td><code>RAPA_LOG_JSON</code></td><td><code>0</code></td><td><code>1</code>: um objeto JSON por linha (<code>hora</code>, <code>nivel</code>, <code>logger</code>, <code>mensagem</code>, <code>rastreio</code>)</td></tr>
+<tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code>, <code>OTEL_EXPORTER_OTLP_TRACES_ENDPOINT</code>, <code>OTEL_SERVICE_NAME</code></td><td>(nenhum), (nenhum), <code>rapa</code></td><td>os traços OpenTelemetry por OTLP/HTTP (o extra <code>observability</code>)</td></tr>
+<tr><td><code>RAPA_GLITCHTIP_DSN</code></td><td>(nenhum)</td><td>as exceções não tratadas, limpas, no GlitchTip (o DSN vem de um Secret)</td></tr>
+</tbody></table></div>
+<p>As opções da linha de comando do serviço são só <code>--host</code> (padrão <code>127.0.0.1</code>) e <code>--port</code> (<code>8000</code>); na imagem de controle, <code>--host 0.0.0.0 --port 8000</code>.</p>
+
+<h3 id="cfg-valores">5.2 Valores principais do chart</h3>
+<p>Os valores ficam em <code>deploy/helm/rapa/values.yaml</code>, cada um com o comentário da variável que preenche. Os principais, com o padrão:</p>
+<div class="tabela"><table>
+<thead><tr><th class="col-var">Valor</th><th>Padrão</th><th>O que faz</th></tr></thead>
+<tbody>
+<tr><td class="grupo" colspan="3">Imagens e endereço</td></tr>
+<tr><td><code>images.control</code>, <code>images.executor</code></td><td><code>registro.exemplo.test/rapa/...</code>, sem digest</td><td>as imagens (o digest vale no lugar da tag); a do executor é <code>RAPA_K8S_IMAGEM_EXECUTOR</code></td></tr>
+<tr><td><code>images.executor.previousDigests</code></td><td><code>[]</code></td><td>os digests do executor que a admissão ainda aceita durante uma atualização</td></tr>
+<tr><td><code>images.pullSecrets</code>, <code>images.requireDigest</code></td><td><code>[]</code>, <code>false</code></td><td>o registro (o primeiro também nos pods de uso único) e a recusa sem digest</td></tr>
+<tr><td><code>publicUrl</code></td><td><code>""</code></td><td><code>RAPA_PUBLIC_URL</code></td></tr>
+<tr><td class="grupo" colspan="3">Identidade</td></tr>
+<tr><td><code>auth.jwt.*</code>, <code>auth.oidc.*</code></td><td>vazios</td><td>os tokens do Keycloak e o login da interface (o segredo em <code>auth.oidc.existingSecret</code>)</td></tr>
+<tr><td><code>auth.organizationAliases</code>, <code>auth.mcpOrigins</code>, <code>auth.liveOrigins</code></td><td>vazios</td><td><code>RAPA_ORGANIZATION_ALIASES</code>, <code>RAPA_MCP_ORIGENS</code>, <code>RAPA_ORIGENS_AO_VIVO</code></td></tr>
+<tr><td><code>auth.rateLimitPerSecond</code>, <code>auth.cookieSecure</code></td><td><code>"20"</code>, <code>true</code></td><td><code>RAPA_LIMITE_POR_SEGUNDO</code>, <code>RAPA_COOKIE_SEGURO</code></td></tr>
+<tr><td><code>auth.dev.*</code></td><td>desligado</td><td>o modo de desenvolvimento, só no kind e em testes</td></tr>
+<tr><td class="grupo" colspan="3">Banco</td></tr>
+<tr><td><code>database.host</code>, <code>database.sslMode</code>, <code>database.caSecret</code></td><td><code>rapa-banco-rw</code>, <code>verify-full</code>, <code>rapa-banco-ca</code></td><td>o banco (o <code>-rw</code> ou o Pooler) com o TLS conferido; a senha de cada papel entra na URL pela expansão <code>$(VAR)</code></td></tr>
+<tr><td><code>database.roles.*.existingSecret</code></td><td><code>rapa-banco-dono</code>, <code>-app</code>, <code>-despachante</code></td><td>os Secrets dos três papéis</td></tr>
+<tr><td><code>database.cnpg.enabled</code>, <code>database.cnpg.name</code></td><td><code>false</code> (<code>true</code> em <code>values-banco.yaml</code>), <code>rapa-banco</code></td><td>o Cluster (só na release do banco); o nome vale nas duas releases para as NetworkPolicies</td></tr>
+<tr><td><code>database.cnpg.instances</code>, <code>storage.size</code>, <code>walStorage.size</code></td><td><code>3</code>, <code>50Gi</code>, <code>20Gi</code></td><td>o tamanho do Cluster</td></tr>
+<tr><td><code>database.cnpg.backup.*</code></td><td>ligado, <code>s3://rapa-backups/banco</code>, <code>30d</code>, <code>"0 0 3 * * *"</code></td><td>o Barman Cloud: o destino, a retenção e o backup diário</td></tr>
+<tr><td><code>database.cnpg.recovery.*</code>, <code>database.cnpg.pooler.enabled</code></td><td>desligados</td><td>a restauração (4.13) e o Pooler do PgBouncer em modo sessão</td></tr>
+<tr><td><code>migration.enabled</code>, <code>migration.grantsJob.enabled</code></td><td><code>true</code>, <code>false</code></td><td>o Job da migração e o Job das permissões</td></tr>
+<tr><td class="grupo" colspan="3">Execuções</td></tr>
+<tr><td><code>executions.namespace</code>, <code>executions.createNamespace</code></td><td><code>rapa-execucoes</code>, <code>true</code></td><td>o namespace dos pods de uso único, com a Pod Security <code>restricted</code></td></tr>
+<tr><td><code>executions.runtimeClass</code>, <code>executions.cpu</code>, <code>executions.memory</code></td><td><code>gvisor</code>, <code>"1"</code>, <code>2Gi</code></td><td><code>RAPA_K8S_RUNTIME_CLASS</code>, <code>RAPA_K8S_CPU</code>, <code>RAPA_K8S_MEMORIA</code></td></tr>
+<tr><td><code>executions.serviceAccount</code>, <code>nodeSelector</code>, <code>tolerations</code></td><td><code>rapa-executor</code>, vazios</td><td>a conta sem permissão e onde os pods rodam</td></tr>
+<tr><td><code>executions.channel.port</code>, <code>executions.channel.ipv6</code></td><td><code>8081</code>, <code>false</code></td><td>o canal do despachante; <code>ipv6</code> marca o cluster IPv6</td></tr>
+<tr><td><code>executions.sessionPort</code></td><td><code>8765</code></td><td>a porta do WebSocket do host de sessão (fixa no código)</td></tr>
+<tr><td><code>executions.egress.proxy.*</code></td><td>vazio, porta 3128</td><td>o proxy de saída (<code>url</code> ou <code>existingSecret</code>) e as redes dele (<code>cidrs</code>)</td></tr>
+<tr><td><code>executions.egress.allowedInternalNetworks</code>, <code>extraInternalNetworks</code></td><td><code>[]</code></td><td>os portais internos permitidos e as redes internas a mais que os robôs nunca alcançam</td></tr>
+<tr><td><code>executions.egress.directInternet</code></td><td><code>true</code></td><td>a saída direta para a internet; desligue quando ela só sai pelo proxy</td></tr>
+<tr><td><code>executions.admissionPolicy.enabled</code></td><td><code>true</code></td><td>a <code>ValidatingAdmissionPolicy</code> dos pods de uso único</td></tr>
+<tr><td class="grupo" colspan="3">Rede e entrada</td></tr>
+<tr><td><code>network.listenAddress</code>, <code>network.policies.enabled</code></td><td><code>0.0.0.0</code>, <code>true</code></td><td>o endereço dos processos (<code>"::"</code> em IPv6) e as NetworkPolicies</td></tr>
+<tr><td><code>network.egress.*</code></td><td>cofre, identidade e armazenamento por namespace; hub, API do Kubernetes e observabilidade vazios</td><td>os destinos de saída do plano de controle; sem <code>to</code>, o destino fica fechado</td></tr>
+<tr><td><code>gateway.enabled</code>, <code>gateway.hostnames</code>, <code>gateway.parentRefs</code></td><td><code>false</code>, <code>[]</code>, <code>rapa-externo</code> / <code>https</code></td><td>as <code>HTTPRoute</code> no Gateway do Envoy</td></tr>
+<tr><td><code>gateway.trustedNetworks</code></td><td><code>[]</code></td><td><code>FORWARDED_ALLOW_IPS</code>: as redes dos pods do Envoy (obrigatórias com o gateway)</td></tr>
+<tr><td><code>gateway.requestTimeout</code>, <code>gateway.webAffinityCookie</code></td><td><code>180s</code>, <code>rapa_afinidade</code></td><td>o prazo dos pedidos comuns e o cookie da afinidade da web</td></tr>
+<tr><td><code>apiDocs</code></td><td><code>false</code></td><td><code>RAPA_DOCS_API</code></td></tr>
+<tr><td class="grupo" colspan="3">Componentes</td></tr>
+<tr><td><code>web.replicas</code>, <code>web.sessions.*</code></td><td><code>1</code>; <code>2</code>, <code>""</code>, <code>600</code>, <code>3600</code></td><td>a interface e os limites das sessões</td></tr>
+<tr><td><code>api.replicas</code>, <code>api.hpa.*</code></td><td><code>2</code>; desligado (2 a 6, 70% de CPU)</td><td>a REST e o MCP</td></tr>
+<tr><td><code>dispatcher.replicas</code>, <code>dispatcher.concurrency</code></td><td><code>2</code>, <code>4</code></td><td>o despachante e <code>RAPA_CONCORRENCIA</code> por réplica</td></tr>
+<tr><td><code>dispatcher.healthPort</code>, <code>dispatcher.terminationGracePeriodSeconds</code>, <code>dispatcher.workSizeLimit</code></td><td><code>8080</code>, <code>2400</code>, <code>20Gi</code></td><td>a saúde para os probes, a espera das execuções ao sair e a pasta de trabalho</td></tr>
+<tr><td><code>operation.workSizeLimit</code>, <code>operation.activeDeadlineSeconds</code></td><td><code>50Gi</code>, <code>14400</code></td><td>o disco da exportação e o prazo do pod da operação</td></tr>
+<tr><td class="grupo" colspan="3">Cofre, armazenamento e observabilidade</td></tr>
+<tr><td><code>vault.mode</code>, <code>vault.address</code>, <code>vault.caSecret</code></td><td><code>openbao</code>, <code>https://openbao.cofre.svc:8200</code>, <code>rapa-openbao-ca</code></td><td><code>RAPA_COFRE</code> (só no despachante e na operação), <code>RAPA_BAO_ENDERECO</code>, <code>RAPA_BAO_CA</code></td></tr>
+<tr><td><code>vault.roles.*</code>, <code>vault.tokenAudience</code></td><td><code>rapa-despachante</code>, <code>rapa-web</code>, <code>rapa-api</code>, <code>rapa-operacao</code>; <code>openbao</code></td><td>o <code>RAPA_BAO_PAPEL</code> de cada componente e a audiência do token projetado</td></tr>
+<tr><td><code>storage.mode</code>, <code>storage.s3.*</code></td><td><code>s3</code>, <code>https://seaweedfs-s3.armazenamento.svc:8333</code>, <code>rapa-artefatos</code>, <code>rapa-s3</code></td><td><code>RAPA_ARMAZENAMENTO</code> e <code>RAPA_S3_*</code></td></tr>
+<tr><td><code>keys.mode</code></td><td><code>openbao</code></td><td><code>RAPA_CHAVES</code></td></tr>
+<tr><td><code>observability.*</code></td><td><code>9100</code>, sem rótulo de empresa, logs em JSON, sem OTLP nem GlitchTip, sem <code>VMPodScrape</code></td><td>métricas, logs, traços e GlitchTip</td></tr>
+<tr><td><code>modelHub.*</code></td><td>vazios</td><td><code>RAPA_LLM_*</code>, com a matriz da sonda num ConfigMap</td></tr>
+<tr><td class="grupo" colspan="3">Publicar, conserto, A1 e evidências</td></tr>
+<tr><td><code>publishing.webhookKey.existingSecret</code></td><td><code>""</code></td><td><code>RAPA_CHAVE_WEBHOOKS</code> (vazio: webhooks em 503)</td></tr>
+<tr><td><code>publishing.*</code></td><td><code>600</code>, <code>5</code>, <code>200</code>, <code>200</code>, <code>1000</code>, <code>5242880</code></td><td>agendas, webhooks e lotes</td></tr>
+<tr><td><code>repairCandidates</code>, <code>a1WarnDays</code></td><td><code>8</code>, <code>30</code></td><td><code>RAPA_CONSERTO_CANDIDATOS</code>, <code>RAPA_A1_AVISO_DIAS</code></td></tr>
+<tr><td><code>evidence.*</code></td><td>vídeo ligado; <code>7</code>, <code>90</code>, <code>400</code></td><td><code>RAPA_VIDEO_EM_FALHAS</code> e os prazos de retenção</td></tr>
+</tbody></table></div>
+<p>No cluster, <code>RAPA_EXECUTOR</code> (no despachante) e <code>RAPA_SESSOES_EXECUTOR</code> (na web) são sempre <code>kubernetes</code>; a web e a api têm <code>RAPA_COFRE=nenhum</code> (só o despachante e a operação leem segredos). A tabela completa de valor para variável está em OPERACAO 1.4; os valores do kind, em <code>deploy/helm/rapa/values-kind.yaml</code>.</p>
+
+<h3 id="cfg-pessoas">5.3 Empresas, áreas, pessoas e papéis</h3>
+<h4>O CLI <code>python -m rapa.control.admin</code></h4>
+<div class="tabela"><table>
+<thead><tr><th>Comando</th><th>Banco</th><th>O que faz</th></tr></thead>
+<tbody>
+<tr><td><code>empresa criar NOME --organizacao ORG --admin SUJEITO [--nome-admin] [--area ...] [--vagas 1] [--fila 1000] [--emprestimo 2.0]</code></td><td>aplicação</td><td>cria a empresa ligada à organização, com o administrador e as áreas, numa transação</td></tr>
+<tr><td><code>empresa consumo EMPRESA --mes AAAA-MM [--json]</code></td><td>aplicação</td><td>o consumo do mês, por área e por origem</td></tr>
+<tr><td><code>empresa congelar EMPRESA --motivo TEXTO</code></td><td>dono</td><td>nada novo começa; a fila é cancelada</td></tr>
+<tr><td><code>empresa descongelar EMPRESA</code></td><td>dono</td><td>volta a empresa a ativa</td></tr>
+<tr><td><code>empresa exportar EMPRESA --saida ARQUIVO [--pasta-arquivos] [--pasta-artefatos]</code></td><td>dono</td><td>exporta tudo num <code>.tar.gz</code> 0600, sem material de chave</td></tr>
+<tr><td><code>empresa apagar EMPRESA --confirmar "NOME" [--segredos-fora-do-openbao]</code></td><td>dono</td><td>apaga uma empresa congelada, os artefatos, os segredos e a chave transit (sem volta)</td></tr>
+<tr><td><code>empresa NOME [--vagas] [--fila]</code>, <code>area EMPRESA NOME</code>, <code>usuario EMPRESA SUJEITO [--nome] [--papel ...]</code></td><td>aplicação</td><td>o cadastro antigo, sem o vínculo com a organização (auditado)</td></tr>
+</tbody></table></div>
+<p>Opções comuns: <code>--url</code> (padrão <code>RAPA_DATABASE_URL</code>), <code>--url-dono</code> (padrão <code>RAPA_OWNER_DATABASE_URL</code>) e <code>--por</code> (quem pediu, para a auditoria; padrão: o usuário do sistema). Nenhum comando imprime segredos. A saída de uma empresa segue sempre a ordem congelar, exportar, entregar o arquivo, apagar (OPERACAO, Parte 2, seção 3).</p>
+<h4>Papéis</h4>
+<div class="tabela"><table>
+<thead><tr><th>Papel</th><th>Na tela</th><th>O que permite</th></tr></thead>
+<tbody>
+<tr><td><code>company_admin</code></td><td>Administração da empresa</td><td>tudo na empresa: dá e tira papéis, desativa pessoas, cria e renomeia áreas, vê o consumo</td></tr>
+<tr><td><code>area_admin</code></td><td>Administração da área</td><td>os papéis da área dele, registrar credenciais, criar agendas, webhooks e lotes</td></tr>
+<tr><td><code>creator</code></td><td>Criação de robôs</td><td>gravar, criar versões e pedir conserto; executar</td></tr>
+<tr><td><code>approver</code></td><td>Aprovação</td><td>validar e publicar versões de outras pessoas; ver os candidatos do conserto; executar</td></tr>
+<tr><td><code>operator</code></td><td>Operação</td><td>executar e criar agendas, webhooks e lotes</td></tr>
+<tr><td><code>auditor</code></td><td>Auditoria</td><td>ver o consumo (na empresa ou na área)</td></tr>
+<tr><td><code>viewer</code></td><td>Leitura</td><td>ver o que é da área (qualquer papel na área já dá a leitura)</td></tr>
+<tr><td><code>credential_custodian</code></td><td>Custódia de credenciais</td><td>renovar o A1 e autorizar robôs a usá-lo</td></tr>
+<tr><td><code>platform_admin</code></td><td>Administração da plataforma</td><td>nunca dado nem tirado pela tela Empresa</td></tr>
+</tbody></table></div>
+<p>Um papel na empresa inteira soma com os da área. Na tela <b>Empresa</b> (ou em <code>PUT /v1/empresa/usuarios/{id}/papeis</code>), quem administra a empresa dá e tira papéis por área ou na empresa inteira, desativa e reativa pessoas e cria e renomeia áreas; quem administra uma área faz o mesmo só com os papéis dela. Ninguém tira o último administrador ativo nem desativa a si mesmo. <b>Usuários no primeiro login:</b> quem entra pela primeira vez com um token de uma organização ligada vira usuário sem papel (o nome vem do claim <code>name</code> ou <code>preferred_username</code>), com a auditoria <code>usuario.criado_no_login</code>.</p>
+
+<h3 id="cfg-a1">5.4 Credenciais e certificado A1</h3>
+<ol class="lista-passos">
+  <li><b>O segredo no cofre.</b> O custodiante grava o segredo direto no OpenBao, com a política da empresa dele, em <code>rapa/data/empresas/&lt;uuid da empresa&gt;/&lt;caminho&gt;</code>, com os campos <code>username</code>, <code>password</code>, <code>totp_secret</code>, <code>pfx_base64</code> (o A1 em base64) e <code>pfx_password</code>. Exemplo, com valores fictícios:
+<pre><code>bao kv put -mount=rapa empresas/00000000-0000-4000-8000-000000000001/portal/acesso \
+  username=usuario-de-exemplo password=@/caminho/da/senha-de-exemplo.txt</code></pre></li>
+  <li><b>O registro.</b> Quem administra a área registra a credencial na tela <b>Credenciais</b> (ou em <code>POST /v1/credenciais</code>): a área, o nome (o mesmo do robô), o tipo, a origem, o caminho no cofre e, no A1, o custodiante (outra pessoa, com o papel de custódia), a validade e a impressão SHA-256 (opcional). O RaPA nunca recebe o arquivo nem a senha.</li>
+  <li><b>A autorização.</b> O custodiante abre a tela do robô e clica em <b>Autorizar este robô neste portal</b> (<code>/v1/robos/{id}/autorizacoes-a1</code>). Ele nunca autoriza um robô cuja versão mais nova (ou a publicada) ele criou.</li>
+  <li><b>Duas aprovações.</b> Duas pessoas com o papel de aprovação, que não são o custodiante, aprovam a versão (a tela mostra "1 de 2 aprovações"); a segunda publica.</li>
+  <li><b>Renovação.</b> Com o certificado novo no cofre, o custodiante registra a validade nova (<code>PATCH /v1/credenciais/{id}</code>) e a impressão nova, se havia uma; com a impressão trocada, as autorizações antigas caem e ele autoriza os robôs de novo.</li>
+  <li><b>Avisos.</b> A partir de <code>RAPA_A1_AVISO_DIAS</code> dias antes (30), o aviso aparece no topo para custodiantes e administradores, na tela Credenciais e em <code>GET /v1/credenciais/vencimentos</code>, uma vez por dia na auditoria e nas métricas <code>rapa_a1_*</code>.</li>
+</ol>
+<div class="aviso atencao">
+  <span class="rotulo">Atenção</span>
+  <p>A impressão é a que quem registra e o custodiante informam: o RaPA não lê o PFX. O caminho no cofre é da empresa, não da área. E a separação de funções compara sujeitos: uma mesma pessoa com dois logins diferentes passa por duas.</p>
+</div>
+
+<h3 id="cfg-capacidade">5.5 Cotas e capacidade</h3>
+<ul>
+  <li><b>Por empresa</b>, na entrada (<code>empresa criar</code>): <code>--vagas</code> (execuções garantidas ao mesmo tempo; padrão 1), <code>--fila</code> (máximo na fila; 1000) e <code>--emprestimo</code> (o teto com empréstimo é a garantia vezes esse fator: acima da garantia, a empresa só usa vagas ociosas, que nenhuma outra precisa para a própria garantia; 2.0). Com a fila cheia, a REST responde 429 (<code>limite_excedido</code>). O CLI não tem um comando para mudar a cota depois.</li>
+  <li><b>Da plataforma</b>: <code>platform_settings.total_browser_slots</code> (30 na migração inicial), alterado como o dono das tabelas, com 10% reservados para gravação, controle ao vivo e testes (<code>interactive_reserve_ratio</code>).</li>
+  <li><b>Vazão</b>: réplicas do despachante (<code>dispatcher.replicas</code>) vezes <code>dispatcher.concurrency</code>, e os nós de execução (cada pod pede <code>executions.cpu</code> e <code>executions.memory</code> mais o custo do gVisor) e a cota do namespace, se houver.</li>
+  <li><b>Prioridade</b>: interativo, depois MCP, REST e interface, depois agenda e webhook, depois lote.</li>
+  <li><b>Outros limites</b>: <code>RAPA_SESSOES_POR_EMPRESA</code> e <code>RAPA_SESSOES_MAX</code>, <code>RAPA_AGENDAS_POR_EMPRESA</code>, o limite por minuto de cada webhook (<code>por_minuto</code>), <code>RAPA_WEBHOOKS_POR_SEGUNDO</code>, <code>RAPA_LOTE_MAX_LINHAS</code>, <code>RAPA_LOTE_MAX_BYTES</code> e <code>RAPA_LIMITE_POR_SEGUNDO</code>.</li>
+</ul>
+
+<h3 id="cfg-retencao">5.6 Retenção das evidências</h3>
+<p>O despachante roda a retenção uma vez por hora (a cada minuto enquanto fica para trás):</p>
+<ul>
+  <li>telas e vídeo de execuções que deram certo ou foram canceladas: depois de <code>RAPA_RETENCAO_SUCESSO_DIAS</code> (7); os arquivos baixados por elas ficam;</li>
+  <li>as evidências (tudo de uma execução que falhou ou ficou indeterminada, e os arquivos baixados das que deram certo) e os retratos do conserto: depois de <code>RAPA_RETENCAO_FALHAS_DIAS</code> (90), com a chave da execução destruída;</li>
+  <li>as chaves de idempotência vencidas; as partições de eventos: depois de <code>RAPA_RETENCAO_EVENTOS_DIAS</code> (400).</li>
+</ul>
+<p>Todos os prazos têm no mínimo 1 dia, e o de sucesso não pode passar o de falhas (o servidor não sobe). O que foi apagado aparece como <b>expirado</b> (a API responde 410). Nada de uma empresa congelada expira.</p>
+<div class="aviso atencao">
+  <span class="rotulo">Atenção</span>
+  <p>Os prazos ainda estão a validar com o jurídico. Mudá-los é mudar os valores <code>evidence.*</code> do chart.</p>
+</div>
+
+<h3 id="cfg-docs-api">5.7 Documentação da API</h3>
+<p>Desligada por padrão. Com <code>RAPA_DOCS_API=1</code> (<code>apiDocs: true</code> no chart), o serviço mostra o Swagger UI em <code>/v1/docs</code>, com os arquivos servidos por ele mesmo (sem CDN, sem o validador público) e o documento OpenAPI em <code>/v1/openapi.json</code> (só as rotas de <code>/v1</code>). As duas abrem sem token e mostram só as rotas e os formatos. Para chamar a API pela página, informe o token em <b>Authorize</b> (sem a palavra <code>Bearer</code>; ele fica só na página aberta) e use <b>Try it out</b>: cada chamada vale como qualquer outra, com os papéis do dono do token. O OpenAPI dos robôs publicados de cada pessoa (<code>GET /v1/openapi-robos.json</code>, com token) está sempre ligado. Ligue onde a documentação for útil (desenvolvimento, homologação, a rede interna).</p>
+
+<h3 id="cfg-observabilidade">5.8 Observabilidade e saúde</h3>
+<ul>
+  <li><b>Sondas.</b> Vida em <code>/saude</code> (503 só pelo despachante parado ou com uma etapa falhando há tempo demais) e prontidão em <code>/saude/pronto</code> (503 com os nomes do que falhou: <code>banco</code>, <code>banco_despachante</code>, <code>despachante</code>, <code>openbao</code> e <code>s3</code>). No despachante, as duas ficam na porta da saúde (<code>dispatcher.healthPort</code>, 8080), nunca na do canal.</li>
+  <li><b>Métricas</b> em <code>GET /metrics</code> na <code>RAPA_METRICAS_PORTA</code>, numa porta própria, nunca pelo gateway; o VictoriaMetrics lê direto do pod (o <code>VMPodScrape</code> opcional do chart). Sem id de execução, nome de robô, de pessoa ou de empresa nos rótulos (o rótulo <code>empresa</code> só com <code>RAPA_METRICAS_POR_EMPRESA=1</code>).</li>
+  <li><b>Alertas que valem a pena</b>: <code>rapa_despachante_saudavel == 0</code>; <code>rapa_despachante_etapa_ok == 0</code> por mais de alguns minutos; <code>rapa_fila_espera_maxima_segundos</code> alta; <code>time() - rapa_banco_lido_em_segundos &gt; 120</code>; <code>rapa_a1_dias_para_vencer &lt; 7</code>; <code>rapa_a1_em_aviso{tipo="vencido"} &gt; 0</code>; aumento de <code>rapa_webhook_entregas_total{resultado="assinatura_invalida"}</code>; <code>rapa_http_pedidos_total{codigo=~"5.."}</code>. Com mais de um despachante, use <code>max</code> na fila e <code>sum</code> nas execuções concluídas.</li>
+  <li><b>Logs em JSON</b> com <code>RAPA_LOG_JSON=1</code> (ligado no chart); <b>traços</b> só com <code>OTEL_EXPORTER_OTLP_ENDPOINT</code>, com uma lista fechada de atributos; <b>GlitchTip</b> só com <code>RAPA_GLITCHTIP_DSN</code>, só com o tipo e a pilha das exceções (a mensagem vira <code>(mensagem omitida)</code>).</li>
+</ul>
+<p>Para conferir à mão, num port-forward do pod:</p>
+<pre><code>curl -s http://127.0.0.1:8000/saude/pronto     # no despachante, a porta 8080
+curl -s http://127.0.0.1:9100/metrics | grep -E '^rapa_(fila|despachante_saudavel|a1_)'</code></pre>
+
+<h3 id="cfg-saida">5.9 Saída dos navegadores: proxy e redes internas</h3>
+<p>Os pods de execução e de sessão só saem para o DNS, para o canal do despachante (só os de execução) e para a internet menos as redes internas (10/8, 172.16/12, 192.168/16, 100.64/10, 169.254/16, 127/8, 0/8 e as de IPv6 equivalentes, inclusive as carregadas pelo NAT64 e pelo 6to4), mais as redes permitidas e o proxy. Dentro do pod, a guarda de saída só deixa os <code>allowed_domains</code> do robô e recusa a própria máquina, o link-local e o metadata da nuvem.</p>
+<ul>
+  <li><b>Portais da intranet</b>: <code>executions.egress.allowedInternalNetworks</code> (<code>RAPA_REDES_INTERNAS_PERMITIDAS</code>), CIDRs estreitos (/16 ou mais em IPv4, /48 ou mais em IPv6), que abrem a guarda e a NetworkPolicy. Uma rede permitida que inclua as do plano de controle as abre para os robôs.</li>
+  <li><b>Proxy corporativo autenticado</b>: <code>executions.egress.proxy.url</code> sem senha, ou, com usuário e senha, o Secret <code>rapa-proxy</code> em <code>executions.egress.proxy.existingSecret</code> (a URL <code>http://usuario:senha@host:porta</code>); a guarda manda os dois no <code>Proxy-Authorization: Basic</code> de cada <code>CONNECT</code>, e eles nunca vão numa linha de comando. Informe também <code>executions.egress.proxy.cidrs</code> e <code>port</code> para a NetworkPolicy. Sem internet direta, desligue <code>executions.egress.directInternet</code>.</li>
+  <li><b>Fora do cluster</b>, no lançador local, a guarda só fica desligada no modo de desenvolvimento sem redes internas permitidas nem proxy de saída; nos pods, ela está sempre ligada.</li>
+  <li><b>Outras redes internas</b> que os robôs nunca alcançam (o pool de IPs do cliente no Outposts, uma rede da empresa fora da RFC 1918, o bloco IPv6 da VPC): <code>executions.egress.extraInternalNetworks</code>.</li>
+</ul>
+<div class="aviso perigo">
+  <span class="rotulo">Perigo</span>
+  <p>No pod, o usuário e a senha do proxy ficam no ambiente inicial do worker e no Secret montado da sessão, que o navegador sem sandbox (o mesmo usuário) lê se uma página o comprometer: use uma conta do proxy só para os robôs.</p>
+</div>
+</section>
+
+<!-- =========================================================================== -->
+<section class="parte" id="uso" aria-labelledby="t-uso">
+<h2 id="t-uso"><span class="parte-rotulo">Parte 6</span>6. Uso, tela a tela</h2>
+<p>As telas abaixo são capturas reais do RaPA sobre a "Empresa Demonstração" (dados inventados), em 1440x900. O menu muda conforme os papéis de quem entrou: <b>Gravar</b> só aparece para quem cria robôs, e <b>Empresa</b> para quem administra ou audita. Clique numa imagem para abri-la no tamanho original.</p>
+
+<h3 id="uso-entrar">6.1 Entrar</h3>
+<p>Em produção, a tela <code>/entrar</code> tem o botão <b>Entrar com a conta corporativa</b>, que leva ao Keycloak (o login OIDC do cliente <code>rapa-interface</code>); a empresa vem da organização da pessoa. No modo de desenvolvimento, a tela <code>/entrar</code> lista um perfil por pessoa do arquivo de tokens (<a href="#fig-entrar">Figura 2</a>). Quem entra sem papel nenhum só vê o pedido para um administrador dar um papel.</p>
+
+<h3 id="uso-catalogo">6.2 Catálogo e Executar</h3>
+<p>O <b>Catálogo</b> (<a href="#fig-catalogo">Figura 3</a>) mostra os robôs publicados que a pessoa pode usar, com o efeito (Leitura, Gravação ou Irreversível), a versão e a busca. <b>Ver passos</b> abre a descrição do robô; <b>Executar</b> abre o formulário das entradas. Num robô irreversível, a pessoa confirma que entende a ação antes de executar; o resultado aparece logo abaixo e é atualizado até a execução terminar.</p>
+<figure id="fig-executar">
+  <a class="imagem" href="img/17-executar.png"><img src="img/17-executar.png" width="2880" height="2042" loading="lazy" alt="Formulário Executar Emitir protocolo com nome, CPF e UF, a confirmação do passo irreversível e o resultado com o número do protocolo"></a>
+  <figcaption><b>Figura 4.</b> Executar pela interface: o formulário das entradas, a confirmação do passo irreversível e o resultado da execução, atualizado até terminar (Eduarda Martins). Endereço: <code>/executar/emitir_protocolo</code>.</figcaption>
+</figure>
+
+<h3 id="uso-execucoes">6.3 Execuções e evidências</h3>
+<p><b>Execuções</b> lista as mais recentes das áreas da pessoa, de todas as origens. A tela de uma execução mostra a versão, a origem, os horários, os passos concluídos, o resultado (as saídas que o robô declara) e as <b>Evidências</b>: as telas em miniatura (clique para ver grande), o vídeo da falha e os arquivos baixados, com tamanho e data. Quem vê a execução vê as evidências; o que a retenção apagou aparece como expirado.</p>
+<figure id="fig-execucoes">
+  <a class="imagem" href="img/07-execucoes.png"><img src="img/07-execucoes.png" width="2880" height="1800" loading="lazy" alt="Lista de execuções com o robô, a situação, a origem e os horários"></a>
+  <figcaption><b>Figura 5.</b> Execuções: as mais recentes das áreas da pessoa, de todas as origens (interface, API REST, MCP, agenda, webhook e lote). Endereço: <code>/execucoes</code>.</figcaption>
+</figure>
+<figure id="fig-execucao-sucesso">
+  <a class="imagem" href="img/18-execucao-sucesso.png"><img src="img/18-execucao-sucesso.png" width="2880" height="2354" loading="lazy" alt="Execução concluída com os detalhes, a tabela lida no portal e os arquivos baixados"></a>
+  <figcaption><b>Figura 6.</b> Execução que deu certo: os detalhes, a tabela lida no portal e os arquivos baixados, com tamanho e data. Endereço: <code>/execucoes/{execucao}</code>.</figcaption>
+</figure>
+<figure id="fig-execucao-falha">
+  <a class="imagem" href="img/08-execucao-evidencias.png"><img src="img/08-execucao-evidencias.png" width="2880" height="2874" loading="lazy" alt="Execução que falhou com o erro elemento não encontrado, o vídeo da falha, a tela guardada e o botão Consertar este passo"></a>
+  <figcaption><b>Figura 7.</b> Execução que falhou: o erro (<code>elemento_nao_encontrado</code>), o vídeo da falha, as telas guardadas e o botão <b>Consertar este passo</b>.</figcaption>
+</figure>
+<p>Os códigos de erro mais comuns: <code>elemento_nao_encontrado</code> e <code>elemento_ambiguo</code> (o conserto ajuda), <code>dominio_nao_permitido</code> (o passo abriu um domínio fora do manifesto), <code>segredo_indisponivel</code> (a credencial ou o segredo falta), <code>certificado_a1_bloqueado</code>, <code>executor_nao_iniciou</code> (o pod não subiu) e <code>empresa_congelada</code>. Uma execução <b>indeterminada</b> parou depois de um passo irreversível: confira o sistema de destino antes de rodar de novo.</p>
+
+<h3 id="uso-gravar">6.4 Gravar e revisar</h3>
+<p>Quem tem o papel de criação abre <b>Gravar</b>, escolhe a área, informa o endereço inicial e o nome da tarefa. O navegador da nuvem abre ao vivo: a pessoa usa o próprio mouse e teclado (acentos e colar funcionam); senhas digitadas não entram na gravação. Sem atividade por 10 minutos (<code>RAPA_SESSAO_OCIOSA_S</code>) ou passados 60 minutos (<code>RAPA_SESSAO_MAX_S</code>), a sessão termina e nada é guardado. No fim, <b>Parar e revisar</b>.</p>
+<figure id="fig-gravar">
+  <a class="imagem" href="img/16-gravar.png"><img src="img/16-gravar.png" width="2880" height="1800" loading="lazy" alt="Tela Gravar com a área, o endereço inicial, o nome da tarefa e as gravações anteriores"></a>
+  <figcaption><b>Figura 8.</b> Gravar: a área, o endereço inicial e o nome da tarefa para abrir o navegador da nuvem, e as gravações anteriores da pessoa (Bruno Reis, criação de robôs). Endereço: <code>/gravar</code>.</figcaption>
+</figure>
+<figure id="fig-ao-vivo">
+  <a class="imagem" href="img/05-gravar-ao-vivo.png"><img src="img/05-gravar-ao-vivo.png" width="2880" height="2026" loading="lazy" alt="Gravação ao vivo do formulário Emitir protocolo no portal de teste, com o tempo restante e o botão Parar e revisar"></a>
+  <figcaption><b>Figura 9.</b> Gravação ao vivo: o navegador da nuvem mostra o portal de teste v1 e a pessoa preenche o formulário com o próprio mouse e teclado. Endereço: <code>/gravar/{sessao}</code>.</figcaption>
+</figure>
+<p>Na <b>revisão</b>, a pessoa confere os dados do robô (nome técnico, título, descrição), as entradas propostas (os valores que mudam a cada execução, como um CPF ou um nome) e os nomes dos passos. Tudo começa em "Rejeitar": só o que a pessoa aceita entra. Sem o hub do modelo, um aviso no topo diz que só as sugestões das regras aparecem. <b>Criar rascunho</b> aplica as escolhas pelo portão de política e cria a versão 1 em rascunho, que outra pessoa aprova.</p>
+<figure id="fig-revisao">
+  <a class="imagem" href="img/06-revisao-gravacao.png"><img class="alta" src="img/06-revisao-gravacao.png" width="2880" height="4456" loading="lazy" alt="Revisão da gravação com o aviso sem o modelo, os dados do robô, as entradas aceitas e os nomes dos passos"></a>
+  <figcaption><b>Figura 10.</b> Revisão da gravação: os dados do robô, as entradas propostas pelas regras (aceitas aqui) e os nomes dos passos, para conferir antes de criar o rascunho; sem o hub de LLM, um aviso no topo. Endereço: <code>/gravar/{sessao}/revisar</code>.</figcaption>
+</figure>
+
+<h3 id="uso-robos">6.5 Robôs, versões e aprovações</h3>
+<p><b>Robôs</b> lista os robôs das áreas da pessoa, com a situação e a versão publicada, e tem o cartão para criar uma versão a partir do manifesto em JSON (o mesmo de <code>POST /v1/robos</code>). A tela de um robô mostra as versões, as mudanças em relação à anterior, os passos, as entradas, as saídas, as credenciais do cofre e os domínios permitidos. O caminho de uma versão: rascunho, <b>Marcar como validada</b>, <b>Publicar</b> por outra pessoa com o papel de aprovação. Ao publicar, o robô vira ferramenta MCP e endpoint REST para quem tem acesso à área. O botão só aparece quando o servidor aceitaria.</p>
+<figure id="fig-robos">
+  <a class="imagem" href="img/03-robos.png"><img src="img/03-robos.png" width="2880" height="2126" loading="lazy" alt="Lista de robôs com a situação e a versão, e o cartão para criar uma versão a partir do manifesto"></a>
+  <figcaption><b>Figura 11.</b> Robôs: os robôs das áreas da pessoa, com a situação e a versão publicada, e o cartão para criar uma versão a partir do manifesto em JSON (Bruno Reis). Endereço: <code>/robos</code>.</figcaption>
+</figure>
+<figure id="fig-robo-a1">
+  <a class="imagem" href="img/04-robo-versoes-aprovacoes.png"><img class="alta" src="img/04-robo-versoes-aprovacoes.png" width="2880" height="4236" loading="lazy" alt="Tela do robô com certificado A1: versão 1 validada com 1 de 2 aprovações, o cartão do certificado com a autorização da custodiante, os passos, as entradas e as credenciais"></a>
+  <figcaption><b>Figura 12.</b> Tela do robô com certificado A1: versões, 1 de 2 aprovações, o cartão do A1 com a autorização da custodiante, os passos, as entradas e as credenciais (Daniel Rocha, aprovação). Endereço: <code>/robos/{robo}</code>.</figcaption>
+</figure>
+
+<h3 id="uso-conserto">6.6 Consertar um passo</h3>
+<p>Quando o alvo de um passo não é encontrado (ou é encontrado mais de uma vez), a tela da execução mostra <b>Consertar este passo</b> (<a href="#fig-execucao-falha">Figura 7</a>). Quem cria robôs na área vê o passo que quebrou, a sugestão do modelo (sem o hub, a pessoa escolhe sozinha) e os candidatos, da maior nota para a menor, montados só do retrato da página na hora da falha: nada é executado de novo. Escolhido o elemento, <b>Criar a versão consertada</b> cria a próxima versão em rascunho, só com aquele alvo trocado, que outra pessoa, com o papel de aprovação, valida e publica. Robôs com A1 não têm conserto assistido.</p>
+<figure id="fig-conserto">
+  <a class="imagem" href="img/09-conserto.png"><img src="img/09-conserto.png" width="2880" height="2936" loading="lazy" alt="Tela Consertar este passo com o passo que quebrou, a sugestão do modelo desligada, quatro candidatos com nota e a escolha do elemento"></a>
+  <figcaption><b>Figura 13.</b> Consertar este passo: o passo que quebrou, a sugestão do modelo (desligada sem o hub de LLM) e os elementos candidatos da página na hora da falha (Bruno Reis). Endereço: <code>/execucoes/{execucao}/conserto</code>.</figcaption>
+</figure>
+<figure id="fig-conserto-versao">
+  <a class="imagem" href="img/21-robo-conserto-versao-nova.png"><img src="img/21-robo-conserto-versao-nova.png" width="2880" height="2510" loading="lazy" alt="Versão 2 do robô consertado pronta para publicar, com a mudança só no alvo do passo"></a>
+  <figcaption><b>Figura 14.</b> A versão consertada pronta para publicar: só o alvo do passo que quebrou mudou, e outra pessoa, com o papel de aprovação, publica (Carla Souza). Endereço: <code>/robos/{robo}?versao=2</code>.</figcaption>
+</figure>
+
+<h3 id="uso-agendas">6.7 Agendas</h3>
+<p>Quem opera ou administra a área cria agendas com uma expressão cron de 5 campos, no fuso <code>America/Sao_Paulo</code> por padrão, e as entradas fixas. O despachante dispara cada ocorrência uma vez (com dois despachantes também), roda a versão publicada no momento e registra o que aconteceu com cada ocorrência: enfileirada, perdida (o serviço ficou fora do ar além da tolerância), substituída, ignorada (robô não publicado, entradas que não valem mais, execução anterior ainda em andamento, fila cheia, certificado bloqueado) ou pulada (empresa congelada).</p>
+<figure id="fig-agendas">
+  <a class="imagem" href="img/10-agendas.png"><img src="img/10-agendas.png" width="2880" height="1800" loading="lazy" alt="Lista de agendas com uma ligada e uma desligada e o formulário de uma agenda nova"></a>
+  <figcaption><b>Figura 15.</b> Agendas: as agendas cron (ligada e desligada) e o formulário de uma nova, com atalhos e o fuso de Brasília (Eduarda Martins). Endereço: <code>/agendas</code>.</figcaption>
+</figure>
+<figure id="fig-agenda">
+  <a class="imagem" href="img/19-agenda-detalhe.png"><img src="img/19-agenda-detalhe.png" width="2880" height="1800" loading="lazy" alt="Detalhe de uma agenda com o robô, a expressão, a próxima ocorrência e o histórico das ocorrências"></a>
+  <figcaption><b>Figura 16.</b> Uma agenda: o robô, a expressão, a próxima ocorrência e o que aconteceu com cada ocorrência. Endereço: <code>/agendas/{agenda}</code>.</figcaption>
+</figure>
+
+<h3 id="uso-webhooks">6.8 Webhooks</h3>
+<p>Um webhook deixa outro sistema iniciar o robô sem token, com uma entrega assinada. A tela mostra o endereço de cada um, o limite por minuto e a última entrega. A chave de assinatura aparece uma vez só, ao criar ou ao trocar a chave: guarde-a no outro sistema. Trocar <code>RAPA_CHAVE_WEBHOOKS</code> invalida as chaves de todos (OPERACAO 1.7).</p>
+<figure id="fig-webhooks">
+  <a class="imagem" href="img/11-webhooks.png"><img src="img/11-webhooks.png" width="2880" height="1800" loading="lazy" alt="Lista de webhooks com o endereço, o limite por minuto e a última entrega"></a>
+  <figcaption><b>Figura 17.</b> Webhooks: o endereço de cada um, o limite por minuto e a última entrega; a chave de assinatura só aparece uma vez, ao criar ou trocar. Endereço: <code>/webhooks</code>.</figcaption>
+</figure>
+<p>A entrega é <code>POST /v1/webhooks/{id}</code> com as entradas do robô em JSON e três cabeçalhos: <code>X-RaPA-Timestamp</code> (só dígitos, a até 5 minutos do servidor), <code>X-RaPA-Delivery</code> (1 a 200 caracteres ASCII visíveis, <b>sem ponto</b>) e <code>X-RaPA-Signature</code> (<code>sha256=</code> e o HMAC-SHA256 hexadecimal de <code>&lt;horário&gt;.&lt;entrega&gt;.&lt;corpo&gt;</code>, com a chave do webhook). A mesma entrega de novo devolve a mesma execução (202); com outro corpo, 409; assinatura errada, horário fora da tolerância ou webhook desconhecido, 401. O cálculo é o de <code>sign_delivery</code> em <code>rapa.control.services.webhooks</code>:</p>
+<pre><code>import hashlib
+import hmac
+import json
+import time
+
+import httpx2
+
+chave = "CHAVE_DO_WEBHOOK"            # a que a tela mostrou ao criar
+corpo = json.dumps({"nome": "Marina Lopes", "cpf": "935.411.347-80", "uf": "RJ"}).encode()
+horario = str(int(time.time()))
+entrega = "pedido-1001"
+mensagem = horario.encode() + b"." + entrega.encode() + b"." + corpo
+assinatura = "sha256=" + hmac.new(chave.encode(), mensagem, hashlib.sha256).hexdigest()
+resposta = httpx2.post(
+    "https://rapa.exemplo.test/v1/webhooks/ID_DO_WEBHOOK",
+    content=corpo,
+    headers={
+        "Content-Type": "application/json",
+        "X-RaPA-Timestamp": horario,
+        "X-RaPA-Delivery": entrega,
+        "X-RaPA-Signature": assinatura,
+    },
+)
+print(resposta.status_code, resposta.json()["run_id"])</code></pre>
+
+<h3 id="uso-lotes">6.9 Lotes</h3>
+<p>Um lote roda o robô uma vez por linha de uma planilha .xlsx (sem fórmulas) ou .csv. Toda linha é conferida antes de criar qualquer coisa: com um erro, nada é criado. As colunas casam com as entradas pelo nome técnico ou pelo título. O andamento é a soma das execuções, e o resultado (só as saídas que o robô declara) sai em CSV ou xlsx, sem nada que vire fórmula no Excel.</p>
+<figure id="fig-lotes">
+  <a class="imagem" href="img/12-lotes.png"><img src="img/12-lotes.png" width="2880" height="1800" loading="lazy" alt="Lista de lotes com o andamento e o envio de uma planilha"></a>
+  <figcaption><b>Figura 18.</b> Lotes: os lotes enviados, com o andamento, e o envio de uma planilha .xlsx ou .csv (conferida linha a linha antes de criar). Endereço: <code>/lotes</code>.</figcaption>
+</figure>
+<figure id="fig-lote">
+  <a class="imagem" href="img/20-lote-detalhe.png"><img src="img/20-lote-detalhe.png" width="2880" height="1800" loading="lazy" alt="Detalhe de um lote com o andamento, cada linha com a execução e o resultado, e os botões para baixar o resultado"></a>
+  <figcaption><b>Figura 19.</b> Um lote: o andamento, cada linha com a execução e o resultado, e o resultado para baixar em CSV ou xlsx. Endereço: <code>/lotes/{lote}</code>.</figcaption>
+</figure>
+
+<h3 id="uso-credenciais">6.10 Credenciais e A1</h3>
+<p>A tela <b>Credenciais</b> mostra os vencimentos próximos, as credenciais registradas (só a referência ao cofre e os metadados) e o registro de uma credencial nova. O certificado A1 precisa de um custodiante e da validade; a revogação (pelo custodiante ou por quem administra a área) leva junto as autorizações. O fluxo completo está em <a href="#cfg-a1">5.4</a>.</p>
+<figure id="fig-credenciais">
+  <a class="imagem" href="img/13-credenciais-a1.png"><img src="img/13-credenciais-a1.png" width="2880" height="2982" loading="lazy" alt="Tela Credenciais com os vencimentos, o certificado A1 e a credencial do portal registrados, e o formulário de registro"></a>
+  <figcaption><b>Figura 20.</b> Credenciais: só a referência ao cofre e os metadados; o certificado A1 com custodiante, validade e impressão, e o registro de uma credencial nova (Ana Lima, administração da empresa). Endereço: <code>/credenciais</code>.</figcaption>
+</figure>
+
+<h3 id="uso-empresa">6.11 Empresa e consumo</h3>
+<p>Quem administra a empresa vê na tela <b>Empresa</b> as pessoas com os papéis (por área ou na empresa inteira), dá e tira papéis, desativa pessoas e cria e renomeia áreas. Quem administra a empresa ou audita vê o consumo do mês, por área e por origem: execuções por situação, minutos de navegador, sessões de gravação e lotes, pelo mês do fuso de Brasília em que cada coisa foi pedida (também em <code>GET /v1/empresa/consumo?mes=AAAA-MM</code> e em <code>empresa consumo</code> no CLI).</p>
+<figure id="fig-empresa">
+  <a class="imagem" href="img/14-empresa-usuarios.png"><img class="alta" src="img/14-empresa-usuarios.png" width="2880" height="5940" loading="lazy" alt="Tela Empresa com as sete pessoas e os papéis de cada uma, as áreas Financeiro e Fiscal e o consumo do mês"></a>
+  <figcaption><b>Figura 21.</b> Empresa (administração): as pessoas com os papéis por área ou na empresa inteira, as áreas e o consumo do mês (Ana Lima). Endereço: <code>/empresa</code>.</figcaption>
+</figure>
+<figure id="fig-consumo">
+  <a class="imagem" href="img/15-empresa-consumo.png"><img src="img/15-empresa-consumo.png" width="2880" height="1800" loading="lazy" alt="Consumo do mês por área e por origem visto pela auditoria"></a>
+  <figcaption><b>Figura 22.</b> Empresa (auditoria): o consumo do mês por área e por origem, em execuções, minutos de navegador, sessões de gravação e lotes (Fábio Nunes, auditoria). Endereço: <code>/empresa</code>.</figcaption>
+</figure>
+
+<h3 id="uso-rest">6.12 API REST</h3>
+<p>A REST fica em <code>/v1</code>, sempre com <code>Authorization: Bearer TOKEN</code> (o token de acesso do Keycloak, ou o de desenvolvimento). Os exemplos usam o serviço local de 3.6.</p>
+<pre><code>URL=http://127.0.0.1:8000
+TOKEN=token-eduarda
+curl -s -H "Authorization: Bearer $TOKEN" $URL/v1/eu
+curl -s -H "Authorization: Bearer $TOKEN" $URL/v1/catalogo</code></pre>
+<p>Iniciar uma execução (202, com o cabeçalho <code>Location</code>); <code>Idempotency-Key</code> é opcional e, repetida, devolve a mesma execução:</p>
+<pre><code>curl -s -X POST $URL/v1/catalogo/emitir_protocolo/execucoes \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: pedido-2026-11-0001" \
+  -d '{"entradas": {"nome": "Helena Duarte", "cpf": "529.982.247-25", "uf": "SP"}}'</code></pre>
+<p>Acompanhar e baixar as evidências:</p>
+<pre><code>curl -s -H "Authorization: Bearer $TOKEN" $URL/v1/execucoes/ID_DA_EXECUCAO
+curl -s -H "Authorization: Bearer $TOKEN" $URL/v1/execucoes/ID_DA_EXECUCAO/artefatos
+curl -s -H "Authorization: Bearer $TOKEN" -o arquivo $URL/v1/execucoes/ID_DA_EXECUCAO/artefatos/NOME_DO_ARTEFATO</code></pre>
+<div class="tabela"><table>
+<thead><tr><th>Rotas</th><th>Para</th></tr></thead>
+<tbody>
+<tr><td><code>GET /v1/eu</code></td><td>quem é o dono do token: os papéis e os nomes da empresa e das áreas</td></tr>
+<tr><td><code>GET /v1/catalogo</code>, <code>/v1/catalogo/busca?q=</code>, <code>/v1/catalogo/{slug}</code>; <code>POST /v1/catalogo/{slug}/execucoes</code></td><td>catálogo e execução</td></tr>
+<tr><td><code>GET /v1/execucoes</code>, <code>/v1/execucoes/{id}</code>, <code>/v1/execucoes/{id}/artefatos</code>, <code>/v1/execucoes/{id}/artefatos/{nome}</code></td><td>execuções e evidências</td></tr>
+<tr><td><code>GET</code> e <code>POST /v1/execucoes/{id}/conserto</code></td><td>candidatos e pedido de conserto</td></tr>
+<tr><td><code>GET</code> e <code>POST /v1/robos</code>; <code>/v1/robos/{id}/versoes</code>, <code>.../versoes/{n}</code>, <code>.../validar</code>, <code>.../publicar</code>, <code>.../aprovacoes</code></td><td>robôs, versões e aprovações</td></tr>
+<tr><td><code>/v1/sessoes</code>, <code>/v1/sessoes/{id}/bilhete</code>, <code>/parar</code>, <code>/propostas</code>, <code>/rascunho</code>; <code>WS /v1/sessoes/{id}/ao-vivo</code></td><td>gravação ao vivo</td></tr>
+<tr><td><code>/v1/agendas</code>, <code>/v1/agendas/{id}</code>, <code>/v1/agendas/{id}/ocorrencias</code></td><td>agendas</td></tr>
+<tr><td><code>/v1/robos/{id}/webhooks</code>, <code>.../webhooks/{wid}</code>, <code>.../webhooks/{wid}/trocar-chave</code>; <code>POST /v1/webhooks/{id}</code></td><td>webhooks e entrega</td></tr>
+<tr><td><code>POST /v1/lotes/previa</code>, <code>POST /v1/lotes</code>, <code>GET /v1/lotes</code>, <code>/v1/lotes/{id}</code>, <code>/linhas</code>, <code>/resultado?formato=</code></td><td>lotes</td></tr>
+<tr><td><code>/v1/credenciais</code>, <code>/v1/credenciais/vencimentos</code>, <code>/v1/credenciais/{id}</code>, <code>/revogar</code>; <code>/v1/robos/{id}/autorizacoes-a1</code></td><td>credenciais e A1</td></tr>
+<tr><td><code>/v1/empresa</code>, <code>/v1/empresa/usuarios</code>, <code>.../{id}/papeis</code>, <code>/desativar</code>, <code>/reativar</code>, <code>/v1/empresa/areas</code>, <code>/v1/empresa/consumo?mes=</code></td><td>a própria empresa</td></tr>
+<tr><td><code>GET /v1/openapi-robos.json</code></td><td>o OpenAPI dos robôs publicados de quem chama</td></tr>
+</tbody></table></div>
+<p>A documentação interativa (<code>/v1/docs</code>, <a href="#cfg-docs-api">5.7</a>) lista todas as rotas com os formatos.</p>
+<figure id="fig-openapi-robos">
+  <a class="imagem" href="img/23-openapi-robos.png"><img src="img/23-openapi-robos.png" width="2880" height="1800" loading="lazy" alt="Começo do documento OpenAPI dos robôs publicados visto no navegador"></a>
+  <figcaption><b>Figura 23.</b> GET /v1/openapi-robos.json: o OpenAPI dos robôs publicados que a pessoa do token pode chamar pelo REST (o começo do documento).</figcaption>
+</figure>
+<figure id="fig-docs-api">
+  <a class="imagem" href="img/24-docs-api.png"><img src="img/24-docs-api.png" width="2880" height="1800" loading="lazy" alt="Swagger UI da API REST do RaPA servido pelo próprio serviço"></a>
+  <figcaption><b>Figura 24.</b> GET /v1/docs (com <code>RAPA_DOCS_API=1</code>): a documentação da API REST no Swagger UI, servido pelo próprio RaPA (sem CDN); a página abre sem token, e o botão Authorize recebe o token que as chamadas feitas por ela (Try it out) mandam.</figcaption>
+</figure>
+
+<h3 id="uso-mcp">6.13 MCP</h3>
+<p>O gateway MCP fica em <code>/mcp</code> (Streamable HTTP), com o mesmo <code>Authorization: Bearer TOKEN</code>. Cada pessoa vê só os robôs publicados da empresa e das áreas dela: uma ferramenta por robô (com o nome técnico, por exemplo <code>emitir_protocolo</code>, e o esquema das entradas) e três fixas: <code>buscar_robo</code> (<code>consulta</code>, <code>limite</code>), <code>executar_robo</code> (<code>robo</code>, <code>entradas</code>, <code>chave_idempotencia</code>) e <code>consultar_execucao</code> (<code>execucao_id</code>). A execução é assíncrona: a resposta traz o <code>run_id</code> e o estado. Com o SDK oficial em Python, como o roteiro das capturas faz:</p>
+<pre><code>import asyncio
+
+import httpx2
+from mcp import Client
+from mcp.client.streamable_http import streamable_http_client
+
+
+async def main() -&gt; None:
+    cabecalhos = {"Authorization": "Bearer token-eduarda"}
+    async with (
+        httpx2.AsyncClient(headers=cabecalhos, timeout=60) as http,
+        Client(streamable_http_client("http://127.0.0.1:8000/mcp", http_client=http), mode="legacy") as mcp,
+    ):
+        resultado = await mcp.call_tool(
+            "emitir_protocolo", {"nome": "Lucas Teixeira", "cpf": "111.444.777-35", "uf": "MG"}
+        )
+        print(resultado.structured_content["run_id"])
+
+
+asyncio.run(main())</code></pre>
+<p>Um agente que chama o MCP com o próprio token precisa, no Keycloak, do mapper <code>audiencia-da-api</code> e do escopo <code>organization</code> (<code>deploy/keycloak/README.md</code>, "Outros clientes da API"). Num navegador, a origem precisa estar em <code>RAPA_MCP_ORIGENS</code>.</p>
+</section>
+
+<!-- =========================================================================== -->
+<section class="parte" id="testes" aria-labelledby="t-testes">
+<h2 id="t-testes"><span class="parte-rotulo">Parte 7</span>7. Testes</h2>
+
+<h3 id="testes-suite">7.1 A suíte</h3>
+<pre><code>uv sync --all-extras
+uv run ruff format src tests deploy docs &amp;&amp; uv run ruff check src tests deploy docs &amp;&amp; uv run mypy
+uv run pytest</code></pre>
+<ul>
+  <li><b>Marcadores</b> (<code>pyproject.toml</code>): <code>browser</code> (abre o Chromium), <code>database</code> (precisa de PostgreSQL) e <code>slow</code> (testes longos, como 100 reexecuções). Por exemplo, só o que não precisa de navegador nem de banco: <code>uv run pytest -m "not browser and not database"</code>.</li>
+  <li><b>Banco</b>: <code>RAPA_TEST_DATABASE_URL</code> (um superusuário) ou os binários locais <code>initdb</code> e <code>pg_ctl</code>, com que os testes sobem um PostgreSQL temporário.</li>
+  <li><b>Navegador</b>: o Chromium em <code>RAPA_CHROMIUM_PATH</code>, <code>/usr/bin/chromium</code> ou <code>/opt/pw-browsers/chromium</code>. Os portais de teste respondem em <code>*.rapa.test</code>, que o Chromium resolve para 127.0.0.1.</li>
+  <li><b>Pulados sem a ferramenta, obrigatórios no CI</b>: o <code>ffmpeg</code> dos testes que filmam (<code>RAPA_TEST_VIDEO_OBRIGATORIO=1</code>), o <code>helm</code> e o <code>kubeconform</code> (<code>RAPA_TEST_CHART_OBRIGATORIO=1</code>) e o <code>bao</code> (<code>RAPA_TEST_BAO_OBRIGATORIO=1</code>; <code>deploy/ci/instalar-bao.sh &lt;pasta&gt;</code> o instala). Sem o <code>bao</code>, o OpenBao falso de <code>tests/control/vault/fakebao.py</code> aplica as políticas como o OpenBao.</li>
+  <li>O ponta a ponta do serviço inteiro (PostgreSQL, Chromium e o portal de teste) está em <code>tests/e2e/</code>; os testes deste manual, em <code>tests/docs/test_manual.py</code> (imagens, âncoras, nada remoto, variáveis e caminhos que existem).</li>
+</ul>
+
+<h3 id="testes-chart">7.2 O chart</h3>
+<p>Os testes de <code>tests/deploy</code> renderizam o chart (<code>helm lint</code>, <code>helm template</code> com os valores padrão, do kind, de produção de exemplo e as releases só do banco) e validam com <code>kubeconform -strict</code> e os esquemas dos CRDs, conferem cada recusa de <code>_validation.tpl</code>, as regras do Dockerfile, o Argo CD, o Keycloak e o CI, e que o chart e o código concordam (<code>tests/deploy/test_chart_matches_code.py</code>: o pod que o lançador monta é o que a admissão, o RBAC e as NetworkPolicies deixam passar).</p>
+<pre><code>RAPA_TEST_CHART_OBRIGATORIO=1 uv run pytest -q tests/deploy -m "not browser and not database"</code></pre>
+<p><code>RAPA_KUBECONFORM_CACHE</code> guarda os esquemas baixados entre execuções.</p>
+
+<h3 id="testes-ci">7.3 O CI</h3>
+<p>O workflow <code>.github/workflows/ci.yml</code> roda em cada pull request e em cada push na <code>main</code>:</p>
+<div class="tabela"><table>
+<thead><tr><th>Job</th><th>O que faz</th></tr></thead>
+<tbody>
+<tr><td><code>testes</code> (Lint, tipos e testes)</td><td>no contêiner <code>python:3.14-slim-trixie</code> com um PostgreSQL 18 de serviço: instala o Chromium e o ffmpeg do Debian e o OpenBao (versão e SHA-256 fixos), <code>uv sync --all-extras --frozen</code>, <code>ruff check</code> e <code>ruff format --check</code>, <code>mypy</code>, primeiro o teste das políticas contra o <code>bao server -dev</code> e depois a suíte inteira (perto de 35 minutos)</td></tr>
+<tr><td><code>chart</code> (helm e kubeconform)</td><td>Helm v3.19.0 e kubeconform v0.7.0, <code>pytest tests/deploy -m "not browser and not database"</code>, sem poder pular</td></tr>
+<tr><td><code>imagens</code> (controle e executor)</td><td>constrói as duas imagens; <code>deploy/ci/testar-controle.sh</code> (usuário 10001, disco só de leitura, migração, CLI, servidor e <code>/saude/pronto</code>) e <code>deploy/ci/testar-executor.sh</code> (o worker de verdade contra o portal de teste); o Trivy só informa</td></tr>
+<tr><td><code>kind</code> (Kubernetes)</td><td>um cluster kind (<code>deploy/kind/cluster.yaml</code>), <code>deploy/kind/instalar.sh</code> (CloudNativePG, OpenBao em modo dev, SeaweedFS, portal de teste, as duas releases com <code>values-kind.yaml</code>, o <code>preparar.sh</code> e uma empresa pelo CLI) e <code>deploy/kind/testar.sh</code> (um robô publicado e executado pela REST num pod de uso único até <code>succeeded</code>, o artefato lido de volta e só cifrado no S3, e nada para trás em <code>rapa-execucoes</code>); numa falha, <code>deploy/kind/recolher-logs.sh</code></td></tr>
+</tbody></table></div>
+<div class="aviso atencao">
+  <span class="rotulo">Atenção</span>
+  <p>Nada no CI roda o gVisor, o Envoy Gateway (a ordem das rotas), o Argo CD (as checagens de saúde da raiz) nem os backups do Barman (desligados no kind): esses só se conferem no ambiente, pelo aceite de 7.5. O job kind não fixa as versões dos charts do CloudNativePG e do OpenBao (<code>CNPG_CHART_VERSION</code> e <code>OPENBAO_CHART_VERSION</code> as fixam).</p>
+</div>
+
+<h3 id="testes-capturas">7.4 Regenerar as capturas</h3>
+<p>As imagens deste manual saem de <code>docs/manual/capturar.py</code>, que sobe um mundo de demonstração inteiro só com as ferramentas locais (sem Docker): um PostgreSQL temporário (<code>initdb</code> e <code>pg_ctl</code> do PATH ou de <code>/usr/lib/postgresql/*/bin</code>) com os três papéis e as migrações, os portais de teste v1 e v2, a "Empresa Demonstração" pelo CLI de verdade, o serviço inteiro com o despachante, e o estado pela REST, pelo MCP e pela interface. Cada página é conferida antes da captura para que nenhum token, chave ou senha apareça.</p>
+<pre><code>uv run python docs/manual/capturar.py --saida docs/manual/img</code></pre>
+<p>Opções: <code>--saida</code> (as imagens antigas só são trocadas no fim, com todas as novas prontas), <code>--porta</code> (a do serviço, se livre; padrão 8000), <code>--chromium</code> (o Chromium completo) e <code>--depurar PASTA</code> (numa falha, guarda ali a tela de cada página aberta, as capturas já feitas e o log do serviço). O roteiro também grava <code>docs/manual/img/capturas.json</code>, com a legenda, a pessoa e o endereço de cada imagem; os testes do manual conferem que toda imagem dele aparece aqui.</p>
+
+<h3 id="testes-aceite">7.5 Aceite depois do deploy no Outposts</h3>
+<p>Rode depois da primeira instalação, de cada atualização e de cada mudança de rede. Os comandos usam os nomes padrão do chart.</p>
+<ol class="check">
+  <li><b>RuntimeClass e nós de execução.</b>
+<pre><code>kubectl get runtimeclass gvisor
+kubectl get nodes -l rapa.dev/execucoes=sim</code></pre>
+  Esperado: a RuntimeClass com o handler <code>runsc</code> e pelo menos um nó de execução <code>Ready</code>.</li>
+  <li><b>Banco pronto e papéis reconciliados.</b>
+<pre><code>kubectl -n rapa wait cluster/rapa-banco --for=condition=Ready --timeout=20m
+kubectl -n rapa get cluster rapa-banco -o jsonpath='{.status.managedRolesStatus.byStatus.reconciled}'</code></pre>
+  Esperado: <code>condition met</code> e a lista com <code>rapa_app</code> e <code>rapa_dispatcher</code>.</li>
+  <li><b>Migração.</b>
+<pre><code>kubectl -n rapa logs job/rapa-migracao</code></pre>
+  Esperado: o Job concluído, sem erro (até <code>ttlSecondsAfterFinished</code>, 24 horas).</li>
+  <li><b>Componentes de pé.</b>
+<pre><code>kubectl -n rapa get deployment rapa-web rapa-api rapa-despachante</code></pre>
+  Esperado: todas as réplicas prontas (1, 2 e 2 por padrão).</li>
+  <li><b>Prontidão da api e do despachante</b> (cada port-forward num terminal):
+<pre><code>kubectl -n rapa port-forward svc/rapa-api 8000:8000
+curl -s http://127.0.0.1:8000/saude/pronto
+kubectl -n rapa port-forward deployment/rapa-despachante 8080:8080
+curl -s http://127.0.0.1:8080/saude/pronto</code></pre>
+  Esperado: <code>{"estado":"pronto"}</code> nos dois. Um 503 traz os nomes do que falhou (<code>banco</code>, <code>banco_despachante</code>, <code>despachante</code>, <code>openbao</code>, <code>s3</code>).</li>
+  <li><b>Métricas do despachante</b> (num port-forward da porta 9100 do pod):
+<pre><code>curl -s http://127.0.0.1:9100/metrics | grep -E '^rapa_(fila|despachante_saudavel|a1_)'</code></pre>
+  Esperado: <code>rapa_despachante_saudavel 1.0</code>.</li>
+  <li><b>Pelo gateway.</b>
+<pre><code>curl -s https://rapa.exemplo.test/saude</code></pre>
+  Esperado: <code>{"estado":"ok","versao":"0.1.0"}</code> (com a versão instalada) e o certificado TLS do Gateway aceito.</li>
+  <li><b>O emissor de dentro do cluster.</b>
+<pre><code>kubectl -n rapa exec deploy/rapa-web -- python -c "import urllib.request; print(urllib.request.urlopen('https://sso.exemplo.test/realms/rapa/.well-known/openid-configuration').status)"</code></pre>
+  Esperado: <code>200</code>.</li>
+  <li><b>Login e empresa.</b> Uma pessoa da organização entra pela interface e vê a empresa dela; com o token de acesso dela (o <b>Evaluate</b> do Keycloak, <code>deploy/keycloak/README.md</code>, seção 4), <code>GET /v1/eu</code> mostra a empresa e os papéis. Esperado: <code>aud</code> com <code>rapa-api</code> e a claim <code>organization</code> com o apelido e o id.</li>
+  <li><b>A guarda de saída</b> (troque a imagem do arquivo pela do executor do ambiente):
+<pre><code>kubectl apply -f deploy/rede/teste-de-saida.yaml
+kubectl -n rapa-execucoes logs -f teste-de-saida
+kubectl -n rapa-execucoes delete pod teste-de-saida</code></pre>
+  Esperado: cada alvo interno (o metadata em IPv4, em IPv6 e pelo NAT64, a API do Kubernetes, o banco, a web, uma rede privada) como <code>ok: fechado</code> e os externos como <code>ok: abriu</code> (sem internet direta, só pelo proxy); o pod termina com sucesso. Um <code>ERRO: abriu</code> num interno é quase sempre o CNI sem NetworkPolicy: ninguém usa o RaPA até passar. Some em <code>ALVOS_DO_AMBIENTE</code> os portais que não estão nas redes permitidas.</li>
+  <li><b>A política de admissão e as NetworkPolicies.</b>
+<pre><code>kubectl get validatingadmissionpolicy rapa-execucoes-pods-de-uso-unico
+kubectl -n rapa get networkpolicy
+kubectl -n rapa-execucoes get networkpolicy</code></pre>
+  Esperado: a política presente e as NetworkPolicies <code>rapa-nega-tudo</code> nos dois namespaces, mais as de cada componente.</li>
+  <li><b>Uma primeira execução.</b> Com a primeira empresa (4.10): o custodiante grava o segredo de um portal de teste da empresa no cofre, quem administra a área registra a credencial, alguém grava um robô de leitura, outra pessoa publica, e uma execução pela REST ou pela interface. Durante a execução:
+<pre><code>kubectl -n rapa-execucoes get pods -l app.kubernetes.io/name=rapa-executor</code></pre>
+  Esperado: um pod <code>rapa-execucao-...</code> aparece, a execução chega a <code>succeeded</code> e o pod e o Secret dele somem no fim.</li>
+  <li><b>Evidências no S3.</b> <code>GET /v1/execucoes/ID_DA_EXECUCAO/artefatos</code> lista as telas e os arquivos, que baixam com o SHA-256 informado. Esperado no bucket <code>rapa-artefatos</code>: só objetos <code>empresas/&lt;empresa&gt;/execucoes/&lt;execução&gt;/&lt;tentativa&gt;/&lt;nome&gt;.enc</code>, cifrados (confira com a ferramenta S3 de vocês).</li>
+  <li><b>Backups.</b>
+<pre><code>kubectl -n rapa get backups.postgresql.cnpg.io
+deploy/banco/testar-restauracao.sh</code></pre>
+  Esperado: um backup concluído (o primeiro logo depois de o Cluster ficar pronto, depois o diário) e o teste de restauração com saída 0 e a última linha com o tempo de recuperação.</li>
+  <li><b>Argo CD</b> (se usado).
+<pre><code>kubectl -n argocd get applications</code></pre>
+  Esperado: <code>rapa-raiz</code>, <code>rapa-banco</code> e <code>rapa</code> sincronizadas e saudáveis.</li>
+</ol>
+</section>
+
+<!-- =========================================================================== -->
+<section class="parte" id="operacao" aria-labelledby="t-operacao">
+<h2 id="t-operacao"><span class="parte-rotulo">Parte 8</span>8. Operação e incidentes</h2>
+
+<h3 id="op-runbook">8.1 Runbook resumido</h3>
+<p>O procedimento completo de cada caso está em OPERACAO 1.8 (e nas seções citadas).</p>
+<div class="tabela"><table>
+<thead><tr><th>Caso</th><th>Como aparece</th><th>O que fazer</th></tr></thead>
+<tbody>
+<tr><td>Despachante parado</td><td><code>/saude</code> da réplica em 503 com <code>despachante_parado</code> ou <code>despachante_com_falha</code>; o probe de vida reinicia o pod depois de 5 minutos</td><td><code>kubectl -n rapa logs deploy/rapa-despachante</code> (o tipo do erro); confira o banco e o papel <code>rapa_dispatcher</code>. A fila só espera; execuções sem passo que grava começado voltam à fila quando a concessão vence</td></tr>
+<tr><td>Despachante que não sobe</td><td><code>rapa.server: configuração inválida: ...</code> no log</td><td>um <code>RAPA_CANAL_ENDERECO</code> sem <code>{ip}</code>, portas cruzadas (serviço, canal, métricas), a imagem do executor que falta, um valor do cofre ou do S3 fora da regra</td></tr>
+<tr><td>Fila cheia</td><td>REST em 429 (<code>limite_excedido</code>)</td><td><code>/v1/empresa/consumo</code> e as métricas da fila; mais réplicas ou <code>dispatcher.concurrency</code>, as vagas da plataforma, nós de execução (5.5)</td></tr>
+<tr><td>A1 vencido</td><td>execuções falham com <code>certificado_a1_bloqueado</code>, sem lançar nada</td><td>o custodiante grava o certificado novo no cofre e renova a validade (<code>PATCH /v1/credenciais/{id}</code>); com a impressão nova, autoriza o robô de novo</td></tr>
+<tr><td>OpenBao selado</td><td><code>/saude/pronto</code> em 503 com <code>openbao</code>; o Envoy responde 503 a tudo</td><td>desbloquear com o quórum (OPERACAO 1.6); tudo volta sozinho em segundos; não atualize o chart durante o incidente</td></tr>
+<tr><td>S3 fora</td><td><code>/saude/pronto</code> em 503 com <code>s3</code>; o Envoy responde 503 a tudo</td><td>os pods e os discos do SeaweedFS e <code>network.egress.s3</code>; os arquivos de passagem esperam no <code>emptyDir</code> do despachante</td></tr>
+<tr><td>Hub do modelo fora</td><td>a revisão mostra só as regras, com aviso; no conserto, a pessoa escolhe sozinha</td><td>as execuções seguem; confira o hub e <code>network.egress.modelHub</code></td></tr>
+<tr><td>Pod de execução que não sobe</td><td>execução <code>executor_nao_iniciou</code></td><td><code>kubectl -n rapa-execucoes get pods -l app.kubernetes.io/name=rapa-executor</code> e <code>describe</code>: RuntimeClass ou <code>runsc</code> que falta, <code>ImagePullBackOff</code> (digest ou <code>rapa-registro</code>), <code>Unschedulable</code>, <code>forbidden</code> (RBAC ou <code>network.egress.kubernetesApi</code>), recusa da <code>ValidatingAdmissionPolicy</code>, canal (porta 8081)</td></tr>
+<tr><td>Segredo que falta</td><td><code>segredo_indisponivel</code> sem nenhum pod</td><td>a credencial na área do robô, o segredo e os campos no KV (<code>rapa/data/empresas/&lt;empresa&gt;/&lt;caminho&gt;</code>), o PFX em base64, o OpenBao de pé</td></tr>
+<tr><td>Guarda de saída</td><td>um interno <code>ERRO: abriu</code> no teste de saída</td><td>o CNI que não aplica NetworkPolicy (OPERACAO 1.9); ninguém usa o RaPA até passar</td></tr>
+<tr><td>Chave dos webhooks</td><td>suspeita de vazamento ou rotação</td><td>OPERACAO 1.7: trocar o Secret <code>rapa-webhooks</code>, reiniciar a web e a api juntas, cada empresa troca a chave de cada webhook</td></tr>
+<tr><td>Perda do banco</td><td>o Cluster não volta</td><td>restaurar de verdade (4.13; OPERACAO 1.5)</td></tr>
+</tbody></table></div>
+
+<h3 id="op-residuos">8.2 Resíduos conhecidos</h3>
+<p>O que o operador precisa saber (as listas completas estão nas seções "Resíduos conhecidos" de <code>docs/CONTRIBUINDO.md</code> e no fim de <code>docs/OPERACAO.md</code>):</p>
+<ul>
+  <li>Com mais de uma réplica da web, a afinidade é por cookie: um cliente da REST que não guarda cookies pode não achar a sessão de gravação que abriu. O token e a ligação de cada sessão ficam na réplica que a abriu.</li>
+  <li>O canal do despachante é o IP do pod: um pod de execução cujo despachante reiniciou perde o canal, e a execução segue as regras de sempre (sem confirmação, o passo que grava não anda).</li>
+  <li>O canal e o WebSocket da sessão falam HTTP sem TLS dentro da rede do cluster; quem chega às portas é a NetworkPolicy que decide.</li>
+  <li><code>RAPA_PASTA_ARQUIVOS</code> não é montada no despachante do cluster: um robô com passo de envio de arquivo falha (fechado).</li>
+  <li>A prontidão também confere o OpenBao e o S3: com um deles fora, a web e a api saem dos Services e o gateway responde 503 a tudo.</li>
+  <li>A Role da web e do despachante lê todos os Secrets do namespace das execuções: o <code>rapa-registro</code> dali só com permissão de baixar imagens.</li>
+  <li>O chart não confere todas as regras cruzadas da partida, e um <code>network.egress.kubernetesApi.to</code> vazio só aparece como aviso nas NOTES (4.8).</li>
+  <li>Fora do chart, <code>python -m rapa.server</code> abre as métricas na 9100 e não sobe com ela ocupada.</li>
+  <li>Os limites dos webhooks ficam na memória de cada processo (com várias réplicas, somam). Trocar <code>RAPA_CHAVE_WEBHOOKS</code> invalida todas as chaves.</li>
+  <li>A impressão do A1 não é lida do PFX; a separação de funções compara sujeitos; o caminho no cofre é da empresa, não da área; o registro pela operação ainda aceita um caminho que a leitura recusa (a execução falha fechada).</li>
+  <li>Os relógios das réplicas precisam de NTP: uma réplica atrasada mais de 1 min 45 s tem as sessões encerradas pelas outras.</li>
+  <li>Um vínculo de organização novo ou trocado demora até 60 segundos em cada processo (o cache).</li>
+  <li>O cliente do S3 segue as variáveis de proxy do ambiente (<code>HTTPS_PROXY</code>), que o chart não define.</li>
+  <li>Os prazos de retenção estão a validar com o jurídico; uma empresa congelada por muito tempo segura a remoção das partições de eventos em que tem eventos.</li>
+  <li>Uma exclusão de empresa que falha depois de o S3 ou o cofre apagarem uma parte deixa o banco inteiro; a repetição apaga o resto.</li>
+  <li>O CLI não muda a cota de uma empresa depois da entrada.</li>
+</ul>
+</section>
+
+<!-- =========================================================================== -->
+<section class="parte" id="apendices" aria-labelledby="t-apendices">
+<h2 id="t-apendices"><span class="parte-rotulo">Apêndices</span>Apêndices</h2>
+
+<h3 id="glossario">A. Glossário</h3>
+<dl class="glossario">
+  <dt>Área</dt><dd>Divisão de uma empresa (Fiscal, Financeiro). Os robôs, as credenciais e a maioria dos papéis são por área.</dd>
+  <dt>Artefato, evidência</dt><dd>O que uma execução guarda: telas, arquivos baixados e o vídeo da falha. No S3, cifrados com uma chave por execução.</dd>
+  <dt>Bilhete</dt><dd>Segredo de uso único: o do canal (um por tentativa) e o da visão ao vivo (vale 60 segundos, uma vez).</dd>
+  <dt>Canal</dt><dd>O servidor HTTP do despachante (porta 8081) com que os pods de execução falam: buscam o trabalho e os segredos, mandam os eventos, os artefatos e o resultado.</dd>
+  <dt>Certificado A1</dt><dd>Certificado digital em arquivo (PFX). O robô que o usa precisa do custodiante e de duas aprovações.</dd>
+  <dt>Congelar</dt><dd>Pôr uma empresa em leitura: nada novo começa, a fila é cancelada e a retenção para.</dd>
+  <dt>Conserto</dt><dd>A troca do alvo de um passo que quebrou, escolhida entre candidatos do retrato da página, como uma versão nova em rascunho.</dd>
+  <dt>Custodiante</dt><dd>A pessoa com o papel <code>credential_custodian</code>, que grava o segredo no cofre, renova o A1 e autoriza os robôs.</dd>
+  <dt>Despachante</dt><dd>O processo que tira as execuções da fila, lança os pods, dispara as agendas, avisa os vencimentos e roda a retenção.</dd>
+  <dt>Efeito</dt><dd>O que um passo faz no sistema de destino: leitura, gravação ou irreversível.</dd>
+  <dt>Execução, tentativa</dt><dd>Um pedido para rodar um robô; cada vez que ele é lançado é uma tentativa.</dd>
+  <dt>Guarda de saída</dt><dd>O proxy SOCKS5 dentro do processo do navegador que só deixa os domínios do robô e fecha a rede interna.</dd>
+  <dt>gVisor</dt><dd>O kernel em espaço de usuário (<code>runsc</code>) que isola os pods de uso único.</dd>
+  <dt>Hub do modelo</dt><dd>O serviço interno com o modelo de linguagem, usado só para criar e consertar robôs.</dd>
+  <dt>Indeterminada</dt><dd>A execução que parou depois de um passo irreversível: uma pessoa confere o sistema de destino.</dd>
+  <dt>Lote</dt><dd>Uma planilha com uma execução por linha.</dd>
+  <dt>Manifesto</dt><dd>O JSON do robô: entradas, saídas, credenciais, domínios permitidos e a lista fechada de passos.</dd>
+  <dt>Organização</dt><dd>A Organization do Keycloak 26 que corresponde a uma empresa; vem no token.</dd>
+  <dt>Pod de uso único</dt><dd>O pod que roda uma única tentativa (ou uma sessão) e some no fim.</dd>
+  <dt>Portão de política</dt><dd>A conferência determinística de que todo domínio, elemento e valor de um robô vem de uma ação gravada, de uma entrada declarada ou do cofre.</dd>
+  <dt>Release</dt><dd>Uma instalação do chart: <code>rapa-banco</code> (só o banco) e <code>rapa</code> (a aplicação).</dd>
+  <dt>Reserva interativa</dt><dd>As vagas (10%) guardadas para gravação, controle ao vivo e testes.</dd>
+  <dt>Retrato</dt><dd>A leitura dos elementos da página na hora da falha, sem valores de campos, usada pelo conserto.</dd>
+  <dt>Sessão de gravação</dt><dd>O navegador na nuvem em que a pessoa demonstra a tarefa, visto ao vivo.</dd>
+  <dt>Sonda, matriz de capacidades</dt><dd>O que <code>python -m rapa.llm.probe</code> grava sobre o hub; sem ela, o hub não é usado.</dd>
+  <dt>Transit</dt><dd>O motor do OpenBao que guarda a chave de cada empresa e embrulha as chaves das execuções.</dd>
+  <dt>Webhook</dt><dd>Um endereço que outro sistema chama, com uma entrega assinada por HMAC, para iniciar um robô.</dd>
+</dl>
+
+<h3 id="onde-esta">B. Onde está cada coisa no repositório</h3>
+<div class="tabela"><table>
+<thead><tr><th>Caminho</th><th>O que tem</th></tr></thead>
+<tbody>
+<tr><td><code>README.md</code></td><td>a situação do projeto, a estrutura e o roteiro local resumido</td></tr>
+<tr><td><code>docs/OPERACAO.md</code></td><td>o roteiro da plataforma: instalar, atualizar, valores e variáveis, backup, cofre, incidentes e a operação das empresas</td></tr>
+<tr><td><code>docs/CONTRIBUINDO.md</code></td><td>as regras de cada parte e os resíduos conhecidos</td></tr>
+<tr><td><code>docs/PLANO-RaPA.md</code></td><td>o plano: decisões, capacidade, fases e riscos</td></tr>
+<tr><td><code>docs/manual/</code></td><td>este manual, as capturas em <code>img/</code> e o roteiro <code>capturar.py</code></td></tr>
+<tr><td><code>pyproject.toml</code>, <code>uv.lock</code></td><td>as dependências, os extras, o ruff, o mypy e o pytest</td></tr>
+<tr><td><code>src/rapa/server.py</code></td><td>o serviço num processo só e todas as variáveis (<code>ServerSettings.from_env</code>)</td></tr>
+<tr><td><code>src/rapa/control/admin.py</code></td><td>o CLI de empresas, áreas e pessoas</td></tr>
+<tr><td><code>src/rapa/control/db/migrate.py</code></td><td>as migrações (Alembic) e as permissões dos papéis</td></tr>
+<tr><td><code>src/rapa/control/</code></td><td>o plano de controle: banco, fila, serviços, API, MCP, lançadores, canal, cofre, S3 e observabilidade</td></tr>
+<tr><td><code>src/rapa/runner/</code>, <code>src/rapa/session/</code></td><td>o executor e o agente do pod; o host da sessão de gravação e a guarda de saída</td></tr>
+<tr><td><code>src/rapa/ui/</code></td><td>a interface em NiceGUI</td></tr>
+<tr><td><code>src/rapa/fixtures/</code></td><td>os portais de teste e os robôs de exemplo</td></tr>
+<tr><td><code>deploy/docker/Dockerfile</code></td><td>as imagens <code>controle</code> e <code>executor</code></td></tr>
+<tr><td><code>deploy/helm/rapa/</code></td><td>o chart: <code>values.yaml</code>, <code>values-banco.yaml</code>, <code>values-kind.yaml</code>, <code>values-producao-exemplo.yaml</code> e os templates</td></tr>
+<tr><td><code>deploy/helm/rapa/templates/_validation.tpl</code></td><td>as recusas do chart</td></tr>
+<tr><td><code>deploy/helm/rapa/templates/admission.yaml</code></td><td>a <code>ValidatingAdmissionPolicy</code> dos pods de uso único</td></tr>
+<tr><td><code>deploy/openbao/</code></td><td><code>preparar.sh</code>, <code>custodiante.sh</code>, as políticas e o README</td></tr>
+<tr><td><code>deploy/keycloak/</code></td><td>o realm de exemplo e o roteiro do Keycloak</td></tr>
+<tr><td><code>deploy/argocd/</code></td><td>as Applications, a raiz e as checagens de saúde</td></tr>
+<tr><td><code>deploy/gvisor/runtimeclass.yaml</code></td><td>a RuntimeClass <code>gvisor</code></td></tr>
+<tr><td><code>deploy/rede/teste-de-saida.yaml</code></td><td>o pod do teste de saída</td></tr>
+<tr><td><code>deploy/banco/testar-restauracao.sh</code></td><td>o teste de restauração semanal</td></tr>
+<tr><td><code>deploy/kind/</code></td><td>o cluster kind do CI e os roteiros de instalação, teste e logs</td></tr>
+<tr><td><code>deploy/ci/</code></td><td>o instalador do <code>bao</code> e os testes das imagens</td></tr>
+<tr><td><code>.github/workflows/ci.yml</code></td><td>o CI</td></tr>
+<tr><td><code>tests/</code></td><td>a suíte (<code>tests/e2e/</code>, <code>tests/deploy/</code>, <code>tests/docs/</code> e os de cada módulo)</td></tr>
+</tbody></table></div>
+</section>
+
+<p class="rodape">Manual do RaPA, gerado a partir do repositório. Para mudar um valor, uma variável ou um comando, mude o código e atualize este arquivo junto: <code>tests/docs/test_manual.py</code> confere as imagens, as âncoras, as variáveis e os caminhos.</p>
+
+</div>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var raiz = document.documentElement;
+  var botao = document.getElementById("abrir-sumario");
+  var sumario = document.getElementById("sumario");
+  var estreita = window.matchMedia("(max-width: 960px)");
+
+  function fechar() {
+    raiz.classList.remove("sumario-aberto");
+    botao.setAttribute("aria-expanded", "false");
+  }
+  botao.addEventListener("click", function () {
+    var aberto = raiz.classList.toggle("sumario-aberto");
+    botao.setAttribute("aria-expanded", aberto ? "true" : "false");
+  });
+  sumario.addEventListener("click", function (evento) {
+    if (evento.target.closest("a") && estreita.matches) { fechar(); }
+  });
+  document.addEventListener("keydown", function (evento) {
+    if (evento.key === "Escape") { fechar(); }
+  });
+
+  function copiar(texto, alvo) {
+    function pronto() {
+      alvo.textContent = "Copiado";
+      alvo.classList.add("ok");
+      setTimeout(function () { alvo.textContent = "Copiar"; alvo.classList.remove("ok"); }, 1500);
+    }
+    function reserva() {
+      var area = document.createElement("textarea");
+      area.value = texto;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.select();
+      try { document.execCommand("copy"); pronto(); } catch (e) { alvo.textContent = "Selecione e copie"; }
+      document.body.removeChild(area);
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(texto).then(pronto, reserva);
+    } else {
+      reserva();
+    }
+  }
+  document.querySelectorAll("pre > code").forEach(function (codigo) {
+    var bloco = document.createElement("div");
+    var pre = codigo.parentElement;
+    bloco.className = "bloco-codigo";
+    pre.parentNode.insertBefore(bloco, pre);
+    bloco.appendChild(pre);
+    var botaoCopiar = document.createElement("button");
+    botaoCopiar.type = "button";
+    botaoCopiar.className = "copiar";
+    botaoCopiar.textContent = "Copiar";
+    botaoCopiar.setAttribute("aria-label", "Copiar o código");
+    botaoCopiar.addEventListener("click", function () { copiar(codigo.innerText.replace(/\n$/, ""), botaoCopiar); });
+    bloco.appendChild(botaoCopiar);
+  });
+
+  var links = {};
+  sumario.querySelectorAll('a[href^="#"]').forEach(function (link) {
+    links[link.getAttribute("href").slice(1)] = link;
+  });
+  var alvos = Array.prototype.filter.call(document.querySelectorAll("main [id]"), function (el) {
+    return Object.prototype.hasOwnProperty.call(links, el.id);
+  });
+  var atual = null;
+  var agendado = false;
+  function marcar() {
+    agendado = false;
+    var escolhido = alvos[0];
+    for (var i = 0; i < alvos.length; i++) {
+      if (alvos[i].getBoundingClientRect().top <= 120) { escolhido = alvos[i]; } else { break; }
+    }
+    var link = escolhido ? links[escolhido.id] : null;
+    if (link === atual) { return; }
+    if (atual) { atual.classList.remove("ativo"); atual.removeAttribute("aria-current"); }
+    if (link) {
+      link.classList.add("ativo");
+      link.setAttribute("aria-current", "location");
+      var caixa = link.getBoundingClientRect();
+      var lateral = sumario.getBoundingClientRect();
+      if (caixa.top < lateral.top + 40 || caixa.bottom > lateral.bottom - 40) {
+        sumario.scrollTop += caixa.top - lateral.top - lateral.height / 3;
+      }
+    }
+    atual = link;
+  }
+  window.addEventListener("scroll", function () {
+    if (!agendado) { agendado = true; window.requestAnimationFrame(marcar); }
+  }, { passive: true });
+  marcar();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,132 @@
+{{- if and .Values.app.enabled .Values.executions.admissionPolicy.enabled }}
+{{- $v := .Values -}}
+{{- $e := $v.executions -}}
+{{- $name := printf "%s-pods-de-uso-unico" $e.namespace -}}
+{{- $accounts := list "despachante" "web" -}}
+{{- $users := list -}}
+{{- range $accounts }}
+{{- $users = append $users (printf "'system:serviceaccount:%s:%s'" $.Release.Namespace (include "rapa.component" (dict "root" $ "component" .))) }}
+{{- end }}
+{{- $dispatcher := printf "system:serviceaccount:%s:%s" .Release.Namespace (include "rapa.component" (dict "root" . "component" "despachante")) -}}
+{{- $image := include "rapa.executorImage" . -}}
+{{- $images := list (printf "'%s'" $image) -}}
+{{- range $v.images.executor.previousDigests }}
+{{- $images = append $images (printf "'%s@%s'" $v.images.executor.repository .) }}
+{{- end }}
+{{- $run := $e.podLabels.run -}}
+{{- $session := $e.podLabels.session -}}
+# O que o token da web e o do despachante podem criar no namespace das execuções: só os
+# pods de uso único, como o lançador os monta (rapa.control.kube). A Pod Security
+# "restricted" do namespace não fixa a imagem, a conta, a RuntimeClass nem o comando; sem
+# esta política, quem tivesse um desses tokens criaria ali um pod no runc, com outra imagem
+# e com o rótulo que abre o canal e a internet.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "rapa.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ $e.namespace }}
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    # As contas do RaPA que criam pods ali (a Role rapa-pods-de-uso-unico).
+    - name: contas-do-rapa
+      expression: "request.userInfo.username in [{{ join ", " $users }}]"
+  variables:
+    - name: app
+      expression: "has(object.metadata.labels) && 'app.kubernetes.io/name' in object.metadata.labels ? object.metadata.labels['app.kubernetes.io/name'] : ''"
+    # Cada conta, o seu rótulo: o despachante lança as execuções (o rótulo que abre o canal)
+    # e a web, as sessões. A web nunca cria um pod que alcance o canal.
+    - name: expected
+      expression: "request.userInfo.username == '{{ $dispatcher }}' ? '{{ $run }}' : '{{ $session }}'"
+    # A pasta do Secret do dono (rapa.control.launcher e rapa.control.sessions.launcher).
+    - name: secretDir
+      expression: "variables.app == '{{ $session }}' ? '/var/run/rapa/sessao' : '/var/run/rapa/canal'"
+    - name: secretVolumes
+      expression: "has(object.spec.volumes) ? object.spec.volumes.filter(v, has(v.secret)).map(v, v.name) : []"
+  validations:
+    - expression: "variables.app == variables.expected"
+      message: "o despachante só cria pods de execução (app.kubernetes.io/name={{ $run }}) e a web, só de sessão ({{ $session }})"
+    - expression: "has(object.spec.serviceAccountName) && object.spec.serviceAccountName == '{{ include "rapa.executorServiceAccount" . }}'"
+      message: "o pod precisa da conta de serviço {{ include "rapa.executorServiceAccount" . }} (sem permissão nenhuma)"
+    - expression: "has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false"
+      message: "o pod não monta o token da conta de serviço (automountServiceAccountToken: false)"
+    {{- if $e.runtimeClass }}
+    - expression: "has(object.spec.runtimeClassName) && object.spec.runtimeClassName == '{{ $e.runtimeClass }}'"
+      message: "o pod precisa da RuntimeClass {{ $e.runtimeClass }} (o gVisor)"
+    {{- end }}
+    # A do executor e, na atualização, a da versão anterior (images.executor.previousDigests):
+    # os pods que o despachante e a web antigos lançam até saírem.
+    - expression: "object.spec.containers.all(c, c.image in [{{ join ", " $images }}])"
+      message: "o pod só roda a imagem do executor ({{ $image }}{{ if $v.images.executor.previousDigests }} ou a anterior, de images.executor.previousDigests{{ end }})"
+    - expression: "(!has(object.spec.initContainers) || size(object.spec.initContainers) == 0) && (!has(object.spec.ephemeralContainers) || size(object.spec.ephemeralContainers) == 0)"
+      message: "o pod não tem contêineres de início nem efêmeros"
+    - expression: >-
+        object.spec.containers.all(c, !has(c.command) && has(c.args) && !has(c.workingDir) &&
+        c.args == (variables.app == '{{ $session }}' ?
+        ['python', '-m', 'rapa.session.host', '--config', '/var/run/rapa/sessao/config.json'] :
+        ['python', '-m', 'rapa.runner.pod']))
+      message: "o pod só roda o agente da execução (python -m rapa.runner.pod) ou o host da sessão (python -m rapa.session.host --config /var/run/rapa/sessao/config.json), conforme o rótulo"
+    # Nada roda no contêiner além do comando: nem ganchos nem sondas exec (a de prontidão da
+    # sessão é tcpSocket, sem host).
+    - expression: >-
+        object.spec.containers.all(c, !has(c.lifecycle) && !has(c.livenessProbe) && !has(c.startupProbe) &&
+        (!has(c.readinessProbe) || (has(c.readinessProbe.tcpSocket) && !has(c.readinessProbe.tcpSocket.host) &&
+        !has(c.readinessProbe.exec) && !has(c.readinessProbe.httpGet) && !has(c.readinessProbe.grpc))))
+      message: "o pod não tem ganchos (lifecycle) nem sondas além da de prontidão tcpSocket"
+    # Só as variáveis que o lançador põe (PATH, NODE_OPTIONS, RAPA_CHROMIUM_PATH,
+    # RAPA_ARGS_NAVEGADOR e as do carregador trocariam o que roda).
+    - expression: >-
+        object.spec.containers.all(c, !has(c.envFrom) && (!has(c.env) ||
+        c.env.all(v, v.name in ['PYTHONUNBUFFERED', 'TMPDIR'] && !has(v.valueFrom))))
+      message: "o pod só tem no ambiente PYTHONUNBUFFERED e TMPDIR"
+    # O que a Pod Security "restricted" pede, conferido aqui também: com
+    # executions.createNamespace=false, o rótulo do namespace é de quem opera, e um rótulo que
+    # falta (ou um "baseline") não pode abrir a rede, os processos e o IPC do nó.
+    - expression: >-
+        !(has(object.spec.hostNetwork) && object.spec.hostNetwork) &&
+        !(has(object.spec.hostPID) && object.spec.hostPID) &&
+        !(has(object.spec.hostIPC) && object.spec.hostIPC) &&
+        has(object.spec.securityContext) && has(object.spec.securityContext.runAsNonRoot) &&
+        object.spec.securityContext.runAsNonRoot == true &&
+        (!has(object.spec.securityContext.runAsUser) || object.spec.securityContext.runAsUser != 0)
+      message: "o pod não usa a rede, os processos nem o IPC do nó e roda como não root (runAsNonRoot)"
+    - expression: >-
+        object.spec.containers.all(c, has(c.securityContext) &&
+        has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation == false &&
+        (!has(c.securityContext.privileged) || c.securityContext.privileged == false) &&
+        (!has(c.securityContext.runAsUser) || c.securityContext.runAsUser != 0) &&
+        has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) &&
+        c.securityContext.capabilities.drop == ['ALL'] && !has(c.securityContext.capabilities.add) &&
+        (!has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0)))
+      message: "o contêiner não é privilegiado, não escala privilégio, não roda como root, tira todas as capacidades e não abre porta no nó"
+    - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.secret) || has(v.emptyDir))"
+      message: "o pod só monta volumes secret e emptyDir"
+    # O Secret do dono só na pasta dele e os emptyDir só em /tmp e /trabalho, sem subPath:
+    # nada cobre a imagem (o PATH, o pacote do RaPA, o Chromium).
+    - expression: >-
+        object.spec.containers.all(c, !has(c.volumeMounts) || c.volumeMounts.all(m,
+        !has(m.subPath) && !has(m.subPathExpr) &&
+        m.mountPath in [variables.secretDir, '/tmp', '/trabalho'] &&
+        (m.name in variables.secretVolumes) == (m.mountPath == variables.secretDir)))
+      message: "o pod só monta o Secret na pasta dele (/var/run/rapa/canal ou /var/run/rapa/sessao) e os emptyDir em /tmp e /trabalho, sem subPath"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "rapa.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $name }}
+  validationActions: [Deny]
+{{- end }}

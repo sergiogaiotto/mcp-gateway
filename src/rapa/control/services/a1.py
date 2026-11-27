@@ -19,8 +19,9 @@ nem para uma versão publicada antes da revisão 0006 só com a aprovação de q
 publicou (às vezes o próprio custodiante).
 
 As mesmas funções servem à aplicação (numa transação fixada na empresa) e ao
-despachante (``BYPASSRLS``, que só lê as colunas que estão aqui: nunca ``vault_path``),
-por isso toda consulta filtra a empresa explicitamente. As mensagens dizem o que falta
+despachante (``BYPASSRLS``; a conferência lê só as colunas que estão aqui, nunca
+``vault_path``, que só o lançador lê, para buscar o segredo no cofre), por isso toda
+consulta filtra a empresa explicitamente. As mensagens dizem o que falta
 pelo nome da credencial e pela origem, nunca com segredos.
 """
 

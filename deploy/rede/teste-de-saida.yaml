@@ -1,0 +1,89 @@
+# Confere a saída dos pods de execução depois de instalar (docs/OPERACAO.md, "Conferir a
+# guarda de saída"): um pod com o mesmo rótulo, a mesma conta de serviço e as mesmas regras de
+# segurança dos pods de uso único tenta abrir conexões para dentro (o metadata da nuvem em IPv4,
+# em IPv6 e pelo NAT64, a API do Kubernetes, o banco, a web, uma rede privada também pelo
+# NAT64) e para fora. Para dentro, tudo precisa falhar; para fora, só o que a NetworkPolicy
+# deixa (a internet direta ou o proxy). Os nomes dos serviços resolvem na família do cluster
+# (IPv6 num cluster IPv6). Num cluster IPv6, ponha em ALVOS_DO_AMBIENTE o endereço IPv6 de um
+# pod do plano de controle (kubectl -n rapa get pod -o wide) e um da VPC, e em
+# ALVOS_EXTERNOS_IPV6 um destino da internet em IPv6. Um endereço IPv6 vai entre colchetes.
+#
+#   kubectl apply -f deploy/rede/teste-de-saida.yaml   # troque a imagem pela do executor
+#   kubectl -n rapa-execucoes logs -f teste-de-saida
+#   kubectl -n rapa-execucoes delete pod teste-de-saida
+apiVersion: v1
+kind: Pod
+metadata:
+  name: teste-de-saida
+  namespace: rapa-execucoes
+  labels:
+    app.kubernetes.io/name: rapa-executor
+spec:
+  restartPolicy: Never
+  serviceAccountName: rapa-executor
+  # O registro privado da imagem do executor (o mesmo Secret dos pods de uso único, criado
+  # no namespace das execuções); num registro público, o kubelet só avisa que ele falta.
+  imagePullSecrets:
+    - name: rapa-registro
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  runtimeClassName: gvisor
+  activeDeadlineSeconds: 120
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: teste
+      image: registro.exemplo.test/rapa/rapa-executor:0.1.0
+      env:
+        # host:porta separados por vírgula. Os internos precisam falhar; os externos, abrir.
+        - name: ALVOS_INTERNOS
+          value: 169.254.169.254:80,[fd00:ec2::254]:80,[64:ff9b::a9fe:a9fe]:80,[::ffff:a9fe:a9fe]:80,kubernetes.default.svc:443,rapa-banco-rw.rapa.svc:5432,rapa-web.rapa.svc:8000,10.0.0.1:443,[64:ff9b::a00:1]:443
+        # Os do ambiente: pods e redes internas que não estão em RAPA_REDES_INTERNAS_PERMITIDAS.
+        - name: ALVOS_DO_AMBIENTE
+          value: ""
+        - name: ALVOS_EXTERNOS
+          value: example.com:443
+        - name: ALVOS_EXTERNOS_IPV6
+          value: ""
+      args:
+        - python
+        - -c
+        - |
+          import os, socket, sys
+          def tenta(alvo):
+              host, _, porta = alvo.rpartition(":")
+              host = host.removeprefix("[").removesuffix("]")
+              try:
+                  with socket.create_connection((host, int(porta)), timeout=3):
+                      return True
+              except OSError:
+                  return False
+          erros = 0
+          internos = os.environ["ALVOS_INTERNOS"] + "," + os.environ.get("ALVOS_DO_AMBIENTE", "")
+          externos = os.environ["ALVOS_EXTERNOS"] + "," + os.environ.get("ALVOS_EXTERNOS_IPV6", "")
+          for alvo in filter(None, internos.split(",")):
+              aberto = tenta(alvo)
+              erros += aberto
+              print(("ERRO: abriu " if aberto else "ok: fechado ") + alvo)
+          for alvo in filter(None, externos.split(",")):
+              aberto = tenta(alvo)
+              erros += not aberto
+              print(("ok: abriu " if aberto else "ERRO: fechado ") + alvo)
+          sys.exit(1 if erros else 0)
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        privileged: false
+        capabilities:
+          drop: [ALL]

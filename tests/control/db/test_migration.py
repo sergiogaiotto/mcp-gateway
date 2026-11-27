@@ -85,7 +85,7 @@ def test_downgrade_and_upgrade_again(pg_database: PgDatabase) -> None:
 
 
 #: A cadeia das revisões, na ordem: cada uma vem da anterior (uma ponta só).
-_REVISIONS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008")
+_REVISIONS = ("0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009")
 
 
 def test_revisions_form_a_single_chain() -> None:
@@ -170,7 +170,7 @@ def _catalog(pg: PgDatabase, database: str) -> dict[str, set[tuple[Any, ...]]]:
 
 
 def test_every_revision_goes_back_exactly_and_up_again(pg_database: PgDatabase) -> None:
-    """De 0001 a 0008, um passo de cada vez: cada volta deixa o banco exatamente como na
+    """De 0001 a 0009, um passo de cada vez: cada volta deixa o banco exatamente como na
     revisão anterior (tabelas, colunas, restrições, índices, gatilhos, corpos das funções,
     políticas e permissões), e subir de novo dá o mesmo de antes."""
     with _scratch_database(pg_database) as name:
@@ -510,11 +510,11 @@ async def test_a1_rules_migrate_back_and_forth(pg_database: PgDatabase) -> None:
             "credentials": (False, False),
             # Aplicação: muda só a validade, inclui aprovações (sem mudar), revoga
             # autorizações (sem trocar a credencial) e só lê os avisos. Despachante: lê a
-            # validade, nunca o caminho no cofre nem quem autorizou, e inclui os avisos;
-            # lê quem aprovou a versão e quem é custodiante (o sujeito do usuário), mais
-            # nada das aprovações e dos usuários.
+            # validade e (desde a 0009) o caminho no cofre, nunca quem autorizou, e inclui
+            # os avisos; lê quem aprovou a versão e quem é custodiante (o sujeito do
+            # usuário), mais nada das aprovações e dos usuários.
             "privileges": (
-                *(True, False, True, False, True, False, False, True, False, False, True),
+                *(True, False, True, False, True, False, False, True, True, False, True),
                 *(True, False, True, True, False),
             ),
         }
@@ -1038,7 +1038,7 @@ async def test_retention_migrates_back_and_forth_and_takes_paths_out(
         url = pg_database.server.url(
             name, pg_database.owner, pg_database.passwords[pg_database.owner]
         )
-        upgrade(url, roles=pg_database.roles)
+        upgrade(url, roles=pg_database.roles, revision="0008")
         head = _retention_schema(pg_database, name)
         assert head == {
             "columns": 2,
@@ -1085,7 +1085,7 @@ async def test_retention_migrates_back_and_forth_and_takes_paths_out(
                     run_id,
                 ),
             )
-        upgrade(url, roles=pg_database.roles)
+        upgrade(url, roles=pg_database.roles, revision="0008")
         assert _retention_schema(pg_database, name) == head
         with pg_database.server.connect(name) as conn:
             row = conn.execute(
@@ -1095,3 +1095,93 @@ async def test_retention_migrates_back_and_forth_and_takes_paths_out(
         stripped = {key: value for key, value in artifact.items() if key != "path"}
         assert row[0] == [stripped, "estranho"]
         assert row[1] == {"nota": "nota.pdf", "total": "3"}
+
+
+# -- 0009: cofre e chaves ---------------------------------------------------------------
+
+
+def _vault_schema(pg: PgDatabase, database: str) -> dict[str, Any]:
+    app, dispatcher = pg.roles.app, pg.roles.dispatcher
+    with pg.server.connect(database) as conn:
+        table = conn.execute(
+            "SELECT relrowsecurity, relforcerowsecurity FROM pg_class "
+            "WHERE relname = 'run_keys' AND relnamespace = 'public'::regnamespace"
+        ).fetchone()
+        function = conn.execute(
+            "SELECT prosecdef FROM pg_proc WHERE proname = 'rapa_purge_run_keys'"
+        ).fetchone()
+        vault_path = conn.execute(
+            "SELECT has_column_privilege(%s, 'credentials', 'vault_path', 'SELECT'), "
+            "has_column_privilege(%s, 'credentials', 'vault_path', 'UPDATE')",
+            (dispatcher, dispatcher),
+        ).fetchone()
+        companies = conn.execute(
+            "SELECT pg_get_expr(polqual, polrelid) FROM pg_policy "
+            "WHERE polrelid = 'companies'::regclass AND polname = 'retention_sweep_read'"
+        ).fetchone()
+        runs_policy = conn.execute(
+            "SELECT count(*) FROM pg_policy "
+            "WHERE polrelid = 'runs'::regclass AND polname = 'retention_sweep_read'"
+        ).fetchone()
+        privileges = (
+            conn.execute(
+                "SELECT has_table_privilege(%s, 'run_keys', 'SELECT'), "
+                "has_table_privilege(%s, 'run_keys', 'INSERT'), "
+                "has_table_privilege(%s, 'run_keys', 'SELECT'), "
+                "has_table_privilege(%s, 'run_keys', 'INSERT'), "
+                "has_table_privilege(%s, 'run_keys', 'UPDATE'), "
+                "has_table_privilege(%s, 'run_keys', 'DELETE'), "
+                "has_function_privilege(%s, 'rapa_purge_run_keys(integer)', 'EXECUTE'), "
+                "has_function_privilege(%s, 'rapa_purge_run_keys(integer)', 'EXECUTE')",
+                (app, app, dispatcher, dispatcher, dispatcher, dispatcher, dispatcher, app),
+            ).fetchone()
+            if table
+            else None
+        )
+    assert vault_path is not None and companies is not None and runs_policy is not None
+    return {
+        "table": tuple(table) if table else None,
+        "definer": function[0] if function else None,
+        "vault_path": tuple(vault_path),
+        "companies_marks_run_keys": "run_keys" in str(companies[0]),
+        "runs_policy": int(runs_policy[0]),
+        "privileges": tuple(privileges) if privileges else None,
+    }
+
+
+def test_vault_keys_migrate_back_and_forth(pg_database: PgDatabase) -> None:
+    with _scratch_database(pg_database) as name:
+        url = pg_database.server.url(
+            name, pg_database.owner, pg_database.passwords[pg_database.owner]
+        )
+        upgrade(url, roles=pg_database.roles)
+        head = _vault_schema(pg_database, name)
+        assert head == {
+            "table": (True, True),
+            "definer": True,
+            # O despachante lê o caminho no cofre (uma referência), nunca o muda.
+            "vault_path": (True, False),
+            "companies_marks_run_keys": True,
+            "runs_policy": 1,
+            # A aplicação só lê as chaves; o despachante lê e inclui, nunca muda nem apaga
+            # (só pela função), e só ele executa a função.
+            "privileges": (True, False, True, True, False, False, True, False),
+        }
+        apply_grants(url, pg_database.roles)
+        assert _vault_schema(pg_database, name) == head
+
+        command.downgrade(alembic_config(url, pg_database.roles), "0008")
+        back = {
+            "table": None,
+            "definer": None,
+            "vault_path": (False, False),
+            "companies_marks_run_keys": False,
+            "runs_policy": 0,
+            "privileges": None,
+        }
+        assert _vault_schema(pg_database, name) == back
+        # Reaplicar as permissões na 0008 não dá ao despachante o caminho no cofre.
+        apply_grants(url, pg_database.roles)
+        assert _vault_schema(pg_database, name) == back
+        upgrade(url, roles=pg_database.roles)
+        assert _vault_schema(pg_database, name) == head

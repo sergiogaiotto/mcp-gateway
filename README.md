@@ -4,7 +4,7 @@ O RaPA cria robôs de automação web (RPA) sob demanda para pessoas de negócio
 
 Tudo é código aberto. O modelo de linguagem (um modelo aberto num hub interno) só ajuda a criar e a consertar robôs; as execuções normais não usam LLM.
 
-O plano completo está em [docs/PLANO-RaPA.md](docs/PLANO-RaPA.md).
+O plano completo está em [docs/PLANO-RaPA.md](docs/PLANO-RaPA.md). O manual de instalação, configuração e testes, com as telas reais, está em [docs/manual/index.html](docs/manual/index.html) (abre direto do repositório, sem internet).
 
 ## Situação
 
@@ -27,22 +27,27 @@ Fase 0, que não depende do AWS Outposts:
 - [x] Regras do certificado A1 (`rapa.control.services.credentials` e `a1`, tela Credenciais, cartão do A1 na tela do robô, `/v1/credenciais` e `/v1/robos/{id}/autorizacoes-a1`): credenciais registradas só pela referência ao cofre, com custodiante, validade e impressão do certificado; a autorização do custodiante por robô e portal, que cai quando o certificado é trocado; duas aprovações de pessoas diferentes (nenhuma delas o custodiante, e nunca de uma versão que o custodiante criou) para publicar um robô com A1, também no banco; o certificado conferido ao enfileirar (todas as origens) e de novo pelo despachante antes de lançar (falha fechada, `certificado_a1_bloqueado`); avisos de vencimento uma vez por dia; três tabelas novas com isolamento por linha (migração 0006) e auditoria
 - [x] Operação por empresa (`rapa.control.services.company`, `rapa.control.services.lifecycle`, tela Empresa, `/v1/empresa` e [docs/OPERACAO.md](docs/OPERACAO.md)): a empresa entra pela linha de comando já ligada à organização do Keycloak (sem reiniciar o serviço) e com o administrador; quem entra pela primeira vez vira usuário sem papel; a própria empresa administra usuários, papéis e áreas e vê o consumo do mês; a plataforma congela (nada novo começa, nem credencial, autorização ou aprovação do A1; a fila é cancelada e a retenção para), exporta tudo (as tabelas das regras do A1 e as evidências incluídas, sem material de chave) e apaga a empresa, com o registro em `platform_events` (migração 0007)
 - [x] Evidências (`rapa.control.artifacts`, `rapa.control.services.artifacts` e `retention`, `rapa.runner.video`; tela da execução e `/v1/execucoes/{id}/artefatos`): as telas, os arquivos baixados e, quando a execução falha ou fica indeterminada, o vídeo dela ficam guardados por execução e saem pela API e pela tela da execução para quem vê a execução, sem nenhum caminho do disco; uma saída de download é o nome do artefato. O despachante apaga, uma vez por hora, o que passou do prazo de retenção (prazos a validar com o jurídico)
+- [x] Execuções e sessões em pods de uso único (`rapa.control.launcher.KubernetesLauncher`, `rapa.control.channel`, `rapa.runner.pod`, `rapa.control.sessions.launcher`): com `RAPA_EXECUTOR=kubernetes`, cada tentativa roda num pod no gVisor que só fala com o canal do despachante que o lançou (bilhete por tentativa, segredos só em memória, nunca uma confirmação inventada), e a saída do navegador passa por uma guarda que só deixa os domínios do robô e fecha a rede interna
+- [x] Cofre e armazenamento (`rapa.control.vault`, `rapa.control.keys`, `rapa.control.cipher`, `rapa.control.backends`; migração 0009): os segredos das credenciais no OpenBao, sempre debaixo da pasta da empresa; os artefatos no S3 (SeaweedFS) cifrados com uma chave por execução, embrulhada pela chave transit da empresa; a retenção e a saída da empresa destroem as chaves
+- [x] Observabilidade e saúde (`rapa.control.observability`, `rapa.control.health`): métricas Prometheus numa porta própria, logs em JSON, traços OpenTelemetry e GlitchTip opcionais e limpos, e `/saude/pronto` com o banco, o despachante, o OpenBao e o S3
+- [x] Deploy no EKS do AWS Outposts (`deploy/`): as imagens, o chart Helm (com o CloudNativePG, as NetworkPolicies que negam tudo, a política de admissão dos pods de uso único e as rotas do Envoy Gateway), o Argo CD, o Keycloak, o preparo do OpenBao e o CI com o chart, as imagens e um cluster kind
 
 ## Estrutura
 
 ```
 src/rapa/
   core/       formato do robô, templates, política, edições, contratos e eventos
-  runner/     executor sobre Playwright (python -m rapa.runner.worker)
+  runner/     executor sobre Playwright (python -m rapa.runner.worker) e o agente do pod (python -m rapa.runner.pod)
   recorder/   gravador da demonstração
   session/    hospedeiro da sessão de gravação ao vivo (python -m rapa.session.host)
   compiler/   compilação da gravação em robô
   repair/     candidatos do conserto a partir do retrato da página que quebrou
   llm/        cliente do hub de LLM, sonda (python -m rapa.llm.probe), generalização e escolha do conserto
-  control/    banco, fila, despachante, agendas, webhooks, lotes, credenciais e regras do A1, evidências, lançador, API REST e gateway MCP
+  control/    banco, fila, despachante, agendas, webhooks, lotes, credenciais e regras do A1, evidências, lançadores (local e em pods) e o canal, cofre, S3 cifrado e chaves, observabilidade e saúde, API REST e gateway MCP
   ui/         interface em NiceGUI (python -m rapa.ui para o modo de desenvolvimento)
   server.py   o serviço num processo só: REST, MCP, interface e despachante
   fixtures/   portais de teste e robôs de exemplo
+deploy/       imagens (docker), chart Helm, Argo CD, Keycloak, gVisor, rede, banco e o CI do kind
 tests/        testes automatizados (pytest)
 docs/         plano e documentação
 ```
@@ -60,10 +65,10 @@ uv run pytest
 ```
 
 ```bash
-uv run ruff check src tests && uv run mypy
+uv run ruff format src tests deploy docs && uv run ruff check src tests deploy docs && uv run mypy
 ```
 
-Os testes de banco usam `RAPA_TEST_DATABASE_URL` (superusuário) ou sobem um PostgreSQL temporário com os binários locais (`initdb`, `pg_ctl`). Os testes com navegador procuram o Chromium em `RAPA_CHROMIUM_PATH`, `/usr/bin/chromium` ou `/opt/pw-browsers/chromium`. Os portais de teste respondem em `*.rapa.test`, que o Chromium resolve para 127.0.0.1.
+Os testes de banco usam `RAPA_TEST_DATABASE_URL` (superusuário) ou sobem um PostgreSQL temporário com os binários locais (`initdb`, `pg_ctl`). Os testes com navegador procuram o Chromium em `RAPA_CHROMIUM_PATH`, `/usr/bin/chromium` ou `/opt/pw-browsers/chromium`. Os portais de teste respondem em `*.rapa.test`, que o Chromium resolve para 127.0.0.1. Os testes do chart precisam do `helm` e do `kubeconform`, e o teste contra o OpenBao de verdade, do binário `bao` (`deploy/ci/instalar-bao.sh <pasta>`); sem eles, são pulados (no CI, nunca).
 
 ## Rodando o RaPA localmente
 
@@ -118,7 +123,7 @@ A interface fica em http://127.0.0.1:8000, a API REST em `/v1` e o gateway MCP e
 
 A documentação da API REST fica desligada por padrão. Com `RAPA_DOCS_API=1`, o serviço mostra o Swagger UI em `/v1/docs` (servido por ele mesmo, sem CDN, então funciona sem internet) e o documento OpenAPI em `/v1/openapi.json`. As duas páginas abrem sem token e mostram só as rotas; para chamar a API pela página, informe o token em **Authorize** (sem a palavra `Bearer`; ele fica só na página aberta, o navegador não o guarda) e use **Try it out**, que vale como qualquer outra chamada, com os papéis do dono do token. Os robôs publicados de cada pessoa ficam em `GET /v1/openapi-robos.json`, com o token, sempre ligado.
 
-Para gravar um robô, entre como quem tem o papel de criação e abra **Gravar**: informe a área e o endereço inicial, faça a tarefa na tela ao vivo e clique em **Parar e revisar**. Cada gravação abre um processo `python -m rapa.session.host` com um Chromium completo (`RAPA_CHROMIUM_PATH`, `RAPA_ARGS_NAVEGADOR`), cuja saída passa por uma guarda que recusa a própria máquina e o metadata da nuvem (as redes privadas do plano de controle ficam com a NetworkPolicy do deploy); os limites e prazos vêm de `RAPA_SESSOES_POR_EMPRESA`, `RAPA_SESSOES_MAX`, `RAPA_SESSAO_OCIOSA_S` e `RAPA_SESSAO_MAX_S`. Com `RAPA_PUBLIC_URL`, o websocket da visão ao vivo só aceita a origem da interface (mais as de `RAPA_ORIGENS_AO_VIVO`). As regras estão em [docs/CONTRIBUINDO.md](docs/CONTRIBUINDO.md). Com o hub de LLM configurado (`RAPA_LLM_BASE_URL`, `RAPA_LLM_MODEL`, `RAPA_LLM_API_KEY` e a matriz da sonda em `RAPA_LLM_CAPACIDADES`, gravada por `python -m rapa.llm.probe --out`), a revisão também mostra as propostas do modelo; sem ele, só as sugestões das regras, com um aviso.
+Para gravar um robô, entre como quem tem o papel de criação e abra **Gravar**: informe a área e o endereço inicial, faça a tarefa na tela ao vivo e clique em **Parar e revisar**. Cada gravação abre um processo `python -m rapa.session.host` com um Chromium completo (`RAPA_CHROMIUM_PATH`, `RAPA_ARGS_NAVEGADOR`), cuja saída passa por uma guarda que recusa a própria máquina e o metadata da nuvem e, fora do modo de desenvolvimento, toda rede que não é da internet, menos as de `RAPA_REDES_INTERNAS_PERMITIDAS` (no cluster, a NetworkPolicy do deploy também fecha as redes do plano de controle); os limites e prazos vêm de `RAPA_SESSOES_POR_EMPRESA`, `RAPA_SESSOES_MAX`, `RAPA_SESSAO_OCIOSA_S` e `RAPA_SESSAO_MAX_S`. Com `RAPA_PUBLIC_URL`, o websocket da visão ao vivo só aceita a origem da interface (mais as de `RAPA_ORIGENS_AO_VIVO`). As regras estão em [docs/CONTRIBUINDO.md](docs/CONTRIBUINDO.md). Com o hub de LLM configurado (`RAPA_LLM_BASE_URL`, `RAPA_LLM_MODEL`, `RAPA_LLM_API_KEY` e a matriz da sonda em `RAPA_LLM_CAPACIDADES`, gravada por `python -m rapa.llm.probe --out`), a revisão também mostra as propostas do modelo; sem ele, só as sugestões das regras, com um aviso.
 
 Um robô publicado também roda por **Agendas** (expressão cron e fuso; o despachante dispara as ocorrências vencidas a cada `RAPA_AGENDA_INTERVALO_S` segundos e ainda roda uma ocorrência atrasada até `RAPA_AGENDA_TOLERANCIA_S`; até `RAPA_AGENDAS_POR_EMPRESA` agendas ligadas por empresa), por **Webhooks** (outro sistema faz `POST /v1/webhooks/{id}` com as entradas em JSON e os cabeçalhos `X-RaPA-Timestamp`, `X-RaPA-Delivery` (sem ponto) e `X-RaPA-Signature`; as leituras de webhook antes da assinatura ficam em `RAPA_WEBHOOKS_POR_SEGUNDO` por processo; ligue com `RAPA_CHAVE_WEBHOOKS`, um texto aleatório de pelo menos 32 caracteres, gerado uma vez, por exemplo com `openssl rand -hex 32`, e guardado como segredo: trocá-lo invalida as chaves de todos os webhooks) e por **Lotes** (uma planilha .xlsx ou .csv, uma execução por linha; limites em `RAPA_LOTE_MAX_LINHAS` e `RAPA_LOTE_MAX_BYTES`). Só quem opera (ou administra) a área cria agendas, webhooks e lotes.
 
@@ -130,7 +135,13 @@ Quem administra a empresa abre **Empresa** para dar e tirar papéis (por área o
 
 A tela de uma execução que terminou mostra as **Evidências**: as telas em miniatura (clique para ver grande), o vídeo da falha e os arquivos baixados, com tamanho e data. Pela API, `GET /v1/execucoes/{id}/artefatos` lista os artefatos e `GET /v1/execucoes/{id}/artefatos/{nome}` baixa um deles (a saída de um passo de download é esse nome). Quem vê a execução vê as evidências. O vídeo só é guardado quando a execução falha ou fica indeterminada, e só se o robô não digita credencial do cofre fora de um campo de senha; `RAPA_VIDEO_EM_FALHAS=0` desliga a gravação, que precisa do `ffmpeg` do Playwright no executor (`playwright install ffmpeg`; sem ele, as execuções rodam sem vídeo, e o servidor avisa no log ao subir). O despachante apaga o que venceu uma vez por hora: as telas e o vídeo de execuções que deram certo depois de `RAPA_RETENCAO_SUCESSO_DIAS` (7); as evidências (tudo de uma execução que falhou ou ficou indeterminada, e os arquivos baixados das que deram certo) e os retratos do conserto depois de `RAPA_RETENCAO_FALHAS_DIAS` (90); as chaves de idempotência vencidas; e os eventos depois de `RAPA_RETENCAO_EVENTOS_DIAS` (400). Esses prazos ainda estão a validar com o jurídico; o que foi apagado aparece como **expirado**. Nada de uma empresa congelada expira: as evidências dela ficam para a exportação da saída da empresa.
 
-Os arquivos de entrada (para robôs que enviam arquivos) ficam em `RAPA_PASTA_ARQUIVOS`, numa subpasta por empresa: `<RAPA_PASTA_ARQUIVOS>/<uuid da empresa>/<arquivo>`. Cada execução só enxerga a subpasta da própria empresa; arquivos soltos na raiz não valem. `/saude` responde 503 enquanto o despachante do processo estiver parado.
+Os arquivos de entrada (para robôs que enviam arquivos) ficam em `RAPA_PASTA_ARQUIVOS`, numa subpasta por empresa: `<RAPA_PASTA_ARQUIVOS>/<uuid da empresa>/<arquivo>`. Cada execução só enxerga a subpasta da própria empresa; arquivos soltos na raiz não valem. `/saude` responde 503 enquanto o despachante do processo estiver parado, e `/saude/pronto` também quando o banco (ou o OpenBao e o S3, se configurados) não responde. Localmente, os segredos vêm do arquivo de `RAPA_SEGREDOS_DEV` (com `RAPA_DEV=1`) e os artefatos ficam em `RAPA_PASTA_ARTEFATOS`; o cofre, o S3, as execuções em pods e a observabilidade têm as variáveis em [docs/OPERACAO.md](docs/OPERACAO.md) (1.11).
+
+## Instalar no Kubernetes
+
+Em produção, o RaPA roda no EKS do AWS Outposts (a única peça da AWS; o resto é código aberto no cluster), pelo chart `deploy/helm/rapa`: a interface (`rapa-web`), a REST e o MCP (`rapa-api`) e o despachante (`rapa-despachante`), com as execuções e as sessões de gravação em pods de uso único no gVisor, as NetworkPolicies que negam tudo por padrão e o banco no CloudNativePG numa release própria. As imagens saem de `deploy/docker/Dockerfile` (alvos `controle` e `executor`) e o Argo CD sincroniza as duas releases, o banco antes, pela Application raiz (`deploy/argocd/raiz.yaml`, com as checagens de saúde de `deploy/argocd/argocd-cm-saude.yaml`).
+
+A ordem de instalação, os segredos, o que cada valor e cada variável fazem, a atualização, o backup e a restauração, o cofre, a observabilidade e os procedimentos de incidente estão em [docs/OPERACAO.md](docs/OPERACAO.md); as regras de cada parte, em [docs/CONTRIBUINDO.md](docs/CONTRIBUINDO.md). O CI valida o chart (`helm lint`, `helm template` e `kubeconform`), constrói e roda as duas imagens e instala tudo num cluster kind (`values-kind.yaml`), onde um robô roda pela REST num pod de uso único.
 
 ## Licença
 

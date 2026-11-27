@@ -91,8 +91,10 @@ def test_safe_return_path() -> None:
 def test_dev_login_configuration_errors() -> None:
     with pytest.raises(ValueError, match="ao menos uma forma"):
         UiAuth()
-    with pytest.raises(ValueError, match="ao menos um perfil"):
-        DevLogin([])
+    # Sem perfis (os tokens ainda sem usuário no banco), o login de desenvolvimento existe
+    # vazio: o serviço sobe e a tela de entrada diz o que falta.
+    empty = DevLogin([])
+    assert empty.profiles == {} and empty.get("perfil1") is None
     with pytest.raises(ValueError, match="repetido"):
         DevLogin([DevProfile("ana", "A", PRINCIPAL), DevProfile("ana", "B", PRINCIPAL)])
     with pytest.raises(ValueError, match="inválida"):

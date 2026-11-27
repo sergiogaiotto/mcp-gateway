@@ -1,0 +1,77 @@
+{
+  "realm": "rapa",
+  "displayName": "RaPA",
+  "enabled": true,
+  "sslRequired": "external",
+  "organizationsEnabled": true,
+  "registrationAllowed": false,
+  "resetPasswordAllowed": true,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "bruteForceProtected": true,
+  "failureFactor": 10,
+  "accessTokenLifespan": 300,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "revokeRefreshToken": true,
+  "refreshTokenMaxReuse": 0,
+  "defaultSignatureAlgorithm": "RS256",
+  "internationalizationEnabled": true,
+  "supportedLocales": ["pt-BR"],
+  "defaultLocale": "pt-BR",
+  "clients": [
+    {
+      "clientId": "rapa-interface",
+      "name": "RaPA (interface)",
+      "description": "Login da interface do RaPA: fluxo de código com PKCE (S256), cliente confidencial. O segredo é gerado pelo Keycloak na importação e nunca fica neste arquivo.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "frontchannelLogout": true,
+      "redirectUris": ["https://rapa.exemplo.test/auth/oidc/retorno"],
+      "webOrigins": ["https://rapa.exemplo.test"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "https://rapa.exemplo.test/",
+        "access.token.lifespan": "300",
+        "use.refresh.tokens": "true"
+      },
+      "defaultClientScopes": ["basic", "profile", "email", "web-origins", "acr", "organization"],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "audiencia-da-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "rapa-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "rapa-api",
+      "name": "RaPA (API REST e MCP)",
+      "description": "Só a audiência dos tokens da API (RAPA_JWT_AUDIENCE): nenhum fluxo de login é deste cliente.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [],
+      "webOrigins": []
+    }
+  ]
+}

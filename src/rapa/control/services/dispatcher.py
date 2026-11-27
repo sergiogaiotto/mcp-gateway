@@ -53,12 +53,23 @@ Com um :class:`rapa.control.artifacts.ArtifactStore`, os artefatos do resultado
 (as telas, os arquivos baixados e o vídeo da falha) são registrados por ele antes
 de gravar o resultado: só o que o store aceita (no lugar certo, sem caminho) vai
 para ``runs.artifacts``. Um artefato recusado fica de fora; o resultado é gravado
-do mesmo jeito.
+do mesmo jeito. O que o store não consegue guardar agora (o S3 ou o cofre fora do ar)
+é tentado de novo algumas vezes; se não der, a execução ganha na mensagem quantos
+artefatos se perderam e, se não tiver outro código, ``artefatos_nao_guardados``. No
+fim, o store solta a tentativa (no S3, a pasta de passagem dela sai inteira).
+
+Observabilidade: :meth:`Dispatcher.step_status` dá a situação de cada etapa do laço
+(as métricas leem na hora da coleta), e com um ``tracer`` (:class:`RunTracer`, o do
+OpenTelemetry quando ligado) cada execução ganha um span, com o id, a tentativa, a
+empresa e, no fim, a situação e o código de erro informados: nunca as entradas, as
+saídas ou a mensagem.
 """
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -69,6 +80,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy.exc import DataError, DBAPIError, IntegrityError
 
 from rapa.control.artifacts import ArtifactStore
+from rapa.control.observability.glitchtip import report_unhandled
 from rapa.control.services._common import now_utc
 from rapa.control.services.queue import PgRunQueue, StaleAttempt
 from rapa.core.contracts import InvalidInput, RunMode, RunnerJob, RunState, uses_a1
@@ -80,6 +92,9 @@ __all__ = [
     "ExpiryWatch",
     "Launcher",
     "RetentionTicker",
+    "RunSpan",
+    "RunTracer",
+    "StepStatus",
     "Ticker",
     "WorkerNotStarted",
     "failure_result",
@@ -110,6 +125,9 @@ _A1_UNCHECKED = (
 )
 #: Artefatos registrados, no máximo, por resultado (o que passar disso fica de fora).
 _MAX_ARTIFACTS = 10_000
+#: Código da execução cujos artefatos não puderam ser guardados (só se ela não tem outro).
+ARTIFACTS_NOT_STORED = "artefatos_nao_guardados"
+_ARTIFACT_RETRY_MAX_S = 30.0
 
 
 class Ticker(Protocol):
@@ -151,6 +169,32 @@ class RetentionTicker(Protocol):
         ...
 
 
+class RunSpan(Protocol):
+    """O span de uma execução, visto do despachante."""
+
+    def finished(self, result: Mapping[str, Any] | None) -> None:
+        """O resultado que o despachante mandou gravar (``None``: a tentativa ficou antiga)."""
+        ...
+
+
+class RunTracer(Protocol):
+    """Quem abre um span por execução (:class:`rapa.control.observability.tracing.RunSpans`)."""
+
+    def run(self, job: RunnerJob) -> AbstractContextManager[RunSpan]:
+        """O span da execução, corrente enquanto o despachante cuida dela."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class StepStatus:
+    """A situação de uma etapa do laço, para as métricas (sem o texto de nenhum erro)."""
+
+    #: Falhas seguidas (0: a última vez deu certo, ou ainda não rodou).
+    failures: int
+    failing_since: datetime | None
+    last_ok: datetime | None
+
+
 class _ReportedArtifact(BaseModel):
     """Um artefato como o executor informa no RESULT.json (o caminho é local)."""
 
@@ -167,7 +211,22 @@ class WorkerNotStarted(Exception):
     Por exemplo: cofre de segredos fora do ar, pasta da tentativa que não pôde
     ser criada ou programa do executor que não abriu. Nenhum passo pode ter
     rodado, então a execução é uma falha comum, nunca um indeterminado.
+
+    ``code`` e ``public_message`` vão para o resultado (nunca um segredo nem o texto de
+    um erro de fora): o lançador local usa o padrão (``executor_nao_iniciado``); o de
+    pods, ``executor_nao_iniciou`` com o motivo do Kubernetes.
     """
+
+    def __init__(
+        self,
+        message: str = "o executor não pôde ser iniciado",
+        *,
+        code: str = "executor_nao_iniciado",
+        public_message: str = "O executor não pôde ser iniciado; nenhum passo foi executado.",
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.public_message = public_message
 
 
 def failure_result(
@@ -242,7 +301,10 @@ class Dispatcher:
         retention: RetentionTicker | None = None,
         retention_interval: float = 3600.0,
         retention_catch_up: float = 60.0,
+        artifact_retries: int = 3,
+        artifact_retry_s: float = 1.0,
         clock: Callable[[], datetime] = now_utc,
+        tracer: RunTracer | None = None,
     ) -> None:
         """``finish_retry_s`` é a primeira espera entre tentativas de gravar o
         resultado (dobra a cada falha, até 5 s); ``finish_grace_s`` é quanto
@@ -260,20 +322,27 @@ class Dispatcher:
         ``"certificates"``).
 
         Com ``artifacts``, os artefatos de cada resultado são registrados pelo store
-        antes de o resultado ser gravado. Com ``retention``, a etapa ``"retention"``
+        antes de o resultado ser gravado; o que o store não consegue guardar agora (o
+        S3 ou o cofre fora do ar) é tentado de novo ``artifact_retries`` vezes, com
+        espera de ``artifact_retry_s`` segundos que dobra a cada vez (até 30 s). Com
+        ``retention``, a etapa ``"retention"``
         roda a cada ``retention_interval`` segundos (uma hora), ou a cada
         ``retention_catch_up`` enquanto ficar para trás.
 
         Uma etapa da manutenção que falha é repetida depois de ``poll_interval``,
         espera que dobra a cada falha seguida, até 60 s. ``unhealthy_after_s`` é
         quanto tempo uma etapa do laço pode falhar sem parar antes de
-        :attr:`healthy` ficar falso."""
+        :attr:`healthy` ficar falso.
+
+        Com ``tracer``, cada execução roda dentro do span dela."""
         if concurrency < 1:
             raise ValueError("a concorrência precisa ser pelo menos 1")
         if finish_retry_s <= 0 or finish_grace_s < 0:
             raise ValueError("as esperas para gravar o resultado precisam ser positivas")
         if unhealthy_after_s < 0:
             raise ValueError("o prazo para acusar falha na saúde não pode ser negativo")
+        if artifact_retries < 0 or artifact_retry_s <= 0:
+            raise ValueError("as novas tentativas de guardar os artefatos precisam ser positivas")
         self.queue = queue
         self.launch = launch
         self.concurrency = concurrency
@@ -289,10 +358,13 @@ class Dispatcher:
         self.alerts = alerts
         self.alerts_interval = alerts_interval
         self.artifacts = artifacts
+        self.artifact_retries = artifact_retries
+        self.artifact_retry_s = artifact_retry_s
         self.retention = retention
         self.retention_interval = retention_interval
         self.retention_catch_up = retention_catch_up
         self.clock = clock
+        self.tracer = tracer
         self._tasks: dict[asyncio.Task[None], RunnerJob] = {}
         self._steps = {name: _StepState() for name in _STEPS}
         self._wakeup = asyncio.Event()
@@ -320,6 +392,27 @@ class Dispatcher:
             name: state.failing_since
             for name, state in self._steps.items()
             if state.failing_since is not None
+        }
+
+    def step_status(self) -> dict[str, StepStatus]:
+        """A situação das etapas do laço que este despachante roda.
+
+        Sempre ``"partitions"``, ``"reap"`` e ``"claim"``; ``"schedules"`` com um
+        agendador, ``"certificates"`` com os avisos do A1 e ``"retention"`` com a retenção.
+        """
+        used = {
+            "schedules": self.scheduler is not None,
+            "certificates": self.alerts is not None,
+            "retention": self.retention is not None,
+        }
+        return {
+            name: StepStatus(
+                failures=state.failures,
+                failing_since=state.failing_since,
+                last_ok=state.last_ok,
+            )
+            for name, state in self._steps.items()
+            if used.get(name, True)
         }
 
     @property
@@ -479,8 +572,9 @@ class Dispatcher:
     def _done(self, task: asyncio.Task[None]) -> None:
         self._tasks.pop(task, None)
         self._wakeup.set()
-        if not task.cancelled() and task.exception() is not None:
-            logger.error("falha inesperada no despacho: %s", type(task.exception()).__name__)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            logger.error("falha inesperada no despacho: %s", type(error).__name__)
+            report_unhandled(error)
 
     async def drain(self) -> None:
         """Espera as execuções em andamento terminarem."""
@@ -562,16 +656,30 @@ class Dispatcher:
             return _A1_UNCHECKED
 
     async def _handle(self, job: RunnerJob) -> None:
+        with contextlib.ExitStack() as stack:
+            span: RunSpan | None = None
+            if self.tracer is not None:
+                try:
+                    span = stack.enter_context(self.tracer.run(job))
+                except Exception as exc:  # o rastreio nunca impede a execução
+                    logger.warning("falha ao abrir o span da execução: %s", type(exc).__name__)
+            result = await self._dispatch(job)
+            if span is not None:
+                try:
+                    span.finished(result)
+                except Exception as exc:
+                    logger.warning("falha ao fechar o span da execução: %s", type(exc).__name__)
+
+    async def _dispatch(self, job: RunnerJob) -> Mapping[str, Any] | None:
+        """Lança a execução e grava o resultado; devolve o resultado mandado gravar."""
         blocked = await self._a1_blocked(job)
         if blocked is not None:
             logger.warning("execução %s não lançada: certificado A1 bloqueado", job.run_id)
-            await self._finish(
-                job,
-                failure_result(
-                    job, ErrorCode.CERTIFICADO_A1_BLOQUEADO.value, blocked, started=False
-                ),
+            refused = failure_result(
+                job, ErrorCode.CERTIFICADO_A1_BLOQUEADO.value, blocked, started=False
             )
-            return
+            await self._finish(job, refused)
+            return refused
         launch_task: asyncio.Task[Mapping[str, Any]] = asyncio.create_task(
             _call(self.launch, job), name=f"lancamento-{job.run_id}"
         )
@@ -584,16 +692,13 @@ class Dispatcher:
             except asyncio.CancelledError:
                 if not stale.is_set():
                     raise
-                # A tentativa ficou antiga: outra já assumiu, nada a gravar.
-                return
+                # A tentativa ficou antiga: outra já assumiu, nada a gravar. O que ela
+                # deixou na passagem nunca vai ser registrado: sai já, não na retenção.
+                await self._release_attempt(job)
+                return None
             except WorkerNotStarted as exc:
                 logger.error("o executor não foi iniciado: %s", _error_name(exc.__cause__ or exc))
-                result = failure_result(
-                    job,
-                    "executor_nao_iniciado",
-                    "O executor não pôde ser iniciado; nenhum passo foi executado.",
-                    started=False,
-                )
+                result = failure_result(job, exc.code, exc.public_message, started=False)
             except Exception as exc:  # o lançador falhou sem entregar resultado
                 logger.error("o lançador falhou: %s", type(exc).__name__)
                 result = failure_result(
@@ -602,6 +707,7 @@ class Dispatcher:
             # A concessão segue renovada até os artefatos e o resultado serem gravados.
             result = await self._register_artifacts(job, result)
             await self._finish(job, result)
+            return result
         finally:
             beats.cancel()
             # Erros da renovação já foram registrados; não impedem gravar o resultado.
@@ -615,36 +721,108 @@ class Dispatcher:
         Sem store, o resultado segue como veio (a fila guarda os artefatos sem o
         caminho). Um erro do store nunca impede gravar o resultado: só o tipo do erro
         vai para o log, nunca o nome do arquivo (que pode trazer dados da execução).
+        No fim, com ou sem erro, o store solta a tentativa (``release_attempt``: no S3,
+        a pasta de passagem dela sai inteira, com o que tiver sobrado em claro).
         """
         store = self.artifacts
-        reported = result.get("artifacts")
-        if store is None or not isinstance(reported, list) or not reported:
+        if store is None:
             return result
-        registered: list[dict[str, Any]] = []
-        refused = 0
-        for raw in reported[:_MAX_ARTIFACTS]:
+        try:
+            return await self._store_artifacts(store, job, result)
+        finally:
+            await self._release_attempt(job)
+
+    async def _release_attempt(self, job: RunnerJob) -> None:
+        """Solta a tentativa no store (a passagem dela sai); um erro só vai para o log."""
+        store = self.artifacts
+        if store is None:
+            return
+        try:
+            await store.release_attempt(job.company_id, job.run_id, job.attempt)
+        except Exception as exc:
+            logger.error(
+                "a passagem dos artefatos de %s não pôde ser limpa: %s",
+                job.run_id,
+                _error_name(exc),
+            )
+
+    async def _store_artifacts(
+        self, store: ArtifactStore, job: RunnerJob, result: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        reported = result.get("artifacts")
+        if not isinstance(reported, list) or not reported:
+            return result
+        refused = max(0, len(reported) - _MAX_ARTIFACTS)
+        pending: list[tuple[int, _ReportedArtifact]] = []
+        for index, raw in enumerate(reported[:_MAX_ARTIFACTS]):
             try:
-                item = _ReportedArtifact.model_validate(raw)
-                info = await store.put(
-                    job.company_id, job.run_id, job.attempt, item.name, item.kind, Path(item.path)
-                )
-            except (ValidationError, ValueError, OSError) as exc:
+                pending.append((index, _ReportedArtifact.model_validate(raw)))
+            except ValidationError:
                 refused += 1
-                logger.warning(
-                    "artefato de %s recusado pelo armazenamento: %s", job.run_id, type(exc).__name__
-                )
-                continue
-            except Exception as exc:  # store fora do ar: o resultado é gravado sem ele
-                refused += 1
-                logger.error(
-                    "falha ao registrar um artefato de %s: %s", job.run_id, _error_name(exc)
-                )
-                continue
-            registered.append(info.model_dump(mode="json"))
-        refused += max(0, len(reported) - _MAX_ARTIFACTS)
+        registered: dict[int, dict[str, Any]] = {}
+        delay = self.artifact_retry_s
+        last: BaseException | None = None
+        for round_ in range(self.artifact_retries + 1):
+            failed: list[tuple[int, _ReportedArtifact]] = []
+            for index, item in pending:
+                try:
+                    info = await store.put(
+                        job.company_id,
+                        job.run_id,
+                        job.attempt,
+                        item.name,
+                        item.kind,
+                        Path(item.path),
+                    )
+                except (ValueError, OSError) as exc:  # fora da regra: nunca vai entrar
+                    refused += 1
+                    logger.warning(
+                        "artefato de %s recusado pelo armazenamento: %s",
+                        job.run_id,
+                        type(exc).__name__,
+                    )
+                    continue
+                except Exception as exc:  # o S3 ou o cofre fora do ar: tenta de novo
+                    failed.append((index, item))
+                    last = exc
+                    continue
+                registered[index] = info.model_dump(mode="json")
+            pending = failed
+            if not pending or round_ == self.artifact_retries:
+                break
+            logger.warning(
+                "%d artefato(s) de %s não foram guardados (%s); de novo em %.1f s",
+                len(pending),
+                job.run_id,
+                _error_name(last) if last is not None else "erro",
+                delay,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, max(_ARTIFACT_RETRY_MAX_S, self.artifact_retry_s))
         if refused:
             logger.warning("%d artefato(s) de %s ficaram de fora", refused, job.run_id)
-        return {**result, "artifacts": registered}
+        out: dict[str, Any] = {
+            **result,
+            "artifacts": [registered[index] for index in sorted(registered)],
+        }
+        if pending:
+            # Nada some calado: a execução diz que perdeu os artefatos (o código só entra
+            # quando ela não tem outro, para não esconder o motivo da falha).
+            logger.error(
+                "%d artefato(s) de %s não puderam ser guardados: %s",
+                len(pending),
+                job.run_id,
+                _error_name(last) if last is not None else "erro",
+            )
+            note = (
+                f"{len(pending)} artefato(s) desta execução não puderam ser guardados: o "
+                "armazenamento (ou o cofre das chaves) não respondeu."
+            )
+            message = result.get("error_message")
+            out["error_code"] = result.get("error_code") or ARTIFACTS_NOT_STORED
+            # No começo: a mensagem do executor pode ser cortada no limite do banco.
+            out["error_message"] = f"{note} {message}" if isinstance(message, str) else note
+        return out
 
     async def _finish(self, job: RunnerJob, result: Mapping[str, Any]) -> None:
         """Grava o resultado, repetindo com espera crescente enquanto o banco falhar.

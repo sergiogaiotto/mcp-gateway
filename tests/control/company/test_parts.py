@@ -233,7 +233,10 @@ async def test_export_and_purge_cover_the_a1_and_evidence_tables(
     # Apagar: só congelada; depois, nenhuma linha da empresa em nenhuma tabela.
     await freeze(owner_engine, company)
     other_before = await _rows(superuser_engine, b.tenant.company_id)
-    purged = await purge_company(owner_engine, company, confirm_name=name, artifacts_dir=root)
+    # Sem o OpenBao (os segredos do A1 não estão nele): quem pede precisa dizer.
+    purged = await purge_company(
+        owner_engine, company, confirm_name=name, artifacts_dir=root, secrets_outside_vault=True
+    )
     assert purged.tables["a1_authorizations"] == before["a1_authorizations"]
     after = await _rows(superuser_engine, company)
     assert set(after) == set(before)
@@ -269,7 +272,7 @@ async def _guarded_delete(
                 text(f"DELETE FROM {table} WHERE company_id = :c"),  # noqa: S608
                 {"c": tenant},
             )
-            assert deleted.rowcount > 0, table  # type: ignore[attr-defined]
+            assert deleted.rowcount > 0, table
             raise RuntimeError("rollback")  # nunca confirma: só interessa se foi aceito
     except RuntimeError:
         return None

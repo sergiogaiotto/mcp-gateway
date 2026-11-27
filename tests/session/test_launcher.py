@@ -21,8 +21,11 @@ def test_child_environment_leaves_control_plane_variables_out(
     monkeypatch.setenv("RAPA_DATABASE_URL", "postgresql://app:segredo@banco/rapa")
     monkeypatch.setenv("RAPA_LLM_API_KEY", "sk-nao-pode-passar")
     monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/pw-browsers")
+    monkeypatch.setenv("PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK", "1")
     env = child_env()
     assert "RAPA_DATABASE_URL" not in env and "RAPA_LLM_API_KEY" not in env
+    # Desligaria a guarda da saída para a própria máquina (o loopback sairia direto).
+    assert "PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK" not in env
     assert env["PLAYWRIGHT_BROWSERS_PATH"] == "/opt/pw-browsers"
 
 

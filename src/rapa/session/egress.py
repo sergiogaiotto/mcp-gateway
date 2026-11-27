@@ -1,68 +1,101 @@
-"""Guarda da saída do navegador da sessão: um proxy SOCKS5 local que recusa a rede interna.
+"""Guarda da saída do navegador: um proxy SOCKS5 local que recusa a rede interna.
 
-O Chromium da sessão roda na máquina do plano de controle (o lançador local) ou num
-pod do cluster. Sem guarda, a pessoa que demonstra poderia abrir a própria máquina
-(``http://127.0.0.1:<porta da API>``, o banco, o canal de outras sessões), o
-metadata da nuvem (``169.254.169.254``, com as credenciais da instância) ou
-qualquer serviço que escute só em ``localhost``, e ver a página pela tela ao vivo.
-O ``route`` do Playwright não basta: ele não é chamado nos saltos de um
-redirecionamento.
+Serve ao navegador da sessão de gravação (:mod:`rapa.session.host`) e ao da execução
+(:mod:`rapa.runner.worker` com ``--guarda-de-saida``). O Chromium roda na máquina do
+plano de controle (os lançadores locais) ou num pod do cluster. Sem guarda, a página
+poderia abrir a própria máquina (``http://127.0.0.1:<porta da API>``, o banco, o canal
+de outras sessões), o metadata da nuvem (``169.254.169.254``, com as credenciais da
+instância) ou qualquer serviço que escute só em ``localhost``. O ``route`` do
+Playwright não basta: ele não é chamado nos saltos de um redirecionamento nem nos
+websockets, e não vê para onde um nome resolve.
 
-Por isso o hospedeiro abre o Chromium com ``--proxy-server=socks5://127.0.0.1:<porta>``
-desta guarda. O Playwright acrescenta ``<-loopback>`` (o loopback também passa pelo
-proxy) e, sem regras próprias do operador, ``MAP * ~NOTFOUND`` (o navegador não
-resolve nomes sozinho). Toda conexão TCP do navegador (navegação, redirecionamentos,
-iframes, workers, service workers, websockets, downloads, o TCP do WebRTC) chega
-aqui com o nome do destino; a guarda:
+Por isso o navegador abre com ``--proxy-server=socks5://127.0.0.1:<porta>`` desta
+guarda. O Playwright acrescenta ``<-loopback>`` (o loopback também passa pelo proxy)
+e, sem regras próprias do operador, ``MAP * ~NOTFOUND`` (o navegador não resolve nomes
+sozinho). Toda conexão TCP do navegador (navegação, redirecionamentos, iframes,
+workers, service workers, websockets, downloads, o TCP do WebRTC, e o proxy do
+Playwright que apresenta o certificado A1, que sai pelo proxy do navegador) chega aqui
+com o nome do destino; a guarda:
 
-1. resolve o nome ela mesma e recusa (resposta SOCKS 0x02, "proibida pela regra") se
-   qualquer endereço for da própria máquina (loopback, ``localhost``), link-local
-   (o metadata da nuvem), ``0.0.0.0/8``, não especificado, multicast, os endereços
-   de metadata fora do link-local (``fd00:ec2::/32`` da AWS, ``100.100.100.200``) ou
-   a forma IPv4 mapeada em IPv6 de um deles;
-2. conecta exatamente ao endereço que conferiu (uma troca de DNS no meio não muda o
-   destino);
-3. só aceita o método sem autenticação e o comando CONNECT (BIND e UDP ASSOCIATE
+1. com uma lista de hosts permitidos (a execução: os ``allowed_domains`` do manifesto),
+   recusa (resposta SOCKS 0x02, "proibida pela regra") todo nome fora dela e todo
+   endereço literal; a sessão de gravação não tem lista;
+2. resolve o nome ela mesma e recusa se qualquer endereço for da própria máquina
+   (loopback, ``localhost``), link-local (o metadata da nuvem), ``0.0.0.0/8``, não
+   especificado, multicast, os endereços de metadata fora do link-local
+   (``fd00:ec2::/32`` da AWS, ``100.100.100.200``) ou a forma IPv6 de um deles; com
+   uma :class:`EgressPolicy` (a execução e a sessão em pods, ou fora do modo de
+   desenvolvimento), recusa também todo endereço que não é da internet (as redes
+   privadas, a ``100.64.0.0/10`` e as reservadas), menos as redes internas que o
+   operador permitiu (``RAPA_REDES_INTERNAS_PERMITIDAS``);
+3. conecta exatamente ao endereço que conferiu (uma troca de DNS no meio não muda o
+   destino; um endereço literal vai na forma canônica, e um com zona, ``%...``, é
+   recusado), ou, com o proxy de saída do operador (``RAPA_PROXY_SAIDA``, um proxy HTTP
+   CONNECT, com ``Proxy-Authorization: Basic`` quando a URL leva usuário e senha), manda
+   o nome para ele, que resolve (só nomes e endereços conferidos: nada
+   se injeta na linha do ``CONNECT``): quando a guarda não resolve o nome
+   (a internet só sai pelo proxy) ou ele resolve para a internet. Um nome que resolve
+   para uma rede interna permitida vai direto, sem o proxy; um que resolve para outra
+   rede interna é recusado mesmo com o proxy;
+4. só aceita o método sem autenticação e o comando CONNECT (BIND e UDP ASSOCIATE
    recebem 0x07), com prazo para o aperto de mão, para a resolução e para a conexão,
    e no máximo :data:`MAX_CONNECTIONS` conexões ao mesmo tempo.
 
-O UDP não passa pelo proxy, então fica fora do navegador: o hospedeiro desliga o
-QUIC (``--disable-quic``; com proxy SOCKS o Chromium já não o usa), força o WebRTC a
-só usar o que passa pelo proxy (``--webrtc-ip-handling-policy=disable_non_proxied_udp``,
-que o Chromium completo respeita e o ``chrome-headless-shell`` ignora) e, para os
-dois, tira o WebRTC das páginas (:data:`WEBRTC_OFF_SCRIPT`, em todo documento, também
-em iframes e janelas novas). Nenhum ``--disable-features`` é acrescentado: o
-Chromium só obedece ao último, e ele desfaria a lista do próprio Playwright.
+O UDP não passa pelo proxy, então fica fora do navegador: quem abre o navegador
+desliga o QUIC (``--disable-quic``; com proxy SOCKS o Chromium já não o usa), força o
+WebRTC a só usar o que passa pelo proxy
+(``--webrtc-ip-handling-policy=disable_non_proxied_udp``, que o Chromium completo
+respeita e o ``chrome-headless-shell`` ignora) e, para os dois, tira o WebRTC das
+páginas (:data:`WEBRTC_OFF_SCRIPT`, em todo documento, também em iframes e janelas
+novas). Nenhum ``--disable-features`` é acrescentado: o Chromium só obedece ao
+último, e ele desfaria a lista do próprio Playwright. Os interruptores de proxy do
+operador (:data:`PROXY_SWITCHES`) saem dos argumentos do navegador
+(:func:`without_proxy_switches`): qualquer um deles tiraria a guarda do caminho.
 
 Os nomes que o operador mapeia explicitamente em ``--host-resolver-rules`` (``MAP
 nome endereço``; os portais de teste em ``*.rapa.test``) valem como mapeados, mesmo
-para o loopback: é configuração do operador, nunca da pessoa.
+para o loopback: é configuração do operador, nunca da pessoa (com uma lista de hosts,
+o nome ainda precisa estar nela).
 
-**Resíduo conhecido:** as redes privadas (10/8, 172.16/12, 192.168/16, fc00::/7)
+**Resíduos conhecidos:** sem :class:`EgressPolicy` (a sessão local no modo de
+desenvolvimento), as redes privadas (10/8, 172.16/12, 192.168/16, fc00::/7)
 continuam abertas, porque os portais de intranet são o caso de uso. As sub-redes do
 banco, da API do Kubernetes e dos outros serviços do plano de controle precisam ser
-fechadas pela NetworkPolicy (ou pelo proxy de saída) do deploy.
+fechadas também pela NetworkPolicy do deploy, e uma rede interna permitida que as
+inclua as abre. Com o proxy de saída, um nome que a guarda não consegue resolver vai
+para o proxy, e o que ele alcança é a regra dele.
 """
 
 import asyncio
+import base64
 import contextlib
 import fnmatch
 import ipaddress
 import json
 import logging
+import re
 import socket
-from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Iterable, Sequence
+from dataclasses import dataclass, field
+from urllib.parse import quote, unquote, urlsplit
 
 __all__ = [
     "BROWSER_NETWORK_ARGS",
+    "GUARD_BREAKING_ENV",
     "MAX_CONNECTIONS",
+    "PROXY_CREDENTIALS_ENV",
+    "PROXY_SWITCHES",
     "WEBRTC_OFF_SCRIPT",
     "EgressGuard",
+    "EgressPolicy",
     "HostRule",
+    "Route",
+    "UpstreamProxy",
     "blocked_address",
     "internal_host",
     "parse_host_rules",
+    "parse_networks",
+    "without_proxy_switches",
 ]
 
 logger = logging.getLogger("rapa.session.egress")
@@ -125,6 +158,246 @@ _METADATA_NETWORKS = (
 )
 
 type Resolver = Callable[[str], Awaitable[list[str]]]
+type Network = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+#: Os argumentos do operador que decidem por onde o navegador sai: o Chromium obedece ao
+#: último ``--proxy-server`` e ao último ``--proxy-bypass-list`` (que desfaz o
+#: ``<-loopback>``), e ``--no-proxy-server`` vence os dois; qualquer um deles tiraria a
+#: guarda do caminho. Valem para nada no navegador guardado (:func:`without_proxy_switches`).
+PROXY_SWITCHES = frozenset(
+    {"proxy-server", "no-proxy-server", "proxy-pac-url", "proxy-auto-detect", "proxy-bypass-list"}
+)
+
+#: Redes que uma rede interna permitida nunca abre: a própria máquina, o link-local (o
+#: metadata da nuvem), o não especificado, o multicast, o broadcast, os endereços de
+#: metadata fora do link-local e a forma IPv6 mapeada de qualquer IPv4.
+_NEVER_OPEN: tuple[Network, ...] = tuple(
+    ipaddress.ip_network(net)
+    for net in (
+        "0.0.0.0/8",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "224.0.0.0/4",
+        "255.255.255.255/32",
+        "100.100.100.200/32",
+        "::/128",
+        "::1/128",
+        "::ffff:0:0/96",
+        "fe80::/10",
+        "ff00::/8",
+        "fd00:ec2::/32",
+    )
+)
+#: Um nome que pode ir ao proxy de saída (nunca um espaço, um CR ou um LF no pedido).
+_NAME = re.compile(r"^[a-z0-9_](?:[a-z0-9_.-]{0,252})$")
+#: A variável de ambiente que leva ``usuário:senha`` do proxy de saída ao worker: a linha de
+#: comando de um processo é legível por qualquer outro da máquina ou do pod; o ambiente,
+#: só pelo mesmo usuário. O worker a tira do ambiente antes de abrir o navegador.
+PROXY_CREDENTIALS_ENV = "RAPA_PROXY_SAIDA_CREDENCIAIS"
+#: Variáveis do Playwright que tirariam o loopback do proxy da guarda (o ``<-loopback>``
+#: do ``--proxy-bypass-list``): com elas, o Chromium abriria a própria máquina (e o
+#: link-local) direto, sem passar pela guarda. Nunca vão para o executor nem para a sessão.
+GUARD_BREAKING_ENV = frozenset({"PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK"})
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def without_proxy_switches(args: Iterable[str]) -> list[str]:
+    """Os argumentos do operador sem os que mudam o proxy do navegador."""
+    return [a for a in args if a.split("=", 1)[0].lstrip("-") not in PROXY_SWITCHES]
+
+
+def parse_networks(raw: str | Iterable[str]) -> tuple[Network, ...]:
+    """As redes internas permitidas (``"10.20.0.0/16, 192.168.5.0/24"`` ou uma lista).
+
+    Cada rede precisa ser exata (``10.20.0.0/16``, nunca ``10.20.1.0/16``, que abriria
+    mais do que parece) e não pode incluir nada de :data:`_NEVER_OPEN`. A mensagem de
+    erro cita só a rede recusada.
+    """
+    items = raw.split(",") if isinstance(raw, str) else list(raw)
+    networks: list[Network] = []
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        try:
+            network = ipaddress.ip_network(text, strict=True)
+        except ValueError:
+            raise ValueError(
+                f"rede interna inválida: '{text}' (use o formato exato, como 10.20.0.0/16)"
+            ) from None
+        if any(_overlap(network, never) for never in _NEVER_OPEN):
+            raise ValueError(
+                f"a rede interna '{text}' inclui endereços que a guarda sempre recusa "
+                "(a própria máquina, o link-local, o metadata da nuvem ou o multicast)"
+            )
+        networks.append(network)
+    return tuple(dict.fromkeys(networks))
+
+
+def _overlap(a: Network, b: Network) -> bool:
+    if isinstance(a, ipaddress.IPv4Network) and isinstance(b, ipaddress.IPv4Network):
+        return a.overlaps(b)
+    if isinstance(a, ipaddress.IPv6Network) and isinstance(b, ipaddress.IPv6Network):
+        return a.overlaps(b)
+    return False
+
+
+@dataclass(frozen=True, slots=True)
+class UpstreamProxy:
+    """O proxy HTTP CONNECT de saída do operador (``RAPA_PROXY_SAIDA``)."""
+
+    host: str
+    port: int
+    #: ``usuário:senha`` do ``Proxy-Authorization: Basic``; nunca no ``repr`` nem em :attr:`url`.
+    credentials: str | None = field(default=None, repr=False)
+
+    @classmethod
+    def parse(cls, url: str, credentials: str | None = None) -> UpstreamProxy:
+        """``http://proxy.interno:3128`` ou ``http://usuário:senha@proxy.interno:3128``.
+
+        Só ``http``, com a porta, sem caminho. Usuário e senha (com ``%`` nos caracteres
+        reservados da URL) vão no ``Proxy-Authorization: Basic`` de cada ``CONNECT``; vêm
+        da URL (o Secret do chart) ou de ``credentials`` (o worker, pelo ambiente). Nenhuma
+        mensagem de erro repete a URL.
+        """
+        try:
+            split = urlsplit(url.strip())
+            port = split.port
+        except ValueError:
+            raise ValueError("o proxy de saída precisa ser um endereço http://host:porta") from None
+        if split.scheme != "http" or not split.hostname:
+            raise ValueError("o proxy de saída precisa ser um endereço http://host:porta")
+        if port is None:
+            raise ValueError("informe a porta do proxy de saída (ex. http://proxy.interno:3128)")
+        if split.path not in ("", "/") or split.query or split.fragment:
+            raise ValueError("o proxy de saída é só http://host:porta, sem caminho")
+        if split.username is not None or split.password is not None:
+            if credentials is not None:
+                raise ValueError("o proxy de saída recebeu usuário e senha duas vezes")
+            credentials = f"{unquote(split.username or '')}:{unquote(split.password or '')}"
+        if credentials is not None:
+            user, separator, _ = credentials.partition(":")
+            if not user or not separator or _CONTROL_CHARS.search(credentials):
+                raise ValueError(
+                    "o usuário e a senha do proxy de saída precisam ser usuario:senha, sem "
+                    "caracteres de controle (escape os reservados da URL com %)"
+                )
+        return cls(split.hostname, port, credentials)
+
+    @property
+    def url(self) -> str:
+        """O endereço sem usuário e senha (o que pode ir para a linha de comando e os logs)."""
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"http://{host}:{self.port}"
+
+    @property
+    def url_with_credentials(self) -> str:
+        """:attr:`url` com usuário e senha: só para o que vai num Secret, no stdin do
+        hospedeiro da sessão ou no canal do despachante (como os segredos do robô)."""
+        if self.credentials is None:
+            return self.url
+        user, _, password = self.credentials.partition(":")
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"http://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{self.port}"
+
+    @property
+    def authorization(self) -> str | None:
+        """O valor do ``Proxy-Authorization`` (``Basic``), se o proxy pede usuário e senha."""
+        if self.credentials is None:
+            return None
+        return "Basic " + base64.b64encode(self.credentials.encode("utf-8")).decode("ascii")
+
+
+@dataclass(frozen=True, slots=True)
+class EgressPolicy:
+    """A rede interna fechada, menos as redes permitidas, e o proxy de saída.
+
+    Sem política (a sessão local no modo de desenvolvimento), só a própria máquina, o
+    link-local e o metadata ficam fechados (:func:`blocked_address`); com ela, todo
+    endereço que não é da internet também fica, menos :attr:`allowed_networks`.
+    """
+
+    #: Redes internas que os robôs (e a sessão) podem alcançar: os portais internos.
+    allowed_networks: tuple[Network, ...] = ()
+    #: Proxy HTTP CONNECT por onde sai a internet, quando ela só sai por ele.
+    upstream_proxy: UpstreamProxy | None = None
+
+    @classmethod
+    def parse(
+        cls,
+        networks: str | Iterable[str] = (),
+        proxy: str | None = None,
+        *,
+        proxy_credentials: str | None = None,
+    ) -> EgressPolicy:
+        return cls(
+            allowed_networks=parse_networks(networks),
+            upstream_proxy=UpstreamProxy.parse(proxy, proxy_credentials) if proxy else None,
+        )
+
+    def reachable(self, address: str) -> bool:
+        """O endereço (já fora de :func:`blocked_address`) é da internet ou de uma rede permitida?"""
+        ip = _address(address)
+        if ip is None:
+            return False
+        return ip.is_global or self.internal_allowed(address)
+
+    def internal_allowed(self, address: str) -> bool:
+        """O endereço está numa rede interna permitida?"""
+        ip = _address(address)
+        if ip is None:
+            return False
+        return any(
+            ip in network for network in self.allowed_networks if network.version == ip.version
+        )
+
+    def worker_args(self) -> list[str]:
+        """Os argumentos do worker que levam esta política (``--guarda-de-saida`` à parte).
+
+        O proxy vai sem usuário e senha: esses vão no ambiente (:meth:`worker_env`).
+        """
+        args = [f"--rede-interna-permitida={network}" for network in self.allowed_networks]
+        if self.upstream_proxy is not None:
+            args.append(f"--proxy-saida={self.upstream_proxy.url}")
+        return args
+
+    def worker_env(self) -> dict[str, str]:
+        """O ambiente do worker que leva usuário e senha do proxy (:data:`PROXY_CREDENTIALS_ENV`)."""
+        proxy = self.upstream_proxy
+        if proxy is None or proxy.credentials is None:
+            return {}
+        return {PROXY_CREDENTIALS_ENV: proxy.credentials}
+
+
+def _address(address: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """O endereço, com o IPv4 que um IPv6 carrega no lugar dele (como :func:`blocked_address`)."""
+    try:
+        ip = ipaddress.ip_address(address.split("%", 1)[0])
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address):
+        embedded = _embedded_ipv4(ip)
+        if embedded is not None:
+            return embedded
+    return ip
+
+
+def _literal(text: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """O endereço literal exato (sem zona), ou ``None`` se o texto não é um endereço."""
+    try:
+        return ipaddress.ip_address(text)
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class Route:
+    """Para onde a guarda leva uma conexão: os endereços conferidos, ou o proxy de saída."""
+
+    #: Os destinos (endereço e porta); pelo proxy, o nome (ou endereço) pedido e a porta.
+    targets: tuple[tuple[str, int], ...]
+    #: A conexão vai pelo proxy de saída (``CONNECT`` com o nome; o proxy resolve).
+    via_proxy: bool = False
 
 
 def blocked_address(address: str) -> bool:
@@ -182,6 +455,10 @@ def _assigned_here(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
         except OSError:
             return False
     return True
+
+
+def _normalize(host: str) -> str:
+    return host.strip("[]").rstrip(".").lower()
 
 
 def _is_localhost(name: str) -> bool:
@@ -245,7 +522,7 @@ async def _system_resolver(name: str) -> list[str]:
 
 
 class EgressGuard:
-    """Proxy SOCKS5 local do navegador da sessão (ver o módulo)."""
+    """Proxy SOCKS5 local do navegador guardado (ver o módulo)."""
 
     def __init__(
         self,
@@ -254,23 +531,42 @@ class EgressGuard:
         resolver: Resolver | None = None,
         on_refused: Callable[[str], None] | None = None,
         max_connections: int = MAX_CONNECTIONS,
+        allowed_hosts: Iterable[str] | None = None,
+        policy: EgressPolicy | None = None,
     ) -> None:
         self.rules = tuple(rules)
         self._resolve_name = resolver or _system_resolver
         self.on_refused = on_refused
         self.max_connections = max_connections
+        #: Os únicos nomes que passam (a execução); ``None`` na sessão de gravação.
+        self.allowed_hosts = (
+            None if allowed_hosts is None else frozenset(_normalize(h) for h in allowed_hosts)
+        )
+        self.policy = policy
         self._server: asyncio.Server | None = None
         self._clients: set[asyncio.Task[None]] = set()
         #: Contagens (para diagnóstico e testes; nunca os destinos).
         self.allowed = 0
         self.refused = 0
+        #: Conexões levadas pelo proxy de saída.
+        self.proxied = 0
 
     @classmethod
     def from_browser_args(
-        cls, browser_args: Sequence[str], *, on_refused: Callable[[str], None] | None = None
+        cls,
+        browser_args: Sequence[str],
+        *,
+        on_refused: Callable[[str], None] | None = None,
+        allowed_hosts: Iterable[str] | None = None,
+        policy: EgressPolicy | None = None,
     ) -> EgressGuard:
         """A guarda com as regras MAP do operador nos argumentos do navegador."""
-        return cls(parse_host_rules(browser_args), on_refused=on_refused)
+        return cls(
+            parse_host_rules(browser_args),
+            on_refused=on_refused,
+            allowed_hosts=allowed_hosts,
+            policy=policy,
+        )
 
     @property
     def active(self) -> int:
@@ -310,33 +606,72 @@ class EgressGuard:
                 return rule
         return None
 
-    async def resolve(self, host: str, port: int) -> list[tuple[str, int]]:
-        """Os destinos conferidos para ``host:port``; vazio se a guarda recusa."""
-        name = host.strip("[]").rstrip(".").lower()
+    def _passes(self, address: str) -> bool:
+        """O endereço pode ser destino (fora do que a guarda sempre recusa e da política)?"""
+        if blocked_address(address):
+            return False
+        return self.policy is None or self.policy.reachable(address)
+
+    def _proxy(self) -> UpstreamProxy | None:
+        return self.policy.upstream_proxy if self.policy is not None else None
+
+    async def route(self, host: str, port: int) -> Route | None:
+        """Para onde levar ``host:port``; ``None`` se a guarda recusa."""
+        name = _normalize(host)
         if not name:
-            return []
+            return None
+        if self.allowed_hosts is not None and name not in self.allowed_hosts:
+            return None
         rule = self._rule_for(name)
         if rule is not None and rule.target is not None:
             if rule.target.upper() == "~NOTFOUND":
-                return []
-            return [_split_target(rule.target, port)]  # configuração do operador
+                return None
+            return Route((_split_target(rule.target, port),))  # configuração do operador
         if _is_localhost(name):
-            return []
-        try:
-            ipaddress.ip_address(name.split("%", 1)[0])
-        except ValueError:
-            pass
-        else:
-            return [] if blocked_address(name) else [(name, port)]
+            return None
+        if "%" in name:
+            # Um endereço com zona (fe80::1%eth0) nunca é destino, e o que vem depois do
+            # "%" não pode ir para a linha do CONNECT nem para a conexão.
+            return None
+        proxy = self._proxy()
+        literal = _literal(name)
+        if literal is not None:
+            # Daqui em diante, só a forma canônica do endereço (nada do texto pedido).
+            canonical = str(literal)
+            if not self._passes(canonical):
+                return None
+            if proxy is not None and not self._direct_internal(canonical):
+                return Route(((canonical, port),), via_proxy=True)
+            return Route(((canonical, port),))
+        if not _NAME.fullmatch(name):
+            return None
         try:
             addresses = await asyncio.wait_for(self._resolve_name(name), RESOLVE_TIMEOUT_S)
         except OSError, TimeoutError, UnicodeError:
-            return []
+            addresses = []
+        if not addresses:
+            # Sem resposta aqui: com o proxy de saída, ele resolve (a internet só sai por ele).
+            return Route(((name, port),), via_proxy=True) if proxy is not None else None
         # Um nome com qualquer resposta interna é recusado inteiro (sem escolher a "boa").
-        if not addresses or any(blocked_address(a) for a in addresses):
-            return []
+        if any(not self._passes(a) for a in addresses):
+            return None
         unique = list(dict.fromkeys(addresses))
-        return [(address, port) for address in unique]
+        if proxy is not None and not all(self._direct_internal(a) for a in unique):
+            # A internet sai pelo proxy: o nome vai para ele, que resolve.
+            return Route(((name, port),), via_proxy=True)
+        return Route(tuple((address, port) for address in unique))
+
+    def _direct_internal(self, address: str) -> bool:
+        """O endereço é de uma rede interna permitida (vai direto, nunca pelo proxy)?"""
+        return self.policy is not None and self.policy.internal_allowed(address)
+
+    async def resolve(self, host: str, port: int) -> list[tuple[str, int]]:
+        """Os destinos conferidos para ``host:port``; vazio se a guarda recusa.
+
+        Pelo proxy de saída, o destino é o próprio nome pedido (ver :meth:`route`).
+        """
+        route = await self.route(host, port)
+        return [] if route is None else list(route.targets)
 
     # -- protocolo -----------------------------------------------------------------
 
@@ -352,20 +687,26 @@ class EgressGuard:
             if request is None:
                 return
             host, port = request
-            targets = await self.resolve(host, port)
-            if not targets:
+            route = await self.route(host, port)
+            if route is None:
                 self.refused += 1
                 await _reply(writer, _NOT_ALLOWED)
                 if self.on_refused is not None:
                     with contextlib.suppress(Exception):
                         self.on_refused(host)
                 return
-            opened = await self._connect(targets)
+            proxy = self._proxy()
+            if route.via_proxy and proxy is not None:
+                opened = await _connect_via_proxy(proxy, *route.targets[0])
+            else:
+                opened = await self._connect(list(route.targets))
             if isinstance(opened, int):
                 await _reply(writer, opened)
                 return
             up_reader, upstream = opened
             self.allowed += 1
+            if route.via_proxy:
+                self.proxied += 1
             await _reply(writer, 0x00)
             await _splice(reader, writer, up_reader, upstream)
         except OSError, TimeoutError, asyncio.IncompleteReadError, ValueError:
@@ -434,6 +775,61 @@ class EgressGuard:
             except OSError, TimeoutError:
                 failure = _HOST_UNREACHABLE
         return failure if targets else _GENERAL_FAILURE
+
+
+#: Tamanho máximo da resposta do proxy de saída ao ``CONNECT`` (só os cabeçalhos).
+_PROXY_HEAD_LIMIT = 16 * 1024
+#: O que pode ir como destino na linha do ``CONNECT``: um nome ou um endereço, nada mais.
+_AUTHORITY_HOST = re.compile(r"^[A-Za-z0-9_.:-]{1,253}$")
+_STATUS_LINE = re.compile(rb"^HTTP/1\.[01] (\d{3})[ \r]")
+
+
+async def _connect_via_proxy(
+    proxy: UpstreamProxy, host: str, port: int
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | int:
+    """Abre o túnel ``CONNECT host:port`` no proxy de saída; o código SOCKS se falhar.
+
+    O proxy é configuração do operador (não passa pela conferência). O nome vai
+    inteiro para ele, que resolve; só um ``200`` abre o túnel. Um destino com algo além
+    de letras, números, ``.``, ``-``, ``_`` e ``:`` nunca vai (nada se injeta na linha do
+    ``CONNECT`` nem no ``Host``), mesmo que alguém chame isto sem passar por :meth:`EgressGuard.route`.
+    """
+    if not _AUTHORITY_HOST.fullmatch(host) or not 0 < port < 65536:
+        return _NOT_ALLOWED
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(proxy.host, proxy.port, limit=_PROXY_HEAD_LIMIT),
+            CONNECT_TIMEOUT_S,
+        )
+    except ConnectionRefusedError:
+        return _HOST_UNREACHABLE
+    except OSError, TimeoutError:
+        return _HOST_UNREACHABLE
+    authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+    authorization = proxy.authorization
+    auth = f"Proxy-Authorization: {authorization}\r\n" if authorization else ""
+    try:
+        writer.write(
+            f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n{auth}\r\n".encode("ascii")
+        )
+        await writer.drain()
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), CONNECT_TIMEOUT_S)
+    except (
+        OSError,
+        TimeoutError,
+        UnicodeError,
+        asyncio.IncompleteReadError,
+        asyncio.LimitOverrunError,
+    ):
+        writer.transport.abort()
+        return _HOST_UNREACHABLE
+    match = _STATUS_LINE.match(head)
+    status = int(match.group(1)) if match else 0
+    if status == 200:
+        return reader, writer
+    writer.transport.abort()
+    # O proxy recusou pela regra dele (403, ou 407: sem usuário e senha, ou errados): proibido.
+    return _NOT_ALLOWED if status in (403, 407) else _HOST_UNREACHABLE
 
 
 async def _reply(writer: asyncio.StreamWriter, code: int) -> None:

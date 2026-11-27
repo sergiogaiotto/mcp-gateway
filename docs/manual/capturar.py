@@ -1717,6 +1717,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "RAPA_CHAVE_WEBHOOKS": webhook_key,
                 "RAPA_DOCS_API": "1",
                 "RAPA_PUBLIC_URL": f"http://127.0.0.1:{port}",
+                # Sem a porta das métricas: a padrão (9100) pode estar em uso na máquina (o
+                # node_exporter, outra captura), e sem ela o serviço não sobe.
+                "RAPA_METRICAS_PORTA": "0",
                 "RAPA_ARGS_NAVEGADOR": shlex.quote(HOST_RESOLVER_ARG),
                 "RAPA_VIDEO_EM_FALHAS": "1",
                 "RAPA_AGENDA_INTERVALO_S": "1",

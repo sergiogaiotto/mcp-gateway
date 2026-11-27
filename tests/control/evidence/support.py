@@ -42,6 +42,8 @@ class _Plan:
     #: Caminhos informados no resultado fora da pasta da tentativa (o store recusa).
     outside: Mapping[str, Path] = field(default_factory=dict)
     error_code: str | None = None
+    #: Arquivos que o executor deixa na pasta da tentativa sem informar no resultado.
+    unreported: Mapping[str, bytes] = field(default_factory=dict)
 
 
 class FakeLauncher:
@@ -62,6 +64,8 @@ class FakeLauncher:
             artifacts.append(_reported(kind, name, path, data))
         for name, path in plan.outside.items():
             artifacts.append(_reported("download", name, path, path.read_bytes()))
+        for name, data in plan.unreported.items():
+            (folder / name).write_bytes(data)
         extra: dict[str, Any] = {"artifacts": artifacts}
         if plan.state != "succeeded":
             extra |= {
@@ -90,7 +94,11 @@ class EvidenceWorld:
         self.store = LocalArtifactStore(root)
         self.launcher = FakeLauncher(root)
         self.dispatcher = Dispatcher(
-            PgRunQueue(dispatcher_db), self.launcher, concurrency=4, artifacts=self.store
+            PgRunQueue(dispatcher_db),
+            self.launcher,
+            concurrency=4,
+            artifacts=self.store,
+            artifact_retry_s=0.01,
         )
 
     async def run(
@@ -100,12 +108,16 @@ class EvidenceWorld:
         state: str = "failed",
         files: Mapping[str, tuple[str, bytes]] | None = None,
         outside: Mapping[str, Path] | None = None,
+        unreported: Mapping[str, bytes] | None = None,
         slug: str = "emitir_protocolo",
     ) -> UUID:
         """Inicia, despacha e termina uma execução com os arquivos dados."""
         run = await self.platform.start(tenant.operator, slug, PROTOCOLO_INPUTS, RunTrigger.REST)
         self.launcher.plans[run.run_id] = _Plan(
-            state, FAILURE_FILES if files is None else files, outside or {}
+            state,
+            FAILURE_FILES if files is None else files,
+            outside or {},
+            unreported=unreported or {},
         )
         await self.dispatcher.run_once()
         await self.dispatcher.drain()
@@ -129,8 +141,8 @@ async def run_row(superuser: AsyncEngine, run_id: UUID) -> dict[str, Any]:
             (
                 await conn.execute(
                     text(
-                        "SELECT artifacts, artifacts_expired_at, captures_expired_at, outputs "
-                        "FROM runs WHERE id = :id"
+                        "SELECT artifacts, artifacts_expired_at, captures_expired_at, outputs, "
+                        "error_code, error_message FROM runs WHERE id = :id"
                     ),
                     {"id": run_id},
                 )

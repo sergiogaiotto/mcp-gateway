@@ -230,6 +230,52 @@ async def test_missing_file_and_delete_run(tmp_path: Path) -> None:
     await store.delete_run(COMPANY, RUN)  # sem nada, não faz nada
 
 
+async def test_list_and_delete_company_follow_the_layout_and_never_a_link(
+    tmp_path: Path,
+) -> None:
+    """A exportação lista e a exclusão apaga pelo store: só a disposição dele, sem atalhos."""
+    store = LocalArtifactStore(tmp_path / "artefatos")
+    company, other, second = new_id(), new_id(), new_id()
+    for who, run, attempt, name in (
+        (company, RUN, 1, "tela.png"),
+        (company, RUN, 2, "nota.pdf"),
+        (company, second, 1, "video.webm"),
+        (other, RUN, 1, "tela.png"),
+    ):
+        folder = attempt_dir(store.root, who, run, attempt)
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / name).write_bytes(DATA)
+    base = store.root / str(company)
+    # Fora da disposição (nome de pasta, tentativa e arquivo fora da regra) ou um atalho
+    # (para a pasta da outra empresa): nada disso é listado.
+    (base / "solto.png").write_bytes(DATA)
+    (base / "nao-e-uuid" / "1").mkdir(parents=True)
+    (base / "nao-e-uuid" / "1" / "x.png").write_bytes(DATA)
+    (base / str(RUN) / "01").mkdir()
+    (base / str(RUN) / "1" / ".oculto").write_bytes(DATA)
+    (base / str(new_id())).symlink_to(store.root / str(other) / str(RUN))
+    (base / str(RUN) / "1" / "atalho.png").symlink_to(
+        store.root / str(other) / str(RUN) / "1" / "tela.png"
+    )
+    listed = [item async for item in store.list_company(company)]
+    assert [(item.run_id, item.attempt, item.name) for item in listed] == sorted(
+        [(RUN, 1, "tela.png"), (RUN, 2, "nota.pdf"), (second, 1, "video.webm")]
+    )
+    assert [item async for item in store.list_company(new_id())] == []
+    # Apagar a empresa: os arquivos dela (sem contar os atalhos) e nada da outra.
+    assert await store.delete_company(company) == 6
+    assert not base.exists()
+    assert (store.root / str(other) / str(RUN) / "1" / "tela.png").read_bytes() == DATA
+    assert await store.delete_company(company) == 0
+    # Um atalho no lugar da pasta da empresa: some só ele, nunca o destino.
+    (store.root / str(company)).symlink_to(store.root / str(other))
+    assert [item async for item in store.list_company(company)] == []
+    assert await store.delete_company(company) == 0
+    assert not (store.root / str(company)).is_symlink()
+    assert (store.root / str(other) / str(RUN) / "1" / "tela.png").exists()
+    assert await LocalArtifactStore(tmp_path / "nao-existe").delete_company(company) == 0
+
+
 def test_launcher_writes_where_the_store_reads(tmp_path: Path) -> None:
     """O lançador e o store local usam a mesma pasta da tentativa."""
     launcher = LocalProcessLauncher(
@@ -298,3 +344,26 @@ async def test_delete_run_keeps_a_legacy_download_name(tmp_path: Path) -> None:
         with pytest.raises(ValueError):
             await store.delete_run(COMPANY, RUN, keep=[(1, bad)])
     assert sorted(path.name for path in folder.iterdir()) == ["nota..fiscal.pdf"]
+
+
+async def test_company_listing_and_reading_include_a_legacy_download_name(
+    tmp_path: Path,
+) -> None:
+    """A saída da empresa leva também o download de antes da regra do ``..``.
+
+    ``nota..fiscal.pdf`` continua em ``runs.artifacts`` e na pasta (a retenção o deixa no
+    prazo das evidências): a exportação o lista e o lê pelo store, como fazia ao percorrer
+    a pasta da empresa. Registrar um nome assim continua recusado.
+    """
+    store = LocalArtifactStore(tmp_path / "artefatos")
+    _write(store, "tela-001.png")
+    legacy = _write(store, "nota..fiscal.pdf", b"%PDF legado")
+    listed = [(item.run_id, item.attempt, item.name) async for item in store.list_company(COMPANY)]
+    assert listed == [(RUN, 1, "nota..fiscal.pdf"), (RUN, 1, "tela-001.png")]
+    assert await _read(store, "nota..fiscal.pdf") == b"%PDF legado"
+    with pytest.raises(ValueError):
+        await store.put(COMPANY, RUN, 1, legacy.name, "download", legacy)
+    # Fora da regra de sempre (começa com ponto, tem barra): nem listado, nem lido.
+    for bad in ("..", ".nota..pdf", "../nota..fiscal.pdf"):
+        with pytest.raises(ArtifactMissing):
+            await store.open(COMPANY, RUN, 1, bad)

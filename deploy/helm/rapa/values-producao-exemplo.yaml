@@ -1,0 +1,160 @@
+# Exemplo de valores de produção (EKS no AWS Outposts). Copie para o repositório de
+# configuração do ambiente e troque os nomes, endereços, redes e digests. Nenhum segredo:
+# só os nomes dos Secrets que o operador cria antes (docs/OPERACAO.md).
+
+images:
+  control:
+    repository: registro.exemplo.test/rapa/rapa-controle
+    digest: sha256:1111111111111111111111111111111111111111111111111111111111111111
+  executor:
+    repository: registro.exemplo.test/rapa/rapa-executor
+    digest: sha256:2222222222222222222222222222222222222222222222222222222222222222
+  pullSecrets:
+    - rapa-registro
+  requireDigest: true
+
+publicUrl: https://rapa.exemplo.test
+
+auth:
+  # O nome do emissor é público; dentro do cluster ele precisa chegar ao Service do Keycloak
+  # (a reescrita do CoreDNS de deploy/keycloak/README.md, "O emissor dentro do cluster"):
+  # a NetworkPolicy só deixa a web e a api saírem para o namespace identidade.
+  jwt:
+    issuer: https://sso.exemplo.test/realms/rapa
+    audience: rapa-api
+    jwksUrl: https://sso.exemplo.test/realms/rapa/protocol/openid-connect/certs
+  oidc:
+    clientId: rapa-interface
+    redirectUri: https://rapa.exemplo.test/auth/oidc/retorno
+    existingSecret: rapa-oidc
+  mcpOrigins: []
+
+database:
+  # O Pooler do PgBouncer (modo sessão) na frente do banco.
+  host: rapa-banco-pooler-rw
+  cnpg:
+    instances: 3
+    storage:
+      size: 100Gi
+      storageClass: gp2
+    walStorage:
+      size: 40Gi
+      storageClass: gp2
+    backup:
+      enabled: true
+      destinationPath: s3://rapa-backups/banco
+      endpointURL: https://seaweedfs-s3.armazenamento.svc:8333
+      existingSecret: rapa-banco-backup-s3
+      caSecret:
+        name: rapa-s3-ca
+        key: ca.crt
+    pooler:
+      enabled: true
+      instances: 2
+    monitoring:
+      enabled: true
+
+migration:
+  grantsJob:
+    enabled: true
+
+executions:
+  runtimeClass: gvisor
+  cpu: "1"
+  memory: 2Gi
+  # Os pods de uso único só nos nós com o gVisor.
+  nodeSelector:
+    rapa.dev/execucoes: "sim"
+  tolerations:
+    - key: rapa.dev/execucoes
+      operator: Exists
+      effect: NoSchedule
+  egress:
+    proxy:
+      url: http://proxy.interno.exemplo.test:3128
+      cidrs:
+        - 10.20.0.10/32
+      port: 3128
+    # Um portal interno que os robôs acessam.
+    allowedInternalNetworks:
+      - 10.30.0.0/24
+    # O bloco IPv6 global da VPC (aqui, o de documentação).
+    extraInternalNetworks:
+      - 2001:db8::/32
+
+network:
+  egress:
+    kubernetesApi:
+      to:
+        - ipBlock:
+            cidr: 10.0.0.0/24
+      ports: [443]
+    modelHub:
+      to:
+        - ipBlock:
+            cidr: 10.40.0.0/24
+      ports: [443]
+    observability:
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoramento
+      ports: [4317, 4318, 8000]
+
+gateway:
+  enabled: true
+  parentRefs:
+    - name: rapa-externo
+      namespace: envoy-gateway-system
+      sectionName: https
+  hostnames:
+    - rapa.exemplo.test
+  # A sub-rede dos pods do Envoy (FORWARDED_ALLOW_IPS, obrigatória com o gateway).
+  trustedNetworks:
+    - 10.0.32.0/20
+
+web:
+  replicas: 2
+
+api:
+  hpa:
+    enabled: true
+
+vault:
+  mode: openbao
+  address: https://openbao.cofre.svc:8200
+  caSecret:
+    name: rapa-openbao-ca
+    key: ca.crt
+
+storage:
+  mode: s3
+  s3:
+    endpoint: https://seaweedfs-s3.armazenamento.svc:8333
+    bucket: rapa-artefatos
+    caSecret:
+      name: rapa-s3-ca
+      key: ca.crt
+    existingSecret: rapa-s3
+
+keys:
+  mode: openbao
+
+observability:
+  otlpEndpoint: http://otel-coletor.monitoramento.svc:4318
+  glitchtip:
+    existingSecret: rapa-glitchtip
+    key: dsn
+  vmPodScrape:
+    enabled: true
+
+modelHub:
+  baseUrl: https://hub.interno.exemplo.test/v1
+  model: qwen-latest
+  existingSecret: rapa-hub
+  capabilities: '{"modelo": "qwen-latest", "capacidades": {}}'
+
+publishing:
+  webhookKey:
+    existingSecret: rapa-webhooks
+    key: chave

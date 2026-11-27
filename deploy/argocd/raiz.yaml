@@ -1,0 +1,36 @@
+# A Application raiz do RaPA ("app of apps"): sincroniza as duas Applications de
+# deploy/argocd/application.yaml na ordem das ondas, o banco (rapa-banco, onda -1) antes da
+# aplicação (rapa, onda 0), e só passa para a onda seguinte quando a anterior fica saudável.
+# Isso pede as checagens de saúde de deploy/argocd/argocd-cm-saude.yaml no argocd-cm (sem a
+# de argoproj.io/Application, o Argo CD não espera a filha). Aplique só esta:
+#
+#   kubectl -n argocd patch configmap argocd-cm --type merge --patch-file deploy/argocd/argocd-cm-saude.yaml
+#   kubectl apply -f deploy/argocd/raiz.yaml
+#
+# O prune fica desligado: tirar uma filha do arquivo não apaga a Application (nem o banco).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: rapa-raiz
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://git.exemplo.test/plataforma/rapa.git
+    targetRevision: main
+    path: deploy/argocd
+    directory:
+      include: application.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    retry:
+      limit: 10
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 10m

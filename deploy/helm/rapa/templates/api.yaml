@@ -1,0 +1,68 @@
+{{- if .Values.app.enabled }}
+{{- $v := .Values -}}
+{{- $sel := dict "root" . "component" "api" -}}
+{{- $env := include "rapa.apiEnv" . -}}
+{{ include "rapa.deployment" (dict "root" . "component" "api" "values" $v.api "port" 8000 "portName" "http" "http" true "kubeApi" false "baoRole" $v.vault.roles.api "env" $env "volumes" (include "rapa.hubVolume" .) "mounts" (include "rapa.hubMount" .) "hpa" $v.api.hpa.enabled) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rapa.component" $sel }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rapa.componentLabels" $sel | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "rapa.selectorLabels" $sel | nindent 4 }}
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+---
+{{ include "rapa.pdb" (dict "root" . "component" "api" "values" $v.api) }}
+---
+{{ include "rapa.serviceAccount" (dict "root" . "component" "api" "automount" false) }}
+{{- if $v.api.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "rapa.component" $sel }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rapa.componentLabels" $sel | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "rapa.component" $sel }}
+  minReplicas: {{ $v.api.hpa.minReplicas }}
+  maxReplicas: {{ $v.api.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $v.api.hpa.cpuUtilization }}
+{{- end }}
+{{- end }}
+
+{{/*
+A api: só REST e MCP, sem interface e sem sessões (pode ter várias réplicas). Não fala com a
+API do Kubernetes (sem token montado) e nunca lê o cofre.
+*/}}
+{{- define "rapa.apiEnv" -}}
+- name: RAPA_HTTP
+  value: "1"
+- name: RAPA_UI
+  value: "0"
+- name: RAPA_SESSOES
+  value: "0"
+- name: RAPA_DOCS_API
+  value: {{ ternary "1" "0" (default false $.Values.apiDocs) | quote }}
+- name: RAPA_COFRE
+  value: nenhum
+{{- end -}}

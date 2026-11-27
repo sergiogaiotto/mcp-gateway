@@ -1,0 +1,10 @@
+# Só o necessário para construir as imagens (deploy/docker/Dockerfile): pyproject.toml,
+# uv.lock, README.md, LICENSE e src/. Nada de segredo, ambiente local ou histórico.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!src/
+src/**/__pycache__/
+src/**/*.py[cod]

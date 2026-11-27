@@ -56,8 +56,8 @@ As regras do certificado A1 (revisão 0006) têm o bloco :func:`a1_grants_sql`. 
 aplicação lê e inclui credenciais, e só muda a validade, a impressão e a revogação
 (nunca apaga); lê e inclui autorizações do custodiante e só as revoga; lê e inclui
 aprovações de versões; e só lê os avisos de vencimento. O despachante lê só as
-colunas de que a conferência antes de lançar precisa: de ``credentials`` (nunca
-``vault_path``), de ``a1_authorizations``, as aprovações de ``version_approvals`` (sem a
+colunas de que a conferência antes de lançar precisa: de ``credentials`` (o ``vault_path`` só
+a partir da 0009), de ``a1_authorizations``, as aprovações de ``version_approvals`` (sem a
 data) e, de ``users``, só a empresa, o identificador e o sujeito (para não contar a
 aprovação do custodiante); e inclui os avisos de vencimento. O
 ``UPDATE`` e o ``DELETE`` amplos que :func:`grants_sql` dá à aplicação em
@@ -77,6 +77,14 @@ ganha só ``EXECUTE`` nas funções que apagam os retratos e as chaves de idempo
 vencidos e removem as partições de eventos antigas (``SECURITY DEFINER``, donas: o
 dono das tabelas). Nenhum papel ganha ``DELETE`` nessas tabelas; as marcas de
 artefatos expirados são colunas de ``runs``, que o despachante já atualiza.
+
+O cofre e as chaves (revisão 0009) têm o bloco :func:`vault_grants_sql`. O despachante
+lê e inclui ``run_keys`` (as chaves embrulhadas das execuções, ao registrar os
+artefatos), executa ``rapa_purge_run_keys`` (a retenção destrói as chaves das execuções
+expiradas) e passa a ler ``credentials.vault_path`` (a referência ao segredo no cofre,
+que o lançador busca no OpenBao). A aplicação só lê ``run_keys``. Ninguém muda nem
+apaga uma chave fora da função e da saída da empresa. :func:`vault_revoke_sql` tira a
+leitura de ``vault_path`` na volta da 0009.
 """
 
 import os
@@ -98,6 +106,8 @@ __all__ = [
     "repair_grants_sql",
     "retention_grants_sql",
     "session_grants_sql",
+    "vault_grants_sql",
+    "vault_revoke_sql",
 ]
 
 DEFAULT_APP_ROLE = "rapa_app"
@@ -262,6 +272,24 @@ _RETENTION_FUNCTIONS = (
     "rapa_drop_event_partitions(integer)",
 )
 
+_VAULT_APP_GRANTS = """
+GRANT SELECT ON run_keys TO {role};
+"""
+
+_VAULT_DISPATCHER_GRANTS = """
+GRANT SELECT (vault_path) ON credentials TO {role};
+GRANT SELECT, INSERT ON run_keys TO {role};
+GRANT EXECUTE ON FUNCTION rapa_purge_run_keys(integer) TO {role};
+"""
+
+#: O que a volta da 0009 tira e não some com a tabela (a coluna fica).
+_VAULT_DISPATCHER_REVOKE = """
+REVOKE SELECT (vault_path) ON credentials FROM {role};
+"""
+
+_VAULT_TABLES = ("run_keys",)
+_VAULT_FUNCTIONS = ("rapa_purge_run_keys(integer)",)
+
 
 def _block(
     role: str,
@@ -386,6 +414,26 @@ def retention_grants_sql(roles: RoleNames) -> list[str]:
     ]
 
 
+def vault_grants_sql(roles: RoleNames) -> list[str]:
+    """Permissões das chaves das execuções e do caminho no cofre (revisão 0009)."""
+    what = "do cofre e das chaves"
+    return [
+        _block(roles.app, _VAULT_APP_GRANTS, tables=_VAULT_TABLES, what=what),
+        _block(
+            roles.dispatcher,
+            _VAULT_DISPATCHER_GRANTS,
+            tables=_VAULT_TABLES,
+            functions=_VAULT_FUNCTIONS,
+            what=what,
+        ),
+    ]
+
+
+def vault_revoke_sql(roles: RoleNames) -> list[str]:
+    """Tira o que :func:`vault_grants_sql` deu e não some com a tabela (volta da 0009)."""
+    return [_block(roles.dispatcher, _VAULT_DISPATCHER_REVOKE)]
+
+
 def all_grants_sql(roles: RoleNames) -> list[str]:
     """Todas as permissões, das tabelas que existirem na revisão atual do banco."""
     return [
@@ -397,4 +445,5 @@ def all_grants_sql(roles: RoleNames) -> list[str]:
         *a1_grants_sql(roles),
         *company_grants_sql(roles),
         *retention_grants_sql(roles),
+        *vault_grants_sql(roles),
     ]
