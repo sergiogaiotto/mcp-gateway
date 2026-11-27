@@ -4,7 +4,7 @@ O RaPA cria robôs de automação web (RPA) sob demanda para pessoas de negócio
 
 Tudo é código aberto. O modelo de linguagem (um modelo aberto num hub interno) só ajuda a criar e a consertar robôs; as execuções normais não usam LLM.
 
-O plano completo está em [docs/PLANO-RaPA.md](docs/PLANO-RaPA.md).
+O plano completo está em [docs/PLANO-RaPA.md](docs/PLANO-RaPA.md). O manual de instalação, configuração e testes, com as telas reais, está em [docs/manual/index.html](docs/manual/index.html) (abre direto do repositório, sem internet).
 
 ## Situação
 
