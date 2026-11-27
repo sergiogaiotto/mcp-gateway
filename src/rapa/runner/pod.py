@@ -47,6 +47,7 @@ import shutil
 import signal
 import sys
 import tempfile
+import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -727,8 +728,15 @@ async def run_pod(
         # Daqui em diante, um SIGTERM (o pod apagado) para o worker e o agente ainda entrega
         # o que tiver e limpa as pastas, em vez de morrer no meio.
         terminated = asyncio.Event()
-        with contextlib.suppress(NotImplementedError, RuntimeError):
-            loop.add_signal_handler(signal.SIGTERM, terminated.set)
+
+        # signal.signal, não loop.add_signal_handler: no fim, o SIGTERM passa direto a ser
+        # ignorado. O remove_signal_handler do asyncio devolve o SIGTERM ao padrão (que mata o
+        # processo) antes de o agente o ignorar, e o pod apagado logo depois do resultado
+        # mataria o agente nesse instante (saída -15, sem ter limpado tudo).
+        def on_sigterm(_signum: int, _frame: object) -> None:
+            loop.call_soon_threadsafe(terminated.set)
+
+        previous = signal.signal(signal.SIGTERM, on_sigterm)
         try:
             return await _run_attempt(
                 client,
@@ -745,8 +753,10 @@ async def run_pod(
         finally:
             await asyncio.to_thread(shutil.rmtree, private, True)
             await asyncio.to_thread(shutil.rmtree, work, True)
-            with contextlib.suppress(NotImplementedError, RuntimeError):
-                loop.remove_signal_handler(signal.SIGTERM)
+            # A tentativa acabou e as pastas estão limpas: marca o fim antes de devolver o
+            # tratamento de antes (o do agente, em _main, que a partir daqui ignora o sinal).
+            _ATTEMPT_OVER.set()
+            signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
 
 
 async def _run_attempt(
@@ -891,14 +901,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+#: Marcado quando a tentativa acabou (entregue ou não) e as pastas já foram limpas.
+_ATTEMPT_OVER = threading.Event()
+
+
+def _outside_attempt(_signum: int, _frame: object) -> None:
+    """O SIGTERM fora da tentativa (no processo do agente; durante ela, quem cuida é run_pod).
+
+    Antes dela (buscando o trabalho), nada começou: o agente sai. Depois dela, o processo só
+    está saindo (o lançador apaga o pod logo depois do resultado): o sinal não muda nada e
+    não mata o agente no meio do fim. Nunca o tratamento padrão, que mataria o processo.
+    """
+    if _ATTEMPT_OVER.is_set():
+        return
+    raise SystemExit(EXIT_FAILED)
+
+
 async def _main(channel_dir: Path, work_root: Path, tmp_root: Path) -> int:
+    signal.signal(signal.SIGTERM, _outside_attempt)
     try:
         return await run_pod(channel_dir, work_root, tmp_root)
     finally:
-        # A tentativa acabou (entregue ou não) e as pastas já foram limpas: um SIGTERM agora
-        # (o lançador apaga o pod logo depois do resultado) não muda nada e não mata o
-        # processo no meio do fim. Antes disso, quem cuida do SIGTERM é o próprio agente.
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        # Também quando a tentativa nem começou: daqui em diante, o processo só está saindo.
+        _ATTEMPT_OVER.set()
 
 
 def main(argv: Sequence[str] | None = None) -> int:

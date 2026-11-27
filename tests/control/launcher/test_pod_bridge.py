@@ -527,15 +527,17 @@ async def test_the_channel_client_ignores_the_proxy_of_the_environment(
 async def test_a_sigterm_after_the_attempt_does_not_kill_the_agent_on_its_way_out(
     tmp_path: Path,
 ) -> None:
-    from rapa.runner.pod import _main
+    from rapa.runner.pod import _main, _outside_attempt
 
     previous = signal.getsignal(signal.SIGTERM)
     try:
         # O lançador apaga o pod logo depois do resultado: o SIGTERM que chega enquanto o
-        # agente já está saindo não troca o código de saída dele.
+        # agente já está saindo não troca o código de saída dele (e nunca é o tratamento
+        # padrão, que mataria o processo com -15).
         assert await _main(tmp_path / "sem-canal", tmp_path, tmp_path) == 1
-        assert signal.getsignal(signal.SIGTERM) == signal.SIG_IGN
+        assert signal.getsignal(signal.SIGTERM) is _outside_attempt
         os.kill(os.getpid(), signal.SIGTERM)  # ignorado
+        await asyncio.sleep(0.05)
     finally:
         signal.signal(signal.SIGTERM, previous)
 

@@ -12,6 +12,7 @@ import os
 import shutil
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
 from datetime import UTC, datetime, timedelta
@@ -261,3 +262,33 @@ def test_secrets_become_private_files_in_the_tmpfs(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="precisam ser texto") as caught:
         materialize_secrets({"portal": {"password": 12345678}}, tmp_path / "outra")
     assert "12345678" not in str(caught.value)
+
+
+_SIGTERM_PROBE = """
+import os, signal, sys, time
+from rapa.runner import pod
+signal.signal(signal.SIGTERM, pod._outside_attempt)
+if sys.argv[1] == "depois":
+    pod._ATTEMPT_OVER.set()
+os.kill(os.getpid(), signal.SIGTERM)
+time.sleep(0.2)
+print("vivo")
+"""
+
+
+@pytest.mark.parametrize(("phase", "code", "alive"), [("depois", 0, True), ("antes", 1, False)])
+def test_sigterm_outside_the_attempt_never_kills_the_agent_by_the_signal(
+    phase: str, code: int, alive: bool
+) -> None:
+    # O lançador apaga o pod logo depois do resultado: o SIGTERM chega com o agente saindo.
+    # Depois da tentativa, o sinal não muda nada (antes, o tratamento padrão matava o
+    # processo no meio do fim, com -15); antes dela, nada começou, e o agente sai com 1.
+    done = subprocess.run(  # noqa: S603 - o próprio interpretador dos testes
+        [sys.executable, "-c", _SIGTERM_PROBE, phase],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert done.returncode == code, done.stderr[-2000:]
+    assert ("vivo" in done.stdout) is alive
